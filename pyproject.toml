@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catan"
+version = "0.1.0"
+description = "Interactive and algorithmic tools for matching neurons across calcium imaging sessions"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "h5py",
+    "opencv-python",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PySide6",
+    "vispy",
+    "qtawesome",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+catan = "catan.gui.app:main"
+catan-match = "catan.cli.match:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["catan*"]

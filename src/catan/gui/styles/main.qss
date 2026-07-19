@@ -1,0 +1,57 @@
+
+
+/* Main app background */
+QMainWindow, QWidget#AppRoot {
+    background: #383838;
+}
+
+/* Generic card */
+QFrame[card="true"] {
+    background: #383838;
+    border: 1px solid #373737;
+    border-radius: 5px;
+}
+
+/* Card header */
+QFrame[cardHeader="true"] {
+    background: #2c3137;
+    /* color: #ffffff; */
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    border-bottom: 1px solid #d6dbe0;
+}
+
+/* Canvas Card */
+QFrame[plotCard="true"] {
+    background: #f7f8fa;
+    border: 1px solid #3a3f44;
+    border-radius: 3px;
+}
+
+/* Section title */
+QLabel[sectionTitle="true"] {
+    font-weight: 600;
+    /* color: #263238; */
+}
+QToolButton[sectionTitle="true"] {
+    font-size: 16px;
+    font-weight: 600;
+    /* color: #263238; */
+}
+                      
+/* Muted text */
+QLabel[muted="true"] {
+    color: #6b7280;
+}
+
+/* Compact tool buttons */
+QToolButton[panelButton="true"], QPushButton[panelButton="true"] {
+    border-radius: 5px;
+    padding: 3px 7px;
+}
+
+/* Softer input fields */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    border-radius: 5px;
+    padding: 2px 5px;
+}
