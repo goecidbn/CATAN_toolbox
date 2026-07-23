@@ -3,7 +3,7 @@ from PySide6.QtCore import Qt
 
 
 from .main_menu import MainMenu
-from .display_area import DisplayArea
+from . import DisplayArea
 
 
 class MainApp(QWidget):

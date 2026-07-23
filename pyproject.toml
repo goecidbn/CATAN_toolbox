@@ -1,20 +1,24 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel", "setuptools_scm>=10"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "catan"
-version = "0.1.0"
-description = "Interactive and algorithmic tools for matching neurons across calcium imaging sessions"
+dynamic = ["version"]
+description = "Interactive and algorithmic tools for matching and curating neurons across calcium imaging sessions"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+
 dependencies = [
-    "numpy",
-    "scipy",
-    "scikit-learn",
-    "h5py",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "h5py>=3.8",
     "opencv-python",
     "tqdm",
+    "matplotlib",
+    "scikit-image",
 ]
 
 [project.optional-dependencies]
@@ -22,10 +26,18 @@ gui = [
     "PySide6",
     "vispy",
     "qtawesome",
+    "psutil",
+    "pyqtdarktheme-fork>=2.3.6",
+    "shiboken6",
 ]
 dev = [
+    "build",
     "pytest",
+    "pytest-cov",
     "ruff",
+    "pre-commit",
+    "nbstripout",
+    "setuptools-scm>=10",
 ]
 
 [project.scripts]
@@ -35,3 +47,18 @@ catan-match = "catan.cli.match:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["catan*"]
+
+[tool.setuptools.package-data]
+"catan.gui.resources" = [
+    "styles/*.qss",
+    "icons/*.svg",
+    "icons/*.png",
+    "images/*.png",
+    "images/*.jpg",
+    "defaults/*.json",
+    "defaults/*.yaml",
+    "defaults/*.toml",
+]
+
+[tool.setuptools_scm]
+version_file = "src/catan/_version.py"

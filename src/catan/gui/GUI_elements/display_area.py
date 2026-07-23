@@ -8,12 +8,10 @@ from PySide6.QtWidgets import (
     QSplitter,
 )
 
-from catan.gui.GUI_elements.display_section import (
-    DisplaySection,
-)
 from catan.gui.plots import BasePlot
-from catan.gui.structures.state import AppState
-from catan.gui.structures.data import Data
+from catan.gui.structures import Data, AppState
+
+from . import DisplaySection
 
 
 def new_id():

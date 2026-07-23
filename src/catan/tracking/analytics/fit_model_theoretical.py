@@ -567,104 +567,104 @@ def debug_objective_once(
 ## PLOTS
 
 
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 
-def plot_empirical_vs_model_components(
-    H, r_edges, c_edges, P_same, P_diff, P_joint, title_prefix=""
-):
-    """
-    Shows 4 panels:
-      empirical, model joint, model same, model diff
-    All are displayed as normalized probabilities per bin.
-    """
-    H = np.asarray(H, dtype=float)
-    Hn = H / H.sum() if H.sum() > 0 else H
+# def plot_empirical_vs_model_components(
+#     H, r_edges, c_edges, P_same, P_diff, P_joint, title_prefix=""
+# ):
+#     """
+#     Shows 4 panels:
+#       empirical, model joint, model same, model diff
+#     All are displayed as normalized probabilities per bin.
+#     """
+#     H = np.asarray(H, dtype=float)
+#     Hn = H / H.sum() if H.sum() > 0 else H
 
-    extent = [c_edges[0], c_edges[-1], r_edges[0], r_edges[-1]]  # x=c, y=r
+#     extent = [c_edges[0], c_edges[-1], r_edges[0], r_edges[-1]]  # x=c, y=r
 
-    fig, axs = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+#     fig, axs = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
 
-    def show(ax, M, title):
-        im = ax.imshow(
-            M,
-            origin="lower",
-            aspect="auto",
-            extent=extent,
-            interpolation="nearest",
-        )
-        ax.set_xlabel("correlation")
-        ax.set_ylabel("distance (µm)")
-        ax.set_title(title)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+#     def show(ax, M, title):
+#         im = ax.imshow(
+#             M,
+#             origin="lower",
+#             aspect="auto",
+#             extent=extent,
+#             interpolation="nearest",
+#         )
+#         ax.set_xlabel("correlation")
+#         ax.set_ylabel("distance (µm)")
+#         ax.set_title(title)
+#         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    show(axs[0, 0], Hn, f"{title_prefix}Empirical (normalized)")
-    show(axs[0, 1], P_joint, f"{title_prefix}Model joint")
-    show(axs[1, 0], P_same, f"{title_prefix}Model SAME component")
-    show(axs[1, 1], P_diff, f"{title_prefix}Model DIFF component")
+#     show(axs[0, 0], Hn, f"{title_prefix}Empirical (normalized)")
+#     show(axs[0, 1], P_joint, f"{title_prefix}Model joint")
+#     show(axs[1, 0], P_same, f"{title_prefix}Model SAME component")
+#     show(axs[1, 1], P_diff, f"{title_prefix}Model DIFF component")
 
-    plt.show()
-
-
-def plot_residual_map(H, P_joint, r_edges, c_edges, eps=1e-15, title="Residuals"):
-    """
-    Plot log-ratio residuals: log((H+eps)/(P_joint+eps)) to see where model misfits.
-    """
-    H = np.asarray(H, dtype=float)
-    Hn = H / H.sum() if H.sum() > 0 else H
-    R = np.log((Hn + eps) / (P_joint + eps))
-
-    extent = [c_edges[0], c_edges[-1], r_edges[0], r_edges[-1]]
-    plt.figure(figsize=(7, 6), constrained_layout=True)
-    im = plt.imshow(
-        R, origin="lower", aspect="auto", extent=extent, interpolation="nearest"
-    )
-    plt.xlabel("correlation")
-    plt.ylabel("distance (µm)")
-    plt.title(title)
-    plt.colorbar(im, fraction=0.046, pad=0.04)
-    plt.show()
+#     plt.show()
 
 
-# ----------------------------
-# Example usage
-# ----------------------------
-if __name__ == "__main__":
-    # Suppose you already built a 128x128 histogram H over (r,c)
-    nrb = 128
-    ncb = 128
-    R_cut = 25.0
+# def plot_residual_map(H, P_joint, r_edges, c_edges, eps=1e-15, title="Residuals"):
+#     """
+#     Plot log-ratio residuals: log((H+eps)/(P_joint+eps)) to see where model misfits.
+#     """
+#     H = np.asarray(H, dtype=float)
+#     Hn = H / H.sum() if H.sum() > 0 else H
+#     R = np.log((Hn + eps) / (P_joint + eps))
 
-    # Example edges:
-    r_edges = np.linspace(0.0, R_cut, nrb + 1)
-    c_edges = np.linspace(0.0, 1.0, ncb + 1)
+#     extent = [c_edges[0], c_edges[-1], r_edges[0], r_edges[-1]]
+#     plt.figure(figsize=(7, 6), constrained_layout=True)
+#     im = plt.imshow(
+#         R, origin="lower", aspect="auto", extent=extent, interpolation="nearest"
+#     )
+#     plt.xlabel("correlation")
+#     plt.ylabel("distance (µm)")
+#     plt.title(title)
+#     plt.colorbar(im, fraction=0.046, pad=0.04)
+#     plt.show()
 
-    # Fake histogram for demo; replace with your accumulated counts
-    rng = np.random.default_rng(0)
-    H = rng.poisson(1.0, size=(nrb, ncb)).astype(float)
 
-    # You should pass the actual FOV size in microns
-    L = 500.0
+# # ----------------------------
+# # Example usage
+# # ----------------------------
+# if __name__ == "__main__":
+#     # Suppose you already built a 128x128 histogram H over (r,c)
+#     nrb = 128
+#     ncb = 128
+#     R_cut = 25.0
 
-    res = fit_from_histogram(
-        H,
-        r_edges,
-        c_edges,
-        R_cut=R_cut,
-        L=L,
-        lam_init=0.002,
-        h_init=10.0,
-        sigma_init=3.0,
-        p_same_init=0.02,
-        n_r_grid=1800,
-        n_c_grid=500,
-        n_theta=1024,
-    )
+#     # Example edges:
+#     r_edges = np.linspace(0.0, R_cut, nrb + 1)
+#     c_edges = np.linspace(0.0, 1.0, ncb + 1)
 
-    print("success:", res.success, res.message)
-    if res.success:
-        print("lambda_hat:", res.lam_hat)
-        print("h_hat:", res.h_hat)
-        print("sigma_eff_hat:", res.sigma_hat)
-        print("p_same_hat:", res.p_same_hat)
-        print("counts used:", res.N_used)
+#     # Fake histogram for demo; replace with your accumulated counts
+#     rng = np.random.default_rng(0)
+#     H = rng.poisson(1.0, size=(nrb, ncb)).astype(float)
+
+#     # You should pass the actual FOV size in microns
+#     L = 500.0
+
+#     res = fit_from_histogram(
+#         H,
+#         r_edges,
+#         c_edges,
+#         R_cut=R_cut,
+#         L=L,
+#         lam_init=0.002,
+#         h_init=10.0,
+#         sigma_init=3.0,
+#         p_same_init=0.02,
+#         n_r_grid=1800,
+#         n_c_grid=500,
+#         n_theta=1024,
+#     )
+
+#     print("success:", res.success, res.message)
+#     if res.success:
+#         print("lambda_hat:", res.lam_hat)
+#         print("h_hat:", res.h_hat)
+#         print("sigma_eff_hat:", res.sigma_hat)
+#         print("p_same_hat:", res.p_same_hat)
+#         print("counts used:", res.N_used)

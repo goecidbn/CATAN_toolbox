@@ -1,6 +1,5 @@
 from typing import List, Optional
 import os, tqdm, importlib
-import numpy as np
 from PySide6.QtWidgets import (
     QWidget,
     QFormLayout,
@@ -24,9 +23,8 @@ from pathlib import Path
 from catan.gui.structures import data, state
 from catan.gui.plots.colors import CyclicColorMap
 
-from . import session_overview
-from .dialog_load_field import FieldSelectDialog, list_file_fields
-from .ResourceMonitor import ResourceMonitor
+from . import SessionOverview, ResourceMonitor
+# from .dialog_load_field import FieldSelectDialog, list_file_fields
 
 app_modes = {
     "Single session": "single",
@@ -146,7 +144,7 @@ class MainMenu(QFrame):
         # self.state.current_session_changed.connect(self.on_current_session_changed)
 
     def rebuild(self):
-        importlib.reload(session_overview)
+        # importlib.reload(session_overview)
         importlib.reload(data)
 
     def change_logging_level(self):
@@ -196,16 +194,16 @@ class MainMenu(QFrame):
         #     finished=self.on_background_done,
         # )
 
-    def on_background_done(self, result):
-        # print("Data loaded, now updating display...")
-        self.data.neurons = result
-        self.set_busy(False)
-        self.current_worker = None
-        self.state.current_job = None
-        self.state.plot_update_required.emit()
-        self.state.current_session_id = 0
+    # def on_background_done(self, result):
+    #     # print("Data loaded, now updating display...")
+    #     # self.data.neurons = result
+    #     self.set_busy(False)
+    #     self.current_worker = None
+    #     self.state.current_job = None
+    #     self.state.plot_update_required.emit()
+    #     self.state.current_session_id = 0
 
-        # self.update_display()
+    #     # self.update_display()
 
     # def add_session(self, this_data: session_data):
 
@@ -271,22 +269,28 @@ class MainMenu(QFrame):
         self.state.assignments = self.data.assignments
 
         ## prepare checking for common path
-        paths = [self.data.sessions[s].path for s in sorted(self.data.sessions.keys())]
+        paths = [session.path for session in self.data.sessions if session.path is not None]
+        assert len(paths) >= 1, "No sessions found in the loaded model."
+
         common_path = os.path.commonpath(paths)
 
-        self.data.sessions = []
-        for s, this_data in tqdm.tqdm(sorted(self.data.sessions.items())):
+        # self.data.sessions = []
+        for session in tqdm.tqdm(self.data.sessions):
             if not common_path == self.root_folder:
                 ## if the common path is not the root_folder, this might be from
                 ## changing systems or file structure since analysing the data,
                 ## so we adjust this
-                new_path = str(
-                    Path(self.root_folder) / Path(paths[s]).relative_to(common_path)
+                if session.path is None:
+                    raise ValueError(
+                        f"Session {session.name} has no path, cannot adjust to new root folder."
+                    )
+                session.path = str(
+                    Path(self.root_folder) / Path(session.path).relative_to(common_path)
                 )
-                this_data.path = (
-                    new_path  # update path to current root folder structure
-                )
-            self.add_session(this_data)
+                # this_data.path = (
+                #     new_path  # update path to current root folder structure
+                # )
+            # self.add_session(this_data)
 
         # self.state.current_session_id = 0
 
@@ -311,7 +315,8 @@ class MainMenu(QFrame):
         """
         ## first, disband previous menu
         while (child := self.paths_layout.takeAt(0)) is not None:
-            child.widget().deleteLater()
+            if child.widget() is not None:
+                child.widget().deleteLater()
 
         ## then, build new menu
 
@@ -329,7 +334,7 @@ class MainMenu(QFrame):
 
         self.paths_layout.addWidget(paths, alignment=Qt.AlignmentFlag.AlignTop)
 
-        self.path_list = session_overview.SessionListPanel(self)
+        self.path_list = SessionOverview(self)
         # self.path_list = PathList(self)
         self.paths_layout.addWidget(self.path_list)
 

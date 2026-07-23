@@ -17,17 +17,8 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
-from catan.gui.plots.BasePlot import BaseCanvas
-from catan.gui.structures.state import AppState
-from catan.gui.structures.data import Data
-from catan.gui.plots import Footprints, Overview, Statistics
-from catan.gui.plots import (
-    SelectionDisplay,
-)
-
-from catan.gui.plots import (
-    Traces,
-)
+from catan.gui.structures import AppState, Data
+from catan.gui.plots import Footprints, Overview, Statistics, SelectionDisplay, Traces
 
 display_modes = {
     "overview": {

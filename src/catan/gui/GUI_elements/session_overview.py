@@ -11,13 +11,17 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
     QMenu,
+    QListWidget,
+    QListWidgetItem,
+    QInputDialog,
+    QColorDialog,
+    QMessageBox,
 )
 
-from catan.gui.structures.data import Data
-from catan.gui.structures.state import AppState
+from catan.gui.structures import AppState, Data
 from catan.gui.data.utils import move_index_along_axis
 
-from catan.gui.GUI_elements.fragments.IconButton import (
+from .fragments.IconButton import (
     make_icon_button,
     set_button_icon,
 )
@@ -297,19 +301,9 @@ class SessionRowWidget(QFrame):
         menu.exec(self.mapToGlobal(pos))
 
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (
-    QWidget,
-    QListWidget,
-    QListWidgetItem,
-    QVBoxLayout,
-    QInputDialog,
-    QColorDialog,
-    QMessageBox,
-)
 
 
-class SessionListPanel(QWidget):
+class SessionOverview(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
 

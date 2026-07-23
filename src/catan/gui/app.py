@@ -1,35 +1,46 @@
+from __future__ import annotations
+
 import sys, os
 
-from pathlib import Path
-
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (
-    QApplication,
-)
-
-from catan.gui.GUI_elements.main_window import CatanToolbox
 
 import qdarktheme
 
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 
+def main() -> int:
 
-STYLE_PATH = Path("styles") / "main.qss"
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ModuleNotFoundError as exc:
+        if exc.name == "PySide6":
+            raise RuntimeError(
+                "The CATAN GUI dependencies are not installed.\n"
+                'Install them with:\n\n'
+                '    python -m pip install "catan[gui]"\n'
+            ) from exc
+        raise
 
+    """Start the CATAN graphical application."""
+    from catan.gui.GUI_elements.main_window import MainWindow
+    app = QApplication.instance()
 
-def main():
-    app = QApplication(sys.argv)
+    owns_application = app is None
+    if app is None:
+        app = QApplication(sys.argv)
     qdarktheme.setup_theme("dark")
 
     font = QFont("Noto Sans", 10)
     app.setFont(font)
 
-    win = CatanToolbox(*sys.argv[1:])
-    # win.resize(2400, 1600)
+    window = MainWindow(*sys.argv[1:])
+    window.show()
 
-    win.show()
+    if owns_application:
+        return app.exec()
 
-    return app.exec()
+
+    return 0
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+src/catan/_version.py
 
 # Jupyter
 .ipynb_checkpoints/

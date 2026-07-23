@@ -1,4 +1,5 @@
-import sys
+import os, psutil, sys
+
 from scipy import sparse
 import numpy as np
 from PySide6.QtCore import QTimer
@@ -114,11 +115,7 @@ def format_bytes(n):
     return f"{n:.1f} TB"
 
 
-import os
-import psutil
-
 process = psutil.Process(os.getpid())
-
 
 def process_memory():
     return process.memory_info().rss

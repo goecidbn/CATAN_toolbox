@@ -8,8 +8,6 @@ from matplotlib.collections import LineCollection
 
 import matplotlib as mpl
 
-# import plotly.graph_objects as go
-
 mpl.rcParams["path.simplify"] = False
 mpl.rcParams["agg.path.chunksize"] = 20000  # or 0 to disable
 
@@ -22,7 +20,7 @@ from matplotlib import (
     cm,
 )
 
-from .neuron_tracking import track_neurons
+from .neuron_tracking import Tracking
 
 from catan.core.plot_utils import (
     plot_with_confidence,
@@ -31,7 +29,7 @@ from catan.core.plot_utils import (
 )
 
 
-class track_neurons_analysis(track_neurons):
+class TrackingAnalysis(Tracking):
     """
     this specifies the different plot functions:
 

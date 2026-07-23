@@ -31,34 +31,11 @@ from catan.core.structures import SessionData, Remapping
 from catan.core.utils import nangauss_filter, pad_axis
 from catan.core.analysis import calculate_statistics, calculate_p
 from catan.core.alignment import _shift_sparse_bilinear
-from catan.core.data import center_of_mass
 
 from .analytics.fit_model_theoretical import (
     fit_histogram_params,
     match_model,
 )
-
-# from .analytics.distance_model import pdf_same_distance, pdf_diff_distance
-
-# from .analytics.correlation_model import pdf_same_correlation, pdf_diff_correlation
-# from .analytics.correlation_model import pdf_reverse_lognormal, pdf_truncated_normal
-
-
-# from .utils_new import (
-#     calculate_statistics,
-#     center_of_mass,
-#     nangauss_filter,
-#     calculate_p,
-#     pad_axis,
-#     shift_sparse_bilinear,
-#     normalize_sparse_array,
-#     apply_remap,
-# )
-
-# ### import general utils stuff from root dir (how to do this more elegantly? submodule?)
-# root_dir = Path.cwd().parents[2]
-# if not root_dir in sys.path:
-#     sys.path.insert(0, str(root_dir))
 
 from catan.core.io import load_data, save_data
 
@@ -66,7 +43,7 @@ logging.basicConfig(level=logging.INFO)
 print("reloading tracking")
 
 
-class track_neurons:
+class Tracking:
 
     union_data: SessionData
 

@@ -1,6 +1,5 @@
 import importlib
-
-from pathlib import Path
+from importlib.resources import files
 
 from PySide6.QtCore import QCoreApplication, QSettings
 from PySide6.QtGui import QAction, QFont, Qt
@@ -11,23 +10,26 @@ from PySide6.QtWidgets import (
     QSplitter,
     QWidget,
 )
-from catan.gui.GUI_elements.display_area import DisplayArea
-from catan.gui.GUI_elements.main_menu import MainMenu
 
-from catan.gui.structures import data, state  # .data import Data
+from catan.gui.resources import (
+    combine_stylesheets,
+    load_stylesheet,
+)
+from catan.gui.structures import AppState, Data
 from catan.gui.interaction import click_events
 
+from . import DisplayArea, MainMenu
 
-class CatanToolbox(QMainWindow):
+class MainWindow(QMainWindow):
 
     settings = QSettings()
-    state = state.AppState()
+    state = AppState()
     # data = Data()
 
     def __init__(self):
         super().__init__()
 
-        self.data: data.Data = data.Data(self.state)
+        self.data: Data = Data(self.state)
 
         # self.settings = QSettings()
         self._restore_settings()
@@ -80,7 +82,6 @@ class CatanToolbox(QMainWindow):
         self.state.data_version += 1
 
         importlib.reload(click_events)
-        importlib.reload(data)
 
         self.gui_elements["display_area"].rebuild()
         self.gui_elements["main_menu"].rebuild()
@@ -92,9 +93,12 @@ class CatanToolbox(QMainWindow):
         if app is None:
             return
 
-        style = self.style_sheet
-        style += Path("src/catan/gui/styles/main.qss").read_text()
-
+        
+        style = combine_stylesheets(
+            self.style_sheet,
+            load_stylesheet("main.qss"),
+        )
+        
         app.setStyleSheet(style)
 
     def print_debug_info(self):
