@@ -153,7 +153,7 @@ class Display(BasePlot.BaseCanvas):
             to_plot_neurons = []
             if adjacent_radius > 1e-2:
                 # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
-                union_centroids = self.data.union_data.centroids
+                union_centroids = self.data.union.centroids
                 distances = np.linalg.norm(
                     union_centroids - union_centroids[this_neuron],
                     axis=1,
@@ -248,7 +248,7 @@ class Display(BasePlot.BaseCanvas):
         # union_centroids = np.nanmean(
         #     self.data.neurons.centroids[displayed_neurons, ...], axis=1
         # )
-        union_centroids = self.data.union_data.centroids[displayed_neurons, ...]
+        union_centroids = self.data.union.centroids[displayed_neurons, ...]
 
         centroid_min = np.nanmin(union_centroids, axis=0)
         centroid_max = np.nanmax(union_centroids, axis=0)
@@ -426,7 +426,7 @@ class Display(BasePlot.BaseCanvas):
         self, component: NeuronComponent
     ) -> tuple[np.ndarray, np.ndarray]:
         # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
-        union_centroids = self.data.union_data.centroids
+        union_centroids = self.data.union.centroids
         neuron_id = component.neuron_id
         d = np.linalg.norm(union_centroids - union_centroids[neuron_id], axis=1)
         try:
@@ -666,7 +666,7 @@ class Display(BasePlot.BaseCanvas):
         submenu_flag.addAction(QAction("... for removal", submenu_flag))
         menu.addMenu(submenu_flag)
 
-        if not self.data.sessions[this_component.session_id].traces_loaded:
+        if not self.data.sessions[this_component.session_id].status["traces_loaded"]:
 
             load_action = QAction("Load trace for this session", menu)
             menu.addAction(load_action)
@@ -798,7 +798,6 @@ class Controller(BasePlot.CanvasController):
         # )
 
     def _on_data_changed(self):
-        print("data changed (footprints)")
         self.replot_neurons()
 
     def initialize_display(self):

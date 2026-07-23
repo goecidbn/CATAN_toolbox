@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple, List
 from functools import partial
 import sys, copy, logging, time
 
-# from tqdm import tqdm
+import h5py
 from tqdm.auto import tqdm
 
 from pathlib import Path
@@ -27,7 +27,7 @@ from scipy import sparse, spatial, special
 from scipy.ndimage import gaussian_filter
 from scipy.optimize import linear_sum_assignment
 
-from catan.core.structures import SessionData, Remapping
+from catan.core.structures import SessionData
 from catan.core.utils import nangauss_filter, pad_axis
 from catan.core.analysis import calculate_statistics, calculate_p
 from catan.core.alignment import _shift_sparse_bilinear
@@ -40,12 +40,12 @@ from .analytics.fit_model_theoretical import (
 from catan.core.io import load_data, save_data
 
 logging.basicConfig(level=logging.INFO)
-print("reloading tracking")
-
 
 class Tracking:
 
-    union_data: SessionData
+    union: SessionData
+
+    HDF5_VERSION = 1
 
     def __init__(self, bins=64, logLevel=logging.ERROR):
 
@@ -155,7 +155,7 @@ class Tracking:
         for s, path in self.progress:
             if s_specific is not None and s not in s_specific:
                 continue
-            sz_union = self.union_data.n_neurons
+            sz_union = self.union.n_neurons
             self.progress.set_description(
                 f"Registering session {s} to {sz_union} neurons, {path.name}"
             )
@@ -512,7 +512,7 @@ class Tracking:
 
         p_same = self.f_same(self.params["arrays"]["distance_bounds"], 1.0)
         idx_cutoff = np.where(p_same < 0.05)[0][0]
-        self.distance_cutoff = self.params["arrays"]["distance_bounds"][idx_cutoff]
+        self.distance_cutoff = max(10, self.params["arrays"]["distance_bounds"][idx_cutoff] * 1.5)  ## make sure, also half-detected ones have a chance!
 
     def get_f_same(self, model="joint"):
 
@@ -610,7 +610,7 @@ class Tracking:
         ## parameters needed for registration process
         # self.nS = 0
         # self.sessions = []
-        self.union_data = SessionData(name="union", params=self.params)
+        self.union = SessionData(name="union", params=self.params)
 
         self.assignments = np.zeros((0, 0), int)  # nNeurons x nSessions
 
@@ -655,10 +655,10 @@ class Tracking:
                 this_data.clean_traces()
             return
 
-        if not self.union_data.spatial_loaded:
+        if not self.union.status["spatial_loaded"]:
 
             A = this_data.A[:, this_data.idx_eval]
-            self.union_data.register_spatial(A=A, dims=this_data.dims)
+            self.union.register_spatial(A=A, dims=this_data.dims)
 
             actually_good = np.where(this_data.idx_eval)[0]
             N_add = len(actually_good)
@@ -689,9 +689,8 @@ class Tracking:
         footprint_shifts, footprint_distances, footprint_correlations, _, _ = (
             calculate_statistics(
                 this_data,
-                self.union_data,
-                distance_threshold=self.distance_cutoff
-                * 1.5,  ## maake sure, also half-detected ones have a chance!
+                self.union,
+                distance_threshold=self.distance_cutoff,
                 nP=12,
                 # params=self.params,
             )
@@ -725,7 +724,7 @@ class Tracking:
 
         ## find neurons which were not matched in current and reference session
         non_matched_ref = np.setdiff1d(
-            list(range(self.union_data.n_neurons)), matched_ref
+            list(range(self.union.n_neurons)), matched_ref
         )
         non_matched = np.setdiff1d(
             list(np.where(this_data.idx_eval)[0]), matches[1][idx_TP]
@@ -757,15 +756,15 @@ class Tracking:
             [
                 (
                     _shift_sparse_bilinear(
-                        self.union_data.A[:, m_ref],  # .reshape(512, 512),
-                        self.union_data.dims,
+                        self.union.A[:, m_ref],  # .reshape(512, 512),
+                        self.union.dims,
                         -footprint_shifts[m_ref, m, 0],
                         -footprint_shifts[m_ref, m, 1],
                         order="C",
                         # output_format="csc",
                     )  # .reshape(-1, 1)
                     if footprint_distances[m_ref, m] > 0.5
-                    else self.union_data.A[:, m_ref]
+                    else self.union.A[:, m_ref]
                 ).multiply(1 - footprint_correlations[m_ref, m] / 2)
                 + this_data.A[:, m].multiply(footprint_correlations[m_ref, m] / 2)
                 for m_ref, m in zip(matched_ref, matched)
@@ -774,22 +773,22 @@ class Tracking:
         )
         # print("time taken (shift):", time.time() - t_start)
 
-        # self.union_data.A[:, matched_ref] = self.union_data.A[:, matched_ref].multiply(
+        # self.union.A[:, matched_ref] = self.union.A[:, matched_ref].multiply(
         #     1 - p_matched[idx_TP] / 2
         # ) + this_data.A[:, matched].multiply(p_matched[idx_TP] / 2)
 
-        self.union_data.A.toarray()[:, matched_ref] = shifted.toarray()
+        self.union.A.toarray()[:, matched_ref] = shifted.toarray()
         ## append new neuron footprints to union
         A_updated = sparse.hstack(
-            [sparse.coo_matrix(self.union_data.A), this_data.A[:, non_matched]],
+            [sparse.coo_matrix(self.union.A), this_data.A[:, non_matched]],
             format="csc",
         )
         # ## update union data
-        self.union_data.register_spatial(A=A_updated)
+        self.union.register_spatial(A=A_updated)
         # print("union update (shift + merge + stack):", time.time() - t_start)
 
         # self.progress.set_description(
-        #     f"Union now contains {self.union_data.n_neurons} neurons"
+        #     f"Union now contains {self.union.n_neurons} neurons"
         # )
 
         ### ------------------------------------------------------------ ###
@@ -914,20 +913,20 @@ class Tracking:
         self.tracking["shifts"] = self.tracking["shifts"][neuron_presence, :, :]
 
         print(
-            f"shape union data before cleaning: {self.union_data.A.shape}, vs {self.union_data.n_neurons}"
+            f"shape union data before cleaning: {self.union.A.shape}, vs {self.union.n_neurons}"
         )
         ## could just rebuild it entirely from the remaining sessions, but for now just remove the columns of empty neurons
         A_cleaned = sparse.hstack(
             [
-                self.union_data.A[:, i]
-                for i in range(self.union_data.n_neurons)
+                self.union.A[:, i]
+                for i in range(self.union.n_neurons)
                 if neuron_presence[i]
             ],
             format="csc",
         )
-        self.union_data.register_spatial(A=A_cleaned)
+        self.union.register_spatial(A=A_cleaned)
 
-        print(f"Updated union data now contains {self.union_data.n_neurons} neurons.")
+        print(f"Updated union data now contains {self.union.n_neurons} neurons.")
 
     # def get_variable_by_cluster(self, var, c=None):
     #     """
@@ -1129,11 +1128,11 @@ class Tracking:
 
         ## check for distance from imaging window borders
         for i in range(2):
-            idx_remove_low = self.union_data.centroids[:, i] < (borders[0, i])
+            idx_remove_low = self.union.centroids[:, i] < (borders[0, i])
             # status[np.any(idx_remove_low, 1)] = False
             status[idx_remove_low] = False
 
-            idx_remove_high = self.union_data.centroids[:, i] > (borders[1, i])
+            idx_remove_high = self.union.centroids[:, i] > (borders[1, i])
             # status[np.any(idx_remove_high, 1)] = False
             status[idx_remove_high] = False
         # clusters["status"] = status
@@ -1422,32 +1421,81 @@ class Tracking:
             save_path.mkdir(parents=True, exist_ok=True)
 
         suffix = fix_suffix(suffix)
-        data = {
-            "sessions": self.sessions,
-            "assignments": self.assignments,
-            "tracking": self.tracking,
-            # "clusters": getattr(self, self.cluster_field),
-        }
-        save_data(data, str(save_path / f"neuron_registration{suffix}{ext}"))
 
+        with h5py.File(save_path / f"neuron_registration{suffix}{ext}", "w") as f:
+            self.to_hdf5(f)
+
+        print(f"Saved neuron registration to {save_path / f'neuron_registration{suffix}{ext}'}")
+
+
+        # data = {
+        #     "sessions": self.sessions,
+        #     "assignments": self.assignments,
+        #     "tracking": self.tracking,
+        #     # "clusters": getattr(self, self.cluster_field),
+        # }
+        # save_data(data, str(save_path / f"neuron_registration{suffix}{ext}"))
+
+    def to_hdf5(self, group: h5py.Group | h5py.File) -> None:
+        group.attrs["object_type"] = "TrackingResult"
+        group.attrs["schema_version"] = self.HDF5_VERSION
+
+        group.create_dataset(
+            "assignments",
+            data=self.assignments,
+            compression="gzip",
+        )
+
+        tracking_group = group.create_group("tracking")
+        tracking_group.create_dataset(
+            "p_matched",
+            data=self.tracking["p_matched"],
+            compression="gzip",
+        )
+        tracking_group.create_dataset(
+            "shifts",
+            data=self.tracking["shifts"],
+            compression="gzip",
+        )
+
+        sessions_group = group.create_group("sessions")
+        sessions_group.attrs["n_sessions"] = len(self.sessions)
+
+        for session in self.sessions:
+            session_group = sessions_group.create_group(
+                f"session_{session.id:03d}"
+            )
+            session.to_hdf5(session_group)
+
+        union_group = sessions_group.create_group(
+            f"union"
+        )
+        self.union.to_hdf5(union_group)
+            
     def load_registration(self, path_registration: str):
 
-        ld = load_data(path_registration, subpath="/")
-        assert (
-            "sessions" in ld and "assignments" in ld and "tracking" in ld
-        ), "Data does not contain necessary fields 'sessions', 'assignments', and 'tracking'"
+        with h5py.File(path_registration, "r") as f:
+            self.assignments, self.tracking, self.sessions, self.union = self.from_hdf5(f)
+        
+        # ld = load_data(path_registration, subpath="/")
+        # print("path:",path_registration)
+        # print(ld.keys())
+        # assert (
+        #     "sessions" in ld and "assignments" in ld and "tracking" in ld
+        # ), "Data does not contain necessary fields 'sessions', 'assignments', and 'tracking'"
 
-        sessions = ld["sessions"]
+        # self.sessions = ld["sessions"]
+        # print(self.sessions)
 
-        self.assignments = ld["assignments"]
-        self.tracking = ld["tracking"]
+        # self.assignments = ld["assignments"]
+        # self.tracking = ld["tracking"]
 
         ## ensure session keys are integers (as saving/loading casts them to strings...)
-        self.sessions = []
-        for s, this_data in sessions.items():
+        # self.sessions = []
+        # for session in sessions:
             # print("remap", this_data["remap"])
             # print("Session key:", s)
-            self.sessions.append(SessionData(**this_data))
+            # self.sessions.append(SessionData(**this_data))
 
         # sessions["file_paths"] = [
         #     str(fp.decode("utf-8")) for fp in sessions["file_paths"]
@@ -1460,6 +1508,37 @@ class Tracking:
         # pathLd = (
         #     Path(self.paths["data"]) / f"matching/neuron_registration{suffix}.{ext}"
         # )
+
+
+    def from_hdf5(cls, group: h5py.Group | h5py.File):
+        if group.attrs.get("object_type") != "TrackingResult":
+            raise ValueError(
+                "The provided HDF5 group does not contain a TrackingResult object."
+            )
+
+        if group.attrs.get("schema_version") != cls.HDF5_VERSION:
+            raise ValueError(
+                f"Schema version mismatch: expected {cls.HDF5_VERSION}, found {group.attrs.get('schema_version')}"
+            )
+
+        assignments = group["assignments"][()]
+        tracking = {
+            "p_matched": group["tracking"]["p_matched"][()],
+            "shifts": group["tracking"]["shifts"][()],
+        }
+
+        sessions_group = group["sessions"]
+        n_sessions = sessions_group.attrs["n_sessions"]
+        sessions = []
+        for i in range(n_sessions):
+            session_group = sessions_group[f"session_{i:03d}"]
+            session = SessionData.from_hdf5(session_group)
+            sessions.append(session)
+
+        union_group = sessions_group["union"]
+        union = SessionData.from_hdf5(union_group)
+
+        return assignments, tracking, sessions, union
 
 
 def mean_of_trunc_lognorm(mu, sigma, trunc_loc):

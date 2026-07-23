@@ -1,6 +1,7 @@
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import inspect
+import h5py
 import numpy as np
 from scipy import sparse
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 from .remap import Remapping
 
 from catan.core.data import center_of_mass
-from catan.core.io import load_data
+from catan.core.io import load_data, write_sparse_matrix, write_optional_attr, write_optional_array, read_sparse_matrix, read_optional_attr, read_optional_array
 
 component_quality_default = {
     "SNR_lowest": 1.0,
@@ -39,49 +40,41 @@ def cast_dict_to_class_attributes(class_instance, dict, exclude_keys=[]):
 
 class SessionData:
     ## meta data
-    name: Optional[str] = None
-    path: Optional[str] = None
-    id: int = -1
+    name: Optional[str] = None  #
+    path: Optional[str] = None  #
+    id: int = -1    #
 
-    active: bool = True
-    time_offset: float = 0.0
+    active: bool = True #
+    time_offset: float = 0.0    #
     session_color: Optional[str] = None
     use_kde: bool = False
 
     # scheduled_for_loading: bool = False
-    # load status flags
-    scheduled_spatial: bool = False
-    scheduled_traces: bool = False
-    scheduled_quality: bool = False
-    spatial_loaded: bool = False
-    traces_loaded: bool = False
-    quality_loaded: bool = False
-
-    # processing status flags
-    aligned: bool = False
-    matched: bool = False
+    status: Dict[str, bool] = {}
 
     ## loaded fields (from input)
     # spatial
     _spatial_fields = ["dims", "A", "Cn"]
-    dims: Tuple[int, int] = (512, 512)
-    A: sparse.csc_matrix  # = None
-    Cn: Optional[np.ndarray] = None
+    dims: Tuple[int, int] = (512, 512)  #
+    A: sparse.csc_matrix  # = None  #
+    Cn: Optional[np.ndarray] = None #
     # temporal
     _trace_fields = ["C", "F_dff", "F_dff_dec", "S", "S_dff"]
     _traces: dict[str, np.ndarray] = {}
     _default_trace: Optional[str] = None
     # other
     _quality_fields = ["SNR_comp", "r_values", "cnn_preds"]
-    quality: dict[str, np.ndarray] = {}
+    quality: dict[str, np.ndarray] = {} #
 
     ## to be calculated (from input)
-    remap: Optional[Remapping] = None
-    n_neurons: int = -1
-    centroids: np.ndarray  # = None
-    idx_eval: np.ndarray  # = None
+    remap: Optional[Remapping] = None   #
+    n_neurons: int = -1 #
+    centroids: np.ndarray  #
+    idx_eval: np.ndarray  #
     ## to be calculated (with additional information)
-    idx_kde: np.ndarray  # = None
+    idx_kde: np.ndarray
+
+    HDF5_VERSION = 1
 
     def __init__(
         self,
@@ -96,16 +89,36 @@ class SessionData:
         self.id = kwargs.get("id", -1)
         self.path = kwargs.get("path", None)
 
+        self.status = {
+            # load status flags
+            "scheduled_spatial": False,
+            "scheduled_traces": False,
+            "scheduled_quality": False,
+            "spatial_loaded": False,
+            "traces_loaded": False,
+            "quality_loaded": False,
+            # processing status flags
+            "aligned": False,
+            "matched": False,
+        }
+
         self.set_parameters(**kwargs)
 
-        if np.isin(self._quality_fields, list(kwargs.keys())).any():
-            self.register_quality(**kwargs)
-
         if np.isin(self._spatial_fields, list(kwargs.keys())).any():
+            self.schedule_spatial_load()
             self.register_spatial(alignment_template=alignment_template, **kwargs)
 
         if np.isin(self._trace_fields, list(kwargs.keys())).any():
+            self.schedule_traces_load()
             self.register_traces(**kwargs)
+
+        if np.isin(self._quality_fields, list(kwargs.keys())).any():
+            self.schedule_quality_load()
+            self.register_quality(**kwargs)
+
+        self.remap = kwargs.get("remap", None)
+        if self.remap is not None:
+            self.status["aligned"] = True
 
     @staticmethod
     def from_dict(data_dict: dict, params={}, **kwargs) -> "SessionData":
@@ -156,12 +169,12 @@ class SessionData:
         which=["quality", "spatial", "temporal"],
         alignment_template: Optional[np.ndarray] = None,
     ):
-        if "quality" in which:
-            self.schedule_quality_load()
         if "spatial" in which:
             self.schedule_spatial_load()
         if "temporal" in which:
             self.schedule_traces_load()
+        if "quality" in which:
+            self.schedule_quality_load()
 
         self.execute_load(alignment_template=alignment_template)
 
@@ -187,32 +200,33 @@ class SessionData:
             subpath="/estimates",
         )
 
-        if self.scheduled_spatial:
+        if self.status["scheduled_spatial"]:
             self.register_spatial(alignment_template=alignment_template, **data)
-            self.scheduled_spatial = False
+            self.status["scheduled_spatial"] = False
 
-        if self.scheduled_traces:
+        if self.status["scheduled_traces"]:
             self.register_traces(**data)
-            self.scheduled_traces = False
+            self.status["scheduled_traces"] = False
 
-        if self.scheduled_quality:
+        if self.status["scheduled_quality"]:
             self.register_quality(**data)
-            self.scheduled_quality = False
+            self.status["scheduled_quality"] = False
 
-    def schedule_quality_load(self, fields=["SNR_comp", "r_values", "cnn_preds"]):
-        if not self.scheduled_quality:
-            self.fields_scheduled_for_loading["quality"] = fields
-            self.scheduled_quality = True
 
     def schedule_spatial_load(self):
-        if not self.scheduled_spatial:
+        if not self.status["scheduled_spatial"]:
             self.fields_scheduled_for_loading["spatial"] = ["A", "Cn"]
-            self.scheduled_spatial = True
+            self.status["scheduled_spatial"] = True
 
     def schedule_traces_load(self, fields=["C", "F_dff", "F_dff_dec", "S", "S_dff"]):
-        if not self.scheduled_traces:
+        if not self.status["scheduled_traces"]:
             self.fields_scheduled_for_loading["temporal"] = fields
-            self.scheduled_traces = True
+            self.status["scheduled_traces"] = True
+
+    def schedule_quality_load(self, fields=["SNR_comp", "r_values", "cnn_preds"]):
+        if not self.status["scheduled_quality"]:
+            self.fields_scheduled_for_loading["quality"] = fields
+            self.status["scheduled_quality"] = True
 
     def clean_data(self):
 
@@ -235,7 +249,7 @@ class SessionData:
         }
 
         if self.quality:
-            self.quality_loaded = True
+            self.status["quality_loaded"] = True
         self.get_idx_eval_from_quality_params()
 
     def get_idx_eval_from_quality_params(self, component_quality=None):
@@ -249,7 +263,7 @@ class SessionData:
         returns:
             * idx_eval boolean array
         """
-        if not self.quality_loaded or self.quality is None:
+        if not self.status["quality_loaded"] or self.quality is None:
             print("no quality info provided, skipping quality-based filtering")
             return
 
@@ -286,8 +300,8 @@ class SessionData:
 
     def clean_quality(self):
         self.quality = {}
-        self.quality_loaded = False
-        self.scheduled_quality = False
+        self.status["quality_loaded"] = False
+        self.status["scheduled_quality"] = False
 
     ### ============================================================================== ###
     ### ================================= TRACE METHODS ============================== ###
@@ -316,8 +330,8 @@ class SessionData:
         # print("Cleaning traces for session. Current traces:", self._traces.keys())
         self._traces = {}
         self._default_trace = None
-        self.traces_loaded = False
-        self.scheduled_traces = False
+        self.status["traces_loaded"] = False
+        self.status["scheduled_traces"] = False
 
     def register_traces(self, **data):
         self._traces = {
@@ -327,7 +341,7 @@ class SessionData:
         }
         self._default_trace = "F_dff" if "F_dff" in self._traces else "C"
         if self._traces:
-            self.traces_loaded = True
+            self.status["traces_loaded"] = True
 
     ### ============================================================================== ###
     ### ================================ SPATIAL METHODS ============================= ###
@@ -339,7 +353,7 @@ class SessionData:
         self.Cn = data.get("Cn", None)
 
         if self.A is not None:
-            self.spatial_loaded = True
+            self.status["spatial_loaded"] = True
 
         # dims = Cn.shape if Cn is not None else dims
         # assert dims is not None, "Either Cn or dims must be provided to prepare_background"
@@ -351,7 +365,7 @@ class SessionData:
         else:
             ## check if A and Cn are consistent (e.g. transposition) and adjust if needed
             # print("testing for transpose of Cn relative to A...")
-            remap = Remapping(A_proj, self.Cn, use_optical_flow=False, evaluate=False)
+            remap = Remapping(template=A_proj, template_reference=self.Cn, use_optical_flow=False, evaluate=False)
             remap.test_transpose(A_proj, self.Cn)
             self.Cn = remap.fix_transpose(self.Cn)
 
@@ -390,7 +404,7 @@ class SessionData:
             * idx_eval boolean array
         """
 
-        if not self.spatial_loaded or self.A is None:
+        if not self.status["spatial_loaded"] or self.A is None:
             raise ValueError(
                 "Spatial data must be loaded before calculating idx_eval from sizes."
             )
@@ -409,8 +423,137 @@ class SessionData:
         self.dims = (512, 512)
         self.A = sparse.csc_matrix((0, 0))
         self.Cn = None
-        self.spatial_loaded = False
-        self.scheduled_spatial = False
+        self.status["spatial_loaded"] = False
+        self.status["scheduled_spatial"] = False
+
+
+    ### =============================================================================== ###
+    ### ================================ SAVE METHODS ================================= ###
+    ### =============================================================================== ###
+    
+    def to_hdf5(self, group: h5py.Group, exclude_fields=["traces"]) -> None:
+        group.attrs["object_type"] = "SessionData"
+        group.attrs["schema_version"] = self.HDF5_VERSION
+
+        write_optional_attr(group, "name", self.name)
+        write_optional_attr(group, "path", str(self.path) if self.path is not None else None)
+        group.attrs["id"] = self.id
+
+        group.attrs["active"] = self.active
+        group.attrs["time_offset"] = self.time_offset
+
+        ## spatial group
+        group.attrs["dims"] = self.dims
+
+        A_group = group.create_group("A")
+        write_sparse_matrix(A_group, self.A)
+
+        write_optional_array(group, "Cn", self.Cn, compression="gzip")
+
+        ## trace group
+        if "traces" not in exclude_fields:
+            traces_group = group.create_group("traces")
+            for key, value in self.traces.items():
+                traces_group.create_dataset(key, data=value, compression="gzip")
+
+        ## quality group
+        quality_group = group.create_group("quality")
+        for key, value in self.quality.items():
+            write_optional_array(quality_group, key, value)
+
+        ## remap substructure
+        if self.remap is not None:
+            remapping_group = group.create_group("remapping")
+            self.remap.to_hdf5(remapping_group)
+
+        write_optional_array(group, "idx_eval", self.idx_eval, compression="gzip")
+
+
+    @classmethod
+    def from_hdf5(cls, group: h5py.Group | h5py.File) -> "SessionData":
+
+        version = int(group.attrs.get("schema_version", 1))
+        if version != 1:
+            raise ValueError(
+                f"Unsupported SessionData schema version: {version}"
+            )
+
+        name = read_optional_attr(group, "name")
+        path = read_optional_attr(group, "path")
+        id = int(group.attrs.get("id", -1))
+
+        active = bool(group.attrs.get("active", True))
+        time_offset = float(group.attrs.get("time_offset", 0.0))
+
+        ## spatial group
+        dims = tuple(group.attrs.get("dims", (512, 512)))
+
+        A = read_sparse_matrix(group["A"]) if "A" in group else sparse.csc_matrix((0, 0))
+        Cn = read_optional_array(group, "Cn")
+
+        ## trace group
+        traces = {}
+        if "traces" in group:
+            traces_group = group["traces"]
+            if isinstance(traces_group, h5py.Group):
+                traces = {key: traces_group[key][()] for key in traces_group}
+
+        ## quality group
+        quality = {}
+        if "quality" in group:
+            quality_group = group["quality"]
+            if isinstance(quality_group, h5py.Group):
+                for key in quality_group:
+                    value = read_optional_array(quality_group, key)
+                    if value is not None:
+                        quality[key] = value
+                        
+        ## remap substructure
+        remap = None
+        if "remapping" in group:
+            remap_group = group["remapping"]
+            if isinstance(remap_group, h5py.Group):
+                remap = Remapping.from_hdf5(remap_group)
+
+        idx_eval = read_optional_array(group, "idx_eval")
+
+        out = cls(
+            name=name,
+            path=path,
+            id=id,
+            active=active,
+            time_offset=time_offset,
+            dims=dims,
+            A=A,
+            Cn=Cn,
+            remap=remap,
+            idx_eval=idx_eval,
+            # **traces,
+            **quality,
+        )
+        # if A is not None:
+        #     out.postprocess_spatial_data()
+        # if quality:
+        #     out.get_idx_eval_from_quality_params()
+        
+        return out
+            
+    # def cast_to_dict(self, fields=None):
+
+    #     if fields is None:
+    #         # set default values
+    #         fields = ["name","path","id","active","time_offset",*self._spatial_fields, "quality","remap","n_neurons","centroids","idx_eval"]
+
+    #     out = {}
+    #     for field in fields:
+    #         assert hasattr(self,field), "SessionData object is missing field {field} for converting to dict"
+    #         out[field] = getattr(self, field)
+    #     return out
+
+            
+        
+
+
 
     ### ============================================================================== ###
     ### ================================ ALIGNMENT METHODS =========================== ###
@@ -427,13 +570,13 @@ class SessionData:
             * remap dict with keys 'shift' and 'idx_ref' for each neuron in this session
         """
 
-        if not self.spatial_loaded or self.A is None or self.Cn is None:
+        if not self.status["spatial_loaded"] or self.A is None or self.Cn is None:
             raise ValueError("Spatial data must be loaded before alignment.")
 
         ## first, calculate remap structure
         self.remap = Remapping(
-            self.Cn,
-            reference=alignment_template,
+            template=self.Cn,
+            template_reference=alignment_template,
             use_optical_flow=use_optical_flow,
             # self.A.sum(axis=1).reshape(self.dims),
             # reference=alignment_template,

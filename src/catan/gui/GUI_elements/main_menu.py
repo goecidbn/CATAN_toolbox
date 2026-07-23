@@ -267,6 +267,8 @@ class MainMenu(QFrame):
 
         self.data.load_model(self.model_file)
         self.data.load_registration(self.registration_file)
+        print(f"Loaded model from {self.model_file} and registration from {self.registration_file}")
+        print(f"Sessions now in memory: {[session.name for session in self.data.sessions]}")
         self.state.assignments = self.data.assignments
 
         ## prepare checking for common path
@@ -292,8 +294,10 @@ class MainMenu(QFrame):
                 #     new_path  # update path to current root folder structure
                 # )
             # self.add_session(this_data)
+            self.state.session_color = (session.id, self.session_colors.next())
+            self.state.session_added = session.id
 
-        # self.state.current_session_id = 0
+        self.state.current_session_id = 0
 
     def handler_data_changed(self, input: tuple[str, int]):
         data_type, data_value = input

@@ -99,14 +99,14 @@ class Display(BasePlot.BaseCanvas):
     def build_neuron_visuals_union(self):
 
         roi_pos, neuron_ids, roi_vals = sparse_A_to_points(
-            self.data.union_data.A, self.data.sessions[0].dims, thr=0.5
+            self.data.union.A, self.data.sessions[0].dims, thr=0.5
         )
 
         self.plotting["data"]["union"] = OverviewRecord(
             pos=roi_pos,
             ids=neuron_ids,
             vals=roi_vals,
-            n_rois=self.data.union_data.n_neurons,
+            n_rois=self.data.union.n_neurons,
             color=None,
         )
 
@@ -283,7 +283,7 @@ class Display(BasePlot.BaseCanvas):
         if (
             self.data.current_session is None
             or "background" not in self.plotting
-            or self.data.union_data.centroids is None
+            or self.data.union.centroids is None
         ):
             return None
 
@@ -292,7 +292,7 @@ class Display(BasePlot.BaseCanvas):
         )
 
         # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
-        union_centroids = self.data.union_data.centroids
+        union_centroids = self.data.union.centroids
         # find closest footprint
         distances = (union_centroids[:, 0] - mouse_pos[0]) ** 2 + (
             union_centroids[:, 1] - mouse_pos[1]

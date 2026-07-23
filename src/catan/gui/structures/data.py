@@ -56,9 +56,9 @@ class Data(Tracking):
         session = self.sessions[session_id]
         ## default to "toggle" if nothing provided
         if to_present is None:
-            to_present = not session.traces_loaded
+            to_present = not session.status["traces_loaded"]
 
-        if session.traces_loaded == to_present:
+        if session.status["traces_loaded"] == to_present:
             return
 
         if to_present:

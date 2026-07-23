@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Any, Optional, List
 
 import logging
 import numpy as np
@@ -94,13 +94,14 @@ def load_data_from_hdf5(
                 # print(f"is group {key}")
                 ## --- Sparse matrix group (CaImAn style) ---
                 if all(d in obj for d in ("indptr", "indices", "data", "shape")):
-                    data = obj["data"]
-                    indices = obj["indices"]
-                    indptr = obj["indptr"]
-                    shape = tuple(obj["shape"][:])
-                    out[key] = sparse.csc_matrix(
-                        (data[:], indices[:], indptr[:]), shape
-                    )
+                    out[key] = read_sparse_matrix(obj)
+                    # data = obj["data"]
+                    # indices = obj["indices"]
+                    # indptr = obj["indptr"]
+                    # shape = tuple(obj["shape"][:])
+                    # out[key] = sparse.csc_matrix(
+                    #     (data[:], indices[:], indptr[:]), shape
+                    # )
                 else:
                     ### recursivity is not entirely clean (reloading of complete file, ...)
                     ### but works for now
@@ -298,3 +299,88 @@ def recursively_save_dict_contents_to_group(
         else:
 
             raise ValueError(f"Cannot save {type(item)} type for key '{key}'.")
+
+
+
+### =============================================================== ###
+### ====================== HELPER FUNCTIONS ======================= ###
+### =============================================================== ###
+
+def write_sparse_matrix(
+    group: h5py.Group,
+    matrix: sparse.spmatrix,
+) -> None:
+    """Write a SciPy sparse matrix into an HDF5 group."""
+    matrix = sparse.csc_matrix(matrix)
+
+    group.attrs["format"] = "csc"
+    group.attrs["shape"] = matrix.shape
+
+    group.create_dataset("data", data=matrix.data)
+    group.create_dataset("indices", data=matrix.indices)
+    group.create_dataset("indptr", data=matrix.indptr)
+
+
+def read_sparse_matrix(group: h5py.Group) -> sparse.csc_matrix:
+    """Read a CSC matrix from an HDF5 group."""
+    matrix_format = group.attrs.get("format","csc")
+
+    if isinstance(matrix_format, bytes):
+        matrix_format = matrix_format.decode("utf-8")
+
+    if matrix_format != "csc":
+        raise ValueError(
+            f"Unsupported sparse matrix format: {matrix_format!r}"
+        )
+
+    if "shape" in group.keys():
+        # ensure consistency with CaImAn style saving
+        shape = tuple(group["shape"][()])
+    else:
+        shape = tuple(int(value) for value in group.attrs["shape"])
+
+    return sparse.csc_matrix(
+        (
+            group["data"][()],
+            group["indices"][()],
+            group["indptr"][()],
+        ),
+        shape=shape,
+    )
+
+
+def write_optional_array(
+    group: h5py.Group,
+    name: str,
+    value: np.ndarray | None,
+    **dataset_kwargs: Any,
+) -> None:
+    if value is not None:
+        group.create_dataset(name, data=value, **dataset_kwargs)
+
+
+def read_optional_array(
+    group: h5py.Group,
+    name: str,
+) -> np.ndarray | None:
+    if name not in group:
+        return None
+
+    return group[name][()]
+
+
+def write_optional_attr(
+    group: h5py.Group,
+    name: str,
+    value: Any | None,
+) -> None:
+    if value is not None:
+        group.attrs[name] = value
+
+
+def read_optional_attr(
+    group: h5py.Group,
+    name: str,
+    default: Any = None,
+) -> Any:
+    return group.attrs[name] if name in group.attrs else default

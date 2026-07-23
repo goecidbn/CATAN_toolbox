@@ -1,6 +1,8 @@
 from typing import Optional, Tuple, TypeVar
 from dataclasses import dataclass
 
+import h5py
+import h5py
 import numpy as np
 from scipy import sparse
 import cv2
@@ -11,6 +13,7 @@ from catan.core.alignment import (
     _build_remap,
     _shift_sparse_bilinear,
 )
+from catan.core.io import write_optional_array, write_optional_attr, read_optional_array, read_optional_attr
 
 MatrixT = TypeVar("MatrixT", sparse.csc_matrix, np.ndarray)
 
@@ -28,6 +31,8 @@ class Remapping:
     min_zcorr: float = 3.0
     c_min: float = 0.1
 
+    HDF5_VERSION = 1
+
     @property
     def total_shift(self):
         if self.shift is not None:
@@ -41,16 +46,31 @@ class Remapping:
 
     def __init__(
         self,
-        A: np.ndarray,
-        reference: np.ndarray,
+        shift: Optional[np.ndarray] = None,
+        c_max: Optional[np.ndarray] = None,
+        c_zscored: Optional[np.ndarray] = None,
+        flow: Optional[np.ndarray] = None,
+        transpose: bool = False,
+
+        template: Optional[np.ndarray] = None,
+        template_reference: Optional[np.ndarray] = None,
         use_optical_flow: bool = True,
         evaluate: bool = True,
     ):
-        # self.dims = reference.shape[-2:]
+        if shift is not None or flow is not None:
+            ## if remapping is provided, populate class directly
+            self.shift = shift
+            self.c_max = c_max
+            self.c_zscored = c_zscored
+            self.flow = flow
+            self.transpose = transpose
+            self.success = True
+            return
 
-        self.success = False
-        if evaluate:
-            self.evaluate(A, reference, use_optical_flow=use_optical_flow)
+        if evaluate and template is not None and template_reference is not None:
+            ## if templates are provided, evaluate remapping
+            self.success = False
+            self.evaluate(template, template_reference, use_optical_flow=use_optical_flow)
 
     def evaluate(
         self,
@@ -262,3 +282,88 @@ class Remapping:
                 "Input A must be either a sparse.csc_matrix or a np.ndarray"
             )
         return A
+
+    def to_hdf5(self, group: h5py.Group) -> None:
+        """
+        Store this Remapping object in an existing empty HDF5 group.
+        """
+        group.attrs["object_type"] = "Remapping"
+        group.attrs["schema_version"] = self.HDF5_VERSION
+
+        write_optional_array(
+            group,
+            "shift",
+            self.shift,
+        )
+        write_optional_array(
+            group,
+            "c_max",
+            self.c_max,
+        )
+
+        write_optional_array(
+            group,
+            "c_zscored",
+            self.c_zscored,
+        )
+
+        write_optional_array(
+            group,
+            "flow",
+            self.flow,
+            compression="gzip",
+        )
+
+        write_optional_attr(
+            group,
+            "transpose",
+            self.transpose,
+        )
+
+    @classmethod
+    def from_hdf5(cls, group: h5py.Group) -> "Remapping":
+        object_type = group.attrs.get("object_type", "")
+
+        if isinstance(object_type, bytes):
+            object_type = object_type.decode("utf-8")
+
+        if object_type and object_type != "Remapping":
+            raise ValueError(
+                f"Expected Remapping group, got {object_type!r}"
+            )
+
+        version = int(group.attrs.get("schema_version", 1))
+
+        if version != 1:
+            raise ValueError(
+                f"Unsupported Remapping schema version: {version}"
+            )
+
+        shift = read_optional_array(
+            group,
+            "shift",
+        )
+        c_max = read_optional_array(
+            group,
+            "c_max",
+        )
+
+        c_zscored = read_optional_array(
+            group,
+            "c_zscored",
+        )
+
+        flow = read_optional_array(
+            group,
+            "flow",
+        )
+
+        transpose = bool(group.attrs.get("transpose", False))
+
+        return cls(
+            shift=shift,
+            c_max=c_max,
+            c_zscored=c_zscored,
+            flow=flow,
+            transpose=transpose,
+        )
