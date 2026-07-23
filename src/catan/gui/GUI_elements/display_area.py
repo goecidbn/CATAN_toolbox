@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 from catan.gui.plots import BasePlot
 from catan.gui.structures import Data, AppState
 
-from . import DisplaySection
+from .display_section import DisplaySection
 
 
 def new_id():

@@ -3,16 +3,16 @@ from typing import Dict, Optional, Tuple, List
 import numpy as np
 from scipy import sparse
 
-import importlib
+# import importlib
 
 from catan.core.structures import SessionData
-from catan.gui.background_tasks import TaskContext
-from catan.tracking import neuron_tracking
+# from catan.gui.background_tasks import TaskContext
+from catan import Tracking
 
-from catan.gui.data.utils import move_index_along_axis
+# from catan.gui.data.utils import move_index_along_axis
 
 print("reloading data.py")
-importlib.reload(neuron_tracking)  # reload to pick up changes during development
+# importlib.reload(neuron_tracking)  # reload to pick up changes during development
 
 
 class Neurons:
@@ -22,17 +22,12 @@ class Neurons:
     union_footprints: Dict[int, sparse.csc_matrix]
 
 
-class Data(neuron_tracking.track_neurons):
+class Data(Tracking):
 
     def __init__(self, state):
 
         super().__init__()
         self.state = state
-        # self.state.assignments = self.assignments
-
-        # self.sessions: List[SessionData] = []
-        # self.neurons: Neurons = Neurons()
-
         self.current_session: Optional[SessionData] = None
 
         self.state.current_session_changed.connect(self._on_current_session_changed)

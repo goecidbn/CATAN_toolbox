@@ -18,7 +18,8 @@ from catan.gui.resources import (
 from catan.gui.structures import AppState, Data
 from catan.gui.interaction import click_events
 
-from . import DisplayArea, MainMenu
+from .display_area import DisplayArea
+from .main_menu import MainMenu
 
 class MainWindow(QMainWindow):
 

@@ -74,7 +74,7 @@ class Display(BasePlot.BaseCanvas):
 
         background /= np.percentile(background, 90)
         self.plotting["background"] = visuals.Image(
-            background,  # .T,
+            background.astype(np.float32),  # .T,
             cmap="viridis",
             method="subdivide",
             parent=self.plot_root,

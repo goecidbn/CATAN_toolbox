@@ -23,7 +23,8 @@ from pathlib import Path
 from catan.gui.structures import data, state
 from catan.gui.plots.colors import CyclicColorMap
 
-from . import SessionOverview, ResourceMonitor
+from .session_overview import SessionOverview
+from .resource_monitor import ResourceMonitor
 # from .dialog_load_field import FieldSelectDialog, list_file_fields
 
 app_modes = {

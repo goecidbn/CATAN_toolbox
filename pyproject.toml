@@ -41,8 +41,21 @@ dev = [
 ]
 
 [project.scripts]
-catan = "catan.gui.app:main"
 catan-match = "catan.cli.match:main"
+
+[project.gui-scripts]
+catan = "catan.gui.app:main"
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "gui: tests that require the optional GUI dependencies",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
