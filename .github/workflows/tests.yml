@@ -44,6 +44,12 @@ jobs:
             python -m pip install --upgrade pip
             python -m pip install -e ".[gui,dev]"
 
+            python -m pip uninstall --yes \
+            opencv-python \
+            opencv-contrib-python
+
+            python -m pip install opencv-python-headless
+
         - name: Run GUI tests
           env:
             LIBGL_ALWAYS_SOFTWARE: "1"
