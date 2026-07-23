@@ -1,3 +1,2 @@
 
-from .app import main
-from .GUI_elements import MainWindow
+"""Graphical user interface for CATAN."""

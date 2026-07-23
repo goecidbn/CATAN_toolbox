@@ -7,13 +7,12 @@ def test_import_catan():
     assert catan is not None
 
 def test_public_api():
-    from catan import main, Tracking, SessionData
+    from catan import Tracking, SessionData
 
-    assert main is not None
     assert Tracking is not None
     assert SessionData is not None
 
-
+    
 
 def test_headless_import():
     result = subprocess.run(
