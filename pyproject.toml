@@ -54,7 +54,7 @@ addopts = [
     "--strict-config",
 ]
 markers = [
-    "gui: tests that require the optional GUI dependencies",
+    "gui: tests requiring PySide6 or a graphical display",
 ]
 
 [tool.setuptools.packages.find]
