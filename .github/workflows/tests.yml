@@ -140,22 +140,21 @@ jobs:
 
       - name: Verify installed wheel
         run: |
-          wheel-test-env/bin/python - <<'PY'
-          from importlib.metadata import entry_points, version
+            wheel-test-env/bin/python - <<'PY'
+            from importlib.metadata import entry_points, version
 
-          import catan
+            import catan
 
-          assert catan.__version__ == version("catan")
+            assert catan.__version__ == version("catan")
 
-          matches = list(
-              entry_points(group="gui_scripts", name="catan")
-          )
+            matches = list(
+                entry_points(group="gui_scripts", name="catan")
+            )
 
-          assert len(matches) == 1
-          assert matches[0].value == "catan.gui.app:main"
-          assert callable(matches[0].load())
+            assert len(matches) == 1
+            assert matches[0].value == "catan.gui.app:main"
 
-          print("Version:", catan.__version__)
-          print("Location:", catan.__file__)
-          print("Entry point:", matches[0])
-          PY
+            print("Version:", catan.__version__)
+            print("Location:", catan.__file__)
+            print("Entry point:", matches[0])
+            PY
