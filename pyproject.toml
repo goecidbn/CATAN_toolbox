@@ -15,7 +15,7 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "h5py>=3.8",
-    "opencv-python-headless",
+    "opencv-python-headless<5",
     "tqdm",
     "matplotlib",
     "scikit-image",
