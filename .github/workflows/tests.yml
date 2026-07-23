@@ -8,39 +8,113 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  gui-tests:
+    name: GUI · Python 3.12
     runs-on: ubuntu-latest
 
-    env:
-      QT_QPA_PLATFORM: offscreen
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        - name: Check out repository
+          uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        
+        - name: Set up Python
+          uses: actions/setup-python@v5
+          with:
+            python-version: "3.12"
+            cache: pip
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
+        - name: Install Linux GUI dependencies
+          run: |
+            sudo apt-get update
+            sudo apt-get install --yes \
+            xvfb \
+            libegl1 \
+            libgl1 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-render-util0 \
+            libxcb-xinerama0
 
-      - name: Install Linux GUI libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libegl1
-          
-      - name: Install CATAN and test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[gui,dev]"
+        - name: Install CATAN
+          run: |
+            python -m pip install --upgrade pip
+            python -m pip install -e ".[gui,dev]"
 
-      - name: Run tests
-        run: python -m pytest
+        - name: Run GUI tests
+          env:
+            LIBGL_ALWAYS_SOFTWARE: "1"
+          run: |
+            xvfb-run \
+            --auto-servernum \
+            --server-args="-screen 0 1280x1024x24" \
+            python -m pytest -s
+    
+#   test:
+#     runs-on: ubuntu-latest
 
-      - name: Build distributions
-        run: |
-          python -m pip install build twine
-          python -m build
-          python -m twine check dist/*
+#     env:
+#         QT_QPA_PLATFORM: offscreen
+
+#     steps:
+#         - name: Check out repository
+#           uses: actions/checkout@v4
+#           with:
+#             fetch-depth: 0
+
+#         - name: Set up Python
+#           uses: actions/setup-python@v5
+#           with:
+#             python-version: "3.12"
+#             cache: pip
+            
+#         - name: Install Linux GUI dependencies
+#           run: |
+#             sudo apt-get update
+#             sudo apt-get install --yes \
+#             xvfb \
+#             libegl1 \
+#             libgl1 \
+#             libxkbcommon-x11-0 \
+#             libxcb-cursor0 \
+#             libxcb-icccm4 \
+#             libxcb-image0 \
+#             libxcb-keysyms1 \
+#             libxcb-render-util0 \
+#             libxcb-xinerama0
+            
+#         - name: Install CATAN and test dependencies
+#           run: |
+#             python -m pip install --upgrade pip
+#             python -m pip install -e ".[gui,dev]"
+        
+#         - name: Diagnose Qt environment
+#           run: |
+#             echo "QT_QPA_PLATFORM=$QT_QPA_PLATFORM"
+#             echo "DISPLAY=$DISPLAY"
+#             python - <<'PY'
+#             import os
+#             from PySide6.QtCore import QLibraryInfo
+
+#             print("QT_QPA_PLATFORM:", os.environ.get("QT_QPA_PLATFORM"))
+#             print("DISPLAY:", os.environ.get("DISPLAY"))
+#             print("Qt plugins:", QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))
+#             PY
+
+#         - name: Run GUI test
+#           env:
+#             QT_DEBUG_PLUGINS: "1"
+#             QT_QPA_PLATFORM: offscreen
+#           run: python -m pytest -s tests/test_gui_smoke.py
+
+#         - name: Run tests
+#           run: python -m pytest
+
+#         - name: Build distributions
+#           run: |
+#             python -m pip install build twine
+#             python -m build
+#             python -m twine check dist/*

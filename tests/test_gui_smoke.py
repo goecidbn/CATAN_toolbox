@@ -1,6 +1,6 @@
 import os, pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # @pytest.mark.gui
@@ -27,9 +27,12 @@ def test_gui_application_imports():
 def test_basic_qt_widget_can_be_created():
     from PySide6.QtWidgets import QApplication, QWidget
 
-    app = QApplication.instance() or QApplication([])
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(["catan-test"])
 
     widget = QWidget()
-    assert widget is not None
+    assert widget.isWidgetType()
 
     widget.close()
+    app.processEvents()
