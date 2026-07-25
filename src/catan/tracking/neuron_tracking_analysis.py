@@ -35,11 +35,11 @@ class TrackingAnalysis(Tracking):
 
       all plots have inputs sv, suffix to specify saving behavior
 
-      1. plot_fit_results
-          inputs:
-            model
-            times
-          creates interactive plot of joint model results
+    #   1. plot_fit_results
+    #       inputs:
+    #         model
+    #         times
+    #       creates interactive plot of joint model results
 
       2. plot_model
           creates general overview of model results and matching performance compared to guess based on nearest neighbours
@@ -297,103 +297,103 @@ class TrackingAnalysis(Tracking):
 
         # return fig
 
-    def plot_fit_results(self, sv=False, suffix="", times=0):
+    # def plot_fit_results(self, sv=False, suffix="", times=0):
 
-        arrays = self.params["arrays"]
+    #     arrays = self.params["arrays"]
 
-        fig = plt.figure(figsize=(6, 4), dpi=150)
-        ax_r = fig.add_subplot(221)
-        ax_r.plot(
-            arrays["distance"],
-            self.model["pdf"]["distance_same"] * self.model["parameters"]["p_same"],
-            color="tab:green",
-            label="f_r_same",
-        )
-        ax_r.plot(
-            arrays["distance"],
-            self.model["pdf"]["distance_diff"]
-            * (1 - self.model["parameters"]["p_same"]),
-            color="tab:red",
-            label="f_r_diff",
-        )
-        ax_r_p_same = ax_r.twinx()
-        ax_r_p_same.plot(
-            arrays["distance"],
-            self.model["p_same"]["distance"],
-            color="tab:blue",
-            label="p_same",
-        )
-        ax_r.legend()
-        ax_r.spines[["right", "top"]].set_visible(False)
+    #     fig = plt.figure(figsize=(6, 4), dpi=150)
+    #     ax_r = fig.add_subplot(221)
+    #     ax_r.plot(
+    #         arrays["distance"],
+    #         self.model["pdf"]["distance_same"] * self.model["parameters"]["p_same"],
+    #         color="tab:green",
+    #         label="f_r_same",
+    #     )
+    #     ax_r.plot(
+    #         arrays["distance"],
+    #         self.model["pdf"]["distance_diff"]
+    #         * (1 - self.model["parameters"]["p_same"]),
+    #         color="tab:red",
+    #         label="f_r_diff",
+    #     )
+    #     ax_r_p_same = ax_r.twinx()
+    #     ax_r_p_same.plot(
+    #         arrays["distance"],
+    #         self.model["p_same"]["distance"],
+    #         color="tab:blue",
+    #         label="p_same",
+    #     )
+    #     ax_r.legend()
+    #     ax_r.spines[["right", "top"]].set_visible(False)
 
-        ax_c = fig.add_subplot(222)
-        ax_c.plot(
-            arrays["correlation"],
-            self.model["pdf"]["correlation_same"] * self.model["parameters"]["p_same"],
-            color="tab:green",
-            label="f_c_same",
-        )
-        ax_c.plot(
-            arrays["correlation"],
-            self.model["pdf"]["correlation_diff"]
-            * (1 - self.model["parameters"]["p_same"]),
-            color="tab:red",
-            label="f_c_diff",
-        )
-        ax_c_p_same = ax_c.twinx()
-        ax_c_p_same.plot(
-            arrays["correlation"],
-            self.model["p_same"]["correlation"],
-            color="tab:blue",
-            label="p_same",
-        )
-        ax_c.legend()
+    #     ax_c = fig.add_subplot(222)
+    #     ax_c.plot(
+    #         arrays["correlation"],
+    #         self.model["pdf"]["correlation_same"] * self.model["parameters"]["p_same"],
+    #         color="tab:green",
+    #         label="f_c_same",
+    #     )
+    #     ax_c.plot(
+    #         arrays["correlation"],
+    #         self.model["pdf"]["correlation_diff"]
+    #         * (1 - self.model["parameters"]["p_same"]),
+    #         color="tab:red",
+    #         label="f_c_diff",
+    #     )
+    #     ax_c_p_same = ax_c.twinx()
+    #     ax_c_p_same.plot(
+    #         arrays["correlation"],
+    #         self.model["p_same"]["correlation"],
+    #         color="tab:blue",
+    #         label="p_same",
+    #     )
+    #     ax_c.legend()
 
-        ax_fsame = fig.add_subplot(224, projection="3d")
-        # CC, RR = np.meshgrid(arrays["correlation"], arrays["distance"])
-        CC, RR = np.meshgrid(
-            arrays["correlation"][self.params["nbins"] // 2 :],
-            arrays["distance"][: self.params["nbins"] // 2],
-        )
-        ax_fsame.plot_surface(
-            CC,
-            RR,
-            self.model["p_same"]["joint"][
-                : self.params["nbins"] // 2, self.params["nbins"] // 2 :
-            ],
-            cmap=plt.cm.RdYlGn,
-        )
-        ax_fsame.view_init(elev=30, azim=40)
-        plt.setp(ax_fsame, xlabel="correlation", ylabel="distance", zlabel="$p_{same}$")
-        plt.tight_layout()
-        plt.show()
+    #     ax_fsame = fig.add_subplot(224, projection="3d")
+    #     # CC, RR = np.meshgrid(arrays["correlation"], arrays["distance"])
+    #     CC, RR = np.meshgrid(
+    #         arrays["correlation"][self.params["nbins"] // 2 :],
+    #         arrays["distance"][: self.params["nbins"] // 2],
+    #     )
+    #     ax_fsame.plot_surface(
+    #         CC,
+    #         RR,
+    #         self.model["p_same"]["joint"][
+    #             : self.params["nbins"] // 2, self.params["nbins"] // 2 :
+    #         ],
+    #         cmap=plt.cm.RdYlGn,
+    #     )
+    #     ax_fsame.view_init(elev=30, azim=40)
+    #     plt.setp(ax_fsame, xlabel="correlation", ylabel="distance", zlabel="$p_{same}$")
+    #     plt.tight_layout()
+    #     plt.show()
 
-        # fig = plt.figure(figsize=(3, 2.75), dpi=300)
-        # ax_fsame = fig.add_subplot(111, projection="3d")
-        # # CC, RR = np.meshgrid(arrays["correlation"], arrays["distance"])
-        # CC, RR = np.meshgrid(
-        #     arrays["correlation"][self.params["nbins"] // 2 :],
-        #     arrays["distance"][: self.params["nbins"] // 2],
-        # )
-        # ax_fsame.plot_surface(
-        #     CC,
-        #     RR,
-        #     self.model["p_same"]["joint"][
-        #         : self.params["nbins"] // 2, self.params["nbins"] // 2 :
-        #     ],
-        #     cmap=plt.cm.RdYlGn,
-        # )
-        # ax_fsame.view_init(elev=20, azim=140)
-        # plt.setp(
-        #     ax_fsame,
-        #     xlabel="similarity",
-        #     ylabel="distance",
-        #     zlabel="$p_{same}$",
-        #     zticks=[],
-        # )
+    #     # fig = plt.figure(figsize=(3, 2.75), dpi=300)
+    #     # ax_fsame = fig.add_subplot(111, projection="3d")
+    #     # # CC, RR = np.meshgrid(arrays["correlation"], arrays["distance"])
+    #     # CC, RR = np.meshgrid(
+    #     #     arrays["correlation"][self.params["nbins"] // 2 :],
+    #     #     arrays["distance"][: self.params["nbins"] // 2],
+    #     # )
+    #     # ax_fsame.plot_surface(
+    #     #     CC,
+    #     #     RR,
+    #     #     self.model["p_same"]["joint"][
+    #     #         : self.params["nbins"] // 2, self.params["nbins"] // 2 :
+    #     #     ],
+    #     #     cmap=plt.cm.RdYlGn,
+    #     # )
+    #     # ax_fsame.view_init(elev=20, azim=140)
+    #     # plt.setp(
+    #     #     ax_fsame,
+    #     #     xlabel="similarity",
+    #     #     ylabel="distance",
+    #     #     zlabel="$p_{same}$",
+    #     #     zticks=[],
+    #     # )
 
-        # plt.tight_layout(w_pad=0.2, h_pad=0.2)
-        # plt.show()
+    #     # plt.tight_layout(w_pad=0.2, h_pad=0.2)
+    #     # plt.show()
 
     def plot_model(self, sv=False, suffix="", times=0):
 
@@ -408,7 +408,7 @@ class TrackingAnalysis(Tracking):
         arrays = self.params["arrays"]
         X, Y = np.meshgrid(arrays["correlation"], arrays["distance"])
 
-        fig = plt.figure(figsize=(7, 4), dpi=150)
+        fig = plt.figure(figsize=(8, 4), dpi=150)
         ax_phase = fig.add_subplot((0.3, 0.13, 0.2, 0.4))
         # add_number(fig, ax_phase, order=1, offset=[-250, 200])
         # ax_phase.imshow(self.model[key_counts][:,:,0],extent=[0,1,0,self.params['neighbor_distance']],aspect='auto',clim=[0,0.25*self.model[key_counts][:,:,0].max()],origin='lower')
@@ -419,7 +419,7 @@ class TrackingAnalysis(Tracking):
         ### --------------------------------------------- ###
         NN_ratio = counts[:, :, 1] / counts[:, :, 0]
         NN_ratio = cmap(NN_ratio)
-        NN_ratio[..., -1] = np.minimum(counts[..., 0] / (np.max(counts) / 3.0), 1)
+        NN_ratio[..., -1] = np.minimum(counts[..., 0] / (np.max(counts) / 5.0), 1)
 
         im_ratio = ax_phase.imshow(
             NN_ratio,
@@ -444,7 +444,8 @@ class TrackingAnalysis(Tracking):
         )
         plt.setp(
             ax_phase,
-            xlim=arrays["correlation_bounds"][[0, -1]],
+            # xlim=arrays["correlation_bounds"][[0, -1]],
+            xlim=[0.5,1],
             ylim=arrays["distance_bounds"][[0, -1]],
             xlabel="correlation",
             ylabel="distance",
@@ -470,11 +471,8 @@ class TrackingAnalysis(Tracking):
         ax_phase.yaxis.set_label_coords(1.15, 0.5)
 
         im_ratio.cmap = cmap
-        if self.params["correlation_model"] == "unshifted":
-            cbaxes = fig.add_subplot((0.41, 0.47, 0.07, 0.03))
-            # cbar.ax.set_xlim([0,0.5])
-        else:
-            cbaxes = fig.add_subplot((0.32, 0.47, 0.07, 0.03))
+
+        cbaxes = fig.add_subplot((0.32, 0.47, 0.07, 0.03))
         cbar = plt.colorbar(im_ratio, cax=cbaxes, orientation="horizontal")
         plt.setp(cbar.ax, xticks=[0, 0.5], xticklabels=["nNN", "NN"])
 
@@ -534,10 +532,18 @@ class TrackingAnalysis(Tracking):
             ls=":",
         )
 
-        ax_dist.set_ylim([0, self.params["neighbor_distance"]])
-        ax_dist.set_xlabel("counts")
-        ax_dist.spines["left"].set_visible(False)
-        ax_dist.spines["top"].set_visible(False)
+        ax_dist_p_same = ax_dist.twiny()
+        ax_dist_p_same.plot(
+            self.model["p_same"]["distance"],
+            arrays["distance"],
+            color="tab:blue",
+            label="p_same",
+        )
+        plt.setp(ax_dist_p_same, xlabel="$p_{same}$", xlim=[1.1, 0])
+        ax_dist_p_same.spines[["left","bottom"]].set_visible(False)
+
+        plt.setp(ax_dist, ylim=[0, self.params["neighbor_distance"]], xlabel="counts")
+        ax_dist.spines[["top","left"]].set_visible(False)
         ax_dist.tick_params(
             axis="y",
             which="both",
@@ -596,7 +602,7 @@ class TrackingAnalysis(Tracking):
         )
 
         ax_corr.set_ylabel("counts")
-        ax_corr.set_xlim([0, 1])
+        ax_corr.set_xlim([0.5, 1])
         ax_corr.spines["right"].set_visible(False)
         ax_corr.spines["top"].set_visible(False)
         ax_corr.tick_params(
@@ -608,92 +614,124 @@ class TrackingAnalysis(Tracking):
             labeltop=False,
         )
 
-        ### --------------------------------------------- ###
-        ### ---------- RoC & further stats plot --------- ###
-        ### --------------------------------------------- ###
-        p_steps, rates = self.calculate_RoC(100)
-
-        ax_cum = plt.axes([0.675, 0.7, 0.3, 0.225])
-        # add_number(fig, ax_cum, order=2)
-
-        uncertain = {}
-        idx_low = np.where(p_steps > 0.05)[0][0]
-        idx_high = np.where(p_steps < 0.95)[0][-1]
-        for key in rates["cumfrac"].keys():
-
-            if key == "joint" and (rates["cumfrac"][key][idx_low] > 0.01) & (
-                rates["cumfrac"][key][idx_high] < 0.99
-            ):
-                ax_cum.fill_between(
-                    [rates["cumfrac"][key][idx_low], rates["cumfrac"][key][idx_high]],
-                    [0, 0],
-                    [1, 1],
-                    facecolor="y",
-                    alpha=0.5,
-                )
-            uncertain[key] = (
-                rates["cumfrac"][key][idx_high] - rates["cumfrac"][key][idx_low]
-            )  # /(1-rates['cumfrac'][key][idx_high+1])
-
-        # print(uncertain)
-        # print(rates["cumfrac"]["joint"])
-        # print(p_steps)
-        ax_cum.axhline(0.05, color="b", linestyle=":")
-        ax_cum.axhline(0.95, color="b", linestyle="-")
-
-        ax_cum.plot(
-            np.append(rates["cumfrac"]["joint"], 1),
-            p_steps,
-            "grey",
-            label="Joint",
+        ax_corr_p_same = ax_corr.twinx()
+        ax_corr_p_same.plot(
+            arrays["correlation"],
+            self.model["p_same"]["correlation"],
+            color="tab:blue",
+            label="p_same",
         )
+        plt.setp(ax_corr_p_same, ylabel="$p_{same}$", ylim=[0,1.1])
+        ax_corr_p_same.spines[["left","top"]].set_visible(False)
 
-        plt.setp(ax_cum, xlim=[0, 1], ylabel="$p_{same}$", xlabel="cumulative fraction")
-        ax_cum.spines[["right", "top"]].set_visible(False)
+        ### =============================================== ###
+        ### ===================== p same ================== ###
+        ### =============================================== ###
 
-        ax_uncertain = plt.axes((0.75, 0.825, 0.05, 0.1))
-        ax_uncertain.bar(3, uncertain["joint"], facecolor="k")
-        plt.setp(ax_uncertain, xticks=[], xticklabels=[])
-        ax_uncertain.spines[["right", "top"]].set_visible(False)
-        ax_uncertain.set_title("uncertain fraction", fontsize=10)
+        ax_fsame = fig.add_subplot(133, projection="3d")
+        # CC, RR = np.meshgrid(arrays["correlation"], arrays["distance"])
+        CC, RR = np.meshgrid(
+            arrays["correlation"][self.params["nbins"] // 2 :],
+            arrays["distance"][: self.params["nbins"] // 2],
+        )
+        ax_fsame.plot_surface(
+            CC,
+            RR,
+            self.model["p_same"]["joint"][
+                : self.params["nbins"] // 2, self.params["nbins"] // 2 :
+            ],
+            cmap=plt.cm.RdYlGn,
+        )
+        ax_fsame.view_init(elev=30, azim=40)
+        plt.setp(ax_fsame, xlabel="correlation", ylabel="distance", zlabel="$p_{same}$")
+        
+        
+        # ### --------------------------------------------- ###
+        # ### ---------- RoC & further stats plot --------- ###
+        # ### --------------------------------------------- ###
+        # p_steps, rates = self.calculate_RoC(100)
 
-        idx = np.where(p_steps == 0.3)[0]
+        # ax_cum = plt.axes([0.675, 0.7, 0.3, 0.225])
+        # # add_number(fig, ax_cum, order=2)
 
-        ax_RoC = plt.axes((0.675, 0.13, 0.125, 0.3))
-        # add_number(fig, ax_RoC, order=3)
+        # uncertain = {}
+        # idx_low = np.where(p_steps > 0.05)[0][0]
+        # idx_high = np.where(p_steps < 0.95)[0][-1]
+        # for key in rates["cumfrac"].keys():
 
-        key_model = "joint"
-        ax_RoC.plot(rates["fp"][key_model], rates["tp"][key_model], "k", label="Joint")
-        ax_RoC.plot(rates["fp"][key_model][idx], rates["tp"][key_model][idx], "kx")
+        #     if key == "joint" and (rates["cumfrac"][key][idx_low] > 0.01) & (
+        #         rates["cumfrac"][key][idx_high] < 0.99
+        #     ):
+        #         ax_cum.fill_between(
+        #             [rates["cumfrac"][key][idx_low], rates["cumfrac"][key][idx_high]],
+        #             [0, 0],
+        #             [1, 1],
+        #             facecolor="y",
+        #             alpha=0.5,
+        #         )
+        #     uncertain[key] = (
+        #         rates["cumfrac"][key][idx_high] - rates["cumfrac"][key][idx_low]
+        #     )  # /(1-rates['cumfrac'][key][idx_high+1])
 
-        plt.setp(ax_RoC, ylabel="true positive", xlabel="false positive")
-        ax_RoC.spines[["right", "top"]].set_visible(False)
+        # # print(uncertain)
+        # # print(rates["cumfrac"]["joint"])
+        # # print(p_steps)
+        # ax_cum.axhline(0.05, color="b", linestyle=":")
+        # ax_cum.axhline(0.95, color="b", linestyle="-")
 
-        ax_fp = plt.axes((0.925, 0.13, 0.05, 0.1))
-        ax_fp.bar(1, rates["fp"]["distance"][idx], facecolor="k")
-        ax_fp.bar(2, rates["fp"]["correlation"][idx], facecolor="k")
-        ax_fp.bar(3, rates["fp"][key_model][idx], facecolor="k")
+        # ax_cum.plot(
+        #     np.append(rates["cumfrac"]["joint"], 1),
+        #     p_steps,
+        #     "grey",
+        #     label="Joint",
+        # )
 
-        plt.setp(ax_fp, xlim=[0.5, 3.5], ylim=[0, 0.05], xticks=[], xticklabels=[])
+        # plt.setp(ax_cum, xlim=[0, 1], ylabel="$p_{same}$", xlabel="cumulative fraction")
+        # ax_cum.spines[["right", "top"]].set_visible(False)
 
-        # ax_fp.set_xticklabels(['Dist.','Joint'],rotation=60,fontsize=10)
+        # ax_uncertain = plt.axes((0.75, 0.825, 0.05, 0.1))
+        # ax_uncertain.bar(3, uncertain["joint"], facecolor="k")
+        # plt.setp(ax_uncertain, xticks=[], xticklabels=[])
+        # ax_uncertain.spines[["right", "top"]].set_visible(False)
+        # ax_uncertain.set_title("uncertain fraction", fontsize=10)
 
-        ax_fp.spines[["right", "top"]].set_visible(False)
-        ax_fp.set_ylabel("false pos.", fontsize=10)
+        # idx = np.where(p_steps == 0.3)[0]
 
-        ax_tp = plt.axes((0.925, 0.33, 0.05, 0.1))
-        # add_number(fig, ax_tp, order=4, offset=[-100, 25])
-        # ax_tp.bar(2,rates['tp']['distance'][idx],facecolor='k')
-        ax_tp.bar(1, rates["tp"]["distance"][idx], facecolor="k")
-        ax_tp.bar(2, rates["tp"]["correlation"][idx], facecolor="k")
-        ax_tp.bar(3, rates["tp"][key_model][idx], facecolor="k")
+        # ax_RoC = plt.axes((0.675, 0.13, 0.125, 0.3))
+        # # add_number(fig, ax_RoC, order=3)
 
-        plt.setp(ax_tp, xlim=[0.5, 3.5], ylim=[0.4, 1], xticks=[], xticklabels=[])
-        ax_tp.spines[["right", "top"]].set_visible(False)
-        # ax_tp.set_ylabel('fraction',fontsize=10)
-        ax_tp.set_ylabel("true pos.", fontsize=10)
+        # key_model = "joint"
+        # ax_RoC.plot(rates["fp"][key_model], rates["tp"][key_model], "k", label="Joint")
+        # ax_RoC.plot(rates["fp"][key_model][idx], rates["tp"][key_model][idx], "kx")
 
-        # plt.tight_layout()
+        # plt.setp(ax_RoC, ylabel="true positive", xlabel="false positive")
+        # ax_RoC.spines[["right", "top"]].set_visible(False)
+
+        # ax_fp = plt.axes((0.925, 0.13, 0.05, 0.1))
+        # ax_fp.bar(1, rates["fp"]["distance"][idx], facecolor="k")
+        # ax_fp.bar(2, rates["fp"]["correlation"][idx], facecolor="k")
+        # ax_fp.bar(3, rates["fp"][key_model][idx], facecolor="k")
+
+        # plt.setp(ax_fp, xlim=[0.5, 3.5], ylim=[0, 0.05], xticks=[], xticklabels=[])
+
+        # # ax_fp.set_xticklabels(['Dist.','Joint'],rotation=60,fontsize=10)
+
+        # ax_fp.spines[["right", "top"]].set_visible(False)
+        # ax_fp.set_ylabel("false pos.", fontsize=10)
+
+        # ax_tp = plt.axes((0.925, 0.33, 0.05, 0.1))
+        # # add_number(fig, ax_tp, order=4, offset=[-100, 25])
+        # # ax_tp.bar(2,rates['tp']['distance'][idx],facecolor='k')
+        # ax_tp.bar(1, rates["tp"]["distance"][idx], facecolor="k")
+        # ax_tp.bar(2, rates["tp"]["correlation"][idx], facecolor="k")
+        # ax_tp.bar(3, rates["tp"][key_model][idx], facecolor="k")
+
+        # plt.setp(ax_tp, xlim=[0.5, 3.5], ylim=[0.4, 1], xticks=[], xticklabels=[])
+        # ax_tp.spines[["right", "top"]].set_visible(False)
+        # # ax_tp.set_ylabel('fraction',fontsize=10)
+        # ax_tp.set_ylabel("true pos.", fontsize=10)
+
+        plt.tight_layout()
         plt.show(block=False)
         if sv:
             ext = "png"
@@ -705,7 +743,7 @@ class TrackingAnalysis(Tracking):
 
     def plot_count_histogram(self, times=0):
 
-        counts = self.scale_counts(times)
+        counts = self.scale_counts(times).astype(np.float32)
         arrays = self.params["arrays"]
 
         plt.figure(figsize=(6, 4), dpi=150)
@@ -730,10 +768,12 @@ class TrackingAnalysis(Tracking):
         title_opts = {
             "y": 1,
             "pad": -14,
-            "color": "white",
+            # "color": "white",
+            "color": "black",
             "fontweight": "bold",
             "fontsize": 10,
         }
+        counts[counts == 0] = np.nan
         ax2 = plt.subplot(223)
         ax2.imshow(counts[..., 0], **im_opts)
         ax2.set_title("all counts", **title_opts)
@@ -1025,16 +1065,16 @@ class TrackingAnalysis(Tracking):
         rc("xtick", labelsize=8)
         rc("ytick", labelsize=8)
 
-        clusters = getattr(self, self.cluster_field)
+        # clusters = getattr(self, self.cluster_field)
 
-        idxes = clusters["assignments"] >= 0
+        idxes = self.assignments >= 0
 
         fig = plt.figure(figsize=(4, 1.5), dpi=150)
         ax_sc1 = fig.add_subplot((0.1, 0.3, 0.35, 0.65))
 
         ax = ax_sc1.twinx()
         ax.hist(
-            clusters["p_matched"][idxes, 1].flat,
+            self.tracking["p_matched"][idxes, 1].flat,
             np.linspace(0, 1, 51),
             facecolor="tab:red",
             alpha=0.3,
@@ -1045,7 +1085,7 @@ class TrackingAnalysis(Tracking):
 
         ax = ax_sc1.twiny()
         ax.hist(
-            clusters["p_matched"][idxes, 0].flat,
+            self.tracking["p_matched"][idxes, 0].flat,
             np.linspace(0, 1, 51),
             facecolor="tab:blue",
             orientation="horizontal",
@@ -1055,8 +1095,8 @@ class TrackingAnalysis(Tracking):
         ax.spines[["top", "right"]].set_visible(False)
 
         ax_sc1.plot(
-            clusters["p_matched"][idxes, 1].flat,
-            clusters["p_matched"][idxes, 0].flat,
+            self.tracking["p_matched"][idxes, 1].flat,
+            self.tracking["p_matched"][idxes, 0].flat,
             ".",
             markeredgewidth=0,
             color="k",
@@ -1081,7 +1121,7 @@ class TrackingAnalysis(Tracking):
         # plt.hist(np.nanmean(clusters['p_matched'],1),np.linspace(0,1,51))
         ax = ax_sc2.twinx()
         ax.hist(
-            np.nanmin(clusters["p_matched"][..., 0], 1),
+            np.nanmin(self.tracking["p_matched"][..., 0], 1),
             np.linspace(0, 1, 51),
             facecolor="tab:red",
             alpha=0.3,
@@ -1091,7 +1131,7 @@ class TrackingAnalysis(Tracking):
 
         ax = ax_sc2.twiny()
         ax.hist(
-            np.nanmean(clusters["p_matched"][..., 0], axis=1),
+            np.nanmean(self.tracking["p_matched"][..., 0], axis=1),
             np.linspace(0, 1, 51),
             facecolor="tab:blue",
             orientation="horizontal",
@@ -1101,8 +1141,8 @@ class TrackingAnalysis(Tracking):
         ax.spines[["top", "right"]].set_visible(False)
 
         ax_sc2.plot(
-            np.nanmin(clusters["p_matched"][..., 0], 1),
-            np.nanmean(clusters["p_matched"][..., 0], axis=1),
+            np.nanmin(self.tracking["p_matched"][..., 0], 1),
+            np.nanmean(self.tracking["p_matched"][..., 0], axis=1),
             ".",
             markeredgewidth=0,
             color="k",
@@ -1114,7 +1154,7 @@ class TrackingAnalysis(Tracking):
         ax_sc2.spines[["top", "right"]].set_visible(False)
 
         ### plot positions of neurons
-        plt.tight_layout()
+        # plt.tight_layout()
         plt.show(block=False)
 
         if sv:
@@ -1133,7 +1173,9 @@ class TrackingAnalysis(Tracking):
 
         nC, nSes = self.assignments.shape
         active = self.assignments >= 0
-        print(active)
+        # print(active)
+
+        centroids = self.build_centroids()
 
         idx_unsure = self.tracking["p_matched"][..., 0] < 0.95
 
@@ -1146,9 +1188,14 @@ class TrackingAnalysis(Tracking):
         cmap = cm.get_cmap("tab20")
         ax_3D.set_prop_cycle(color=cmap.colors)
         for n in n_arr:
+            # centroids = np.zeros((nSes, 2))
+            # for s in range(nSes):
+            #     fp_id = self.assignments[n, s]
+            #     if fp_id>=0:
+            #         centroids[s, :] = self.sessions[s].centroids[fp_id, :]
             ax_3D.scatter(
-                clusters["cm"][n, :, 0],
-                clusters["cm"][n, :, 1],
+                centroids[n,:, 0],
+                centroids[n,:, 1],
                 np.arange(nSes),
                 s=0.5,
             )  # linewidth=2)
@@ -1171,7 +1218,7 @@ class TrackingAnalysis(Tracking):
         # ax = plt.subplot(243)
         ax = fig.add_axes((0.65, 0.65, 0.125, 0.275))
         # add_number(fig, ax, order=2, offset=[-50, 25])
-        dx = np.diff(clusters["cm"][..., 0], axis=1) * self.params["pxtomu"]
+        dx = np.diff(centroids[..., 0], axis=1) * self.params["pxtomu"]
         ax.hist(
             dx.flatten(), np.linspace(-10, 10, 101), facecolor="tab:blue", alpha=0.5
         )
@@ -1185,14 +1232,13 @@ class TrackingAnalysis(Tracking):
             ax,
             xlabel="$\\Delta$x [$\\mu$m]",
             ylabel="density",
-            ylim=[0, 10000],
             yticks=[],
         )
         ax.spines[["top", "left", "right"]].set_visible(False)
 
         # ax = plt.subplot(244)
         ax = fig.add_axes((0.8, 0.65, 0.125, 0.275))
-        dy = np.diff(clusters["cm"][..., 1], axis=1) * self.params["pxtomu"]
+        dy = np.diff(centroids[..., 1], axis=1) * self.params["pxtomu"]
         ax.hist(
             dy.flatten(), np.linspace(-10, 10, 101), facecolor="tab:blue", alpha=0.5
         )
@@ -1202,7 +1248,7 @@ class TrackingAnalysis(Tracking):
             facecolor="tab:red",
             alpha=0.5,
         )
-        plt.setp(ax, xlabel="$\\Delta$y [$\\mu$m]", ylim=[0, 10000], yticks=[])
+        plt.setp(ax, xlabel="$\\Delta$y [$\\mu$m]", yticks=[])
         ax.spines[["top", "left", "right"]].set_visible(False)
 
         ax = fig.add_axes([0.73, 0.85, 0.075, 0.05])
@@ -1215,7 +1261,7 @@ class TrackingAnalysis(Tracking):
             facecolor="tab:red",
             alpha=0.5,
         )
-        plt.setp(ax, yticks=[], ylim=[0, 500])
+        plt.setp(ax, yticks=[])
         # ax.set_xlabel('$\\Delta$x [$\\mu$m]',fontsize=10)
         ax.spines[["top", "left", "right"]].set_visible(False)
 
@@ -1231,16 +1277,16 @@ class TrackingAnalysis(Tracking):
         )
         # ax.set_xlabel('$\\Delta$y [$\\mu$m]',fontsize=10)
         ax.spines[["top", "left", "right"]].set_visible(False)
-        plt.setp(ax, ylim=[0, 500], yticks=[])
+        plt.setp(ax, yticks=[])
 
         ROI_diff = np.full((nC, nSes, 2), np.nan)
         com_ref = np.full((nC, 2), np.nan)
         for n in range(nC):
             s_ref = np.where(active[n, :])[0]
             if len(s_ref) > 0:
-                com_ref[n, :] = clusters["cm"][n, s_ref[0], :]
+                com_ref[n, :] = centroids[n, s_ref[0], :]
                 ROI_diff[n, : nSes - s_ref[0], :] = (
-                    clusters["cm"][n, s_ref[0] :, :] - com_ref[n, :]
+                    centroids[n, s_ref[0] :, :] - com_ref[n, :]
                 )
                 # print('neuron %d, first session: %d, \tposition: (%.2f,%.2f)'%(n,s_ref[0],com_ref[n,0],com_ref[n,1]))
 
@@ -1311,13 +1357,24 @@ class TrackingAnalysis(Tracking):
         # if sv:
         # pl_dat.save_fig('ROI_positions')
 
+    def build_centroids(self):
+
+        centroids = np.full(self.assignments.shape + (2,), np.nan)
+
+        for s,session in enumerate(self.sessions):
+            active_neurons = np.where(self.assignments[:, s] >= 0)[0]
+            fp_ids = self.assignments[active_neurons, s]
+            centroids[active_neurons, s, :] = session.centroids[fp_ids, :]
+
+        return centroids
+
     def plot_match_statistics(self, s, s_ref=None):
 
         print("### Plotting matching score statistics ###")
 
-        print(
-            "now add example how to calculate footprint correlation(?), sketch how to fill cost-matrix"
-        )
+        # print(
+        #     "now add example how to calculate footprint correlation(?), sketch how to fill cost-matrix"
+        # )
         if s_ref is None:
             s_ref = s - 1
         margins = 20
@@ -1325,16 +1382,13 @@ class TrackingAnalysis(Tracking):
         ### ------------------------------------------------------------- ###
         ### -------------- Load and preprocess data --------------------- ###
         ### ------------------------------------------------------------- ###
-        clusters = getattr(self, self.cluster_field)
+        # clusters = getattr(self, self.cluster_field)
 
-        active = clusters["assignments"] >= 0
+        active = self.assignments >= 0
 
-        try:
-            ref_data = self.sessions[s_ref]
-            this_data = self.sessions[s]
-        except:
-            this_data = self.sessions[str(s)]
-            ref_data = self.sessions[str(s_ref)]
+        ref_data = self.sessions[s_ref]
+        this_data = self.sessions[s]
+        
 
         A_ref = ref_data.A
         Cn_ref = ref_data.Cn
@@ -1343,8 +1397,10 @@ class TrackingAnalysis(Tracking):
         Cn = this_data.Cn
         dims = this_data.dims
 
+        centroids = self.build_centroids()
+
         D_ROIs = spatial.distance.squareform(
-            spatial.distance.pdist(clusters["cm"][:, s_ref, :])
+            spatial.distance.pdist(centroids[:, s_ref, :])
         )
         np.fill_diagonal(D_ROIs, np.nan)
 
@@ -1353,15 +1409,15 @@ class TrackingAnalysis(Tracking):
         )[0]
         c = np.random.choice(idx_dense)
 
-        n = int(clusters["assignments"][c, s_ref])
+        n = int(self.assignments[c, s_ref])
 
         fig = plt.figure(figsize=(7, 4), dpi=150)
         props = dict(boxstyle="round", facecolor="w", alpha=0.8)
 
         ## plot ROIs from a single session
-        n_close = clusters["assignments"][D_ROIs[c, :] < margins * 1.5, s_ref]
+        n_close = self.assignments[D_ROIs[c, :] < margins * 1.5, s_ref]
 
-        x, y = clusters["cm"][c, s_ref, :].astype("int")
+        x, y = centroids[c, s_ref, :].astype("int")
 
         ax_ROIs1 = fig.add_axes((0.05, 0.55, 0.25, 0.4))
         # add_number(fig, ax_ROIs1, order=1, offset=[-25, 25])
@@ -1371,7 +1427,7 @@ class TrackingAnalysis(Tracking):
         ax_ROIs1.imshow(Cn_ref, origin="lower", clim=[0, 1])
         An = normalize_array(A_ref[..., n].toarray()).reshape(dims)
         for nn in n_close:
-            cc = np.where(clusters["assignments"][:, s_ref] == nn)[0]
+            cc = np.where(self.assignments[:, s_ref] == nn)[0]
             # print(cc, nn)
             ax_ROIs1.contour(
                 normalize_array(A_ref[..., nn].toarray()).reshape(dims),
@@ -1396,9 +1452,9 @@ class TrackingAnalysis(Tracking):
         )
 
         D_ROIs_cross = spatial.distance.cdist(
-            clusters["cm"][:, s_ref, :], clusters["cm"][:, s, :]
+            centroids[:, s_ref, :], centroids[:, s, :]
         )
-        n_close = clusters["assignments"][D_ROIs_cross[c, :] < margins * 2, s]
+        n_close = self.assignments[D_ROIs_cross[c, :] < margins * 2, s]
 
         ## plot ROIs of session 2 compared to one of session 1
         ax_ROIs2 = fig.add_axes((0.35, 0.55, 0.25, 0.4))
@@ -1406,9 +1462,9 @@ class TrackingAnalysis(Tracking):
 
         Cn = normalize_array(Cn)
         ax_ROIs2.imshow(Cn, origin="lower", clim=[0, 1])
-        n_match = clusters["assignments"][c, s]
+        n_match = self.assignments[c, s]
         for nn in n_close:
-            cc = np.where(clusters["assignments"][:, s] == nn)
+            cc = np.where(self.assignments[:, s] == nn)
             if not (nn == n_match):  # & (cluster.stats['SNR'][cc,s+1]>3):
                 ax_ROIs2.contour(
                     normalize_array(A[..., nn].toarray()).reshape(dims),
@@ -1639,16 +1695,21 @@ class TrackingAnalysis(Tracking):
     def plot_alignment_statistics(self, s_ref=0, s_this=1):
 
         print("### Plotting session alignment procedure and statistics ###")
-        # session_alignment = getattr(self, self.results[0])
-        clusters = getattr(self, self.cluster_field)
 
-        nC, nS = clusters["assignments"].shape
+        """
+            Careful: shift is not displayed properly:
+            currently, shift between corrected backgrounds is calculated (thus max @(0,0))
+            and shift arrow shows shift wrt all (already corrected) reference sessions, not the actual raw one
+        """
+
+
+        nC, nS = self.assignments.shape
         self.classify_sessions()
-        active = clusters["assignments"] >= 0
+        active = self.assignments >= 0
 
         # s = s-1
 
-        com_mean = np.nanmean(clusters["cm"], 1)
+        # com_mean = np.nanmean(clusters["cm"], 1)
 
         # self.alignment_template = session_alignment["template"]
 
@@ -1693,13 +1754,13 @@ class TrackingAnalysis(Tracking):
         # p_vals = np.zeros((cluster.meta['nSes'],4))*np.nan
         p_vals = np.zeros((nS, 2)) * np.nan
         # fig1 = plt.figure(figsize=(7,5),dpi=pl_dat.sv_opt['dpi'])
-        fig = plt.figure(figsize=(7, 5), dpi=150)
+        fig = plt.figure(figsize=(10, 3), dpi=150)
         for s in tqdm.tqdm(
             np.where(self.alignment_status)[0][1:]
         ):  # cluster.meta['nSes'])):
 
-            com_silent = com_mean[~active[:, s], :]
-            com_active = com_mean[active[:, s], :]
+            com_silent = self.union.centroids[~active[:, s], :]
+            com_active = self.union.centroids[active[:, s], :]
 
             if self.sessions[s].remap.flow:
                 # pathSession2 = pathcat([cluster.meta['pathMouse'],'Session%02d/results_redetect.mat'%(s+1)])
@@ -1795,11 +1856,11 @@ class TrackingAnalysis(Tracking):
 
                 props = dict(boxstyle="round", facecolor="w", alpha=0.8)
 
-                ax_im1 = plt.axes([0.1, 0.625, 0.175, 0.35])
+                ax_im1 = fig.add_subplot([0.1, 0.325, 0.225, 0.6])
                 # add_number(fig, ax_im1, order=1, offset=[-50, -5])
                 im_col = np.zeros((512, 512, 3))
                 im_col[:, :, 0] = Cn_ref
-                ax_im1.imshow(im_col, origin="lower")
+                ax_im1.imshow(im_col, origin="lower", aspect="auto")
                 ax_im1.text(50, 430, "Session %d" % s_this, bbox=props, fontsize=8)
                 ax_im1.set_xticks([])
                 ax_im1.set_yticks([])
@@ -1807,8 +1868,8 @@ class TrackingAnalysis(Tracking):
                 im_col = np.zeros((512, 512, 3))
                 im_col[:, :, 1] = Cn_this
 
-                ax_im2 = plt.axes([0.05, 0.575, 0.175, 0.35])
-                ax_im2.imshow(im_col, origin="lower")
+                ax_im2 = fig.add_subplot([0.05, 0.175, 0.225, 0.6])
+                ax_im2.imshow(im_col, origin="lower", aspect="auto")
                 ax_im2.text(50, 430, "Session %d" % s_ref, bbox=props, fontsize=8)
                 ax_im2.set_xticks([])
                 ax_im2.set_yticks([])
@@ -1817,9 +1878,9 @@ class TrackingAnalysis(Tracking):
                 # sbar = ScaleBar(530.68/512 *10**(-6),location='lower right')
                 # ax_im2.add_artist(sbar)
 
-                ax_sShift = plt.axes([0.4, 0.575, 0.175, 0.35])
+                ax_sShift = fig.add_subplot([0.4, 0.175, 0.225, 0.6])
                 # add_number(fig, ax_sShift, order=2)
-                cbaxes = plt.axes([0.4, 0.88, 0.05, 0.02])
+                cbaxes = fig.add_subplot([0.4, 0.8, 0.075, 0.04])
 
                 C = signal.convolve(
                     Cn_ref - Cn_ref.mean(),
@@ -1856,7 +1917,7 @@ class TrackingAnalysis(Tracking):
                 ax_sShift.text(
                     -13,
                     -13,
-                    f"shift: ({self.sessions[s].remap.shift[0]},{self.sessions[s].remap.shift[1]})",
+                    f"shift: ({self.sessions[s].remap.shift[0]:.2f},{self.sessions[s].remap.shift[1]:.2f})",
                     size=10,
                     ha="left",
                     va="bottom",
@@ -1870,7 +1931,7 @@ class TrackingAnalysis(Tracking):
                 ax_sShift.set_xlabel("$\\Delta x [\\mu m]$")
                 ax_sShift.set_ylabel("$\\Delta y [\\mu m]$")
 
-                ax_sShift_all = plt.axes([0.54, 0.79, 0.1, 0.15])
+                ax_sShift_all = fig.add_subplot([0.55, 0.6, 0.11, 0.25])
                 for ss in range(1, nS):
                     if self.alignment_status[ss]:
                         col = [0.6, 0.6, 0.6]
@@ -1897,29 +1958,29 @@ class TrackingAnalysis(Tracking):
                 ax_sShift_all.yaxis.tick_right()
                 ax_sShift_all.xaxis.set_label_position("top")
                 ax_sShift_all.xaxis.tick_top()
-                ax_sShift_all.set_xlim([-25, 50])
+                ax_sShift_all.set_xlim([-15, 15])
 
-                ax_sShift_all.set_ylim([-25, 50])
+                ax_sShift_all.set_ylim([-15, 15])
                 # ax_sShift_all.set_xlabel('x [px]',fontsize=10)
                 # ax_sShift_all.set_ylabel('y [px]',fontsize=10)
 
                 idxes = 50
                 # tx = dims[0]/2 - 1
                 # ty = tilt_ax_y[int(tx)]
-                ax_OptFlow = plt.axes([0.8, 0.625, 0.175, 0.25])
-                # add_number(fig, ax_OptFlow, order=3)
+                # ax_OptFlow = plt.axes([0.8, 0.625, 0.175, 0.25])
+                # # add_number(fig, ax_OptFlow, order=3)
 
-                x_grid, y_grid = np.meshgrid(
-                    np.arange(0.0, dims[0]).astype(np.float32),
-                    np.arange(0.0, dims[1]).astype(np.float32),
-                )
+                # x_grid, y_grid = np.meshgrid(
+                #     np.arange(0.0, dims[0]).astype(np.float32),
+                #     np.arange(0.0, dims[1]).astype(np.float32),
+                # )
 
-                ax_OptFlow.set_xlim([0, dims[0]])
-                ax_OptFlow.set_ylim([0, dims[1]])
-                ax_OptFlow.set_xlabel("$x [\\mu m]$")
-                ax_OptFlow.set_ylabel("$y [\\mu m]$")
+                # ax_OptFlow.set_xlim([0, dims[0]])
+                # ax_OptFlow.set_ylim([0, dims[1]])
+                # ax_OptFlow.set_xlabel("$x [\\mu m]$")
+                # ax_OptFlow.set_ylabel("$y [\\mu m]$")
 
-                ax_sShifted = plt.axes([0.75, 0.11, 0.2, 0.325])
+                ax_sShifted = fig.add_subplot([0.7, 0.175, 0.225, 0.6])
                 # add_number(fig, ax_sShifted, order=6, offset=[-5, 25])
                 im_col = np.zeros((512, 512, 3))
                 im_col[:, :, 0] = Cn_ref
@@ -1929,105 +1990,105 @@ class TrackingAnalysis(Tracking):
                 ax_sShifted.set_xticks([])
                 ax_sShifted.set_yticks([])
 
-                ax_scatter = plt.axes([0.1, 0.125, 0.2, 0.3])
-                # add_number(fig, ax_scatter, order=4)
-                ax_scatter.scatter(com_silent[:, 0], com_silent[:, 1], s=0.7, c="k")
-                ax_scatter.scatter(
-                    com_active[:, 0], com_active[:, 1], s=0.7, c="tab:orange"
-                )
-                # x_ax = np.linspace(0,dims[0]-1,dims[0])
-                # y_ax = n[0]/n[1]*(p[0]-x_ax) + p[1] + n[2]/n[1]*p[2]
-                if self.sessions[s].remap.flow:
-                    ax_scatter.plot(
-                        np.linspace(0, dims[0] - 1, dims[0]),
-                        tilt_ax,
-                        "-",
-                        color="tab:green",
-                    )
-                    ax_hist.hist(
-                        dist_silent,
-                        np.linspace(0, 400, 51),
-                        facecolor="k",
-                        alpha=0.5,
-                        density=True,
-                        label="silent",
-                    )
-                    ax_hist.hist(
-                        dist_active,
-                        np.linspace(0, 400, 51),
-                        facecolor="tab:orange",
-                        alpha=0.5,
-                        density=True,
-                        label="active",
-                    )
+                # ax_scatter = plt.axes([0.1, 0.125, 0.2, 0.3])
+                # # add_number(fig, ax_scatter, order=4)
+                # ax_scatter.scatter(com_silent[:, 0], com_silent[:, 1], s=0.7, c="k")
+                # ax_scatter.scatter(
+                #     com_active[:, 0], com_active[:, 1], s=0.7, c="tab:orange"
+                # )
+                # # x_ax = np.linspace(0,dims[0]-1,dims[0])
+                # # y_ax = n[0]/n[1]*(p[0]-x_ax) + p[1] + n[2]/n[1]*p[2]
+                # if self.sessions[s].remap.flow:
+                #     ax_scatter.plot(
+                #         np.linspace(0, dims[0] - 1, dims[0]),
+                #         tilt_ax,
+                #         "-",
+                #         color="tab:green",
+                #     )
+                #     ax_hist.hist(
+                #         dist_silent,
+                #         np.linspace(0, 400, 51),
+                #         facecolor="k",
+                #         alpha=0.5,
+                #         density=True,
+                #         label="silent",
+                #     )
+                #     ax_hist.hist(
+                #         dist_active,
+                #         np.linspace(0, 400, 51),
+                #         facecolor="tab:orange",
+                #         alpha=0.5,
+                #         density=True,
+                #         label="active",
+                #     )
 
-                # ax_scatter.plot(x_ax,y_ax,'k-')
-                ax_scatter.set_xlim([0, dims[0]])
-                ax_scatter.set_ylim([0, dims[0]])
-                ax_scatter.set_xlabel("x [$\\mu$m]")
-                ax_scatter.set_ylabel("y [$\\mu$m]")
+                # # ax_scatter.plot(x_ax,y_ax,'k-')
+                # ax_scatter.set_xlim([0, dims[0]])
+                # ax_scatter.set_ylim([0, dims[0]])
+                # ax_scatter.set_xlabel("x [$\\mu$m]")
+                # ax_scatter.set_ylabel("y [$\\mu$m]")
 
-                # x_grid, y_grid = np.meshgrid(np.arange(0., dims[0]).astype(np.float32),
-                # np.arange(0., dims[1]).astype(np.float32))
+                # # x_grid, y_grid = np.meshgrid(np.arange(0., dims[0]).astype(np.float32),
+                # # np.arange(0., dims[1]).astype(np.float32))
 
-                ax_hist = plt.axes([0.4, 0.125, 0.3, 0.3])
-                # add_number(fig, ax_hist, order=5, offset=[-50, 25])
-                # ax_hist.hist(dist_mean,np.linspace(0,400,21),facecolor='k',alpha=0.5,density=True,label='all neurons')
+                # ax_hist = plt.axes([0.4, 0.125, 0.3, 0.3])
+                # # add_number(fig, ax_hist, order=5, offset=[-50, 25])
+                # # ax_hist.hist(dist_mean,np.linspace(0,400,21),facecolor='k',alpha=0.5,density=True,label='all neurons')
 
-                ax_hist.legend(loc="lower left", fontsize=8)
-                ax_hist.set_ylabel("density")
-                ax_hist.set_yticks([])
-                ax_hist.set_xlabel("distance from axis [$\\mu$m]")
-                ax_hist.set_xlim([0, 400])
-                ax_hist.spines[["top", "right"]].set_visible(False)
+                # ax_hist.legend(loc="lower left", fontsize=8)
+                # ax_hist.set_ylabel("density")
+                # ax_hist.set_yticks([])
+                # ax_hist.set_xlabel("distance from axis [$\\mu$m]")
+                # ax_hist.set_xlim([0, 400])
+                # ax_hist.spines[["top", "right"]].set_visible(False)
         # except:
         # pass
 
-        ax_p = plt.axes([0.525, 0.325, 0.125, 0.125])
-        ax_p.axhline(0.01, color="k", linestyle="--")
-        ax_p.plot(
-            np.where(self.alignment_status)[0],
-            p_vals[self.alignment_status, 0],
-            "k",
-            linewidth=0.5,
-        )
-        ax_p.plot(
-            np.where(self.alignment_status)[0],
-            p_vals[self.alignment_status, 1],
-            "tab:orange",
-            linewidth=0.5,
-        )
-        # ax_p.plot(np.where(self.alignment_status)[0],p_vals[self.alignment_status],'b')
-        # ax_p.plot(np.where(self.alignment_status)[0],p_vals[self.alignment_status,2],'--',color=[0.6,0.6,0.6])
-        # ax_p.plot(np.where(self.alignment_status)[0],p_vals[self.alignment_status,3],'g--')
-        ax_p.set_yscale("log")
-        ax_p.xaxis.set_label_position("top")
-        ax_p.yaxis.set_label_position("right")
-        ax_p.tick_params(
-            axis="y",
-            which="both",
-            left=False,
-            right=True,
-            labelright=True,
-            labelleft=False,
-        )
-        ax_p.tick_params(
-            axis="x",
-            which="both",
-            top=True,
-            bottom=False,
-            labeltop=True,
-            labelbottom=False,
-        )
-        # ax_p.xaxis.tick_top()
-        # ax_p.yaxis.tick_right()
-        ax_p.set_xlabel("session")
-        ax_p.set_ylim([10 ** (-4), 1])
-        # ax_p.set_ylim([1,0])
-        ax_p.set_ylabel(
-            "p-value", fontsize=8, rotation="horizontal", labelpad=-5, y=-0.2
-        )
-        ax_p.spines[["bottom", "left"]].set_visible(False)
+        # ax_p = plt.axes([0.525, 0.325, 0.125, 0.125])
+        # ax_p.axhline(0.01, color="k", linestyle="--")
+        # ax_p.plot(
+        #     np.where(self.alignment_status)[0],
+        #     p_vals[self.alignment_status, 0],
+        #     "k",
+        #     linewidth=0.5,
+        # )
+        # ax_p.plot(
+        #     np.where(self.alignment_status)[0],
+        #     p_vals[self.alignment_status, 1],
+        #     "tab:orange",
+        #     linewidth=0.5,
+        # )
+        # # ax_p.plot(np.where(self.alignment_status)[0],p_vals[self.alignment_status],'b')
+        # # ax_p.plot(np.where(self.alignment_status)[0],p_vals[self.alignment_status,2],'--',color=[0.6,0.6,0.6])
+        # # ax_p.plot(np.where(self.alignment_status)[0],p_vals[self.alignment_status,3],'g--')
+        # ax_p.set_yscale("log")
+        # ax_p.xaxis.set_label_position("top")
+        # ax_p.yaxis.set_label_position("right")
+        # ax_p.tick_params(
+        #     axis="y",
+        #     which="both",
+        #     left=False,
+        #     right=True,
+        #     labelright=True,
+        #     labelleft=False,
+        # )
+        # ax_p.tick_params(
+        #     axis="x",
+        #     which="both",
+        #     top=True,
+        #     bottom=False,
+        #     labeltop=True,
+        #     labelbottom=False,
+        # )
+        # # ax_p.xaxis.tick_top()
+        # # ax_p.yaxis.tick_right()
+        # ax_p.set_xlabel("session")
+        # ax_p.set_ylim([10 ** (-4), 1])
+        # # ax_p.set_ylim([1,0])
+        # ax_p.set_ylabel(
+        #     "p-value", fontsize=8, rotation="horizontal", labelpad=-5, y=-0.2
+        # )
+        # ax_p.spines[["bottom", "left"]].set_visible(False)
         # ax_p.tick_params(axis='x',which='both',top=True,bottom=False,labeltop=True,labelbottom=False)
 
         plt.tight_layout()

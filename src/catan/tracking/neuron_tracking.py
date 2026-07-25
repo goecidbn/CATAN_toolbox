@@ -13,6 +13,7 @@ TODO:
 last updated on January 28th, 2024
 """
 
+import os
 from typing import Dict, Optional, Tuple, List
 from functools import partial
 import sys, copy, logging, time
@@ -47,23 +48,40 @@ class Tracking:
 
     HDF5_VERSION = 1
 
-    def __init__(self, bins=64, logLevel=logging.ERROR):
+    def __init__(self, neighbor_distance=25.0, bins=64, n_threads=1, use_kde=False, pxtomu=1., L=512, logLevel=logging.ERROR):
+        """
+        Central class for neuron tracking via session registration, model building and neuron registration
+        
+        Parameters
+        ----------
 
+        neighbor_distance : float = 25.
+            the distance (in mu m) up to where neuron similarities and distances are calculated and registered for model building (shouldn't be much smaller, as the distance model requires at least some further ranging data)
+            
+        bins : int = 64
+            number of bins used for model building and count registration. Should be a number 2^n to allow scaling down.
+
+        n_threads: int = 1
+            the number of threads to use, when calculating footprint similarity - the costly part of the analysis
+            
+        use_kde: bool = False
+            specifies, whether neurons from areas of lowest and highest neuron density are excluded when building the probabilistic model. Costly, but can avoid some weird behavior
+            
+        pxtomu: float = 1.
+            the factor to transform pixels to micrometer (mu m) distance
+        
+        L: int = 512
+            number of pixels along one dimension (actually - this should rather be the window length in mu m)
+                    """
         self.log = logging.getLogger("matchinglogger")
         self.log.setLevel(logLevel)
 
-        self.params = {
-            # "min_session_correlation_zscore": 3.0,
-            # "min_session_correlation": 0.2,
-            # "max_session_shift": 100.0,
-            "pxtomu": 1.0,
-            "binary": False,
-            "neighbor_distance": 20.0,
-            "correlation_model": ["shifted"],
-            "L": 512.0,
-            # "use_kde": True,
-            # "qtl": [0.05, 0.95],
-        }
+        self.params = {}
+        self.params["neighbor_distance"] = neighbor_distance
+        self.params["bins"] = bins
+        self.params["n_threads"] = n_threads
+        self.params["use_kde"] = use_kde
+        self.params["pxtomu"] = pxtomu
 
         self._update_bins(bins)
 
@@ -71,11 +89,14 @@ class Tracking:
         self.reference_data = None
 
         self.reset_data()
+        self.reset_model()
         self.reset_registration()
 
     def reset_data(self):
         self.sessions: List[SessionData] = []
 
+    def reset_model(self):
+        self.model = None
         self.counts = {
             "same": np.zeros((self.params["nbins"], self.params["nbins"]), int),
             "cross": np.zeros((self.params["nbins"], self.params["nbins"], 3), int),
@@ -88,6 +109,32 @@ class Tracking:
         load_content: List[str] = ["quality", "spatial", "temporal"],
         align=True,
     ):
+        """
+        Register a new session from a file, load the data and add it to the list of sessions. The session is aligned to the previous sessions if align=True.
+
+        Input
+        
+        - from_file: str 
+            
+            Path to the session file
+
+        - name: Optional[str]
+
+            Optional name for this session
+        
+        - load_content: list[str] = ["spatial", "temporal", "quality"]
+
+            Specifies which data should be loaded and can be either combination of the three above - but setting all is strongly encouraged.
+            
+            spatial: loads footprint and background data - necessary to do any kind of further processing
+            traces: loads temporal traces - not entirely necessary, but is used to test for overlapping neurons with highly correlated activity 
+            quality: loads quality parameters (SNR_comp, r_values, cnn_preds for CaImAn) which are used for thresholding
+        
+        - align: bool = True
+
+            Flag for aligning the spatial components to prior registered sessions (using rigid and non-rigid correction). Highly encouraged to leave this enabled, unless sessions are already aligned. For further details see demo notebook `alignment.ipynb`
+
+        """
 
         if isinstance(from_file, (str, Path)):
             this_data = SessionData(
@@ -160,54 +207,6 @@ class Tracking:
                 f"Registering session {s} to {sz_union} neurons, {path.name}"
             )
             self.register_neurons(from_file=path, align_to_reference=align_to_reference)
-
-    # def get_data(
-    #     self,
-    #     from_file: str | Path,
-    #     fields_spatial=["A", "Cn"],
-    #     fields_trace=["C", "F_dff"],
-    #     fields_quality=["SNR_comp", "r_values", "cnn_preds"],
-    #     alignment_template=None,
-    # ) -> SessionData:
-
-    #     fields = [*fields_spatial, *fields_trace, *fields_quality]
-
-    #     try:
-    #         ## per default, assume caiman output structure
-    #         loaded = load_data(
-    #             from_file,
-    #             fields=fields,
-    #             subpath="/estimates",
-    #         )
-    #     except:
-    #         ## if fails, assume flat data
-    #         loaded = load_data(
-    #             from_file,
-    #             fields=fields,
-    #             subpath="",
-    #         )
-
-    #     quality = {k: loaded.get(k, None) for k in fields_quality}
-    #     session = SessionData(
-    #         loaded["A"],
-    #         loaded["Cn"],
-    #         params=self.params,
-    #         alignment_template=alignment_template,
-    #         path=str(from_file),
-    #         quality=quality,
-    #     )
-    #     session.load_traces(fields=fields_trace)
-    #     # traces = {
-    #     #     k: loaded[k]
-    #     #     for k in fields_trace
-    #     #     if k in loaded.keys() and isinstance(loaded.get(k, None), np.ndarray)
-    #     # }
-    #     for key in fields_trace:
-    #         if key not in loaded.keys():
-    #             print(f"Warning: trace field {key} not found in loaded data.")
-    #             continue
-
-    #     return session
 
     def update_model_with_data(
         self,
@@ -1162,26 +1161,11 @@ class Tracking:
 
     def scale_counts(self, times=0, key="cross"):
 
-        # key_counts = (
-        #     "counts"
-        #     if self.params["correlation_model"] == "shifted"
-        #     else "counts_unshifted"
-        # )
-
         counts = scale_down_counts(self.counts[key], times)
         bins = counts.shape[0]
 
-        # for key in self.counts.keys():
-        #     self.counts[key] = scale_down_counts(self.counts[key], times)
-        # # counts = scale_down_counts(self.counts, times)
-        # bins = self.counts["same"].shape[0]
         self._update_bins(bins)
         return counts
-
-        # if self.model["p_same"]["joint"].shape[0] != bins:
-        #     self.fit_model(times=times)
-
-        # return counts
 
     ### ------------------------------------------------------------ ###
     """
@@ -1378,7 +1362,8 @@ class Tracking:
         ## that doesn't really work, if registration is not run yet
         ## - make sure to have path somewhere alreaady during model building
         if save_path is None:
-            save_path = Path(self.sessions[0].path).parents[1] / "matching"
+            save_path = Path(os.path.commonpath(session.path for session in self.sessions)) / "matching"
+            # save_path = Path(self.sessions[0].path).parents[1] / "matching"
         # elif isinstance(save_path, str):
 
         save_path = Path(save_path)
@@ -1413,7 +1398,8 @@ class Tracking:
     ):
 
         if save_path is None:
-            save_path = Path(self.sessions[0].path).parents[1] / "matching"
+            save_path = Path(os.path.commonpath(session.path for session in self.sessions)) / "matching"
+            # save_path = Path(self.sessions[0].path).parents[1] / "matching"
         # elif isinstance(save_path, str):
         save_path = Path(save_path)
         assert isinstance(save_path, Path), "save_path should be a Path object"
