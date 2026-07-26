@@ -3,8 +3,12 @@ from importlib.metadata import entry_points
 
 @pytest.mark.gui
 def test_gui_entrypoint_exists():
+    
     matches = list(
-        entry_points(group="gui_scripts", name="catan")
+        entry_points(
+            group="gui_scripts",
+            name="catan-gui",
+        )
     )
 
     assert len(matches) == 1

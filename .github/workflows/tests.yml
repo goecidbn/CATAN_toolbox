@@ -103,16 +103,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[gui,dev]"
-
-      - if: runner.os == 'Linux'
-        name: Run GUI tests (Linux uses xvfb)
-        run: |
-          xvfb-run -a pytest -m gui
       
-      - if: runner.os != 'Linux'
-        name: Run GUI tests (non-Linux)
-        run: |
-          pytest -m gui
+      - name: Run GUI tests on Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a pytest -m gui
+      
+      - name: Run GUI tests on Windows and macOS
+        if: runner.os != 'Linux'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -m gui
 
   build:
     name: Build and test distributions
@@ -219,57 +219,52 @@ jobs:
               str(wheels[0]),
           ])
           "
-
-      - name: Verify installed package
+      
+      - name: Verify installed package on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          python -c "
-          import os
-          import subprocess
-          from pathlib import Path
-
-          venv_python = (
-              Path('wheel-test-env/Scripts/python.exe')
-              if os.name == 'nt'
-              else Path('wheel-test-env/bin/python')
-          )
-
-          code = '''
+          wheel-test-env/bin/python -c "
           import catan
 
-          assert hasattr(catan, \"__version__\")
+          assert hasattr(catan, '__version__')
           assert catan.__version__
 
-          print(f\"Installed CATAN version: {catan.__version__}\")
-          '''
-
-          subprocess.check_call([
-              str(venv_python),
-              '-c',
-              code,
-          ])
+          print(f'Installed CATAN version: {catan.__version__}')
           "
 
-      - name: Verify entry-point metadata
+      - name: Verify installed package on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          python -c "
-          import os
-          import subprocess
-          from pathlib import Path
+          & .\wheel-test-env\Scripts\python.exe -c @"
+          import catan
 
-          venv_python = (
-              Path('wheel-test-env/Scripts/python.exe')
-              if os.name == 'nt'
-              else Path('wheel-test-env/bin/python')
-          )
+          assert hasattr(catan, '__version__')
+          assert catan.__version__
 
-          code = '''
+          print(f'Installed CATAN version: {catan.__version__}')
+          "@
+
+      - name: Verify entry-point metadata on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          wheel-test-env/bin/python -c "
           from importlib.metadata import entry_points
 
           cli_matches = list(
-              entry_points(group=\"console_scripts\", name=\"catan\")
+              entry_points(
+                  group='console_scripts',
+                  name='catan',
+              )
           )
+
           gui_matches = list(
-              entry_points(group=\"gui_scripts\", name=\"catan-gui\")
+              entry_points(
+                  group='gui_scripts',
+                  name='catan-gui',
+              )
           )
 
           assert len(cli_matches) == 1, cli_matches
@@ -278,77 +273,78 @@ jobs:
           cli = cli_matches[0]
           gui = gui_matches[0]
 
-          assert cli.value == \"catan.cli:main\"
-          assert gui.value == \"catan.gui.app:main\"
+          assert cli.value == 'catan.cli:main'
+          assert gui.value == 'catan.gui.app:main'
 
-          print(f\"CLI: {cli.name} -> {cli.value}\")
-          print(f\"GUI: {gui.name} -> {gui.value}\")
-          '''
-
-          subprocess.check_call([
-              str(venv_python),
-              '-c',
-              code,
-          ])
+          print(f'CLI entry point: {cli.name} -> {cli.value}')
+          print(f'GUI entry point: {gui.name} -> {gui.value}')
           "
 
-      - name: Verify CLI commands
+      - name: Verify entry-point metadata on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          python -c "
-          import os
-          import subprocess
-          from pathlib import Path
+          & .\wheel-test-env\Scripts\python.exe -c @"
+          from importlib.metadata import entry_points
 
-          scripts_dir = (
-              Path('wheel-test-env/Scripts')
-              if os.name == 'nt'
-              else Path('wheel-test-env/bin')
-          )
-
-          executable = (
-              scripts_dir / 'catan.exe'
-              if os.name == 'nt'
-              else scripts_dir / 'catan'
-          )
-
-          if not executable.exists():
-              raise FileNotFoundError(
-                  f'CLI executable was not created: {executable}'
+          cli_matches = list(
+              entry_points(
+                  group='console_scripts',
+                  name='catan',
               )
+          )
 
-          commands = [
-              [str(executable), '--help'],
-              [str(executable), '--version'],
-              [str(executable), 'match', '--help'],
-          ]
+          gui_matches = list(
+              entry_points(
+                  group='gui_scripts',
+                  name='catan-gui',
+              )
+          )
 
-          for command in commands:
-              print('Running:', ' '.join(command))
-              subprocess.check_call(command)
-          "
+          assert len(cli_matches) == 1, cli_matches
+          assert len(gui_matches) == 1, gui_matches
 
-      - name: Verify GUI launcher exists
+          cli = cli_matches[0]
+          gui = gui_matches[0]
+
+          assert cli.value == 'catan.cli:main'
+          assert gui.value == 'catan.gui.app:main'
+
+          print(f'CLI entry point: {cli.name} -> {cli.value}')
+          print(f'GUI entry point: {gui.name} -> {gui.value}')
+          "@
+
+      - name: Verify CLI commands on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          python -c "
-          import os
-          from pathlib import Path
+          wheel-test-env/bin/catan --help
+          wheel-test-env/bin/catan --version
+          wheel-test-env/bin/catan match --help
 
-          scripts_dir = (
-              Path('wheel-test-env/Scripts')
-              if os.name == 'nt'
-              else Path('wheel-test-env/bin')
-          )
+      - name: Verify CLI commands on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\wheel-test-env\Scripts\catan.exe --help
+          & .\wheel-test-env\Scripts\catan.exe --version
+          & .\wheel-test-env\Scripts\catan.exe match --help
 
-          executable = (
-              scripts_dir / 'catan-gui.exe'
-              if os.name == 'nt'
-              else scripts_dir / 'catan-gui'
-          )
+      - name: Verify GUI launcher exists on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          test -x wheel-test-env/bin/catan-gui
+          echo "GUI launcher exists: wheel-test-env/bin/catan-gui"
 
-          if not executable.exists():
-              raise FileNotFoundError(
-                  f'GUI executable was not created: {executable}'
-              )
+      - name: Verify GUI launcher exists on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $launcher = ".\wheel-test-env\Scripts\catan-gui.exe"
 
-          print(f'GUI executable: {executable}')
-          "
+          if (-not (Test-Path $launcher)) {
+              throw "GUI launcher was not created: $launcher"
+          }
+
+          Write-Output "GUI launcher exists: $launcher"
