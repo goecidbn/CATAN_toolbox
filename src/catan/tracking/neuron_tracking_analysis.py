@@ -154,10 +154,10 @@ class TrackingAnalysis(Tracking):
 
         # import anywidget
 
-        clusters = getattr(self, self.cluster_field)
+        # clusters = getattr(self, self.cluster_field)
 
-        cm_mean = np.nanmean(clusters["cm"], axis=1)
-        cm_dists = spatial.distance.squareform(spatial.distance.pdist(cm_mean))
+        # cm_mean = np.nanmean(clusters["cm"], axis=1)
+        cm_dists = spatial.distance.squareform(spatial.distance.pdist(self.union.centroids))
 
         confusion_candidates = np.where(
             np.logical_and(cm_dists > 0, cm_dists < confusion_distance)
@@ -171,7 +171,7 @@ class TrackingAnalysis(Tracking):
         for i, j in zip(*confusion_candidates):
             if j > i:
                 continue
-            assignments = clusters["assignments"][(i, j), :].T
+            assignments = self.assignments[(i, j), :].T
             confused_sessions = np.where(np.all(assignments >= 0, axis=1))[0]
             valid_candidates.append((i, j, assignments, confused_sessions))
 
@@ -2107,7 +2107,7 @@ class TrackingAnalysis(Tracking):
         # clusters = getattr(self, self.cluster_field)
 
         dims = self.sessions[0].dims
-        nC, nS = self.clusters["assignments"].shape
+        nC, nS = self.assignments.shape
 
         X = np.arange(0, dims[0])
         Y = np.arange(0, dims[1])
@@ -2121,7 +2121,7 @@ class TrackingAnalysis(Tracking):
                 ax = ax_in
 
             for s in range(nS):
-                idx = self.clusters["assignments"][c, s]
+                idx = self.assignments[c, s]
                 # print("footprint:", s, idx)
                 if idx < 0:
                     continue
@@ -2142,7 +2142,7 @@ class TrackingAnalysis(Tracking):
 
             margin = 15
             com = (
-                np.nanmean(self.clusters["cm"][c, ...], axis=0) / self.params["pxtomu"]
+                self.union.centroids# / self.params["pxtomu"]
             )
             ax.update_layout(
                 scene=dict(
@@ -2161,7 +2161,7 @@ class TrackingAnalysis(Tracking):
                 ax = ax_in
 
             for s in range(nS):
-                idx = self.clusters["assignments"][c, s]
+                idx = self.assignments[c, s]
                 # print("footprint:", s, idx)
                 if idx < 0:
                     continue
@@ -2181,9 +2181,8 @@ class TrackingAnalysis(Tracking):
                 )
 
             margin = 15
-            com = (
-                np.nanmean(self.clusters["cm"][c, ...], axis=0) / self.params["pxtomu"]
-            )
+            com = self.union.centroids[c,:]
+            # print()
             plt.setp(
                 ax,
                 xlim=[com[0] - margin, com[0] + margin],

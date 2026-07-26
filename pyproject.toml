@@ -74,10 +74,10 @@ dev = [
 ]
 
 [project.scripts]
-catan-match = "catan.cli.match:main"
+catan = "catan.cli:main"
 
 [project.gui-scripts]
-catan = "catan.gui.app:main"
+catan-gui = "catan.gui.app:main"
 
 [project.urls]
 Homepage = "https://github.com/woxxel/CATAN_toolbox"
