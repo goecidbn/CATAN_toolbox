@@ -110,8 +110,6 @@ jobs:
       
       - name: Run GUI tests on Windows and macOS
         if: runner.os != 'Linux'
-        env:
-          QT_QPA_PLATFORM: offscreen
         run: pytest -m gui
 
   build:
