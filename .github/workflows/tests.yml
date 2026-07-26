@@ -104,14 +104,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[gui,dev]"
       
-      - name: Run GUI tests on Linux
-        if: runner.os == 'Linux'
-        run: xvfb-run -a pytest -m gui
-      
-      - name: Run GUI tests on Windows and macOS
-        if: runner.os != 'Linux'
-        run: pytest -m gui
+      - name: Run GUI tests
+        env:
+          QT_QPA_PLATFORM: minimal
+        run: pytest -m gui -vv -s
+        timeout-minutes: 5
 
+      
   build:
     name: Build and test distributions
     runs-on: ubuntu-latest

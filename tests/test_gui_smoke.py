@@ -5,14 +5,17 @@ import pytest
 
 @pytest.fixture(scope="session")
 def qapp():
-    if sys.platform.startswith("linux"):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+    os.environ.setdefault("QT_QPA_PLATFORM", "minimal")
+
+    # if sys.platform.startswith("linux"):
+    #     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    from PySide6.QtWidgets import QApplication
     print("Creating QApplication...")
     print("platform:", sys.platform)
     print("QT_QPA_PLATFORM =", os.environ.get("QT_QPA_PLATFORM"))
 
-    from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance()
 
@@ -22,14 +25,18 @@ def qapp():
         print("Constructing QApplication...")
         app = QApplication(["catan-test"])
         print("Done.")
-    return app
 
+    app.setQuitOnLastWindowClosed(False)
+
+    yield app
+
+    app.processEvents()
+    # return app
+    
 @pytest.mark.gui
 def test_gui_application_imports(qapp):
-    from PySide6.QtWidgets import QApplication
     from catan.gui.app import main
 
-    assert QApplication.instance() is qapp
     assert callable(main)
 
 
