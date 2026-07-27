@@ -11,6 +11,8 @@ from catan.gui.structures.state import NeuronComponent
 from catan.gui.plots import BasePlot
 from catan.gui.interaction import click_events
 
+print("reloading Overview.py")
+
 
 @dataclass
 class OverviewRecord:

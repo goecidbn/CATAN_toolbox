@@ -21,11 +21,11 @@ from catan.gui.interaction import click_events
 from .display_area import DisplayArea
 from .main_menu import MainMenu
 
+
 class MainWindow(QMainWindow):
 
     settings = QSettings()
     state = AppState()
-    # data = Data()
 
     def __init__(self):
         super().__init__()
@@ -94,12 +94,11 @@ class MainWindow(QMainWindow):
         if app is None:
             return
 
-        
         style = combine_stylesheets(
             self.style_sheet,
             load_stylesheet("main.qss"),
         )
-        
+
         app.setStyleSheet(style)
 
     def print_debug_info(self):

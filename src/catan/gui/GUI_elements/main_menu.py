@@ -25,6 +25,7 @@ from catan.gui.plots.colors import CyclicColorMap
 
 from .session_overview import SessionOverview
 from .resource_monitor import ResourceMonitor
+
 # from .dialog_load_field import FieldSelectDialog, list_file_fields
 
 app_modes = {
@@ -68,9 +69,6 @@ class MainMenu(QFrame):
     """
     Side menu panel for data loading and parameter settings.
     Contains file path selectors, load/save buttons, and mode checkboxes.
-
-    Exposes:
-        - load_button: QPushButton
     """
 
     def __init__(self, parent):
@@ -80,22 +78,12 @@ class MainMenu(QFrame):
         self._restore_settings()
 
         self.state: state.AppState = parent.state
-        # self.tracking: track_neurons = parent.tracking
         self.data: data.Data = parent.data
 
         self.threadpool = QThreadPool.globalInstance()
         self.current_worker = None
 
         self.session_colors = CyclicColorMap(n_colors=20, cmap_name="twilight")
-
-        """
-        TODO:
-            move some parts to AppState:
-                * app mode (single session / multi-session tracking / video)
-                * auto-advance checkbox
-                * skip processed checkbox
-                * file paths
-        """
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setMinimumWidth(250)  # adjust to taste
@@ -104,8 +92,6 @@ class MainMenu(QFrame):
             QSizePolicy.Policy.Expanding,
         )
 
-        # self.panel = QFrame()
-        # self.panel.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(8)
@@ -134,15 +120,9 @@ class MainMenu(QFrame):
         layout.addStretch()  # push everything up, so empty space is at the bottom
         layout.addWidget(ResourceMonitor(parent=self))
 
-        # layout.addLayout(self.build_menu_data_paths())
-
-        # Meta parameters (add more as you need)
-
         self.dropdown_app_mode.currentIndexChanged.connect(self.change_app_mode)
 
-        # self.state.app_mode_changed.connect(self.on_app_mode_changed)
         self.state.data_changed.connect(self.handler_data_changed)
-        # self.state.current_session_changed.connect(self.on_current_session_changed)
 
     def rebuild(self):
         # importlib.reload(session_overview)
@@ -181,7 +161,7 @@ class MainMenu(QFrame):
         # self.display_area.set_controls_enabled(not busy)
 
     def on_load_clicked(self):
-        
+
         # run "busy method" to load data and update model
         mode = app_modes[self.dropdown_app_mode.currentText()]
         if mode == "single":
@@ -267,12 +247,18 @@ class MainMenu(QFrame):
 
         self.data.load_model(self.model_file)
         self.data.load_registration(self.registration_file)
-        print(f"Loaded model from {self.model_file} and registration from {self.registration_file}")
-        print(f"Sessions now in memory: {[session.name for session in self.data.sessions]}")
+        print(
+            f"Loaded model from {self.model_file} and registration from {self.registration_file}"
+        )
+        print(
+            f"Sessions now in memory: {[session.name for session in self.data.sessions]}"
+        )
         self.state.assignments = self.data.assignments
 
         ## prepare checking for common path
-        paths = [session.path for session in self.data.sessions if session.path is not None]
+        paths = [
+            session.path for session in self.data.sessions if session.path is not None
+        ]
         assert len(paths) >= 1, "No sessions found in the loaded model."
 
         common_path = os.path.commonpath(paths)
