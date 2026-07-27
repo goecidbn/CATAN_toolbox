@@ -1,7 +1,7 @@
 # CATAN
 
 **CATAN** (**C**uration and **A**nalysis of **T**racked **A**cross-sessions **N**eurons)
-is an open-source toolbox for the analysis, tracking and curation of neuronal populations
+is an open-source, cross-platform toolbox for the analysis, tracking and curation of neuronal populations
 in longitudinal calcium imaging experiments.
 
 It provides an interactive GUI together with a Python API for
@@ -38,7 +38,7 @@ pip install catan-toolbox[gui]
 or
 
 ```bash
-git clone https://github.com/woxxel/CATAN_toolbox.git
+git clone https://github.com/goecidbn/CATAN_toolbox.git
 cd CATAN
 pip install -e ".[gui]"
 ```
@@ -70,7 +70,7 @@ main()
 ## Development
 
 ```bash
-git clone https://github.com/woxxel/CATAN_toolbox.git
+git clone https://github.com/goecidbn/CATAN_toolbox.git
 pip install -e ".[gui,dev]"
 ```
 
