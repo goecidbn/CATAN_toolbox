@@ -139,7 +139,7 @@ class Tracking:
 
         if isinstance(from_file, (str, Path)):
             this_data = SessionData(
-                name=name if name is not None else str(from_file).split("/")[-2],
+                name=name if name is not None else Path(from_file).parent.name,
                 path=str(from_file),
                 id=len(self.sessions),
             )

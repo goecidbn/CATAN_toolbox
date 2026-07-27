@@ -181,7 +181,7 @@ class MainMenu(QFrame):
         # self.display_area.set_controls_enabled(not busy)
 
     def on_load_clicked(self):
-        # print("Loading data...")
+        
         # run "busy method" to load data and update model
         mode = app_modes[self.dropdown_app_mode.currentText()]
         if mode == "single":

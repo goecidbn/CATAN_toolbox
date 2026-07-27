@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import sys
 
-# os.environ["QT_QPA_PLATFORM"] = "xcb"
-
 def main() -> int:
 
     try:
@@ -14,7 +12,7 @@ def main() -> int:
             raise RuntimeError(
                 "The CATAN GUI dependencies are not installed.\n"
                 'Install them with:\n\n'
-                '    python -m pip install "catan[gui]"\n'
+                '    python -m pip install "catan-toolbox[gui]"\n'
             ) from exc
         raise
 
