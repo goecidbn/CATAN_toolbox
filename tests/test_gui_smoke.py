@@ -1,38 +1,54 @@
-import os, pytest
+import os
+import sys
+import pytest
 
-# os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+@pytest.fixture(scope="session")
+def qapp():
 
-# @pytest.mark.gui
-# def test_main_window_can_be_created():
-#     from PySide6.QtWidgets import QApplication
-#     from catan.gui.GUI_elements.main_window import MainWindow
+    os.environ.setdefault("QT_QPA_PLATFORM", "minimal")
 
-#     app = QApplication.instance() or QApplication([])
+    # if sys.platform.startswith("linux"):
+    #     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-#     window = MainWindow()
-
-#     assert window is not None
-
-#     window.close()
-@pytest.mark.gui
-def test_gui_application_imports():
     from PySide6.QtWidgets import QApplication
-    from catan.gui.app import main
+    print("Creating QApplication...")
+    print("platform:", sys.platform)
+    print("QT_QPA_PLATFORM =", os.environ.get("QT_QPA_PLATFORM"))
 
-    assert QApplication is not None
-    assert callable(main)
-
-@pytest.mark.gui
-def test_basic_qt_widget_can_be_created():
-    from PySide6.QtWidgets import QApplication, QWidget
 
     app = QApplication.instance()
+
+    print("Existing app:", app)
+
     if app is None:
+        print("Constructing QApplication...")
         app = QApplication(["catan-test"])
+        print("Done.")
+
+    app.setQuitOnLastWindowClosed(False)
+
+    yield app
+
+    app.processEvents()
+    # return app
+    
+@pytest.mark.gui
+def test_gui_application_imports(qapp):
+    from catan.gui.app import main
+
+    assert callable(main)
+
+
+@pytest.mark.gui
+def test_basic_qt_widget_can_be_created(qapp):
+    from PySide6.QtWidgets import QWidget
 
     widget = QWidget()
+
     assert widget.isWidgetType()
+    assert not widget.isVisible()
 
     widget.close()
-    app.processEvents()
+    widget.deleteLater()
+    qapp.processEvents()

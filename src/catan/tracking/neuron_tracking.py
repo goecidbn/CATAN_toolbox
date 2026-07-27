@@ -82,6 +82,7 @@ class Tracking:
         self.params["n_threads"] = n_threads
         self.params["use_kde"] = use_kde
         self.params["pxtomu"] = pxtomu
+        self.params["L"] = L
 
         self._update_bins(bins)
 
@@ -1354,28 +1355,17 @@ class Tracking:
     ### ------------------------------------------------------------ ###
     def save_model(
         self,
-        save_path: Optional[str | Path] = None,
+        output_directory: Optional[str | Path] = None,
         suffix: str = "",
         ext: str = ".hdf5",
     ):
 
-        ## that doesn't really work, if registration is not run yet
-        ## - make sure to have path somewhere alreaady during model building
-        if save_path is None:
-            save_path = Path(os.path.commonpath(session.path for session in self.sessions)) / "matching"
-            # save_path = Path(self.sessions[0].path).parents[1] / "matching"
-        # elif isinstance(save_path, str):
-
-        save_path = Path(save_path)
-
-        assert isinstance(save_path, Path), "save_path should be a Path object"
-        if not save_path.exists():
-            save_path.mkdir(parents=True, exist_ok=True)
+        output_directory = self.get_result_directory(output_directory)
 
         fix_suffix(suffix)
 
         data = {"counts": self.counts, "model": self.model}
-        save_data(data, str(save_path / f"match_model{suffix}{ext}"))
+        save_data(data, str(output_directory / f"match_model{suffix}{ext}"))
 
     def load_model(self, path_model: str):
 
@@ -1392,26 +1382,18 @@ class Tracking:
 
     def save_registration(
         self,
-        save_path: Optional[str | Path] = None,
+        output_directory: Optional[str | Path] = None,
         suffix: str = "",
         ext: str = ".hdf5",
     ):
-
-        if save_path is None:
-            save_path = Path(os.path.commonpath(session.path for session in self.sessions)) / "matching"
-            # save_path = Path(self.sessions[0].path).parents[1] / "matching"
-        # elif isinstance(save_path, str):
-        save_path = Path(save_path)
-        assert isinstance(save_path, Path), "save_path should be a Path object"
-        if not save_path.exists():
-            save_path.mkdir(parents=True, exist_ok=True)
+        output_directory = self.get_result_directory(output_directory)
 
         suffix = fix_suffix(suffix)
 
-        with h5py.File(save_path / f"neuron_registration{suffix}{ext}", "w") as f:
+        with h5py.File(output_directory / f"neuron_registration{suffix}{ext}", "w") as f:
             self.to_hdf5(f)
 
-        print(f"Saved neuron registration to {save_path / f'neuron_registration{suffix}{ext}'}")
+        print(f"Saved neuron registration to {output_directory / f'neuron_registration{suffix}{ext}'}")
 
 
         # data = {
@@ -1420,7 +1402,7 @@ class Tracking:
         #     "tracking": self.tracking,
         #     # "clusters": getattr(self, self.cluster_field),
         # }
-        # save_data(data, str(save_path / f"neuron_registration{suffix}{ext}"))
+        # save_data(data, str(output_directory / f"neuron_registration{suffix}{ext}"))
 
     def to_hdf5(self, group: h5py.Group | h5py.File) -> None:
         group.attrs["object_type"] = "TrackingResult"
@@ -1526,6 +1508,30 @@ class Tracking:
 
         return assignments, tracking, sessions, union
 
+    def get_result_directory(
+        self,
+        output_directory: Path | str | None = None,
+    ) -> Path:
+        if output_directory is None:
+            output_directory = self._default_matching_directory()
+
+        output_directory = Path(output_directory).expanduser().resolve()
+        assert isinstance(output_directory, Path), f"output_directory {output_directory} should be a Path object"
+        
+        output_directory.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        return output_directory
+
+    def _default_matching_directory(
+        self,
+    ) -> Path:
+
+        candidate_paths = [Path(session.path).parent for session in self.sessions if session.path is not None]
+        common_path = os.path.commonpath([str(path) for path in candidate_paths])
+        return Path(common_path) / "matching"
 
 def mean_of_trunc_lognorm(mu, sigma, trunc_loc):
 

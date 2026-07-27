@@ -3,7 +3,7 @@ requires = ["setuptools>=77.0.3", "wheel", "setuptools_scm>=10"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "catan"
+name = "catan-toolbox"
 dynamic = ["version"]
 
 description = "Interactive and algorithmic tools for matching and curating neurons across calcium imaging sessions"
@@ -38,7 +38,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 
-    "Operating System :: POSIX :: Linux",
+    "Operating System :: OS Independent",
 
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Image Processing",
@@ -74,10 +74,10 @@ dev = [
 ]
 
 [project.scripts]
-catan-match = "catan.cli.match:main"
+catan = "catan.cli:main"
 
 [project.gui-scripts]
-catan = "catan.gui.app:main"
+catan-gui = "catan.gui.app:main"
 
 [project.urls]
 Homepage = "https://github.com/woxxel/CATAN_toolbox"

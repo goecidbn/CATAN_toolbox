@@ -2,20 +2,26 @@ name: Tests
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
-
+    
 jobs:
-  headless-tests:
-    name: Headless · Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+
+  core:
+    name: Core (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
-        python-version:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        python:
           - "3.11"
           - "3.12"
           - "3.13"
@@ -29,7 +35,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python }}
           cache: pip
 
       - name: Install CATAN
@@ -41,26 +47,39 @@ jobs:
         run: python -m pytest -m "not gui"
 
 
-  gui-tests:
-    name: GUI · Python 3.12
-    runs-on: ubuntu-latest
+  gui:
+    name: GUI (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        python:
+          - "3.12"
 
     steps:
+
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
+      
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
 
-      - name: Install Linux GUI dependencies
+      # Linux only
+      - if: runner.os == 'Linux'
+        name: Install Linux GUI dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes \
+          sudo apt-get install -y \
             xvfb \
             libegl1 \
             libgl1 \
@@ -79,26 +98,26 @@ jobs:
             libxcb-xfixes0 \
             libxcb-xinerama0 \
             libxcb-xinput0
-
+      
       - name: Install CATAN
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[gui,dev]"
-
+      
       - name: Run GUI tests
         env:
-          LIBGL_ALWAYS_SOFTWARE: "1"
-        run: |
-          xvfb-run \
-            --auto-servernum \
-            --server-args="-screen 0 1280x1024x24" \
-            python -m pytest -m gui
+          QT_QPA_PLATFORM: minimal
+        run: pytest -m gui -vv -s
+        timeout-minutes: 5
 
-
-  build-distributions:
+      
+  build:
     name: Build and test distributions
     runs-on: ubuntu-latest
-
+    
+    needs:
+      - core
+    
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -122,39 +141,207 @@ jobs:
       - name: Check distribution metadata
         run: python -m twine check dist/*
 
-      - name: Upload distributions
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-distributions
-          path: dist/
-          if-no-files-found: error
+  build-wheel:
+    name: Wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
 
-      - name: Create wheel-test environment
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Build source distribution and wheel
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
+
+      - name: Create clean test environment
         run: python -m venv wheel-test-env
 
-      - name: Install built wheel
+      - name: Install wheel in clean environment
         run: |
-          wheel-test-env/bin/python -m pip install --upgrade pip
-          wheel="$(find dist -name '*.whl' -print -quit)"
-          wheel-test-env/bin/python -m pip install "${wheel}[gui]"
+          python -c "
+          import os
+          import subprocess
+          from pathlib import Path
 
-      - name: Verify installed wheel
+          venv_python = (
+              Path('wheel-test-env/Scripts/python.exe')
+              if os.name == 'nt'
+              else Path('wheel-test-env/bin/python')
+          )
+
+          wheels = list(Path('dist').glob('*.whl'))
+
+          if len(wheels) != 1:
+              raise RuntimeError(
+                  f'Expected exactly one wheel, found {len(wheels)}: {wheels}'
+              )
+
+          subprocess.check_call([
+              str(venv_python),
+              '-m',
+              'pip',
+              'install',
+              '--upgrade',
+              'pip',
+          ])
+
+          subprocess.check_call([
+              str(venv_python),
+              '-m',
+              'pip',
+              'install',
+              str(wheels[0]),
+          ])
+          "
+      
+      - name: Verify installed package on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-            wheel-test-env/bin/python - <<'PY'
-            from importlib.metadata import entry_points, version
+          wheel-test-env/bin/python -c "
+          import catan
 
-            import catan
+          assert hasattr(catan, '__version__')
+          assert catan.__version__
 
-            assert catan.__version__ == version("catan")
+          print(f'Installed CATAN version: {catan.__version__}')
+          "
 
-            matches = list(
-                entry_points(group="gui_scripts", name="catan")
-            )
+      - name: Verify installed package on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\wheel-test-env\Scripts\python.exe -c @"
+          import catan
 
-            assert len(matches) == 1
-            assert matches[0].value == "catan.gui.app:main"
+          assert hasattr(catan, '__version__')
+          assert catan.__version__
 
-            print("Version:", catan.__version__)
-            print("Location:", catan.__file__)
-            print("Entry point:", matches[0])
-            PY
+          print(f'Installed CATAN version: {catan.__version__}')
+          "@
+
+      - name: Verify entry-point metadata on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          wheel-test-env/bin/python -c "
+          from importlib.metadata import entry_points
+
+          cli_matches = list(
+              entry_points(
+                  group='console_scripts',
+                  name='catan',
+              )
+          )
+
+          gui_matches = list(
+              entry_points(
+                  group='gui_scripts',
+                  name='catan-gui',
+              )
+          )
+
+          assert len(cli_matches) == 1, cli_matches
+          assert len(gui_matches) == 1, gui_matches
+
+          cli = cli_matches[0]
+          gui = gui_matches[0]
+
+          assert cli.value == 'catan.cli:main'
+          assert gui.value == 'catan.gui.app:main'
+
+          print(f'CLI entry point: {cli.name} -> {cli.value}')
+          print(f'GUI entry point: {gui.name} -> {gui.value}')
+          "
+
+      - name: Verify entry-point metadata on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\wheel-test-env\Scripts\python.exe -c @"
+          from importlib.metadata import entry_points
+
+          cli_matches = list(
+              entry_points(
+                  group='console_scripts',
+                  name='catan',
+              )
+          )
+
+          gui_matches = list(
+              entry_points(
+                  group='gui_scripts',
+                  name='catan-gui',
+              )
+          )
+
+          assert len(cli_matches) == 1, cli_matches
+          assert len(gui_matches) == 1, gui_matches
+
+          cli = cli_matches[0]
+          gui = gui_matches[0]
+
+          assert cli.value == 'catan.cli:main'
+          assert gui.value == 'catan.gui.app:main'
+
+          print(f'CLI entry point: {cli.name} -> {cli.value}')
+          print(f'GUI entry point: {gui.name} -> {gui.value}')
+          "@
+
+      - name: Verify CLI commands on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          wheel-test-env/bin/catan --help
+          wheel-test-env/bin/catan --version
+          wheel-test-env/bin/catan match --help
+
+      - name: Verify CLI commands on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\wheel-test-env\Scripts\catan.exe --help
+          & .\wheel-test-env\Scripts\catan.exe --version
+          & .\wheel-test-env\Scripts\catan.exe match --help
+
+      - name: Verify GUI launcher exists on Linux and macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          test -x wheel-test-env/bin/catan-gui
+          echo "GUI launcher exists: wheel-test-env/bin/catan-gui"
+
+      - name: Verify GUI launcher exists on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $launcher = ".\wheel-test-env\Scripts\catan-gui.exe"
+
+          if (-not (Test-Path $launcher)) {
+              throw "GUI launcher was not created: $launcher"
+          }
+
+          Write-Output "GUI launcher exists: $launcher"

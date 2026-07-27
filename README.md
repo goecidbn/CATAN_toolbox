@@ -1,7 +1,7 @@
 # CATAN
 
-**CATAN** (Calcium Tracking and Analysis Toolbox for Across-session Neurons)
-is an open-source toolbox for the analysis and tracking of neuronal populations
+**CATAN** (**C**uration and **A**nalysis of **T**racked **A**cross-sessions **N**eurons)
+is an open-source, cross-platform toolbox for the analysis, tracking and curation of neuronal populations
 in longitudinal calcium imaging experiments.
 
 It provides an interactive GUI together with a Python API for
@@ -32,13 +32,13 @@ CATAN is primarily designed for CaImAn output but aims to remain extensible.
 ## Installation
 
 ```bash
-pip install catan[gui]
+pip install catan-toolbox[gui]
 ```
 
 or
 
 ```bash
-git clone https://github.com/<user>/CATAN.git
+git clone https://github.com/goecidbn/CATAN_toolbox.git
 cd CATAN
 pip install -e ".[gui]"
 ```
@@ -47,7 +47,7 @@ pip install -e ".[gui]"
 CATAN allows for a GUI-less setup, not requiring graphic libraries such as PySide6 and vispy. For most users, the installation including the GUI will be of interest and can be set up via the commands above. For a graphic-less setup, use
 
 ```bash
-pip install catan
+pip install catan-toolbox
 ```
 ---
 
@@ -70,7 +70,7 @@ main()
 ## Development
 
 ```bash
-git clone ...
+git clone https://github.com/goecidbn/CATAN_toolbox.git
 pip install -e ".[gui,dev]"
 ```
 
