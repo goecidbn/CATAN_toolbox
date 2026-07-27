@@ -1,7 +1,7 @@
 # CATAN
 
-**CATAN** (Calcium Tracking and Analysis Toolbox for Across-session Neurons)
-is an open-source toolbox for the analysis and tracking of neuronal populations
+**CATAN** (**C**uration and **A**nalysis of **T**racked **A**cross-sessions **N**eurons)
+is an open-source toolbox for the analysis, tracking and curation of neuronal populations
 in longitudinal calcium imaging experiments.
 
 It provides an interactive GUI together with a Python API for
@@ -70,7 +70,7 @@ main()
 ## Development
 
 ```bash
-git clone ...
+git clone https://github.com/woxxel/CATAN_toolbox.git
 pip install -e ".[gui,dev]"
 ```
 
