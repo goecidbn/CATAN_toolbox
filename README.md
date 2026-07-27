@@ -32,13 +32,13 @@ CATAN is primarily designed for CaImAn output but aims to remain extensible.
 ## Installation
 
 ```bash
-pip install catan[gui]
+pip install catan-toolbox[gui]
 ```
 
 or
 
 ```bash
-git clone https://github.com/<user>/CATAN.git
+git clone https://github.com/woxxel/CATAN_toolbox.git
 cd CATAN
 pip install -e ".[gui]"
 ```
@@ -47,7 +47,7 @@ pip install -e ".[gui]"
 CATAN allows for a GUI-less setup, not requiring graphic libraries such as PySide6 and vispy. For most users, the installation including the GUI will be of interest and can be set up via the commands above. For a graphic-less setup, use
 
 ```bash
-pip install catan
+pip install catan-toolbox
 ```
 ---
 
