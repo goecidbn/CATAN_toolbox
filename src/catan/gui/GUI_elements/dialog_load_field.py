@@ -1,6 +1,6 @@
 import h5py
-import os
 import numpy as np
+from pathlib import Path
 from scipy.io import loadmat
 from typing import List, Optional, Tuple
 from PySide6.QtWidgets import (
@@ -137,7 +137,7 @@ def list_mat_fields(path: str) -> List[FieldInfo]:
 
 def list_file_fields(path: str) -> List[FieldInfo]:
     """Dispatch depending on extension (.h5/.hdf5/.mat)."""
-    ext = os.path.splitext(path)[1].lower()
+    ext = Path(path).suffix.lower()
     if ext in (".h5", ".hdf5"):
         return list_hdf5_datasets(path)
     elif ext == ".mat":
