@@ -63,8 +63,6 @@ paths = {
     },
 }
 
-print("reloading main menu")
-
 
 class MainMenu(QFrame):
     """
@@ -167,11 +165,13 @@ class MainMenu(QFrame):
         self.set_busy(True)
         mode = app_modes[self.dropdown_app_mode.currentText()]
         if mode == "single":
+            finished = None
+            if self.checkbox_traces_load.isChecked():
+                finished = lambda id: self.data.change_trace_presence(id, True)
             self.state.tasks.start(
-                "Load session data", self.load_from_session, finished=None
+                "Load session data", self.load_from_session, finished=finished
             )
 
-            # self.load_from_session(set_active=True)
         if mode == "tracking":
             self.load_from_tracking()
 
@@ -222,9 +222,12 @@ class MainMenu(QFrame):
         if ctx is not None:
             ctx.message("Loading session data...")
             ctx.progress(0)
+
+        load_content = ["spatial"]
+        load_content += ["quality"] if self.checkbox_quality_load.isChecked() else []
         self.data.register_session(
             from_file=str(self.results_file),
-            load_content=["spatial"],
+            load_content=load_content,
             align=True,
             ctx=ctx,
         )
@@ -253,6 +256,7 @@ class MainMenu(QFrame):
 
         if set_active or self.state.current_session_id is None:
             self.state.current_session_id = session_id
+        return session_id
 
     def load_from_tracking(self):
 
@@ -428,6 +432,14 @@ class MainMenu(QFrame):
             entry_layout.addWidget(self.paths[name]["button"])
             form.addRow(f"{info['label']}:", entry_layout)
 
+        self.checkbox_quality_load = QCheckBox("Load quality on registration")
+        self.checkbox_quality_load.setChecked(True)
+        form.addRow(self.checkbox_quality_load)
+
+        self.checkbox_traces_load = QCheckBox("Load traces on registration")
+        self.checkbox_traces_load.setChecked(False)
+        form.addRow(self.checkbox_traces_load)
+
         ## Button connections
         self.paths["root"]["button"].clicked.connect(
             lambda: self.choose_path(
@@ -455,6 +467,7 @@ class MainMenu(QFrame):
                 display_text="Select results file",
             )
         )
+
         # self.paths["footprints"]["button"].clicked.connect(
         #     lambda: self.choose_path(
         #         pick_dir=False,
@@ -556,7 +569,6 @@ class MainMenu(QFrame):
             )
 
         if path and edit_line is not None:
-            # print(f"Chosen path: {path}, only tail: {only_tail}")
             edit_line.setText(
                 str(Path(path).relative_to(init_path)) if only_tail else path
             )  # fill QLineEdit

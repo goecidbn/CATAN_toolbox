@@ -157,7 +157,6 @@ class Display(BasePlot.BaseCanvas):
 
         time_axis = (np.arange(session.trace.shape[1]) + session.time_offset) / f
 
-        print("traces:", traces.keys())
         ## build one big line with NaN separators for better performance
         parts = []
         for i, key in enumerate(self.labels):

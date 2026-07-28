@@ -36,8 +36,6 @@ from catan.core.image_correlation import calculate_img_correlation
 
 importlib.reload(FootprintSlider)
 
-print("reloading Footprints.py")
-
 
 @dataclass
 class FootprintRecord:

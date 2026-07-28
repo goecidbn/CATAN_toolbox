@@ -155,9 +155,6 @@ class Tracking:
                 path=str(from_file),
                 id=len(self.sessions),
             )
-            print(
-                f"Registering session {this_data.name} from {this_data.path} with fields: {load_content}"
-            )
             this_data.load_data(
                 which=load_content,
                 alignment_template=self.alignment_template if align else None,

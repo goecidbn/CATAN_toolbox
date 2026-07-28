@@ -54,7 +54,6 @@ importlib.reload(series_with_confidence)
 importlib.reload(plotdata_series)
 importlib.reload(StatisticsData)
 importlib.reload(Threshold)
-print("reloading Statistics.py")
 
 
 @dataclass

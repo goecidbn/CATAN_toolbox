@@ -17,7 +17,6 @@ from catan.core.io import (
     read_optional_attr,
     read_optional_array,
 )
-from catan.gui.background_tasks import TaskContext, TaskManager
 
 component_quality_default = {
     "SNR_lowest": 1.0,
@@ -177,11 +176,8 @@ class SessionData:
         self,
         which=["quality", "spatial", "temporal"],
         alignment_template: Optional[np.ndarray] = None,
-        ctx: Optional[TaskContext] = None,
+        ctx: Optional[object] = None,
     ):
-        print(
-            f"Loading data for session {self.name} from {self.path} with fields: {which}"
-        )
         if "spatial" in which:
             self.schedule_spatial_load()
         if "temporal" in which:
@@ -194,7 +190,7 @@ class SessionData:
     def execute_load(
         self,
         alignment_template: Optional[np.ndarray] = None,
-        ctx: Optional[TaskContext] = None,
+        ctx: Optional[object] = None,
     ):
 
         assert (
@@ -512,9 +508,7 @@ class SessionData:
         write_optional_array(group, "idx_eval", self.idx_eval, compression="gzip")
 
     @classmethod
-    def from_hdf5(
-        cls, group: h5py.Group | h5py.File, ctx: Optional[TaskManager] = None
-    ) -> "SessionData":
+    def from_hdf5(cls, group: h5py.Group | h5py.File = None) -> "SessionData":
 
         version = int(group.attrs.get("schema_version", 1))
         if version != 1:
@@ -527,9 +521,9 @@ class SessionData:
         active = bool(group.attrs.get("active", True))
         time_offset = float(group.attrs.get("time_offset", 0.0))
 
-        A, Cn, dims = cls.spatial_from_hdf5(cls, group, ctx=ctx)
-        traces = cls.traces_from_hdf5(cls, group, ctx=ctx)
-        quality = cls.quality_from_hdf5(cls, group, ctx=ctx)
+        A, Cn, dims = cls.spatial_from_hdf5(cls, group)
+        traces = cls.traces_from_hdf5(cls, group)
+        quality = cls.quality_from_hdf5(cls, group)
 
         ## remap substructure
         remap = None
@@ -561,14 +555,14 @@ class SessionData:
         return out
 
     def spatial_from_hdf5(
-        self, group: h5py.Group | h5py.File, ctx: Optional[TaskContext] = None
+        self, group: h5py.Group | h5py.File, ctx: Optional[object] = None
     ) -> Tuple[sparse.csc_matrix, Optional[np.ndarray], Tuple[int, int]]:
         """
         Load spatial data from an HDF5 group or file.
 
         Parameters:
             group (h5py.Group | h5py.File): The HDF5 group or file to read from.
-            ctx (Optional[TaskContext]): Optional context for progress reporting and cancellation.
+            ctx (Optional[object]): Optional context for progress reporting and cancellation.
         Returns:
             Tuple[sparse.csc_matrix, Optional[np.ndarray], Tuple[int, int]]: A tuple containing the loaded spatial data (A, Cn, dims).
         """
@@ -587,14 +581,14 @@ class SessionData:
         self,
         group: h5py.Group | h5py.File,
         fields: List[str] = ["C", "F_dff", "F_dff_dec", "S", "S_dff"],
-        ctx: Optional[TaskContext] = None,
+        ctx: Optional[object] = None,
     ) -> dict:
         """
         Load trace data from an HDF5 group or file.
 
         Parameters:
             group (h5py.Group | h5py.File): The HDF5 group or file to read from.
-            ctx (Optional[TaskContext]): Optional context for progress reporting and cancellation.
+            ctx (Optional[object]): Optional context for progress reporting and cancellation.
         Returns:
             dict: A dictionary containing the loaded trace data.
         """
@@ -605,7 +599,6 @@ class SessionData:
                 if key not in group:
                     print(f"Warning: Trace key '{key}' not found in HDF5 group.")
                     continue
-                print(f"Loading trace key: {key}")
                 value = read_optional_array(group, key)
                 if value is not None:
                     traces[key] = value
@@ -615,14 +608,14 @@ class SessionData:
         self,
         group: h5py.Group | h5py.File,
         fields: List[str] = ["SNR_comp", "r_values", "cnn_preds"],
-        ctx: Optional[TaskContext] = None,
+        ctx: Optional[object] = None,
     ) -> dict:
         """
         Load quality data from an HDF5 group or file.
 
         Parameters:
             group (h5py.Group | h5py.File): The HDF5 group or file to read from.
-            ctx (Optional[TaskContext]): Optional context for progress reporting and cancellation.
+            ctx (Optional[object]): Optional context for progress reporting and cancellation.
         Returns:
             dict: A dictionary containing the loaded quality data.
         """

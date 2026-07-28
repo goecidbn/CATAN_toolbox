@@ -12,9 +12,6 @@ from catan import Tracking
 
 # from catan.gui.data.utils import move_index_along_axis
 
-print("reloading data.py")
-# importlib.reload(neuron_tracking)  # reload to pick up changes during development
-
 
 class Neurons:
 
