@@ -157,6 +157,7 @@ class Display(BasePlot.BaseCanvas):
 
         time_axis = (np.arange(session.trace.shape[1]) + session.time_offset) / f
 
+        print("traces:", traces.keys())
         ## build one big line with NaN separators for better performance
         parts = []
         for i, key in enumerate(self.labels):
@@ -224,16 +225,22 @@ class Display(BasePlot.BaseCanvas):
             self.data is None
             or self.data.current_session is None
             or self.state.selected_components is None
+            or len(self.labels) == 0
         ):
             return
 
         time_lim = [np.inf, -np.inf]
 
         if single:
-            to_plot_components = [self.state.focused_component]
+            to_plot_components = (
+                [self.state.focused_component]
+                if self.state.focused_component is not None
+                else None
+            )
         else:
             to_plot_components = self.state.selected_components
 
+        # to_plot_components = [c for c in to_plot_components if c is not None]
         if not to_plot_components:
             return
         ## restrict number of traces to plot, to avoid performance drop
@@ -345,7 +352,7 @@ class Controller(BasePlot.CanvasController):
     #     # self.canvas = PlotCanvas(display_section, self.controls, config)
 
     def build_controls(self):
-
+        super().build_controls()
         self.controls["slider"] = FootprintSliderController(self.section)
         self.section.x_options_layout.addWidget(self.controls["slider"])
 
@@ -355,7 +362,9 @@ class Controller(BasePlot.CanvasController):
 
         self.controls["trace_options"].options_changed.connect(self.replot_neurons)
 
-    def _on_data_changed(self):
+    def _on_data_changed(self, input: Tuple[str, int]):
+        if input[0] == "traces":
+            self.build_controls()
         self.replot_neurons()
 
     def _on_selection_changed(self):

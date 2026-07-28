@@ -43,7 +43,7 @@ class Data(Tracking):
 
         self.current_session = self.sessions[session_id]
 
-        self.change_trace_presence(session_id, True)
+        # self.change_trace_presence(session_id, True)
 
     def change_trace_presence(self, session_id: int, to_present: Optional[bool] = None):
         """
@@ -58,11 +58,35 @@ class Data(Tracking):
             return
 
         if to_present:
-            session.load_data(["temporal"])
+            self.state.tasks.start(
+                f"Loading traces for {getattr(session, 'name', f'Session {session_id}')}",
+                lambda ctx: session.load_data(["temporal"], ctx),
+                finished=lambda id=session_id: self._on_data_changed(("traces", id)),
+            )
         else:
             session.clean_traces()
+            self._on_data_changed(("traces", session_id))
 
-        self._on_data_changed(("traces", session_id))
+    def change_quality_presence(
+        self, session_id: int, to_present: Optional[bool] = None
+    ):
+        """
+        should be realized by session structure directly
+        """
+        session = self.sessions[session_id]
+        ## default to "toggle" if nothing provided
+        if to_present is None:
+            to_present = not session.status["quality_loaded"]
+
+        if session.status["quality_loaded"] == to_present:
+            return
+
+        if to_present:
+            session.load_data(["quality"])
+        else:
+            session.clean_quality()
+
+        self._on_data_changed(("quality", session_id))
 
     def move_session(self, old_session_id: int, new_session_id: int):
         super().move_session(old_session_id, new_session_id)
@@ -73,13 +97,20 @@ class Data(Tracking):
         for component in self.state.selected_components:
 
             if component.session_id == old_session_id:
-                components.add(NeuronComponent(neuron_id=component.neuron_id, session_id=new_session_id))
+                components.add(
+                    NeuronComponent(
+                        neuron_id=component.neuron_id, session_id=new_session_id
+                    )
+                )
             elif component.session_id == new_session_id:
-                components.add(NeuronComponent(neuron_id=component.neuron_id, session_id=old_session_id))
+                components.add(
+                    NeuronComponent(
+                        neuron_id=component.neuron_id, session_id=old_session_id
+                    )
+                )
             else:
                 components.add(component)
         self.state.update_selected_components(list(components))
-
 
         if self.current_session is not None:
             self.state.current_session_id = self.current_session.id
@@ -92,9 +123,12 @@ class Data(Tracking):
         name: Optional[str] = None,
         load_content: List[str] = ["spatial", "temporal", "quality"],
         align=True,
+        **kwargs,
     ) -> int:
         """ """
-        session_id = super().register_session(from_file, name, load_content, align)
+        session_id = super().register_session(
+            from_file, name, load_content, align, **kwargs
+        )
         # Notify that sessions have changed
         self._on_data_changed(("sessions", session_id))
         return session_id
@@ -164,11 +198,13 @@ class Data(Tracking):
                     self.state.assignments[component.neuron_id, :]
                 )[0]
                 if len(other_sessions):
-                    components.add(NeuronComponent(neuron_id=component.neuron_id, session_id=other_sessions[0]))
+                    components.add(
+                        NeuronComponent(
+                            neuron_id=component.neuron_id, session_id=other_sessions[0]
+                        )
+                    )
 
-        self.state.update_selected_components(
-            list(components)
-        )
+        self.state.update_selected_components(list(components))
 
     def load_registration(self, path_registration: str | Path):
         super().load_registration(path_registration)

@@ -73,21 +73,18 @@ class BaseCanvas(scene.SceneCanvas):
                     return
                 component = component[0]
             fp_id = self.state.get_footprint_from_component(component)
-            session_name = self.data.sessions[component.session_id].name
-            if fp_id >= 0:
-                A = self.data.sessions[component.session_id].A[:, fp_id]
+            session = self.data.sessions[component.session_id]
+            session_name = session.name
+            if fp_id is not None and fp_id >= 0:
+                A = session.A[:, fp_id]
                 metrics = {
-                    "SNR": self.data.sessions[component.session_id].quality["SNR_comp"][
-                        fp_id
-                    ],
-                    "r-value": self.data.sessions[component.session_id].quality[
-                        "r_values"
-                    ][fp_id],
-                    "CNN": self.data.sessions[component.session_id].quality[
-                        "cnn_preds"
-                    ][fp_id],
-                    "Size": int((A > A.max() * 0.01).sum()),
+                    "size": int((A > A.max() * 0.01).sum()),
                 }
+                if session.status["quality_loaded"]:
+                    metrics["SNR"] = session.quality["SNR_comp"][fp_id]
+                    metrics["r-value"] = session.quality["r_values"][fp_id]
+                    metrics["CNN"] = session.quality["cnn_preds"][fp_id]
+
                 text = "Neuron ID: {}\n{} \n".format(component.neuron_id, session_name)
                 text += "\n".join(
                     f"* {k}: {v:.0f}" if isinstance(v, int) else f"* {k}: {v:.3f}"
@@ -194,7 +191,8 @@ class BaseDisplayController(QObject):
         self.initialize_display()
 
     def build_controls(self):
-        pass
+        self.clean_controls()
+        # pass
 
     def configure_display(self):
         raise NotImplementedError("Subclasses must implement configure_display()")
@@ -202,17 +200,21 @@ class BaseDisplayController(QObject):
     def deactivate(self):
         self.state.logger.debug("Deactivating plot controller")
         self.disconnect_signals()
-        for key in self.controls:
-            self.controls[key].parent = None
-            self.controls[key].deleteLater()
-
-        self.controls.clear()
+        self.clean_controls()
 
         if self.display_widget is not None:
             self.section.clear_display_widget()
             self.display_widget.parent = None
             self.display_widget.deleteLater()
             self.display_widget = None
+
+    def clean_controls(self):
+
+        for key in self.controls:
+            self.controls[key].parent = None
+            self.controls[key].deleteLater()
+
+        self.controls.clear()
 
     def disconnect_signals(self):
         self.state.selected_components_changed.disconnect(self._on_selection_changed)

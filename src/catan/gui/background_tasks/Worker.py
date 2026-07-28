@@ -13,9 +13,8 @@ class TaskContext:
 
     def cancelled(self):
         return self.cancel_check()
-    
 
-    
+
 class WorkerSignals(QObject):
     finished = Signal(object)
     error = Signal(str)

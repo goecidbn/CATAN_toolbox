@@ -1017,6 +1017,8 @@ class Controller(BasePlot.CanvasController):
     canvas: Display
 
     def build_controls(self):
+        super().build_controls()
+
         # print("Building controls for PlotController (statistics display)")
         self.engine = StatisticEngine(
             registry=STATISTICS,

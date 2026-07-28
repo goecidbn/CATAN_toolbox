@@ -773,6 +773,8 @@ class Controller(BasePlot.CanvasController):
         self.controls["parameter"].display_parameter_changed.disconnect()
 
     def build_controls(self):
+        super().build_controls()
+
         self.controls["slider"] = FootprintSlider.FootprintSliderController(
             self.section
         )

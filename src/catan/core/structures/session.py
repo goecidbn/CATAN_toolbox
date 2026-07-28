@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import inspect
 import h5py
@@ -10,7 +10,6 @@ from .remap import Remapping
 
 from catan.core.data import center_of_mass
 from catan.core.io import (
-    load_data,
     write_sparse_matrix,
     write_optional_attr,
     write_optional_array,
@@ -18,6 +17,7 @@ from catan.core.io import (
     read_optional_attr,
     read_optional_array,
 )
+from catan.gui.background_tasks import TaskContext, TaskManager
 
 component_quality_default = {
     "SNR_lowest": 1.0,
@@ -67,7 +67,8 @@ class SessionData:
     A: sparse.csc_matrix  # = None  #
     Cn: Optional[np.ndarray] = None  #
     # temporal
-    _trace_fields = ["C", "F_dff", "F_dff_dec", "S", "S_dff"]
+    # _trace_fields = ["C", "F_dff", "F_dff_dec", "S", "S_dff"]
+    _trace_fields = ["C", "F_dff_dec", "S_dff"]
     _traces: dict[str, np.ndarray] = {}
     _default_trace: Optional[str] = None
     # other
@@ -176,7 +177,11 @@ class SessionData:
         self,
         which=["quality", "spatial", "temporal"],
         alignment_template: Optional[np.ndarray] = None,
+        ctx: Optional[TaskContext] = None,
     ):
+        print(
+            f"Loading data for session {self.name} from {self.path} with fields: {which}"
+        )
         if "spatial" in which:
             self.schedule_spatial_load()
         if "temporal" in which:
@@ -184,9 +189,13 @@ class SessionData:
         if "quality" in which:
             self.schedule_quality_load()
 
-        self.execute_load(alignment_template=alignment_template)
+        self.execute_load(alignment_template=alignment_template, ctx=ctx)
 
-    def execute_load(self, alignment_template: Optional[np.ndarray] = None):
+    def execute_load(
+        self,
+        alignment_template: Optional[np.ndarray] = None,
+        ctx: Optional[TaskContext] = None,
+    ):
 
         assert (
             self.path is not None
@@ -198,34 +207,53 @@ class SessionData:
             # print("No fields scheduled for loading.")
             return
 
-        data = load_data(
-            self.path,
-            fields=[
-                field
-                for sublist in self.fields_scheduled_for_loading.values()
-                for field in sublist
-            ],
-            subpath="/estimates",
-        )
+        with h5py.File(self.path, "r") as f:
+            f = f["/estimates"]
+            if not isinstance(f, h5py.Group):
+                raise ValueError(
+                    f"Expected '/estimates' group in HDF5 file, but got {type(f)}"
+                )
 
-        if self.status["scheduled_spatial"]:
-            self.register_spatial(alignment_template=alignment_template, **data)
-            self.status["scheduled_spatial"] = False
+            if self.status["scheduled_spatial"]:
+                A, Cn, dims = self.spatial_from_hdf5(f, ctx=ctx)
+                if ctx is not None:
+                    ctx.progress(10)
+                self.register_spatial(
+                    alignment_template=alignment_template, A=A, Cn=Cn, dims=dims
+                )
+                self.status["scheduled_spatial"] = False
 
-        if self.status["scheduled_traces"]:
-            self.register_traces(**data)
-            self.status["scheduled_traces"] = False
+            if self.status["scheduled_traces"]:
+                traces = self.traces_from_hdf5(
+                    f,
+                    fields=self.fields_scheduled_for_loading.get("temporal", []),
+                    ctx=ctx,
+                )
+                if ctx is not None:
+                    ctx.progress(20)
+                self.register_traces(traces=traces)
+                self.status["scheduled_traces"] = False
 
-        if self.status["scheduled_quality"]:
-            self.register_quality(**data)
-            self.status["scheduled_quality"] = False
+            if self.status["scheduled_quality"]:
+                quality = self.quality_from_hdf5(
+                    f,
+                    fields=self.fields_scheduled_for_loading.get("quality", []),
+                    ctx=ctx,
+                )
+                if ctx is not None:
+                    ctx.progress(30)
+                self.register_quality(quality=quality)
+                self.status["scheduled_quality"] = False
 
     def schedule_spatial_load(self):
         if not self.status["scheduled_spatial"]:
             self.fields_scheduled_for_loading["spatial"] = ["A", "Cn"]
             self.status["scheduled_spatial"] = True
 
-    def schedule_traces_load(self, fields=["C", "F_dff", "F_dff_dec", "S", "S_dff"]):
+    def schedule_traces_load(self, fields=None):
+        if fields is None:
+            fields = self._trace_fields
+
         if not self.status["scheduled_traces"]:
             self.fields_scheduled_for_loading["temporal"] = fields
             self.status["scheduled_traces"] = True
@@ -249,11 +277,12 @@ class SessionData:
 
     def register_quality(self, **data):
 
-        self.quality = {
-            key: data[key]
-            for key in data
-            if key in self.fields_scheduled_for_loading.get("quality", [])
-        }
+        # self.quality = {
+        #     key: data[key]
+        #     for key in data
+        #     if key in self.fields_scheduled_for_loading.get("quality", [])
+        # }
+        self.quality = data.get("quality", {})
 
         if self.quality:
             self.status["quality_loaded"] = True
@@ -341,11 +370,12 @@ class SessionData:
         self.status["scheduled_traces"] = False
 
     def register_traces(self, **data):
-        self._traces = {
-            key: data[key]
-            for key in data
-            if key in self.fields_scheduled_for_loading.get("temporal", [])
-        }
+        # self._traces = {
+        #     key: data[key]
+        #     for key in data
+        #     if key in self.fields_scheduled_for_loading.get("temporal", [])
+        # }
+        self._traces = data.get("traces", {})
         self._default_trace = "F_dff" if "F_dff" in self._traces else "C"
         if self._traces:
             self.status["traces_loaded"] = True
@@ -482,7 +512,9 @@ class SessionData:
         write_optional_array(group, "idx_eval", self.idx_eval, compression="gzip")
 
     @classmethod
-    def from_hdf5(cls, group: h5py.Group | h5py.File) -> "SessionData":
+    def from_hdf5(
+        cls, group: h5py.Group | h5py.File, ctx: Optional[TaskManager] = None
+    ) -> "SessionData":
 
         version = int(group.attrs.get("schema_version", 1))
         if version != 1:
@@ -495,33 +527,9 @@ class SessionData:
         active = bool(group.attrs.get("active", True))
         time_offset = float(group.attrs.get("time_offset", 0.0))
 
-        ## spatial group
-        dims = tuple(group.attrs.get("dims", (512, 512)))
-
-        A = (
-            read_sparse_matrix(group["A"])
-            if "A" in group
-            else sparse.csc_matrix((0, 0))
-        )
-        Cn = read_optional_array(group, "Cn")
-
-        ## trace group
-        traces = {}
-        if "traces" in group:
-            traces_group = group["traces"]
-            if isinstance(traces_group, h5py.Group):
-                traces = {key: traces_group[key][()] for key in traces_group}
-        assert isinstance(traces, dict), "Traces should be a dictionary"
-
-        ## quality group
-        quality = {}
-        if "quality" in group:
-            quality_group = group["quality"]
-            if isinstance(quality_group, h5py.Group):
-                for key in quality_group:
-                    value = read_optional_array(quality_group, key)
-                    if value is not None:
-                        quality[key] = value
+        A, Cn, dims = cls.spatial_from_hdf5(cls, group, ctx=ctx)
+        traces = cls.traces_from_hdf5(cls, group, ctx=ctx)
+        quality = cls.quality_from_hdf5(cls, group, ctx=ctx)
 
         ## remap substructure
         remap = None
@@ -551,6 +559,86 @@ class SessionData:
         #     out.get_idx_eval_from_quality_params()
 
         return out
+
+    def spatial_from_hdf5(
+        self, group: h5py.Group | h5py.File, ctx: Optional[TaskContext] = None
+    ) -> Tuple[sparse.csc_matrix, Optional[np.ndarray], Tuple[int, int]]:
+        """
+        Load spatial data from an HDF5 group or file.
+
+        Parameters:
+            group (h5py.Group | h5py.File): The HDF5 group or file to read from.
+            ctx (Optional[TaskContext]): Optional context for progress reporting and cancellation.
+        Returns:
+            Tuple[sparse.csc_matrix, Optional[np.ndarray], Tuple[int, int]]: A tuple containing the loaded spatial data (A, Cn, dims).
+        """
+
+        dims = tuple(group.attrs.get("dims", (512, 512)))
+
+        A = (
+            read_sparse_matrix(group["A"])
+            if "A" in group
+            else sparse.csc_matrix((0, 0))
+        )
+        Cn = read_optional_array(group, "Cn")
+        return A, Cn, dims
+
+    def traces_from_hdf5(
+        self,
+        group: h5py.Group | h5py.File,
+        fields: List[str] = ["C", "F_dff", "F_dff_dec", "S", "S_dff"],
+        ctx: Optional[TaskContext] = None,
+    ) -> dict:
+        """
+        Load trace data from an HDF5 group or file.
+
+        Parameters:
+            group (h5py.Group | h5py.File): The HDF5 group or file to read from.
+            ctx (Optional[TaskContext]): Optional context for progress reporting and cancellation.
+        Returns:
+            dict: A dictionary containing the loaded trace data.
+        """
+
+        traces = {}
+        if np.isin(fields, list(group.keys())).any():
+            for key in fields:
+                if key not in group:
+                    print(f"Warning: Trace key '{key}' not found in HDF5 group.")
+                    continue
+                print(f"Loading trace key: {key}")
+                value = read_optional_array(group, key)
+                if value is not None:
+                    traces[key] = value
+        return traces
+
+    def quality_from_hdf5(
+        self,
+        group: h5py.Group | h5py.File,
+        fields: List[str] = ["SNR_comp", "r_values", "cnn_preds"],
+        ctx: Optional[TaskContext] = None,
+    ) -> dict:
+        """
+        Load quality data from an HDF5 group or file.
+
+        Parameters:
+            group (h5py.Group | h5py.File): The HDF5 group or file to read from.
+            ctx (Optional[TaskContext]): Optional context for progress reporting and cancellation.
+        Returns:
+            dict: A dictionary containing the loaded quality data.
+        """
+
+        quality = {}
+        if np.isin(fields, list(group.keys())).any():
+            for key in fields:
+                if key not in group:
+                    print(f"Warning: Quality key '{key}' not found in HDF5 group.")
+                    continue
+
+                value = read_optional_array(group, key)
+                if value is not None:
+                    quality[key] = value
+
+        return quality
 
     # def cast_to_dict(self, fields=None):
 

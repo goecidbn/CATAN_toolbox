@@ -120,6 +120,7 @@ class Tracking:
         name: Optional[str] = None,
         load_content: List[str] = ["quality", "spatial", "temporal"],
         align=True,
+        **kwargs,
     ) -> int:
         """
         Register a new session from a file, load the data and add it to the list of sessions. The session is aligned to the previous sessions if align=True.
@@ -154,9 +155,13 @@ class Tracking:
                 path=str(from_file),
                 id=len(self.sessions),
             )
+            print(
+                f"Registering session {this_data.name} from {this_data.path} with fields: {load_content}"
+            )
             this_data.load_data(
                 which=load_content,
                 alignment_template=self.alignment_template if align else None,
+                **kwargs,
             )
             self.sessions.append(this_data)
 

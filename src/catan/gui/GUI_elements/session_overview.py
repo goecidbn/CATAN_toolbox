@@ -39,8 +39,8 @@ class SessionRowWidget(QFrame):
     changeColorRequested = Signal(int)
 
     traceToggled = Signal(int)
+    qualityToggled = Signal(int)
     matchToggled = Signal(int)
-    dataToggled = Signal(int)
 
     removeRequested = Signal(int)
 
@@ -85,32 +85,23 @@ class SessionRowWidget(QFrame):
         self.offset_label.setObjectName("SessionOffsetLabel")
         self.offset_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.data_button = make_icon_button(
-            ("fa6s.upload", "fa5s.upload"),
-            tooltip="Load session data",
-            fallback_theme_icon="document-open",
-        )
+        self.trace_button = make_icon_button()
+        self.quality_button = make_icon_button()
+        self.match_button = make_icon_button()
 
-        self.match_button = make_icon_button(
-            ("fa6s.layer-group", "fa5s.layer-group"),
-            tooltip="Add to matching",
-            fallback_theme_icon="applications-games",
-        )
-
-        self.trace_button = make_icon_button(
-            (
-                # "fa6s.wave-square",
-                # "fa5s.wave-square",
-                "fa6s.chart-line",
-                "fa5s.chart-line",
-            ),
-            tooltip="Load traces",
-            fallback_theme_icon="media-playback-start",
+        self.delete_button = make_icon_button(
+            ("fa6s.ban", "fa5s.ban"),
+            color="red",
+            tooltip="Remove session data",
+            fallback_theme_icon="edit-delete",
         )
 
         # self.trace_button = QPushButton()
         self.trace_button.clicked.connect(
             lambda: self.traceToggled.emit(self.session_id)
+        )
+        self.quality_button.clicked.connect(
+            lambda: self.qualityToggled.emit(self.session_id)
         )
 
         # self.match_button = QPushButton()
@@ -119,7 +110,9 @@ class SessionRowWidget(QFrame):
         )
 
         # self.data_button = QPushButton()
-        self.data_button.clicked.connect(lambda: self.dataToggled.emit(self.session_id))
+        self.delete_button.clicked.connect(
+            lambda: self.removeRequested.emit(self.session_id)
+        )
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 3, 6, 3)
@@ -131,8 +124,9 @@ class SessionRowWidget(QFrame):
         layout.addWidget(self.offset_label)
         layout.addStretch()
         layout.addWidget(self.trace_button)
+        layout.addWidget(self.quality_button)
         layout.addWidget(self.match_button)
-        layout.addWidget(self.data_button)
+        layout.addWidget(self.delete_button)
 
         self.refresh()
 
@@ -163,69 +157,43 @@ class SessionRowWidget(QFrame):
         self._update_background()
 
     def _update_buttons(self):
-        # has_traces = self.session.status["traces_loaded"]
-        # is_matched = getattr(self.session, "matched", False)
-        # is_loaded = getattr(self.session, "loaded", True)
-        # is_scheduled = getattr(self.session, "scheduled_for_loading", False)
 
-        # self.trace_button.setText("Unload traces" if has_traces else "Load traces")
-        # self.match_button.setText("Unmatch" if is_matched else "Match")
+        matched = self.session.status["matched"]
+        set_button_icon(
+            self.match_button,
+            ("fa6s.layer-group", "fa5s.layer-group"),
+            color="white" if not matched else "red",
+            tooltip=("Add to matching" if not matched else "Remove from matching"),
+            fallback_theme_icon=(
+                "applications-games" if not matched else "edit-delete"
+            ),
+        )
 
-        # print("Updating buttons for session", self.session_id, ":", has_traces)
-        if self.session.status["traces_loaded"]:
-            set_button_icon(
-                self.trace_button,
-                ("fa6s.trash-can", "fa5s.trash-alt"),
-                tooltip="Unload traces",
-                fallback_theme_icon="edit-delete",
-            )
-        else:
-            set_button_icon(
-                self.trace_button,
-                (
-                    # "fa6s.wave-square", "fa5s.wave-square",
-                    "fa6s.chart-line",
-                    "fa5s.chart-line",
-                ),
-                tooltip="Load traces",
-                fallback_theme_icon="media-playback-start",
-            )
+        trace_loaded = self.session.status["traces_loaded"]
+        set_button_icon(
+            self.trace_button,
+            ("fa6s.chart-line", "fa5s.chart-line"),
+            color="white" if not trace_loaded else "red",
+            tooltip=("Load traces" if not trace_loaded else "Unload traces"),
+            fallback_theme_icon=(
+                "media-playback-start" if not trace_loaded else "edit-delete"
+            ),
+        )
 
-        if self.session.status["matched"]:
-            set_button_icon(
-                self.match_button,
-                ("fa6s.note-sticky", "fa5s.note-sticky"),
-                tooltip="Remove from matching",
-                fallback_theme_icon="edit-delete",
-            )
-        else:
-            set_button_icon(
-                self.match_button,
-                ("fa6s.layer-group", "fa5s.layer-group"),
-                tooltip="Add to matching",
-                fallback_theme_icon="applications-games",
-            )
-
-        if self.session.status["spatial_loaded"]:
-            set_button_icon(
-                self.data_button,
-                ("fa6s.trash-can", "fa5s.trash-alt"),
-                tooltip="Remove session data",
-                fallback_theme_icon="edit-delete",
-            )
-        else:
-            set_button_icon(
-                self.data_button,
-                ("fa6s.upload", "fa5s.upload"),
-                tooltip="Load session data",
-                fallback_theme_icon="document-open",
-            )
-        # if is_loaded:
-        #     self.data_button.setText("Remove")
-        # elif is_scheduled:
-        #     self.data_button.setText("Load")
-        # else:
-        #     self.data_button.setText("Load")
+        quality_loaded = self.session.status["quality_loaded"]
+        set_button_icon(
+            self.quality_button,
+            ("fa6s.chart-column", "fa5s.chart-column"),
+            color="white" if not quality_loaded else "red",
+            tooltip=(
+                "Load quality parameters"
+                if not quality_loaded
+                else "Remove quality parameters"
+            ),
+            fallback_theme_icon=(
+                "document-open" if not quality_loaded else "edit-delete"
+            ),
+        )
 
     def _update_background(self):
         color = getattr(self.session, "color", QColor("#555555"))
@@ -285,10 +253,10 @@ class SessionRowWidget(QFrame):
             self.trace_button.text(), lambda: self.traceToggled.emit(self.session_id)
         )
         menu.addAction(
-            self.match_button.text(), lambda: self.matchToggled.emit(self.session_id)
+            self.quality_button.text(), lambda: self.dataToggled.emit(self.session_id)
         )
         menu.addAction(
-            self.data_button.text(), lambda: self.dataToggled.emit(self.session_id)
+            self.match_button.text(), lambda: self.matchToggled.emit(self.session_id)
         )
 
         menu.addSeparator()
@@ -318,6 +286,8 @@ class SessionOverview(QWidget):
 
         self._row_widgets: dict[int, SessionRowWidget] = {}
 
+        self.state.data_changed.connect(self.refresh_rows)
+
         self.rebuild()
 
     def rebuild(self):
@@ -342,8 +312,8 @@ class SessionOverview(QWidget):
         # row.changeColorRequested.connect(self.change_session_color)
 
         row.traceToggled.connect(self.toggle_traces)
+        row.qualityToggled.connect(self.toggle_quality)
         row.matchToggled.connect(self.toggle_match)
-        row.dataToggled.connect(self.toggle_session_data)
         row.removeRequested.connect(self.remove_session)
 
         item.setSizeHint(row.sizeHint())
@@ -440,9 +410,12 @@ class SessionOverview(QWidget):
     #         self.state.data_changed.emit()
 
     def toggle_traces(self, session_id: int):
-        # print("Toggling traces for session", session_id)
 
         self.data.change_trace_presence(session_id)
+        self.refresh_rows()
+
+    def toggle_quality(self, session_id: int):
+        self.data.change_quality_presence(session_id)
         self.refresh_rows()
 
     def toggle_match(self, session_id: int):
@@ -453,20 +426,6 @@ class SessionOverview(QWidget):
             self.data.register_neurons(from_session_id=session_id)
 
         self.refresh_rows()
-
-    def toggle_session_data(self, session_id: int):
-        session = self.data.sessions[session_id]
-
-        if getattr(session, "loaded", True):
-            self.remove_session(session_id)
-            return
-
-        # Future implementation.
-        session.load_data()
-
-        self.refresh_rows()
-
-        self.state.data_changed.emit(("sessions", session_id))
 
     def remove_session(self, session_id: int):
         session = self.data.sessions[session_id]

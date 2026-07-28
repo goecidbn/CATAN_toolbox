@@ -22,6 +22,7 @@ from pathlib import Path
 
 from catan.gui.structures import data, state
 from catan.gui.plots.colors import CyclicColorMap
+from catan.gui.background_tasks import TaskContext
 
 from .session_overview import SessionOverview
 from .resource_monitor import ResourceMonitor
@@ -213,16 +214,27 @@ class MainMenu(QFrame):
     # self.data.sessions.append(this_data)
     # self.state.session_added = session_id
 
-    def load_from_session(self, set_active=True):
+    def load_from_session(self, set_active=True, ctx: Optional[TaskContext] = None):
         """
         TODO:
         * change tracking stucture to hold assignments in base structure (and access from there, not hand over)
         """
-
-        self.data.register_session(from_file=str(self.results_file), align=True)
+        if ctx is not None:
+            ctx.message("Loading session data...")
+            ctx.progress(0)
+        self.data.register_session(
+            from_file=str(self.results_file),
+            load_content=["spatial"],
+            align=True,
+            ctx=ctx,
+        )
         session_id = self.data.sessions[-1].id
 
         ## run tracking algorithm hereafter
+        if ctx is not None:
+            ctx.message("Update match model...")
+            ctx.progress(33)
+
         self.data.update_model_with_data(
             from_session_id=session_id,
         )
@@ -230,6 +242,10 @@ class MainMenu(QFrame):
 
         if len(self.data.sessions) > 1:
             self.data.fit_to_model()
+
+        if ctx is not None:
+            ctx.progress(66)
+            ctx.message("Registering neurons...")
 
         self.data.register_neurons(from_session_id=session_id, clean_traces=False)
 

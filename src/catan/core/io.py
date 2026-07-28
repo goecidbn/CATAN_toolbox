@@ -301,10 +301,10 @@ def recursively_save_dict_contents_to_group(
             raise ValueError(f"Cannot save {type(item)} type for key '{key}'.")
 
 
-
 ### =============================================================== ###
 ### ====================== HELPER FUNCTIONS ======================= ###
 ### =============================================================== ###
+
 
 def write_sparse_matrix(
     group: h5py.Group,
@@ -323,15 +323,13 @@ def write_sparse_matrix(
 
 def read_sparse_matrix(group: h5py.Group) -> sparse.csc_matrix:
     """Read a CSC matrix from an HDF5 group."""
-    matrix_format = group.attrs.get("format","csc")
+    matrix_format = group.attrs.get("format", "csc")
 
     if isinstance(matrix_format, bytes):
         matrix_format = matrix_format.decode("utf-8")
 
     if matrix_format != "csc":
-        raise ValueError(
-            f"Unsupported sparse matrix format: {matrix_format!r}"
-        )
+        raise ValueError(f"Unsupported sparse matrix format: {matrix_format!r}")
 
     if "shape" in group.keys():
         # ensure consistency with CaImAn style saving

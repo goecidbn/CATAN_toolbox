@@ -1,6 +1,7 @@
 from PySide6.QtCore import QObject, Signal, QThreadPool
 from .Worker import Worker
 
+
 class TaskManager(QObject):
 
     task_started = Signal(str)

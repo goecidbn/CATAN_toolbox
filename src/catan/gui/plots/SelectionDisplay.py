@@ -46,6 +46,8 @@ class Display(QWidget):
 
         self.state.focused_component_changed.connect(self.highlight_display)
 
+        self.state.data_changed.connect(self.update_display)
+
     def update_display(self):
         if self.state.selected_components is None:
             self.stats_table.setRowCount(0)
@@ -68,6 +70,12 @@ class Display(QWidget):
             else:
                 self.stats_table.setItem(n, 1, QTableWidgetItem(f"{footprint_id}"))
                 for i, metric in enumerate(self.metrics):
+                    if (
+                        self.metrics[metric]
+                        not in self.data.sessions[component.session_id].quality
+                    ):
+                        self.stats_table.setItem(n, i + 2, QTableWidgetItem("--"))
+                        continue
                     value = "{:.2f}".format(
                         self.data.sessions[component.session_id].quality[
                             self.metrics[metric]
