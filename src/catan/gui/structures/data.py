@@ -4,6 +4,7 @@ import numpy as np
 from scipy import sparse
 
 from catan.core.structures import SessionData
+from catan.gui.structures.state import NeuronComponent
 from pathlib import Path
 
 # from catan.gui.background_tasks import TaskContext
@@ -68,11 +69,17 @@ class Data(Tracking):
         self.state.assignments = self.assignments
 
         ## adjust selected components to reflect the new session IDs
+        components = set()
         for component in self.state.selected_components:
+
             if component.session_id == old_session_id:
-                component.session_id = new_session_id
+                components.add(NeuronComponent(neuron_id=component.neuron_id, session_id=new_session_id))
             elif component.session_id == new_session_id:
-                component.session_id = old_session_id
+                components.add(NeuronComponent(neuron_id=component.neuron_id, session_id=old_session_id))
+            else:
+                components.add(component)
+        self.state.update_selected_components(list(components))
+
 
         if self.current_session is not None:
             self.state.current_session_id = self.current_session.id
@@ -141,26 +148,26 @@ class Data(Tracking):
     ):
 
         ## adjust selected components to reflect the new session IDs
+        components = set()
         for component in self.state.selected_components:
             if component.session_id == session_id:
 
                 ## first, check if neuron is still present
                 if component.neuron_id >= self.assignments.shape[0]:
-                    component.session_id = -1  # No other sessions, mark as invalid
                     continue
 
                 # if new_session_id >= 0:
-                component.session_id = new_session_id
+                # component.session_id = new_session_id
                 ## dynamically find first first session presence, if session is removed
-                if new_session_id == -1:
-                    other_sessions = np.where(
-                        self.state.assignments[component.neuron_id, :]
-                    )[0]
-                    if len(other_sessions):
-                        component.session_id = other_sessions[0]
+                # if new_session_id == -1:
+                other_sessions = np.where(
+                    self.state.assignments[component.neuron_id, :]
+                )[0]
+                if len(other_sessions):
+                    components.add(NeuronComponent(neuron_id=component.neuron_id, session_id=other_sessions[0]))
 
         self.state.update_selected_components(
-            [c for c in self.state.selected_components if c.session_id != -1]
+            list(components)
         )
 
     def load_registration(self, path_registration: str | Path):

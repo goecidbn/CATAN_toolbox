@@ -54,7 +54,7 @@ class Display(QWidget):
         self.stats_table.setRowCount(len(self.state.selected_components))
 
         for n, component in enumerate(self.state.selected_components):
-
+            print(f"Updating display for component: {component}")
             footprint_id = self.state.get_footprint_from_component(component)
 
             self.stats_table.setItem(

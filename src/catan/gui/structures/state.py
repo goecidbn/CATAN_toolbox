@@ -8,8 +8,7 @@ import logging
 from catan.gui.background_tasks import TaskManager
 
 
-# @dataclass(frozen=True, slots=True)
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class NeuronComponent:
     session_id: int
     neuron_id: int
