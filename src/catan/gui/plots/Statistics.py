@@ -1148,6 +1148,18 @@ class Controller(BasePlot.CanvasController):
             self.controls["x_selector"].set_query_preparer(None)
 
         self.canvas.clear()
+
+        ## load quality params if SNR, RVAL, or CNN are selected
+        if (
+            self.current_x_query is not None
+            and self.current_x_query.statistic_key in ["snr", "rval", "cnn"]
+        ) or (
+            self.current_y_query is not None
+            and self.current_y_query.statistic_key in ["snr", "rval", "cnn"]
+        ):
+            if not self.data.current_session.status["quality_loaded"]:
+                self.data.change_quality_presence(self.state.current_session_id, True)
+
         self.rebuild_plot_data()
         self.update_canvas()
 
