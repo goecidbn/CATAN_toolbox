@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Tuple, Optional, List
 from scipy import sparse
 from scipy.ndimage import gaussian_filter
 
@@ -91,7 +92,11 @@ def crop_to_common_bbox(A1, A2, m=0) -> tuple[np.ndarray, np.ndarray]:
     return A1, A2
 
 
-def pad_axis(a, dim_pads=None, value=np.nan):
+def pad_axis(
+    a: np.ndarray,
+    dim_pads: Optional[List[int] | Tuple[int, ...]] = None,
+    value: float = np.nan,
+) -> np.ndarray:
 
     if dim_pads is None:
         dim_pads = [1] * len(a.shape)

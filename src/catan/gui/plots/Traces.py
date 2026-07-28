@@ -148,14 +148,14 @@ class Display(BasePlot.BaseCanvas):
             return
 
         footprint_id = self.state.get_footprint_from_component(component)
+        session_id = component.session_id
+        session = self.data.sessions[session_id]
 
-        traces = self.data.sessions[component.session_id].traces
-        if not traces:
+        traces = session.traces
+        if not session.status["traces_loaded"] or session.trace is None:
             return
 
-        time_axis = (
-            np.arange(traces["C"].shape[1]) + self.data.current_session.time_offset
-        ) / f
+        time_axis = (np.arange(session.trace.shape[1]) + session.time_offset) / f
 
         ## build one big line with NaN separators for better performance
         parts = []
@@ -196,7 +196,7 @@ class Display(BasePlot.BaseCanvas):
             "default",
             "line",
             values=0.7,
-            colors=self.state.session_colors[self.state.current_session_id],
+            colors=self.state.session_colors[session_id],
         )
 
         line = visuals.Line(

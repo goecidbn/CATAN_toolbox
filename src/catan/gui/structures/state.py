@@ -8,7 +8,8 @@ import logging
 from catan.gui.background_tasks import TaskManager
 
 
-@dataclass(frozen=True, slots=True)
+# @dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class NeuronComponent:
     session_id: int
     neuron_id: int
@@ -160,7 +161,7 @@ class AppState(QObject):
     def session_added(self, session_id: int):
         # print(f"[STATE] Adding new session {session_id} to state...")
         self._session_active.append(True)
-        self.data_changed.emit(("session", session_id))
+        # self.data_changed.emit(("session", session_id))
 
     # --- current session ---
     @property
@@ -168,11 +169,11 @@ class AppState(QObject):
         return self._current_session_id
 
     @current_session_id.setter
-    def current_session_id(self, s: int):
+    def current_session_id(self, s: Optional[int]):
         if s != self._current_session_id:
             self._current_session_id = s
             self.current_session_changed.emit(s)
-            self.session_active = (s, True)
+            # self.session_active = (s, True)
 
     # --- current neuron ---
     """ 
@@ -215,12 +216,12 @@ class AppState(QObject):
                     ## if component is not in current selection, add it
                     selected_components.append(component)
 
-            if len(selected_components) == 0:
-                selected_components = None
-
         else:
             ## mode for replacing the current selection with a new one
             selected_components = components
+
+        if isinstance(selected_components, list) and len(selected_components) == 0:
+            selected_components = None
 
         if (
             selected_components is not None

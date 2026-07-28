@@ -3,9 +3,9 @@ from typing import Dict, Optional, Tuple, List
 import numpy as np
 from scipy import sparse
 
-# import importlib
-
 from catan.core.structures import SessionData
+from pathlib import Path
+
 # from catan.gui.background_tasks import TaskContext
 from catan import Tracking
 
@@ -32,6 +32,10 @@ class Data(Tracking):
 
         self.state.current_session_changed.connect(self._on_current_session_changed)
 
+    def _on_data_changed(self, change):
+        self.state.data_version += 1
+        self.state.data_changed.emit(change)
+
     def _on_current_session_changed(self, session_id: int):
         if session_id < 0 or session_id >= len(self.sessions):
             raise ValueError(f"Invalid session_id {session_id}")
@@ -39,15 +43,6 @@ class Data(Tracking):
         self.current_session = self.sessions[session_id]
 
         self.change_trace_presence(session_id, True)
-
-    def unregister_neurons(self, session_id: int):
-
-        super().unregister_neurons(session_id)
-        self.state.update_selected_components(None)
-
-    def remove_session(self, session_id: int):
-        super().remove_session(session_id)
-        self.state.update_selected_components(None)
 
     def change_trace_presence(self, session_id: int, to_present: Optional[bool] = None):
         """
@@ -65,132 +60,110 @@ class Data(Tracking):
             session.load_data(["temporal"])
         else:
             session.clean_traces()
-        self.state.data_changed.emit(("traces", -1))
 
-    def move_session(self, old_index: int, new_index: int):
-        """
-        should be moved to neuron_tracking
-        """
-        print(f"Moving session from index {old_index} to {new_index}")
-        session = self.sessions.pop(old_index)
-        self.sessions.insert(new_index, session)
+        self._on_data_changed(("traces", session_id))
 
-        self.state.update_selected_components(None)
+    def move_session(self, old_session_id: int, new_session_id: int):
+        super().move_session(old_session_id, new_session_id)
+        self.state.assignments = self.assignments
 
-        # Reorder all session-indexed arrays here.
-        # if "centroids" in self.neurons:
-        # self.neurons.centroids = move_index_along_axis(
-        #     self.neurons.centroids, axis=1, old=old_index, new=new_index
-        # )
+        ## adjust selected components to reflect the new session IDs
+        for component in self.state.selected_components:
+            if component.session_id == old_session_id:
+                component.session_id = new_session_id
+            elif component.session_id == new_session_id:
+                component.session_id = old_session_id
 
-    # def remove_session(self, session_id: int):
-    #     if session_id < 0 or session_id >= len(self.sessions):
-    #         raise ValueError(f"Invalid session_id {session_id}")
+        if self.current_session is not None:
+            self.state.current_session_id = self.current_session.id
 
-    #     self.sessions.pop(session_id)
+        self._on_data_changed(("assignments", -1))  # Notify that sessions have changed
 
-    #     # Reorder all session-indexed arrays here.
-    #     self.assignments = np.delete(self.assignments, session_id, axis=1)
+    def register_session(
+        self,
+        from_file: Optional[str | Path] = None,
+        name: Optional[str] = None,
+        load_content: List[str] = ["spatial", "temporal", "quality"],
+        align=True,
+    ) -> int:
+        """ """
+        session_id = super().register_session(from_file, name, load_content, align)
+        # Notify that sessions have changed
+        self._on_data_changed(("sessions", session_id))
+        return session_id
 
-    #     # rebuild_results = self.rebuild_neurons()
-    #     # if rebuild_results is not None:
-    #     # self.neurons = rebuild_results
-    #     # if "centroids" in self.neurons:
-    #     #     self.neurons["centroids"] = np.delete(self.neurons["centroids"], session_id, axis=1)
-    #     # self.session_metadata = remove_from_list(...)
-    #     # invalidate statistic caches
+    def remove_session(self, session_id: int):
 
-    # def rebuild_neuron(self, neuron_id: int, ctx: Optional[TaskContext] = None):
+        super().remove_session(session_id)
+        self.state.assignments = self.assignments
 
-    #     if not self.sessions:
-    #         return
+        self.adjust_selected_components_after_data_change(session_id, -1)
 
-    #     session_ids = np.where(self.state.assignments[neuron_id, :] >= 0)[0]
-    #     footprint_ids = self.state.assignments[neuron_id, session_ids]
+        if self.current_session is not None:
+            self.state.current_session_id = self.current_session.id
 
-    #     # build new centroids for neuron
-    #     for session_id, fp_id in zip(session_ids, footprint_ids):
+        self._on_data_changed(("assignments", -1))  # Notify that sessions have changed
 
-    #         # centroid = self.sessions[session_id].centroids[fp_id, :]
-    #         session = self.sessions[session_id]
-    #         if not session or session.centroids is None:
-    #             raise ValueError(
-    #                 f"Session {session_id} not found in data.sessions or centroids are missing"
-    #             )
+    def register_neurons(
+        self,
+        from_file: Optional[str | Path] = None,
+        from_data: Optional[SessionData] = None,
+        from_session_id: Optional[int] = None,
+        align_to_reference: bool = True,
+        clean_traces: bool = True,
+        p_thr=[0.5, 0.3],
+    ):
+        """ """
+        super().register_neurons(
+            from_file=from_file,
+            from_data=from_data,
+            from_session_id=from_session_id,
+            align_to_reference=align_to_reference,
+            clean_traces=clean_traces,
+            p_thr=p_thr,
+        )
+        self.state.assignments = self.assignments
+        self._on_data_changed(("assignments", -1))  # Notify that neurons have changed
 
-    #         self.neurons.centroids[fp_id, session_id, :] = session.centroids[fp_id, :]
+    def unregister_neurons(self, session_id: int):
 
-    #     ## build new union footprint for neuron
-    #     footprints = sparse.hstack(
-    #         [
-    #             (
-    #                 self.sessions[s].A[:, fp_id]
-    #                 if fp_id >= 0
-    #                 else sparse.csc_matrix((np.prod(self.sessions[s].dims), 1))
-    #             )
-    #             for s, fp_id in zip(session_ids, footprint_ids)
-    #         ],
-    #         format="csc",
-    #     )
-    #     union_footprint = footprints.mean(axis=1)
-    #     union_footprint[union_footprint < 0.001] = 0  # threshold small values to zero
-    #     union_footprint = sparse.csc_matrix(union_footprint)
-    #     self.neurons.union_footprints[neuron_id] = union_footprint
+        super().unregister_neurons(session_id)
+        self.state.assignments = self.assignments
+        if self.state.current_session_id == session_id:
+            self.state.current_session_id = None
 
-    # def rebuild_neurons(self, ctx: Optional[TaskContext] = None) -> Neurons | None:
-    #     assignments = self.state.assignments
-    #     if ctx is not None:
-    #         ctx.message("Rebuilding neuron data...")
-    #         ctx.progress(0)
-    #     fields = ["centroids"]
-    #     quality_fields = ["SNR_comp", "r_values", "cnn_preds"]
+        self.adjust_selected_components_after_data_change(session_id, -1)
 
-    #     neurons = Neurons()
-    #     neurons.n = assignments.shape[0]
-    #     if not self.sessions or assignments is None:
-    #         print("No data or assignments available to build neurons.")
-    #         return None
+        self._on_data_changed(("assignments", -1))
 
-    #     centroids = np.full(assignments.shape + (2,), np.nan, dtype=np.float32)
-    #     for session_id, footprints in enumerate(assignments.T):
+    def adjust_selected_components_after_data_change(
+        self, session_id: int, new_session_id: int
+    ):
 
-    #         if (
-    #             self.sessions[session_id] is None
-    #             or self.sessions[session_id].centroids is None
-    #         ):
-    #             continue
-    #         fp_idx = np.where(footprints >= 0)[0]
-    #         fp_ids = assignments[fp_idx, session_id]
-    #         centroids[fp_idx, session_id, :] = self.sessions[session_id].centroids[
-    #             fp_ids, :
-    #         ]
-    #     neurons.centroids = centroids
+        ## adjust selected components to reflect the new session IDs
+        for component in self.state.selected_components:
+            if component.session_id == session_id:
 
-    #     neurons.union_footprints = {}
-    #     for neuron, footprint_ids in enumerate(assignments):
-    #         if ctx is not None and ctx.cancel_check():
-    #             ctx.message("Cancelled by user.")
-    #             return None
+                ## first, check if neuron is still present
+                if component.neuron_id >= self.assignments.shape[0]:
+                    component.session_id = -1  # No other sessions, mark as invalid
+                    continue
 
-    #         footprints = sparse.hstack(
-    #             [
-    #                 (
-    #                     self.sessions[s].A[:, f]
-    #                     if f >= 0
-    #                     else sparse.csc_matrix((np.prod(self.sessions[s].dims), 1))
-    #                 )
-    #                 for s, f in enumerate(footprint_ids)
-    #             ],
-    #             format="csc",
-    #         )
-    #         union_footprint = footprints.mean(axis=1)
-    #         union_footprint[union_footprint < 0.001] = (
-    #             0  # threshold small values to zero
-    #         )
-    #         union_footprint = sparse.csc_matrix(union_footprint)
-    #         neurons.union_footprints[neuron] = union_footprint
+                # if new_session_id >= 0:
+                component.session_id = new_session_id
+                ## dynamically find first first session presence, if session is removed
+                if new_session_id == -1:
+                    other_sessions = np.where(
+                        self.state.assignments[component.neuron_id, :]
+                    )[0]
+                    if len(other_sessions):
+                        component.session_id = other_sessions[0]
 
-    #         if ctx is not None:
-    #             ctx.progress(int((neuron + 1) / len(assignments) * 100))
+        self.state.update_selected_components(
+            [c for c in self.state.selected_components if c.session_id != -1]
+        )
 
-    #     return neurons
+    def load_registration(self, path_registration: str | Path):
+        super().load_registration(path_registration)
+        self.state.assignments = self.assignments
+        self._on_data_changed(("assignments", -1))  # Notify that neurons have changed

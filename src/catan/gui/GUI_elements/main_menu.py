@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Dict, Optional, Tuple, List
 import os, tqdm, importlib
 from PySide6.QtWidgets import (
     QWidget,
@@ -150,8 +150,8 @@ class MainMenu(QFrame):
     # print()
 
     def set_busy(self, busy: bool):
-        pass
-        # self.button_load.setEnabled(not busy)
+        # pass
+        self.button_load.setEnabled(not busy)
         # self.plot_mode_selector.setEnabled(not busy)
         # self.button_cancel.setVisible(busy)
 
@@ -163,11 +163,14 @@ class MainMenu(QFrame):
     def on_load_clicked(self):
 
         # run "busy method" to load data and update model
+        self.set_busy(True)
         mode = app_modes[self.dropdown_app_mode.currentText()]
         if mode == "single":
             self.load_from_session(set_active=True)
         if mode == "tracking":
             self.load_from_tracking()
+
+        self.set_busy(False)
 
         # self.state.tasks.start(
         #     "rebuild_neurons",
@@ -223,22 +226,10 @@ class MainMenu(QFrame):
 
         if len(self.data.sessions) > 1:
             self.data.fit_to_model()
-            # try:
-            #     # print("Fitting model to data...")
-            # except Exception as e:
-            #     # print("Error fitting model:", e)
-            #     QMessageBox.warning(
-            #         self,
-            #         "Model fitting error",
-            #         f"An error occurred while fitting the model to the data:\n{e}",
-            #     )
-            #     self.state.session_added = session_id
-            #     return
 
         self.data.register_neurons(from_session_id=session_id, clean_traces=False)
-        self.state.assignments = self.data.assignments
+
         self.state.session_added = session_id
-        # print(self.state.assignments)
 
         if set_active or self.state.current_session_id is None:
             self.state.current_session_id = session_id
@@ -253,7 +244,6 @@ class MainMenu(QFrame):
         print(
             f"Sessions now in memory: {[session.name for session in self.data.sessions]}"
         )
-        self.state.assignments = self.data.assignments
 
         ## prepare checking for common path
         paths = [
@@ -288,7 +278,7 @@ class MainMenu(QFrame):
     def handler_data_changed(self, input: tuple[str, int]):
         data_type, data_value = input
         if (
-            data_type != "session"
+            data_type != "sessions"
             or self.data is None
             or not isinstance(data_value, int)
         ):
@@ -528,7 +518,7 @@ class MainMenu(QFrame):
         pick_dir: bool = False,
         init_path: str = "",
         only_tail: bool = False,
-        edit_line: QLineEdit | None = None,
+        edit_line: Optional[QLineEdit] = None,
         display_text: str = "Select file",
     ):
         if pick_dir:

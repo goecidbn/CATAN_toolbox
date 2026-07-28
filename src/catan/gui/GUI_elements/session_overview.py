@@ -163,16 +163,16 @@ class SessionRowWidget(QFrame):
         self._update_background()
 
     def _update_buttons(self):
-        has_traces = getattr(self.session, "traces_loaded", False)
-        is_matched = getattr(self.session, "matched", False)
-        is_loaded = getattr(self.session, "loaded", True)
-        is_scheduled = getattr(self.session, "scheduled_for_loading", False)
+        # has_traces = self.session.status["traces_loaded"]
+        # is_matched = getattr(self.session, "matched", False)
+        # is_loaded = getattr(self.session, "loaded", True)
+        # is_scheduled = getattr(self.session, "scheduled_for_loading", False)
 
         # self.trace_button.setText("Unload traces" if has_traces else "Load traces")
         # self.match_button.setText("Unmatch" if is_matched else "Match")
 
         # print("Updating buttons for session", self.session_id, ":", has_traces)
-        if has_traces:
+        if self.session.status["traces_loaded"]:
             set_button_icon(
                 self.trace_button,
                 ("fa6s.trash-can", "fa5s.trash-alt"),
@@ -191,7 +191,7 @@ class SessionRowWidget(QFrame):
                 fallback_theme_icon="media-playback-start",
             )
 
-        if is_matched:
+        if self.session.status["matched"]:
             set_button_icon(
                 self.match_button,
                 ("fa6s.note-sticky", "fa5s.note-sticky"),
@@ -206,7 +206,7 @@ class SessionRowWidget(QFrame):
                 fallback_theme_icon="applications-games",
             )
 
-        if is_loaded:
+        if self.session.status["spatial_loaded"]:
             set_button_icon(
                 self.data_button,
                 ("fa6s.trash-can", "fa5s.trash-alt"),
@@ -299,8 +299,6 @@ class SessionRowWidget(QFrame):
         menu.addAction(remove_action)
 
         menu.exec(self.mapToGlobal(pos))
-
-
 
 
 class SessionOverview(QWidget):
@@ -415,8 +413,7 @@ class SessionOverview(QWidget):
         session.time_offset = value
         self.refresh_rows()
 
-        if hasattr(self.state, "data_changed"):
-            self.state.data_changed.emit(("session", session_id))
+        self.state.data_changed.emit(("sessions", session_id))
 
     # def change_session_color(self, session_id: int):
     #     session = self.data.sessions[session_id]
@@ -450,19 +447,12 @@ class SessionOverview(QWidget):
 
     def toggle_match(self, session_id: int):
 
-        if getattr(self.data.sessions[session_id], "matched", False):
+        if self.data.sessions[session_id].status["matched"]:
             self.data.unregister_neurons(session_id)
         else:
             self.data.register_neurons(from_session_id=session_id)
 
         self.refresh_rows()
-
-        # if hasattr(self.state, "data_changed"):
-        self.state.assignments = self.data.assignments
-        print(
-            " not optimal - both should be updated automatically, or only one should exist!"
-        )
-        self.state.data_changed.emit(("assignment", -1))
 
     def toggle_session_data(self, session_id: int):
         session = self.data.sessions[session_id]
@@ -476,8 +466,7 @@ class SessionOverview(QWidget):
 
         self.refresh_rows()
 
-        if hasattr(self.state, "data_changed"):
-            self.state.data_changed.emit(("session", session_id))
+        self.state.data_changed.emit(("sessions", session_id))
 
     def remove_session(self, session_id: int):
         session = self.data.sessions[session_id]
@@ -496,11 +485,7 @@ class SessionOverview(QWidget):
         # in assignments, plots, tracking arrays, caches, etc.
         self.data.remove_session(session_id)
 
-        self.reindex_sessions_after_order_change()
         self.rebuild_after_structure_change()
-
-        if hasattr(self.state, "data_changed"):
-            self.state.data_changed.emit(("session", session_id))
 
     def move_session(self, session_id: int, delta: int):
         new_id = session_id + delta
@@ -509,22 +494,5 @@ class SessionOverview(QWidget):
             return
 
         self.data.move_session(session_id, new_id)
-        self.state.assignments = move_index_along_axis(
-            self.state.assignments, axis=1, old=session_id, new=new_id
-        )
 
-        self.reindex_sessions_after_order_change()
         self.rebuild_after_structure_change()
-
-        if hasattr(self.state, "data_changed"):
-            self.state.data_changed.emit(("session", -1))
-
-    def reindex_sessions_after_order_change(self):
-        for session_id, session in enumerate(self.data.sessions):
-
-            if session is None:
-                continue
-
-            if self.state.current_session_id == session.id:
-                self.state.current_session_id = session_id
-            session.id = session_id

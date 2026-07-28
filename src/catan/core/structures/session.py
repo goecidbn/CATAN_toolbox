@@ -9,7 +9,15 @@ from pathlib import Path
 from .remap import Remapping
 
 from catan.core.data import center_of_mass
-from catan.core.io import load_data, write_sparse_matrix, write_optional_attr, write_optional_array, read_sparse_matrix, read_optional_attr, read_optional_array
+from catan.core.io import (
+    load_data,
+    write_sparse_matrix,
+    write_optional_attr,
+    write_optional_array,
+    read_sparse_matrix,
+    read_optional_attr,
+    read_optional_array,
+)
 
 component_quality_default = {
     "SNR_lowest": 1.0,
@@ -42,10 +50,10 @@ class SessionData:
     ## meta data
     name: Optional[str] = None  #
     path: Optional[str] = None  #
-    id: int = -1    #
+    id: int = -1  #
 
-    active: bool = True #
-    time_offset: float = 0.0    #
+    active: bool = True  #
+    time_offset: float = 0.0  #
     session_color: Optional[str] = None
     use_kde: bool = False
 
@@ -57,18 +65,18 @@ class SessionData:
     _spatial_fields = ["dims", "A", "Cn"]
     dims: Tuple[int, int] = (512, 512)  #
     A: sparse.csc_matrix  # = None  #
-    Cn: Optional[np.ndarray] = None #
+    Cn: Optional[np.ndarray] = None  #
     # temporal
     _trace_fields = ["C", "F_dff", "F_dff_dec", "S", "S_dff"]
     _traces: dict[str, np.ndarray] = {}
     _default_trace: Optional[str] = None
     # other
     _quality_fields = ["SNR_comp", "r_values", "cnn_preds"]
-    quality: dict[str, np.ndarray] = {} #
+    quality: dict[str, np.ndarray] = {}  #
 
     ## to be calculated (from input)
-    remap: Optional[Remapping] = None   #
-    n_neurons: int = -1 #
+    remap: Optional[Remapping] = None  #
+    n_neurons: int = -1  #
     centroids: np.ndarray  #
     idx_eval: np.ndarray  #
     ## to be calculated (with additional information)
@@ -211,7 +219,6 @@ class SessionData:
         if self.status["scheduled_quality"]:
             self.register_quality(**data)
             self.status["scheduled_quality"] = False
-
 
     def schedule_spatial_load(self):
         if not self.status["scheduled_spatial"]:
@@ -365,7 +372,12 @@ class SessionData:
         else:
             ## check if A and Cn are consistent (e.g. transposition) and adjust if needed
             # print("testing for transpose of Cn relative to A...")
-            remap = Remapping(template=A_proj, template_reference=self.Cn, use_optical_flow=False, evaluate=False)
+            remap = Remapping(
+                template=A_proj,
+                template_reference=self.Cn,
+                use_optical_flow=False,
+                evaluate=False,
+            )
             remap.test_transpose(A_proj, self.Cn)
             self.Cn = remap.fix_transpose(self.Cn)
 
@@ -426,17 +438,18 @@ class SessionData:
         self.status["spatial_loaded"] = False
         self.status["scheduled_spatial"] = False
 
-
     ### =============================================================================== ###
     ### ================================ SAVE METHODS ================================= ###
     ### =============================================================================== ###
-    
+
     def to_hdf5(self, group: h5py.Group, exclude_fields=["traces"]) -> None:
         group.attrs["object_type"] = "SessionData"
         group.attrs["schema_version"] = self.HDF5_VERSION
 
         write_optional_attr(group, "name", self.name)
-        write_optional_attr(group, "path", str(self.path) if self.path is not None else None)
+        write_optional_attr(
+            group, "path", str(self.path) if self.path is not None else None
+        )
         group.attrs["id"] = self.id
 
         group.attrs["active"] = self.active
@@ -468,15 +481,12 @@ class SessionData:
 
         write_optional_array(group, "idx_eval", self.idx_eval, compression="gzip")
 
-
     @classmethod
     def from_hdf5(cls, group: h5py.Group | h5py.File) -> "SessionData":
 
         version = int(group.attrs.get("schema_version", 1))
         if version != 1:
-            raise ValueError(
-                f"Unsupported SessionData schema version: {version}"
-            )
+            raise ValueError(f"Unsupported SessionData schema version: {version}")
 
         name = read_optional_attr(group, "name")
         path = read_optional_attr(group, "path")
@@ -488,7 +498,11 @@ class SessionData:
         ## spatial group
         dims = tuple(group.attrs.get("dims", (512, 512)))
 
-        A = read_sparse_matrix(group["A"]) if "A" in group else sparse.csc_matrix((0, 0))
+        A = (
+            read_sparse_matrix(group["A"])
+            if "A" in group
+            else sparse.csc_matrix((0, 0))
+        )
         Cn = read_optional_array(group, "Cn")
 
         ## trace group
@@ -497,6 +511,7 @@ class SessionData:
             traces_group = group["traces"]
             if isinstance(traces_group, h5py.Group):
                 traces = {key: traces_group[key][()] for key in traces_group}
+        assert isinstance(traces, dict), "Traces should be a dictionary"
 
         ## quality group
         quality = {}
@@ -507,7 +522,7 @@ class SessionData:
                     value = read_optional_array(quality_group, key)
                     if value is not None:
                         quality[key] = value
-                        
+
         ## remap substructure
         remap = None
         if "remapping" in group:
@@ -528,16 +543,15 @@ class SessionData:
             Cn=Cn,
             remap=remap,
             idx_eval=idx_eval,
-            # **traces,
-            **quality,
+            **{traces | quality},
         )
         # if A is not None:
         #     out.postprocess_spatial_data()
         # if quality:
         #     out.get_idx_eval_from_quality_params()
-        
+
         return out
-            
+
     # def cast_to_dict(self, fields=None):
 
     #     if fields is None:
@@ -549,11 +563,6 @@ class SessionData:
     #         assert hasattr(self,field), "SessionData object is missing field {field} for converting to dict"
     #         out[field] = getattr(self, field)
     #     return out
-
-            
-        
-
-
 
     ### ============================================================================== ###
     ### ================================ ALIGNMENT METHODS =========================== ###
@@ -597,7 +606,7 @@ class SessionData:
         # print(f"Evaluating alignment status for session {self.name}...")
         if self.remap is None:
             ## if no remapping was done, assume this is the first session (and include it!)
-            self.aligned = True
+            self.status["aligned"] = True
             return
         params = params or self.params
         max_shift = params.get("max_session_shift", 50.0)
@@ -611,34 +620,34 @@ class SessionData:
 
         ## check for coherence with other sessions (low shift, high correlation)
         if self.remap.shift is None:
-            self.aligned = False
+            self.status["aligned"] = False
             return
         abs_shift = np.sqrt(self.remap.shift[0] ** 2 + self.remap.shift[1] ** 2)
         if np.isnan(abs_shift) or (abs_shift > max_shift):
-            self.aligned = False
+            self.status["aligned"] = False
             return  ## huge shift
 
         if self.remap.c_max is None:
-            self.aligned = False
+            self.status["aligned"] = False
             return
         if (
             np.all(np.isnan(self.remap.c_max))
             or np.nanmedian(self.remap.c_max) < min_corr
         ):
-            self.aligned = False
+            self.status["aligned"] = False
             return
 
         if self.remap.c_zscored is None:
-            self.aligned = False
+            self.status["aligned"] = False
             return
         if (
             np.all(np.isnan(self.remap.c_zscored))
             or np.nanmedian(self.remap.c_zscored) < min_zscore
         ):
-            self.aligned = False
+            self.status["aligned"] = False
             return
 
-        self.aligned = True
+        self.status["aligned"] = True
 
     ### ============================================================================== ###
     ### =========================== KERNEL DENSITY ESTIMATE ========================== ###

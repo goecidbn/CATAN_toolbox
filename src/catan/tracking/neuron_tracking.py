@@ -42,37 +42,48 @@ from catan.core.io import load_data, save_data
 
 logging.basicConfig(level=logging.INFO)
 
+
 class Tracking:
 
+    assignments: np.ndarray
     union: SessionData
 
     HDF5_VERSION = 1
 
-    def __init__(self, neighbor_distance=25.0, bins=64, n_threads=1, use_kde=False, pxtomu=1., L=512, logLevel=logging.ERROR):
+    def __init__(
+        self,
+        neighbor_distance=25.0,
+        bins=64,
+        n_threads=1,
+        use_kde=False,
+        pxtomu=1.0,
+        L=512,
+        logLevel=logging.ERROR,
+    ):
         """
         Central class for neuron tracking via session registration, model building and neuron registration
-        
+
         Parameters
         ----------
 
         neighbor_distance : float = 25.
             the distance (in mu m) up to where neuron similarities and distances are calculated and registered for model building (shouldn't be much smaller, as the distance model requires at least some further ranging data)
-            
+
         bins : int = 64
             number of bins used for model building and count registration. Should be a number 2^n to allow scaling down.
 
         n_threads: int = 1
             the number of threads to use, when calculating footprint similarity - the costly part of the analysis
-            
+
         use_kde: bool = False
             specifies, whether neurons from areas of lowest and highest neuron density are excluded when building the probabilistic model. Costly, but can avoid some weird behavior
-            
+
         pxtomu: float = 1.
             the factor to transform pixels to micrometer (mu m) distance
-        
+
         L: int = 512
             number of pixels along one dimension (actually - this should rather be the window length in mu m)
-                    """
+        """
         self.log = logging.getLogger("matchinglogger")
         self.log.setLevel(logLevel)
 
@@ -109,28 +120,28 @@ class Tracking:
         name: Optional[str] = None,
         load_content: List[str] = ["quality", "spatial", "temporal"],
         align=True,
-    ):
+    ) -> int:
         """
         Register a new session from a file, load the data and add it to the list of sessions. The session is aligned to the previous sessions if align=True.
 
         Input
-        
-        - from_file: str 
-            
+
+        - from_file: str
+
             Path to the session file
 
         - name: Optional[str]
 
             Optional name for this session
-        
+
         - load_content: list[str] = ["spatial", "temporal", "quality"]
 
             Specifies which data should be loaded and can be either combination of the three above - but setting all is strongly encouraged.
-            
+
             spatial: loads footprint and background data - necessary to do any kind of further processing
-            traces: loads temporal traces - not entirely necessary, but is used to test for overlapping neurons with highly correlated activity 
+            traces: loads temporal traces - not entirely necessary, but is used to test for overlapping neurons with highly correlated activity
             quality: loads quality parameters (SNR_comp, r_values, cnn_preds for CaImAn) which are used for thresholding
-        
+
         - align: bool = True
 
             Flag for aligning the spatial components to prior registered sessions (using rigid and non-rigid correction). Highly encouraged to leave this enabled, unless sessions are already aligned. For further details see demo notebook `alignment.ipynb`
@@ -153,6 +164,7 @@ class Tracking:
             raise ValueError(
                 "from_file must be provided for session registration for now - registration from raw data to be implemented later"
             )
+        return this_data.id
 
     @property
     def alignment_template(self):
@@ -166,7 +178,7 @@ class Tracking:
             [
                 this_data.Cn
                 for this_data in self.sessions[-alignment_window:]
-                if this_data.aligned
+                if this_data.status["aligned"]
             ],
             axis=0,
         )
@@ -226,7 +238,7 @@ class Tracking:
             align_to_reference=align_to_reference,
         )
 
-        if not this_data.aligned:
+        if not this_data.status["aligned"]:
             print(f"Session {from_file} did not pass quality criteria, skipping.")
             return
 
@@ -512,7 +524,9 @@ class Tracking:
 
         p_same = self.f_same(self.params["arrays"]["distance_bounds"], 1.0)
         idx_cutoff = np.where(p_same < 0.05)[0][0]
-        self.distance_cutoff = max(10, self.params["arrays"]["distance_bounds"][idx_cutoff] * 1.5)  ## make sure, also half-detected ones have a chance!
+        self.distance_cutoff = max(
+            10, self.params["arrays"]["distance_bounds"][idx_cutoff] * 1.5
+        )  ## make sure, also half-detected ones have a chance!
 
     def get_f_same(self, model="joint"):
 
@@ -640,10 +654,10 @@ class Tracking:
             align_to_reference=align_to_reference,
         )
 
-        if not this_data.aligned or this_data.A is None:
+        if not this_data.status["aligned"] or this_data.A is None:
 
             print(f"Session {this_data.path} did not pass quality criteria, skipping.")
-            self.assignments = pad_axis(self.assignments, (0, 1), -1)
+            self.assignments = pad_axis(self.assignments, [0, 1], -1)
             self.tracking["p_matched"] = pad_axis(
                 self.tracking["p_matched"], (0, 1, 0), np.nan
             )
@@ -679,7 +693,7 @@ class Tracking:
             self.tracking["shifts"][:, this_data.id, :] = 0.0
 
             # self.handover_parameters(N_add, this_data)
-            this_data.matched = True
+            this_data.status["matched"] = True
             if clean_traces:
                 this_data.clean_traces()
             # self.nS += 1
@@ -723,9 +737,7 @@ class Tracking:
             matched = np.array([], "int")
 
         ## find neurons which were not matched in current and reference session
-        non_matched_ref = np.setdiff1d(
-            list(range(self.union.n_neurons)), matched_ref
-        )
+        non_matched_ref = np.setdiff1d(list(range(self.union.n_neurons)), matched_ref)
         non_matched = np.setdiff1d(
             list(np.where(this_data.idx_eval)[0]), matches[1][idx_TP]
         )
@@ -818,7 +830,7 @@ class Tracking:
             assert np.all(
                 self.assignments[:, this_data.id] == -1
             ), "Session already has assignments, cannot overwrite!"
-            print(f"adding {N_add} new neurons to union for session {this_data.id}")
+            # print(f"adding {N_add} new neurons to union for session {this_data.id}")
             self.assignments = pad_axis(self.assignments, (N_add, 0), -1)
             self.tracking["p_matched"] = pad_axis(
                 self.tracking["p_matched"], (N_add, 0, 0), np.nan
@@ -858,13 +870,41 @@ class Tracking:
         ### --------------------------------------------------------------------------- ###
 
         # self.handover_parameters(N_add, this_data)
-        this_data.matched = True
+        this_data.status["matched"] = True
         if clean_traces:
             this_data.clean_traces()
 
         # if np.any(np.all(self.tracking["p_matched"] > 0.9, axis=2)):
         #     print("double match!")
         #     return
+
+    def move_session(self, old_session_id: int, new_session_id: int):
+        """
+        Moves a session's data from one session ID to another, updating assignments and tracking accordingly.
+        """
+        if old_session_id < 0 or old_session_id >= self.assignments.shape[1]:
+            raise ValueError(
+                "Invalid old_session_id. It must be within the range of existing sessions."
+            )
+        if new_session_id < 0 or new_session_id >= self.assignments.shape[1]:
+            raise ValueError(
+                "Invalid new_session_id. It must be within the range of existing sessions."
+            )
+
+        session = self.sessions.pop(old_session_id)
+        self.sessions.insert(new_session_id, session)
+        self.reindex_sessions_after_order_change()
+
+        # Move the session's data in assignments and tracking
+        self.assignments[:, [old_session_id, new_session_id]] = self.assignments[
+            :, [new_session_id, old_session_id]
+        ]
+        self.tracking["p_matched"][:, [old_session_id, new_session_id], :] = (
+            self.tracking["p_matched"][:, [new_session_id, old_session_id], :]
+        )
+        self.tracking["shifts"][:, [old_session_id, new_session_id], :] = self.tracking[
+            "shifts"
+        ][:, [new_session_id, old_session_id], :]
 
     def unregister_neurons(self, session_id: int):
         """
@@ -882,7 +922,9 @@ class Tracking:
         self.tracking["shifts"][:, session_id, :] = np.nan
 
         self.updating_neuron_presence()  # Update neuron presence and clean union data
-        self.sessions[session_id].matched = False  # Mark the session as unmatched
+        self.sessions[session_id].status[
+            "matched"
+        ] = False  # Mark the session as unmatched
 
     def remove_session(self, session_id: int):
         """
@@ -903,6 +945,7 @@ class Tracking:
 
         self.updating_neuron_presence()  # Update neuron presence and clean union data
         self.sessions.pop(session_id)
+        self.reindex_sessions_after_order_change()  # Reindex sessions after removal
 
     def updating_neuron_presence(self):
 
@@ -912,9 +955,6 @@ class Tracking:
         self.tracking["p_matched"] = self.tracking["p_matched"][neuron_presence, :, :]
         self.tracking["shifts"] = self.tracking["shifts"][neuron_presence, :, :]
 
-        print(
-            f"shape union data before cleaning: {self.union.A.shape}, vs {self.union.n_neurons}"
-        )
         ## could just rebuild it entirely from the remaining sessions, but for now just remove the columns of empty neurons
         A_cleaned = sparse.hstack(
             [
@@ -926,7 +966,15 @@ class Tracking:
         )
         self.union.register_spatial(A=A_cleaned)
 
-        print(f"Updated union data now contains {self.union.n_neurons} neurons.")
+        # print(f"Updated union data now contains {self.union.n_neurons} neurons.")
+
+    def reindex_sessions_after_order_change(self):
+        for session_id, session in enumerate(self.sessions):
+
+            if session is None:
+                continue
+
+            session.id = session_id
 
     # def get_variable_by_cluster(self, var, c=None):
     #     """
@@ -1028,7 +1076,7 @@ class Tracking:
         for session in self.sessions:
 
             session.evaluate_alignment_status()
-            status[session.id] = session.aligned
+            status[session.id] = session.status["aligned"]
         ## check for coherence with other sessions (low shift, high correlation)
         # abs_shift = np.array([np.sqrt(x**2 + y**2) for (x, y) in alignment["shift"]])
         # status[abs_shift > max_shift] = False  ## huge shift
@@ -1390,11 +1438,14 @@ class Tracking:
 
         suffix = fix_suffix(suffix)
 
-        with h5py.File(output_directory / f"neuron_registration{suffix}{ext}", "w") as f:
+        with h5py.File(
+            output_directory / f"neuron_registration{suffix}{ext}", "w"
+        ) as f:
             self.to_hdf5(f)
 
-        print(f"Saved neuron registration to {output_directory / f'neuron_registration{suffix}{ext}'}")
-
+        print(
+            f"Saved neuron registration to {output_directory / f'neuron_registration{suffix}{ext}'}"
+        )
 
         # data = {
         #     "sessions": self.sessions,
@@ -1430,55 +1481,22 @@ class Tracking:
         sessions_group.attrs["n_sessions"] = len(self.sessions)
 
         for session in self.sessions:
-            session_group = sessions_group.create_group(
-                f"session_{session.id:03d}"
-            )
+            session_group = sessions_group.create_group(f"session_{session.id:03d}")
             session.to_hdf5(session_group)
 
-        union_group = sessions_group.create_group(
-            f"union"
-        )
+        union_group = sessions_group.create_group(f"union")
         self.union.to_hdf5(union_group)
-            
-    def load_registration(self, path_registration: str):
+
+    def load_registration(self, path_registration: str | Path):
 
         with h5py.File(path_registration, "r") as f:
-            self.assignments, self.tracking, self.sessions, self.union = self.from_hdf5(f)
-        
-        # ld = load_data(path_registration, subpath="/")
-        # print("path:",path_registration)
-        # print(ld.keys())
-        # assert (
-        #     "sessions" in ld and "assignments" in ld and "tracking" in ld
-        # ), "Data does not contain necessary fields 'sessions', 'assignments', and 'tracking'"
+            self.assignments, self.tracking, self.sessions, self.union = self.from_hdf5(
+                f
+            )
 
-        # self.sessions = ld["sessions"]
-        # print(self.sessions)
-
-        # self.assignments = ld["assignments"]
-        # self.tracking = ld["tracking"]
-
-        ## ensure session keys are integers (as saving/loading casts them to strings...)
-        # self.sessions = []
-        # for session in sessions:
-            # print("remap", this_data["remap"])
-            # print("Session key:", s)
-            # self.sessions.append(SessionData(**this_data))
-
-        # sessions["file_paths"] = [
-        #     str(fp.decode("utf-8")) for fp in sessions["file_paths"]
-        # ]
-        # if suffix is None:
-        #     suffix = self.paths["suffix"]
-        # suffix = fix_suffix(suffix)
-
-        # ext = "mat" if (matlab is None and self.matlab) or matlab else "pkl"
-        # pathLd = (
-        #     Path(self.paths["data"]) / f"matching/neuron_registration{suffix}.{ext}"
-        # )
-
-
-    def from_hdf5(cls, group: h5py.Group | h5py.File):
+    def from_hdf5(
+        cls, group: h5py.Group | h5py.File
+    ) -> tuple[np.ndarray, dict[str, np.ndarray], list[SessionData], SessionData]:
         if group.attrs.get("object_type") != "TrackingResult":
             raise ValueError(
                 "The provided HDF5 group does not contain a TrackingResult object."
@@ -1490,20 +1508,36 @@ class Tracking:
             )
 
         assignments = group["assignments"][()]
+        assert isinstance(
+            assignments, np.ndarray
+        ), "Assignments should be a numpy array"
         tracking = {
             "p_matched": group["tracking"]["p_matched"][()],
             "shifts": group["tracking"]["shifts"][()],
         }
+        assert isinstance(tracking, dict), "Tracking should be a dictionary"
+        assert isinstance(
+            tracking["p_matched"], np.ndarray
+        ), "p_matched should be a numpy array"
+        assert isinstance(
+            tracking["shifts"], np.ndarray
+        ), "shifts should be a numpy array"
 
         sessions_group = group["sessions"]
         n_sessions = sessions_group.attrs["n_sessions"]
         sessions = []
         for i in range(n_sessions):
             session_group = sessions_group[f"session_{i:03d}"]
+            assert isinstance(
+                session_group, h5py.Group
+            ), f"Session group for session {i} is not a valid HDF5 group"
             session = SessionData.from_hdf5(session_group)
             sessions.append(session)
 
         union_group = sessions_group["union"]
+        assert isinstance(
+            union_group, h5py.Group
+        ), "Union group is not a valid HDF5 group"
         union = SessionData.from_hdf5(union_group)
 
         return assignments, tracking, sessions, union
@@ -1516,8 +1550,10 @@ class Tracking:
             output_directory = self._default_matching_directory()
 
         output_directory = Path(output_directory).expanduser().resolve()
-        assert isinstance(output_directory, Path), f"output_directory {output_directory} should be a Path object"
-        
+        assert isinstance(
+            output_directory, Path
+        ), f"output_directory {output_directory} should be a Path object"
+
         output_directory.mkdir(
             parents=True,
             exist_ok=True,
@@ -1529,9 +1565,14 @@ class Tracking:
         self,
     ) -> Path:
 
-        candidate_paths = [Path(session.path).parent for session in self.sessions if session.path is not None]
+        candidate_paths = [
+            Path(session.path).parent
+            for session in self.sessions
+            if session.path is not None
+        ]
         common_path = os.path.commonpath([str(path) for path in candidate_paths])
         return Path(common_path) / "matching"
+
 
 def mean_of_trunc_lognorm(mu, sigma, trunc_loc):
 

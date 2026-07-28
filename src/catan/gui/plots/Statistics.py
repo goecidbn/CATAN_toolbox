@@ -54,6 +54,7 @@ importlib.reload(series_with_confidence)
 importlib.reload(plotdata_series)
 importlib.reload(StatisticsData)
 importlib.reload(Threshold)
+print("reloading Statistics.py")
 
 
 @dataclass
@@ -1075,6 +1076,11 @@ class Controller(BasePlot.CanvasController):
         self.canvas.signals.bin_clicked.connect(self._on_visual_clicked)
 
         self.canvas._on_threshold_changed = self._on_threshold_changed
+
+    def _on_data_changed(self, input: Tuple[str, int]):
+        if input[0] == "assignments":
+            self.rebuild_plot_data()
+            self.update_canvas()
 
     def _on_plot_params_changed(self):
         self.rebuild_plot_data()

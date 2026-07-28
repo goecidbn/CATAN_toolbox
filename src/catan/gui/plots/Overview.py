@@ -63,7 +63,7 @@ class Display(BasePlot.BaseCanvas):
         self.plotting["overlays"]["selected"].order = 70
 
     def plot_background(self):
-        print("Plotting background")
+
         if self.data.current_session is None:
             return
 
@@ -73,6 +73,8 @@ class Display(BasePlot.BaseCanvas):
             del self.plotting["background"]
 
         background = self.data.current_session.Cn
+        if background is None:
+            return
 
         background /= np.percentile(background, 90)
         self.plotting["background"] = visuals.Image(
@@ -84,7 +86,7 @@ class Display(BasePlot.BaseCanvas):
         self.plotting["background"].order = -1000  # ensure it's in the back
         self.plotting["background"].set_gl_state(depth_test=False, blend=False)
 
-        H, W = self.data.current_session.Cn.shape[:2]
+        H, W = background.shape[:2]
         self.view.camera.set_range(
             x=(0, W),
             y=(0, H),
@@ -261,6 +263,12 @@ class Display(BasePlot.BaseCanvas):
             key = self.state.current_session_id
         else:
             key = "union"
+
+        if key is None:
+            ## can happen on session unregistration
+            self.plotting["overlays"][style].visible = False
+            self.update()
+            return
 
         neuron_ids = [c.neuron_id for c in component]
         mask = np.isin(self.plotting["data"][key].ids, neuron_ids)

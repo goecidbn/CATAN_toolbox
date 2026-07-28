@@ -64,10 +64,11 @@ def get_footprint_id_from_mouse_pos(canvas, pos, centroids) -> Optional[int]:
 
 def print_debug(state, data):
 
-    # print("Current session:", state.current_session_id)
-    print(f"current session neurons:", data.sessions[0].traces_loaded)
-    print(f" union data:", data.union_data.A.shape)
-    print(f"union footprints:", data.union_data.A)
+    print("Current session:", state.current_session_id)
+    print(f"current session traces:", data.current_session.status["traces_loaded"])
+    print(f"current session traces:", data.current_session.traces)
+    # print(f" union data:", data.union_data.A.shape)
+    # print(f"union footprints:", data.union_data.A)
     # print(f"current session neurons:", data.sessions[1].traces_loaded)
     # print(f"current session neurons:", data.sessions[0].traces)
 

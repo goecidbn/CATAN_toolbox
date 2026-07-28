@@ -36,6 +36,8 @@ from catan.core.image_correlation import calculate_img_correlation
 
 importlib.reload(FootprintSlider)
 
+print("reloading Footprints.py")
+
 
 @dataclass
 class FootprintRecord:
@@ -672,9 +674,7 @@ class Display(BasePlot.BaseCanvas):
             menu.addAction(load_action)
 
             load_action.triggered.connect(
-                lambda: self.data.trigger_traces_load(
-                    this_component.session_id, self.state.data_changed
-                )
+                lambda: self.data.change_trace_presence(this_component.session_id, True)
             )
 
         menu.exec(QCursor.pos())
@@ -797,8 +797,9 @@ class Controller(BasePlot.CanvasController):
         #     lambda: self._on_session_only_changed()
         # )
 
-    def _on_data_changed(self):
-        self.replot_neurons()
+    def _on_data_changed(self, input: Tuple[str, int]):
+        if input[0] == "assignments":
+            self.replot_neurons()
 
     def initialize_display(self):
         if self.single_mode:
