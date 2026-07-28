@@ -166,7 +166,11 @@ class MainMenu(QFrame):
         self.set_busy(True)
         mode = app_modes[self.dropdown_app_mode.currentText()]
         if mode == "single":
-            self.load_from_session(set_active=True)
+            self.state.tasks.start(
+                "Load session data", self.load_from_session, finished=None
+            )
+
+            # self.load_from_session(set_active=True)
         if mode == "tracking":
             self.load_from_tracking()
 
