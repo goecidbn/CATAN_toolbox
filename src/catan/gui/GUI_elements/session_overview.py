@@ -40,7 +40,7 @@ class SessionRowWidget(QFrame):
 
     traceToggled = Signal(int)
     qualityToggled = Signal(int)
-    matchToggled = Signal(int)
+    spatialToggled = Signal(int)
 
     removeRequested = Signal(int)
 
@@ -87,7 +87,7 @@ class SessionRowWidget(QFrame):
 
         self.trace_button = make_icon_button()
         self.quality_button = make_icon_button()
-        self.match_button = make_icon_button()
+        self.spatial_button = make_icon_button()
 
         self.delete_button = make_icon_button(
             ("fa6s.ban", "fa5s.ban"),
@@ -104,9 +104,9 @@ class SessionRowWidget(QFrame):
             lambda: self.qualityToggled.emit(self.session_id)
         )
 
-        # self.match_button = QPushButton()
-        self.match_button.clicked.connect(
-            lambda: self.matchToggled.emit(self.session_id)
+        # self.spatial_button = QPushButton()
+        self.spatial_button.clicked.connect(
+            lambda: self.spatialToggled.emit(self.session_id)
         )
 
         # self.data_button = QPushButton()
@@ -125,7 +125,7 @@ class SessionRowWidget(QFrame):
         layout.addStretch()
         layout.addWidget(self.trace_button)
         layout.addWidget(self.quality_button)
-        layout.addWidget(self.match_button)
+        layout.addWidget(self.spatial_button)
         layout.addWidget(self.delete_button)
 
         self.refresh()
@@ -158,16 +158,26 @@ class SessionRowWidget(QFrame):
 
     def _update_buttons(self):
 
-        matched = self.session.status["matched"]
-        set_button_icon(
-            self.match_button,
-            ("fa6s.layer-group", "fa5s.layer-group"),
-            color="white" if not matched else "red",
-            tooltip=("Add to matching" if not matched else "Remove from matching"),
-            fallback_theme_icon=(
-                "applications-games" if not matched else "edit-delete"
-            ),
-        )
+        spatial_loaded = self.session.status["spatial_loaded"]
+        if not spatial_loaded:
+            set_button_icon(
+                self.spatial_button,
+                ("fa6s.layer","fa5s.layer"),
+                color="white",
+                tooltip="Load footprint data",
+                fallback_theme_icon="applications-games",
+            )
+        else:
+            matched = self.session.status["matched"]
+            set_button_icon(
+                self.spatial_button,
+                ("fa6s.layer-group", "fa5s.layer-group"),
+                color="white" if not matched else "red",
+                tooltip=("Add to matching" if not matched else "Remove from matching"),
+                fallback_theme_icon=(
+                    "applications-games" if not matched else "edit-delete"
+                ),
+            )
 
         trace_loaded = self.session.status["traces_loaded"]
         set_button_icon(
@@ -253,10 +263,10 @@ class SessionRowWidget(QFrame):
             self.trace_button.text(), lambda: self.traceToggled.emit(self.session_id)
         )
         menu.addAction(
-            self.quality_button.text(), lambda: self.dataToggled.emit(self.session_id)
+            self.quality_button.text(), lambda: self.qualityToggled.emit(self.session_id)
         )
         menu.addAction(
-            self.match_button.text(), lambda: self.matchToggled.emit(self.session_id)
+            self.spatial_button.text(), lambda: self.spatialToggled.emit(self.session_id)
         )
 
         menu.addSeparator()
@@ -286,7 +296,7 @@ class SessionOverview(QWidget):
 
         self._row_widgets: dict[int, SessionRowWidget] = {}
 
-        self.state.data_changed.connect(self.refresh_rows)
+        self.state.data_changed.connect(self._on_data_changed)
 
         self.rebuild()
 
@@ -313,7 +323,7 @@ class SessionOverview(QWidget):
 
         row.traceToggled.connect(self.toggle_traces)
         row.qualityToggled.connect(self.toggle_quality)
-        row.matchToggled.connect(self.toggle_match)
+        row.spatialToggled.connect(self.toggle_spatial)
         row.removeRequested.connect(self.remove_session)
 
         item.setSizeHint(row.sizeHint())
@@ -323,6 +333,13 @@ class SessionOverview(QWidget):
 
         self._row_widgets[session_id] = row
 
+    def _on_data_changed(self,input):
+        data_type, data_var = input
+        if data_type in ["session"]:
+            self.rebuild()
+        else:
+            self.refresh_rows()
+
     def refresh_rows(self):
         """
         Use this when session properties changed but the order did not.
@@ -331,12 +348,6 @@ class SessionOverview(QWidget):
             row.session_id = session_id
             row.session = self.data.sessions[session_id]
             row.refresh()
-
-    def rebuild_after_structure_change(self):
-        """
-        Use this after adding/removing/reordering sessions.
-        """
-        self.rebuild()
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         session_id = item.data(Qt.ItemDataRole.UserRole)
@@ -418,14 +429,16 @@ class SessionOverview(QWidget):
         self.data.change_quality_presence(session_id)
         self.refresh_rows()
 
-    def toggle_match(self, session_id: int):
+    def toggle_spatial(self, session_id: int):
+        
+        if not self.data.sessions[session_id].status["spatial_loaded"]:
+            self.data.change_spatial_presence(session_id,True)
+            return
 
         if self.data.sessions[session_id].status["matched"]:
             self.data.unregister_neurons(session_id)
         else:
             self.data.register_neurons(from_session_id=session_id)
-
-        self.refresh_rows()
 
     def remove_session(self, session_id: int):
         session = self.data.sessions[session_id]
@@ -444,8 +457,6 @@ class SessionOverview(QWidget):
         # in assignments, plots, tracking arrays, caches, etc.
         self.data.remove_session(session_id)
 
-        self.rebuild_after_structure_change()
-
     def move_session(self, session_id: int, delta: int):
         new_id = session_id + delta
 
@@ -453,5 +464,3 @@ class SessionOverview(QWidget):
             return
 
         self.data.move_session(session_id, new_id)
-
-        self.rebuild_after_structure_change()

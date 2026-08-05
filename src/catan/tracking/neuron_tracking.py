@@ -174,13 +174,16 @@ class Tracking:
         if len(self.sessions) == 0:
             return None
 
-        alignment_window = min(len(self.sessions), 10)
+        aligned_sessions = [session for session in self.sessions if session.status["aligned"]]
+        if len(aligned_sessions) == 0:
+            return None
+
+        alignment_window = min(len(aligned_sessions), 10)
 
         return np.stack(
             [
-                this_data.Cn
-                for this_data in self.sessions[-alignment_window:]
-                if this_data.status["aligned"]
+                session.Cn
+                for session in aligned_sessions[-alignment_window:]
             ],
             axis=0,
         )
@@ -250,7 +253,7 @@ class Tracking:
 
         if self.reference_data is not None:
             self.update_model_counts(this_data, mode="to_reference")
-
+        this_data.status["registered_to_model"] = True
         # self.alignment_template = copy.deepcopy(this_data.Cn)
         self.reference_data = copy.deepcopy(this_data)
 
@@ -916,6 +919,11 @@ class Tracking:
             raise ValueError(
                 "Invalid session_id. It must be within the range of existing sessions."
             )
+        self.sessions[session_id].status["matched"] = False  
+
+        if len(self.sessions) == 1:
+            self.reset_registration()
+            return
         # print(f"Session {session_id} has been unregistered. Updating union data...")
 
         # Mark assignments and tracking stats in this session as unassigned
@@ -924,18 +932,29 @@ class Tracking:
         self.tracking["shifts"][:, session_id, :] = np.nan
 
         self.updating_neuron_presence()  # Update neuron presence and clean union data
-        self.sessions[session_id].status[
-            "matched"
-        ] = False  # Mark the session as unmatched
+        # Mark the session as unmatched
 
     def remove_session(self, session_id: int):
         """
         Removes a session from the union data and updates assignments and tracking accordingly.
         """
-        if session_id < 0 or session_id >= self.assignments.shape[1]:
+        if session_id < 0 or session_id > len(self.sessions):
             raise ValueError(
                 "Invalid session_id. It must be within the range of existing sessions."
             )
+        if len(self.sessions)==1:
+            ## when last session is removed
+            self.reset_registration()
+            self.reset_data()
+            return
+        
+        self.sessions.pop(session_id)
+        
+        if session_id >= self.assignments.shape[1]:
+            raise ValueError(
+                "Session has not been registered yet."
+            )
+
         # print(f"Session {session_id} has been unregistered. Updating union data...")
 
         # Mark assignments and tracking stats in this session as unassigned
@@ -946,7 +965,6 @@ class Tracking:
         self.tracking["shifts"] = np.delete(self.tracking["shifts"], session_id, axis=1)
 
         self.updating_neuron_presence()  # Update neuron presence and clean union data
-        self.sessions.pop(session_id)
         self.reindex_sessions_after_order_change()  # Reindex sessions after removal
 
     def updating_neuron_presence(self):

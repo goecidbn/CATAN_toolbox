@@ -312,22 +312,25 @@ class Display(BasePlot.BaseCanvas):
         vertices_all = []
         faces_all = []
         colors_all = []
-        for session_id in range(len(self.data.sessions)):
+        for session in self.data.sessions:
 
-            component = NeuronComponent(session_id, neuron)
+            if not session.status["matched"]:
+                continue
+
+            component = NeuronComponent(session.id, neuron)
 
             fp_id = self.state.get_footprint_from_component(component)
             if fp_id is None or fp_id < 0:
                 continue
 
-            rgba = self.state.session_colors[session_id]
+            rgba = self.state.session_colors[session.id]
             rgba[3] = alpha
 
-            z_offset = float(session_id) * z_stretch
+            z_offset = float(session.id) * z_stretch
 
             v, f, c, pick_points = footprint_to_mesh(
-                self.data.sessions[session_id].A[:, fp_id],
-                self.data.sessions[session_id].dims,
+                self.data.sessions[session.id].A[:, fp_id],
+                self.data.sessions[session.id].dims,
                 z_offset=z_offset,
                 z_scale=z_stretch,
                 z_thr=thr,

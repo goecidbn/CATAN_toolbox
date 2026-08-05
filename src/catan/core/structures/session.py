@@ -107,6 +107,7 @@ class SessionData:
             "quality_loaded": False,
             # processing status flags
             "aligned": False,
+            "registered_to_model": False,
             "matched": False,
         }
 
@@ -200,7 +201,7 @@ class SessionData:
             self.path
         ).exists(), f"Path {self.path} does not exist, cannot reload traces."
         if len(self.fields_scheduled_for_loading) == 0:
-            # print("No fields scheduled for loading.")
+            print("No fields scheduled for loading.")
             return
 
         with h5py.File(self.path, "r") as f:

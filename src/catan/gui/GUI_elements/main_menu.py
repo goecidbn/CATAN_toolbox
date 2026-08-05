@@ -122,6 +122,7 @@ class MainMenu(QFrame):
         self.dropdown_app_mode.currentIndexChanged.connect(self.change_app_mode)
 
         self.state.data_changed.connect(self.handler_data_changed)
+        self.state.busy_changed.connect(self.toggle_busy)
 
     def rebuild(self):
         # importlib.reload(session_overview)
@@ -132,50 +133,27 @@ class MainMenu(QFrame):
         self.state.set_logging_level(self.logging.currentText())
         print("Logging level changed to:", self.state.logging_level)
 
-    # def on_current_session_changed(self, session_id: int):
-    #     print(f"Current session changed to {session_id}")
-
-    ## cleaning previous trace to free memory
-    ## shouldnt happen when comparing two analyses from one dataset (how?)
-    # if self.data.current_session is not None:
-    #     self.data.current_session.clean_traces()
-
-    # self.data.current_session = self.data.sessions[session_id]
-    # self.data.sessions[session_id].load_traces()
-    # print("traces loaded, now present:", self.data.current_session.traces.keys())
-    # print(
-    #     "traces loaded, now present:", self.data.sessions[session_id].traces.keys()
-    # )
-    # print()
-
-    def set_busy(self, busy: bool):
-        # pass
+    def toggle_busy(self, busy: bool):
         self.button_load.setEnabled(not busy)
-        # self.plot_mode_selector.setEnabled(not busy)
         # self.button_cancel.setVisible(busy)
-
-        # self.progress_bar.setVisible(busy)
-
-        # optional: allow panning/hovering but block plot-changing controls
-        # self.display_area.set_controls_enabled(not busy)
 
     def on_load_clicked(self):
 
         # run "busy method" to load data and update model
-        self.set_busy(True)
+        self.state.busy = True
         mode = app_modes[self.dropdown_app_mode.currentText()]
         if mode == "single":
-            finished = None
-            if self.checkbox_traces_load.isChecked():
-                finished = lambda id: self.data.change_trace_presence(id, True)
+
+            def finished(id):
+                if self.checkbox_traces_load.isChecked():
+                    self.data.change_trace_presence(id, True)
+                self.state.busy = False
             self.state.tasks.start(
                 "Load session data", self.load_from_session, finished=finished
             )
 
         if mode == "tracking":
             self.load_from_tracking()
-
-        self.set_busy(False)
 
         # self.state.tasks.start(
         #     "rebuild_neurons",
@@ -214,53 +192,108 @@ class MainMenu(QFrame):
     # self.data.sessions.append(this_data)
     # self.state.session_added = session_id
 
-    def load_from_session(self, set_active=True, ctx: Optional[TaskContext] = None):
+    def load_from_session(self, set_active=False, ctx: Optional[TaskContext] = None):
         """
         TODO:
         * change tracking stucture to hold assignments in base structure (and access from there, not hand over)
         """
         if ctx is not None:
-            ctx.message("Loading session data...")
-            ctx.progress(0)
+            progress = 0
 
-        load_content = ["spatial"]
-        load_content += ["quality"] if self.checkbox_quality_load.isChecked() else []
-        self.data.register_session(
-            from_file=str(self.results_file),
-            load_content=load_content,
-            align=True,
-            ctx=ctx,
-        )
-        session_id = self.data.sessions[-1].id
+            ct_ld = 1 # 1 ct for model fitting
+            for session in self.data.sessions:
+                if not session.status["spatial_loaded"] or not session.status["quality_loaded"]:
+                    # one count for loading
+                    ct_ld += 1
+                if not session.status["registered_to_model"]:
+                    # one count for alignment & model building
+                    ct_ld += 1
+                if not session.status["matched"]:
+                    # one count for registration
+                    ct_ld += 1
+                
+            progress_step = 1/ct_ld
+
+            ctx.progress(progress)
+
+        for s,session in enumerate(self.data.sessions):
+            if ctx is not None:
+                ctx.message(f"{session.name}: Loading data...")
+            load_content = []
+            if not session.status["spatial_loaded"]:
+                load_content.append("spatial")
+            if not session.status["quality_loaded"] and self.checkbox_quality_load.isChecked():
+                load_content.append("quality")
+            # if not session.status["traces_loaded"] and self.checkbox_traces_load.isChecked():
+            #     load_content.append("temporal")
+            session.load_data(which=load_content,alignment_template=self.data.alignment_template,ctx=ctx)
+
+            if ctx is not None:
+                progress += progress_step
+                ctx.progress(progress)
+
+            if not session.status["registered_to_model"]:
+                
+                if ctx is not None:
+                    ctx.message(f"{session.name}: Updating model...")
+                self.data.update_model_with_data(
+                    from_session_id=session.id,
+                )
+                if ctx is not None:
+                    progress += progress_step
+                    ctx.progress(progress)
+
+
+        # load_content = ["spatial"]
+        # load_content += ["quality"] if self.checkbox_quality_load.isChecked() else []
+        # self.data.register_session(
+        #     from_file=str(self.results_file),
+        #     load_content=load_content,
+        #     align=True,
+        #     ctx=ctx,
+        # )
+        # session_id = self.data.sessions[-1].id
 
         ## run tracking algorithm hereafter
+        # if ctx is not None:
+        #     ctx.message("Update match model...")
+        #     ctx.progress(33)
+
+        
         if ctx is not None:
-            ctx.message("Update match model...")
-            ctx.progress(33)
-
-        self.data.update_model_with_data(
-            from_session_id=session_id,
-        )
-        self.state.session_color = (session_id, self.session_colors.next())
-
+            ctx.message(f"Fitting model...")
+        
         if len(self.data.sessions) > 1:
             self.data.fit_to_model()
-
         if ctx is not None:
-            ctx.progress(66)
-            ctx.message("Registering neurons...")
+            progress += progress_step
+            ctx.progress(progress)
+        # if ctx is not None:
+        #     ctx.progress(66)
+        #     ctx.message("Registering neurons...")
 
-        self.data.register_neurons(from_session_id=session_id, clean_traces=False)
+        for session in self.data.sessions:
+            if ctx is not None:
+                ctx.message(f"{session.name}: Matching neurons...")
+            
+            if not session.status["matched"]:
+                self.data.register_neurons(from_session_id=session.id, clean_traces=False)
 
-        self.state.session_added = session_id
+            if ctx is not None:
+                progress += progress_step
+                ctx.progress(progress)
+            # self.state.session_added = session_id
 
         if set_active or self.state.current_session_id is None:
-            self.state.current_session_id = session_id
-        return session_id
+            self.state.current_session_id = self.data.sessions[-1].id
+        # return session_id
 
     def load_from_tracking(self):
 
         self.data.load_model(self.model_file)
+
+        ## load session data from a registration file 
+        ## instead of from separate sessions
         self.data.load_registration(self.registration_file)
         print(
             f"Loaded model from {self.model_file} and registration from {self.registration_file}"
@@ -277,7 +310,6 @@ class MainMenu(QFrame):
 
         common_path = os.path.commonpath(paths)
 
-        # self.data.sessions = []
         for session in tqdm.tqdm(self.data.sessions):
             if not common_path == self.root_folder:
                 ## if the common path is not the root_folder, this might be from
@@ -290,16 +322,15 @@ class MainMenu(QFrame):
                 session.path = str(
                     Path(self.root_folder) / Path(session.path).relative_to(common_path)
                 )
-                # this_data.path = (
-                #     new_path  # update path to current root folder structure
-                # )
-            # self.add_session(this_data)
+            
             self.state.session_color = (session.id, self.session_colors.next())
             self.state.session_added = session.id
 
         self.state.current_session_id = 0
 
     def handler_data_changed(self, input: tuple[str, int]):
+
+        ## only evaluate, when session is added / removed (?)
         data_type, data_value = input
         if (
             data_type != "sessions"
@@ -340,7 +371,6 @@ class MainMenu(QFrame):
         self.paths_layout.addWidget(paths, alignment=Qt.AlignmentFlag.AlignTop)
 
         self.path_list = SessionOverview(self)
-        # self.path_list = PathList(self)
         self.paths_layout.addWidget(self.path_list)
 
         self.path_list.rebuild()
@@ -465,6 +495,7 @@ class MainMenu(QFrame):
                 only_tail=True,
                 edit_line=self.paths["results"]["edit"],
                 display_text="Select results file",
+                add_to_pending=True
             )
         )
 
@@ -553,6 +584,7 @@ class MainMenu(QFrame):
         only_tail: bool = False,
         edit_line: Optional[QLineEdit] = None,
         display_text: str = "Select file",
+        add_to_pending: bool = False
     ):
         if pick_dir:
             path = QFileDialog.getExistingDirectory(
@@ -568,12 +600,21 @@ class MainMenu(QFrame):
                 "HDF5 files (*.hdf5 *.h5);;MATLAB files (*.mat);;All files (*)",
             )
 
+        relative_path = str(Path(path).relative_to(init_path)) if only_tail else path
+
+        if add_to_pending:
+            session_id = self.data.register_session(
+                from_file=str(path),
+                load_content=[],
+            )
+            self.state.session_color = (session_id, self.session_colors.next())
+                            
+
         if path and edit_line is not None:
-            edit_line.setText(
-                str(Path(path).relative_to(init_path)) if only_tail else path
-            )  # fill QLineEdit
+            edit_line.setText(relative_path)
         elif path:
-            return str(Path(path).relative_to(init_path)) if only_tail else path
+            return relative_path
+
 
     @property
     def root_folder(self) -> str:

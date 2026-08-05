@@ -30,7 +30,6 @@ class AppState(QObject):
     # Signals for things that can change
 
     session_color_changed = Signal(int, object)  # session_id, color_value
-    session_offset_changed = Signal(int, int)  # session_id, offset_value
 
     current_session_changed = Signal(int)
 
@@ -39,6 +38,7 @@ class AppState(QObject):
     highlighted_component_changed = Signal()
 
     # compare_mode_changed = Signal(str)
+    busy_changed = Signal(bool)
     plot_update_required = Signal()
     session_toggled = Signal(tuple)
 
@@ -52,7 +52,6 @@ class AppState(QObject):
 
         self._session_colors = []
         self._session_active = []
-        self._session_offsets = []
 
         self._selected_components: Optional[List[NeuronComponent]] = None
         self._focused_component: Optional[NeuronComponent] = None
@@ -83,34 +82,13 @@ class AppState(QObject):
         self.time_ref = time()
 
     @property
-    def app_mode(self):
-        pass
+    def busy(self):
+        return self._busy
 
-    @property
-    def session_offsets(self):
-        return self._session_offsets
-
-    @property
-    def session_offset(self):
-        return (
-            self._session_offsets[self.current_session_id]
-            if self.current_session_id is not None
-            else None
-        )
-
-    @session_offset.setter
-    def session_offset(self, input: Tuple[int, int]):
-        session_id, offset = input
-
-        if session_id == len(self._session_offsets):
-            self._session_offsets.append(offset)
-        elif session_id < len(self._session_offsets):
-            self._session_offsets[session_id] = offset
-        else:
-            raise IndexError(
-                f"Session ID {session_id} is out of bounds for session_offsets list of length {len(self._session_offsets)}"
-            )
-        self.session_offset_changed.emit(session_id, offset)
+    @busy.setter
+    def busy(self, val: bool):
+        self._busy = val
+        self.busy_changed.emit(val)
 
     @property
     def session_colors(self):
