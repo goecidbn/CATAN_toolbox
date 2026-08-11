@@ -194,7 +194,6 @@ class Data(Tracking):
             self.state.current_session_id = None
 
         self.adjust_selected_components_after_data_change(session_id, -1)
-
         self._on_data_changed(("assignments", -1))
 
     def adjust_selected_components_after_data_change(

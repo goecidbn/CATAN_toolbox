@@ -43,12 +43,12 @@ paths = {
         "label": "Root folder",
         "root": None,
     },
-    "results": {
-        "mode": ["single"],
-        "type": "file",
-        "label": "Results file",
-        "root": "root",
-    },
+    # "results": {
+    #     "mode": ["single"],
+    #     "type": "file",
+    #     "label": "Results file",
+    #     "root": "root",
+    # },
     "model": {
         "mode": ["tracking"],
         "type": "file",
@@ -148,6 +148,7 @@ class MainMenu(QFrame):
                 if self.checkbox_traces_load.isChecked():
                     self.data.change_trace_presence(id, True)
                 self.state.busy = False
+
             self.state.tasks.start(
                 "Load session data", self.load_from_session, finished=finished
             )
@@ -200,9 +201,12 @@ class MainMenu(QFrame):
         if ctx is not None:
             progress = 0
 
-            ct_ld = 1 # 1 ct for model fitting
+            ct_ld = 1  # 1 ct for model fitting
             for session in self.data.sessions:
-                if not session.status["spatial_loaded"] or not session.status["quality_loaded"]:
+                if (
+                    not session.status["spatial_loaded"]
+                    or not session.status["quality_loaded"]
+                ):
                     # one count for loading
                     ct_ld += 1
                 if not session.status["registered_to_model"]:
@@ -211,29 +215,36 @@ class MainMenu(QFrame):
                 if not session.status["matched"]:
                     # one count for registration
                     ct_ld += 1
-                
-            progress_step = 1/ct_ld
+
+            progress_step = 1 / ct_ld
 
             ctx.progress(progress)
 
-        for s,session in enumerate(self.data.sessions):
+        for s, session in enumerate(self.data.sessions):
             if ctx is not None:
                 ctx.message(f"{session.name}: Loading data...")
             load_content = []
             if not session.status["spatial_loaded"]:
                 load_content.append("spatial")
-            if not session.status["quality_loaded"] and self.checkbox_quality_load.isChecked():
+            if (
+                not session.status["quality_loaded"]
+                and self.checkbox_quality_load.isChecked()
+            ):
                 load_content.append("quality")
             # if not session.status["traces_loaded"] and self.checkbox_traces_load.isChecked():
             #     load_content.append("temporal")
-            session.load_data(which=load_content,alignment_template=self.data.alignment_template,ctx=ctx)
+            session.load_data(
+                which=load_content,
+                alignment_template=self.data.alignment_template,
+                ctx=ctx,
+            )
 
             if ctx is not None:
                 progress += progress_step
                 ctx.progress(progress)
 
             if not session.status["registered_to_model"]:
-                
+
                 if ctx is not None:
                     ctx.message(f"{session.name}: Updating model...")
                 self.data.update_model_with_data(
@@ -242,7 +253,6 @@ class MainMenu(QFrame):
                 if ctx is not None:
                     progress += progress_step
                     ctx.progress(progress)
-
 
         # load_content = ["spatial"]
         # load_content += ["quality"] if self.checkbox_quality_load.isChecked() else []
@@ -259,10 +269,9 @@ class MainMenu(QFrame):
         #     ctx.message("Update match model...")
         #     ctx.progress(33)
 
-        
         if ctx is not None:
             ctx.message(f"Fitting model...")
-        
+
         if len(self.data.sessions) > 1:
             self.data.fit_to_model()
         if ctx is not None:
@@ -275,9 +284,11 @@ class MainMenu(QFrame):
         for session in self.data.sessions:
             if ctx is not None:
                 ctx.message(f"{session.name}: Matching neurons...")
-            
+
             if not session.status["matched"]:
-                self.data.register_neurons(from_session_id=session.id, clean_traces=False)
+                self.data.register_neurons(
+                    from_session_id=session.id, clean_traces=False
+                )
 
             if ctx is not None:
                 progress += progress_step
@@ -292,7 +303,7 @@ class MainMenu(QFrame):
 
         self.data.load_model(self.model_file)
 
-        ## load session data from a registration file 
+        ## load session data from a registration file
         ## instead of from separate sessions
         self.data.load_registration(self.registration_file)
         print(
@@ -322,7 +333,7 @@ class MainMenu(QFrame):
                 session.path = str(
                     Path(self.root_folder) / Path(session.path).relative_to(common_path)
                 )
-            
+
             self.state.session_color = (session.id, self.session_colors.next())
             self.state.session_added = session.id
 
@@ -357,18 +368,34 @@ class MainMenu(QFrame):
         ## then, build new menu
 
         # File paths & fields
-        paths = QFrame()
-        paths.setFrameShape(QFrame.Shape.StyledPanel)
+        formFrame = QFrame()
+        formFrame.setFrameShape(QFrame.Shape.StyledPanel)
+
+        form = QFormLayout(formFrame)
+
+        name = "root"
+        self.paths[name] = {}
+
+        self.paths[name]["edit"] = QLineEdit(
+            self.defaults[f"{name}_{paths[name]['type']}"]
+        )
+        self.paths[name]["button"] = QPushButton("...")
+        self.paths[name]["button"].setFixedWidth(50)
+
+        entry_layout = QHBoxLayout()
+        entry_layout.addWidget(self.paths[name]["edit"])
+        entry_layout.addWidget(self.paths[name]["button"])
+        form.addRow(f"{paths[name]['label']}:", entry_layout)
 
         mode = self.dropdown_app_mode.currentText()
         if app_modes[mode] == "single":
-            paths.setLayout(self._build_form_data_paths_single())
+            formFrame.setLayout(self._build_form_data_paths_single())
         elif app_modes[mode] == "tracking":
-            paths.setLayout(self._build_form_data_paths_tracking())
+            formFrame.setLayout(self._build_form_data_paths_tracking())
         else:
             self.paths_layout.addWidget(QLabel("Video mode options coming soon."))
 
-        self.paths_layout.addWidget(paths, alignment=Qt.AlignmentFlag.AlignTop)
+        self.paths_layout.addWidget(formFrame, alignment=Qt.AlignmentFlag.AlignTop)
 
         self.path_list = SessionOverview(self)
         self.paths_layout.addWidget(self.path_list)
@@ -441,6 +468,11 @@ class MainMenu(QFrame):
 
         return form
 
+    def _on_load_option_changed(self, index: int):
+
+        self.selector_load_from.setCurrentIndex(index)
+        # self.selector_load_from.setCurrentText(self.state.logging_level)
+
     def _build_form_data_paths_single(self) -> QFormLayout:
         form = QFormLayout()
 
@@ -455,12 +487,38 @@ class MainMenu(QFrame):
                 self.defaults[f"{name}_{info['type']}"]
             )
             self.paths[name]["button"] = QPushButton("...")
-            self.paths[name]["button"].setFixedWidth(30)
+            self.paths[name]["button"].setFixedWidth(50)
 
             entry_layout = QHBoxLayout()
+            if name == "results":
+                self.paths[name]["button_wildcard"] = QPushButton(".*")
+                self.paths[name]["button_wildcard"].setFixedWidth(30)
+                entry_layout.addWidget(self.paths[name]["button_wildcard"])
+                self.paths[name]["button_wildcard"].clicked.connect(
+                    self.load_from_wildcard
+                )
+                self.paths[name]["button"].setText("Load")
+                # self.paths[name]["button"].setVisible(False)
+                # self.paths[name]["edit"].setVisible(False)
+
             entry_layout.addWidget(self.paths[name]["edit"])
             entry_layout.addWidget(self.paths[name]["button"])
             form.addRow(f"{info['label']}:", entry_layout)
+
+        entry_layout = QHBoxLayout()
+        self.load_options = ["Session", ".* (glob)", "Tracked"]
+        self.selector_load_from = QComboBox()
+        self.selector_load_from.addItems(self.load_options)
+        self.selector_load_from.currentIndexChanged.connect(
+            self._on_load_option_changed
+        )
+
+        self._on_load_option_changed(0)
+        entry_layout.addWidget(self.selector_load_from)
+
+        # currentTextChanged.connect(self.change_logging_level)
+
+        form.addRow(f"Load from", entry_layout)
 
         self.checkbox_quality_load = QCheckBox("Load quality on registration")
         self.checkbox_quality_load.setChecked(True)
@@ -488,16 +546,16 @@ class MainMenu(QFrame):
         #     )
         # )
 
-        self.paths["results"]["button"].clicked.connect(
-            lambda: self.choose_path(
-                pick_dir=False,
-                init_path=self.root_folder,
-                only_tail=True,
-                edit_line=self.paths["results"]["edit"],
-                display_text="Select results file",
-                add_to_pending=True
-            )
-        )
+        # self.paths["results"]["button"].clicked.connect(
+        #     lambda: self.choose_path(
+        #         pick_dir=False,
+        #         init_path=self.root_folder,
+        #         only_tail=True,
+        #         edit_line=self.paths["results"]["edit"],
+        #         display_text="Select results file",
+        #         add_to_pending=True
+        #     )
+        # )
 
         # self.paths["footprints"]["button"].clicked.connect(
         #     lambda: self.choose_path(
@@ -577,6 +635,11 @@ class MainMenu(QFrame):
 
         return form
 
+    def load_from_wildcard(self):
+        print("load from wildcard ...")
+        # self.paths[name]["button"].setVisible(False)
+        self.paths["results"]["edit"].setVisible(False)
+
     def choose_path(
         self,
         pick_dir: bool = False,
@@ -584,7 +647,7 @@ class MainMenu(QFrame):
         only_tail: bool = False,
         edit_line: Optional[QLineEdit] = None,
         display_text: str = "Select file",
-        add_to_pending: bool = False
+        add_to_pending: bool = False,
     ):
         if pick_dir:
             path = QFileDialog.getExistingDirectory(
@@ -608,13 +671,11 @@ class MainMenu(QFrame):
                 load_content=[],
             )
             self.state.session_color = (session_id, self.session_colors.next())
-                            
 
         if path and edit_line is not None:
             edit_line.setText(relative_path)
         elif path:
             return relative_path
-
 
     @property
     def root_folder(self) -> str:
