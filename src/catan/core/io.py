@@ -347,6 +347,25 @@ def read_sparse_matrix(group: h5py.Group) -> sparse.csc_matrix:
     )
 
 
+
+def read_hdf5_field(h5ref: h5py.File, field_path: str):
+    """
+        method for reading from h5-file,
+        given that the complete field path is provided
+    """
+    item = h5ref.get(field_path,None)
+    if item is None:
+        raise ValueError(f"Opened h5 file does not contain field_path {field_path}")
+    
+    if isinstance(item, h5py.Group):
+        ## assume sparseness
+        data = read_sparse_matrix(item)
+        # return
+    else:
+        data = item[()]
+    
+    return data
+
 def write_optional_array(
     group: h5py.Group,
     name: str,

@@ -1,6 +1,11 @@
-from typing import Dict, Optional, Tuple, List
-import os, tqdm, importlib
+from typing import Dict, Optional, Tuple, List, Callable
+import importlib
+
 from PySide6.QtWidgets import (
+    QDialog,
+    QGridLayout,
+    QInputDialog,
+    QMenu,
     QWidget,
     QFormLayout,
     QLineEdit,
@@ -14,54 +19,27 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QSizePolicy,
     QComboBox,
+    QToolButton,
+    QWidgetAction,
 )
 from PySide6.QtCore import QSettings, QThreadPool, Qt
+from PySide6.QtGui import QAction, QCursor
+from .fragments.dialog_load_field import FieldSelectDialog
 from shiboken6 import isValid
 
 from pathlib import Path
+from functools import partial
 
-from catan.gui.structures import data, state
-from catan.gui.plots.colors import CyclicColorMap
-from catan.gui.background_tasks import TaskContext
+from catan.gui.structures import data, state, config
 
-from .session_overview import SessionOverview
 from .resource_monitor import ResourceMonitor
+from .fragments.FileReviewDialog import GlobReviewDialog
+from .fragments.TaskQueueDisplay import TaskOverviewDisplay, TaskQueueDisplay
+from .fragments.FieldChips import FieldChip
+from .utils.FlowLayout import FlowLayout
 
-# from .dialog_load_field import FieldSelectDialog, list_file_fields
-
-app_modes = {
-    "Single session": "single",
-    "Neuron tracking": "tracking",
-    "Video": "video",
-}
-
-## defines paths which can be defined (and reloaded) by GUI
-paths = {
-    "root": {
-        "mode": ["single", "tracking"],
-        "type": "folder",
-        "label": "Root folder",
-        "root": None,
-    },
-    # "results": {
-    #     "mode": ["single"],
-    #     "type": "file",
-    #     "label": "Results file",
-    #     "root": "root",
-    # },
-    "model": {
-        "mode": ["tracking"],
-        "type": "file",
-        "label": "Model file",
-        "root": "root",
-    },
-    "registration": {
-        "mode": ["tracking"],
-        "type": "file",
-        "label": "Registration file",
-        "root": "root",
-    },
-}
+# from .session_overview import SessionOverview
+from . import session_overview
 
 
 class MainMenu(QFrame):
@@ -74,18 +52,17 @@ class MainMenu(QFrame):
         super().__init__(parent)
 
         self.settings = QSettings()
-        self._restore_settings()
-
+        self.config: config.ConfigData = parent.config
         self.state: state.AppState = parent.state
         self.data: data.Data = parent.data
+
+        self._restore_settings()
 
         self.threadpool = QThreadPool.globalInstance()
         self.current_worker = None
 
-        self.session_colors = CyclicColorMap(n_colors=20, cmap_name="twilight")
-
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setMinimumWidth(250)  # adjust to taste
+        self.setMinimumWidth(300)  # adjust to taste
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
@@ -102,15 +79,6 @@ class MainMenu(QFrame):
         layout.addWidget(QLabel("Logging level:"))
         layout.addWidget(self.logging)
 
-        # self.checkbox_mode_multi = QCheckBox("Multi-session tracking mode")
-        self.dropdown_app_mode = QComboBox()
-        self.dropdown_app_mode.addItems([key for key in app_modes.keys()])
-        self.dropdown_app_mode.setToolTip(
-            "Select application mode: Single session stats, Multi-session neuron tracking, or Video mode"
-        )
-        layout.addWidget(QLabel("App mode options:"))
-        layout.addWidget(self.dropdown_app_mode)
-
         self.paths_menu = QWidget()
         self.paths_layout = QVBoxLayout(self.paths_menu)
         self.build_app_mode_menu()
@@ -119,14 +87,18 @@ class MainMenu(QFrame):
         layout.addStretch()  # push everything up, so empty space is at the bottom
         layout.addWidget(ResourceMonitor(parent=self))
 
-        self.dropdown_app_mode.currentIndexChanged.connect(self.change_app_mode)
+        self.task_overview = TaskOverviewDisplay(
+            self.state.tasks,
+        )
+        layout.addWidget(self.task_overview)
 
-        self.state.data_changed.connect(self.handler_data_changed)
+        self.state.data_changed.connect(self._on_data_changed)
         self.state.busy_changed.connect(self.toggle_busy)
 
     def rebuild(self):
         # importlib.reload(session_overview)
         importlib.reload(data)
+        importlib.reload(session_overview)
 
     def change_logging_level(self):
 
@@ -141,206 +113,75 @@ class MainMenu(QFrame):
 
         # run "busy method" to load data and update model
         self.state.busy = True
-        mode = app_modes[self.dropdown_app_mode.currentText()]
-        if mode == "single":
+        for session in self.data.sessions:
+            self.load_data_from_session(session.id)
 
-            def finished(id):
-                if self.checkbox_traces_load.isChecked():
-                    self.data.change_trace_presence(id, True)
-                self.state.busy = False
+    def load_data_from_session(self, session_id: int):
+
+        session = self.data.sessions[session_id]
+
+        self.state.tasks.start(
+            "loading",
+            f"Loading data for {session.name}",
+            self.data.load_data,
+            session_id=session_id,
+            fields_to_load=self.config.fields,
+            finished=lambda input=("session", session_id): self.state.data_changed.emit(
+                input
+            ),
+        )
+
+        if (
+            not session.status["registered_to_model"]
+            and self.checkbox_model_registration.isChecked()
+        ):
+            self.state.tasks.start(
+                "model update",
+                f"Update model for {session.name}",
+                self.data.update_model_with_data,
+                from_session_index=session_id,
+                finished=self.fit_after_loading,
+                ready=lambda session=session: session.status["aligned"],
+            )
+
+        if (
+            not session.status["registered_to_model"]
+            and self.checkbox_neuron_registration.isChecked()
+        ):
 
             self.state.tasks.start(
-                "Load session data", self.load_from_session, finished=finished
+                "calculating",
+                f"Register neurons for {session.name}",
+                self.data.register_neurons,
+                from_session_index=session_id,
+                clean_traces=False,
+                ready=lambda session=session, session_id=session_id: (
+                    (session_id == 0) or self.data.model_fitted
+                )
+                and session.status["aligned"],
             )
 
-        if mode == "tracking":
-            self.load_from_tracking()
+    def fit_after_loading(self, key: str = "model update"):
 
-        # self.state.tasks.start(
-        #     "rebuild_neurons",
-        #     self.data.rebuild_neurons,
-        #     finished=self.on_background_done,
-        # )
+        if (
+            self.state.tasks.current[key] is not None
+            or len(self.state.tasks.queues[key]) > 0
+        ):
+            return
 
-    # def on_background_done(self, result):
-    #     # print("Data loaded, now updating display...")
-    #     # self.data.neurons = result
-    #     self.set_busy(False)
-    #     self.current_worker = None
-    #     self.state.current_job = None
-    #     self.state.plot_update_required.emit()
-    #     self.state.current_session_id = 0
+        print(" ------ fit to model! ------")
 
-    #     # self.update_display()
-
-    # def add_session(self, this_data: session_data):
-
-    ## always add new session at the end of the list
-    # session_id = len(self.data.sessions)
-
-    # self.state.session_color = (session_id, self.session_colors.next())
-    # self.state.session_offset = (session_id, 0)
-
-    # if not hasattr(this_data, "path") or not this_data.path:
-    #     name = f"Session {session_id + 1}"
-    # else:
-    #     path = Path(this_data.path).relative_to(self.root_folder)
-    #     name = str(path.parent)
-
-    # this_data.name = name
-    # this_data.loaded = True
-
-    # self.data.sessions.append(this_data)
-    # self.state.session_added = session_id
-
-    def load_from_session(self, set_active=False, ctx: Optional[TaskContext] = None):
-        """
-        TODO:
-        * change tracking stucture to hold assignments in base structure (and access from there, not hand over)
-        """
-        if ctx is not None:
-            progress = 0
-
-            ct_ld = 1  # 1 ct for model fitting
-            for session in self.data.sessions:
-                if (
-                    not session.status["spatial_loaded"]
-                    or not session.status["quality_loaded"]
-                ):
-                    # one count for loading
-                    ct_ld += 1
-                if not session.status["registered_to_model"]:
-                    # one count for alignment & model building
-                    ct_ld += 1
-                if not session.status["matched"]:
-                    # one count for registration
-                    ct_ld += 1
-
-            progress_step = 1 / ct_ld
-
-            ctx.progress(progress)
-
-        for s, session in enumerate(self.data.sessions):
-            if ctx is not None:
-                ctx.message(f"{session.name}: Loading data...")
-            load_content = []
-            if not session.status["spatial_loaded"]:
-                load_content.append("spatial")
-            if (
-                not session.status["quality_loaded"]
-                and self.checkbox_quality_load.isChecked()
-            ):
-                load_content.append("quality")
-            # if not session.status["traces_loaded"] and self.checkbox_traces_load.isChecked():
-            #     load_content.append("temporal")
-            session.load_data(
-                which=load_content,
-                alignment_template=self.data.alignment_template,
-                ctx=ctx,
-            )
-
-            if ctx is not None:
-                progress += progress_step
-                ctx.progress(progress)
-
-            if not session.status["registered_to_model"]:
-
-                if ctx is not None:
-                    ctx.message(f"{session.name}: Updating model...")
-                self.data.update_model_with_data(
-                    from_session_id=session.id,
-                )
-                if ctx is not None:
-                    progress += progress_step
-                    ctx.progress(progress)
-
-        # load_content = ["spatial"]
-        # load_content += ["quality"] if self.checkbox_quality_load.isChecked() else []
-        # self.data.register_session(
-        #     from_file=str(self.results_file),
-        #     load_content=load_content,
-        #     align=True,
-        #     ctx=ctx,
-        # )
-        # session_id = self.data.sessions[-1].id
-
-        ## run tracking algorithm hereafter
-        # if ctx is not None:
-        #     ctx.message("Update match model...")
-        #     ctx.progress(33)
-
-        if ctx is not None:
-            ctx.message(f"Fitting model...")
-
-        if len(self.data.sessions) > 1:
-            self.data.fit_to_model()
-        if ctx is not None:
-            progress += progress_step
-            ctx.progress(progress)
-        # if ctx is not None:
-        #     ctx.progress(66)
-        #     ctx.message("Registering neurons...")
-
-        for session in self.data.sessions:
-            if ctx is not None:
-                ctx.message(f"{session.name}: Matching neurons...")
-
-            if not session.status["matched"]:
-                self.data.register_neurons(
-                    from_session_id=session.id, clean_traces=False
-                )
-
-            if ctx is not None:
-                progress += progress_step
-                ctx.progress(progress)
-            # self.state.session_added = session_id
-
-        if set_active or self.state.current_session_id is None:
-            self.state.current_session_id = self.data.sessions[-1].id
-        # return session_id
-
-    def load_from_tracking(self):
-
-        self.data.load_model(self.model_file)
-
-        ## load session data from a registration file
-        ## instead of from separate sessions
-        self.data.load_registration(self.registration_file)
-        print(
-            f"Loaded model from {self.model_file} and registration from {self.registration_file}"
-        )
-        print(
-            f"Sessions now in memory: {[session.name for session in self.data.sessions]}"
+        self.state.tasks.start(
+            "calculating",
+            "Fit model to data",
+            self.data.fit_to_model,
         )
 
-        ## prepare checking for common path
-        paths = [
-            session.path for session in self.data.sessions if session.path is not None
-        ]
-        assert len(paths) >= 1, "No sessions found in the loaded model."
+        # if not task.worker.is_cancelled():
+        #     task.worker.cancel()
+        #     print("Cancelled model update task after loading.")
 
-        common_path = os.path.commonpath(paths)
-
-        for session in tqdm.tqdm(self.data.sessions):
-            if not common_path == self.root_folder:
-                ## if the common path is not the root_folder, this might be from
-                ## changing systems or file structure since analysing the data,
-                ## so we adjust this
-                if session.path is None:
-                    raise ValueError(
-                        f"Session {session.name} has no path, cannot adjust to new root folder."
-                    )
-                session.path = str(
-                    Path(self.root_folder) / Path(session.path).relative_to(common_path)
-                )
-
-            self.state.session_color = (session.id, self.session_colors.next())
-            self.state.session_added = session.id
-
-        self.state.current_session_id = 0
-
-    def handler_data_changed(self, input: tuple[str, int]):
-
+    def _on_data_changed(self, input: tuple[str, int]):
         ## only evaluate, when session is added / removed (?)
         data_type, data_value = input
         if (
@@ -350,10 +191,18 @@ class MainMenu(QFrame):
         ):
             return
 
-        session_id = data_value
+        ## disable changing root path, when sessions are loaded,
+        ## to avoid path inconsistencies
+        sessions_loaded = len(self.data.sessions) > 0
 
-        session = self.data.sessions[session_id]
-        self.path_list._add_session_row(session_id, session)
+        self.root["button"].setEnabled(not sessions_loaded)
+        self.root["edit"].setEnabled(not sessions_loaded)
+        for key in self.config.fields:
+            self.config.fields[key]["opts_ref"].setVisible(sessions_loaded)
+
+        # session_id = data_value
+        # session = self.data.sessions[session_id]
+        # self.path_list._add_session_row(session_id, session)
 
     def build_app_mode_menu(self):
         """
@@ -372,273 +221,297 @@ class MainMenu(QFrame):
         formFrame.setFrameShape(QFrame.Shape.StyledPanel)
 
         form = QFormLayout(formFrame)
+        self.form = form
 
-        name = "root"
-        self.paths[name] = {}
-
-        self.paths[name]["edit"] = QLineEdit(
-            self.defaults[f"{name}_{paths[name]['type']}"]
-        )
-        self.paths[name]["button"] = QPushButton("...")
-        self.paths[name]["button"].setFixedWidth(50)
+        ## add connected path loading and editing option for root path
+        self.root = {
+            "path": self.defaults[f"root_folder"],
+            "edit": QLineEdit(text=self.defaults[f"root_folder"]),
+            "button": QPushButton("..."),
+        }
+        self.root["button"].setFixedWidth(50)
 
         entry_layout = QHBoxLayout()
-        entry_layout.addWidget(self.paths[name]["edit"])
-        entry_layout.addWidget(self.paths[name]["button"])
-        form.addRow(f"{paths[name]['label']}:", entry_layout)
+        entry_layout.addWidget(self.root["edit"])
+        entry_layout.addWidget(self.root["button"])
+        form.addRow(f"Root folder:", entry_layout)
 
-        mode = self.dropdown_app_mode.currentText()
-        if app_modes[mode] == "single":
-            formFrame.setLayout(self._build_form_data_paths_single())
-        elif app_modes[mode] == "tracking":
-            formFrame.setLayout(self._build_form_data_paths_tracking())
-        else:
-            self.paths_layout.addWidget(QLabel("Video mode options coming soon."))
+        # lambda path: self.root["path"] = path
+        def on_root_path_changed():
+            self.root["path"] = self.root["edit"].text().strip()
+
+        self.root["button"].clicked.connect(
+            lambda: (
+                self.choose_path(
+                    pick_dir=True,
+                    edit_line=self.root["edit"],
+                    display_text="Select root folder",
+                ),
+                on_root_path_changed(),
+            )
+        )
+        self.root["edit"].editingFinished.connect(on_root_path_changed)
+        form.addRow(QLabel("Data paths:"), QLabel(""))
+        self.loader = {}
+
+        self.models = ["Local"]
+        self.assignments = ["Local"]
+
+        form.addRow(
+            QLabel("Session Data"),
+            self.build_load_options("session", ["Detection", ".* (glob)", "Tracked"]),
+        )
+        # self.loader["session"]["selector"].setCurrentIndex(1)
+
+        opt_row = QHBoxLayout()
+        self.loader["session"]["edit"] = QLineEdit("", placeholderText="regex pattern")
+        self.loader["session"]["edit"].setText("Session0*/neuron*")
+
+        opt_row.addWidget(self.loader["session"]["edit"])
+        # opt_row.addWidget(self.loader["session"]["button"])
+        form.addRow(opt_row)
+        self.loader["session"]["additional_options"] = opt_row
+
+        self._on_load_option_changed("session", 0)
+
+        form.addRow(
+            QLabel("Model Data"),
+            self.build_load_options("model", self.models, add_option=True),
+        )
+        form.addRow(
+            QLabel("Assignment Data"),
+            self.build_load_options("assignment", self.assignments, add_option=True),
+        )
 
         self.paths_layout.addWidget(formFrame, alignment=Qt.AlignmentFlag.AlignTop)
 
-        self.path_list = SessionOverview(self)
+        load_options = self.build_load_defaults()
+        self.paths_layout.addWidget(load_options, alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.checkbox_model_registration = QCheckBox("Register to model after loading")
+        self.checkbox_model_registration.setChecked(True)
+        form.addRow(self.checkbox_model_registration)
+
+        self.checkbox_neuron_registration = QCheckBox("Track neurons after loading")
+        self.checkbox_neuron_registration.setChecked(True)
+        form.addRow(self.checkbox_neuron_registration)
+
+        ### triggering processing
+        ## default processing
+        self.button_load = QToolButton(self)
+        self.button_load.setText("Process data")
+        self.button_load.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.button_load.clicked.connect(self.on_load_clicked)
+
+        ## alternative processing
+        menu = QMenu(self.button_load)
+        menu.addAction(QAction("Complete loading", menu))
+        menu.addAction(QAction("Complete model registration", menu))
+        menu.addAction(QAction("Complete registration", menu))
+        self.button_load.setMenu(menu)
+
+        self.paths_layout.addWidget(self.button_load)
+
+        self.button_save = QPushButton("Save results")
+        self.paths_layout.addWidget(self.button_save)
+
+        self.path_list = session_overview.SessionOverview(self)
         self.paths_layout.addWidget(self.path_list)
 
         self.path_list.rebuild()
 
-        # Buttons
-        self.button_load = QPushButton("Load data")
-        self.button_save = QPushButton("Save results")
-        self.paths_layout.addWidget(self.button_load)
-        self.paths_layout.addWidget(self.button_save)
+        # self.checkbox_auto_advance = QCheckBox("Auto-advance to next cluster")
+        # self.checkbox_skip_processed_side = QCheckBox("Skip processed in navigation")
+        # self.paths_layout.addWidget(self.checkbox_auto_advance)
+        # self.paths_layout.addWidget(self.checkbox_skip_processed_side)
 
-        self.checkbox_auto_advance = QCheckBox("Auto-advance to next cluster")
-        self.checkbox_skip_processed_side = QCheckBox("Skip processed in navigation")
-        self.paths_layout.addWidget(self.checkbox_auto_advance)
-        self.paths_layout.addWidget(self.checkbox_skip_processed_side)
+        self.path_list.load_requested.connect(self.load_data_from_session)
 
-        self.button_load.clicked.connect(self.on_load_clicked)
+    def build_load_defaults(self) -> QWidget:
 
-    def change_app_mode(self):
-        self.build_app_mode_menu()
+        ### Options for default processing
+        load_options = QWidget()
+        load_options_layout = QVBoxLayout(load_options)
+        load_options_layout.setContentsMargins(4, 4, 4, 4)
+        load_options_layout.setSpacing(3)
 
-    def _build_form_data_paths_tracking(self) -> QFormLayout:
+        load_options_layout.addWidget(QLabel("Load options on registration:"))
 
-        form = QFormLayout()
+        def callback(group_key, label, method="edit"):
 
-        for name, info in paths.items():
-            if "tracking" not in info["mode"]:
-                continue
-            self.paths[name] = {}
+            if self.data.current_session is None:
+                path = self.data.sessions[0].path
+            else:
+                path = self.data.current_session.path
 
-            self.paths[name]["edit"] = QLineEdit(
-                self.defaults[f"{name}_{info['type']}"]
+            assert isinstance(
+                path, str | Path
+            ), "No valid session path found for field selection."
+
+            self.config.change_config_fields(
+                group_key,
+                label,
+                partial(FieldSelectDialog.get_field, path=path),
+                method,
             )
-            self.paths[name]["button"] = QPushButton("...")
-            self.paths[name]["button"].setFixedWidth(30)
 
-            entry_layout = QHBoxLayout()
-            entry_layout.addWidget(self.paths[name]["edit"])
-            entry_layout.addWidget(self.paths[name]["button"])
-            form.addRow(f"{info['label']}:", entry_layout)
-
-        ## Button connections
-        self.paths["root"]["button"].clicked.connect(
-            lambda: self.choose_path(
-                pick_dir=True,
-                edit_line=self.paths["root"]["edit"],
-                display_text="Select root folder",
+            self.config.fields[group_key]["opts_ref"].rebuild(
+                self.config.fields[group_key]
             )
-        )
 
-        self.paths["model"]["button"].clicked.connect(
-            lambda: self.choose_path(
-                pick_dir=False,
-                init_path=self.root_folder,
-                only_tail=True,
-                edit_line=self.paths["model"]["edit"],
-                display_text="Select model file",
+        ## loading options
+        self.field_options = {}
+        for key, load_data in self.config.fields.items():
+            load_data["opts_ref"] = OptionList(key, load_data, callback)
+
+            opts_widget = checkbox_with_options(
+                load_data,
+                lambda checked, key=key: self.config.fields[key].update(
+                    {"load": checked}
+                ),
             )
-        )
-        self.paths["registration"]["button"].clicked.connect(
-            lambda: self.choose_path(
-                pick_dir=False,
-                init_path=self.root_folder,
-                only_tail=True,
-                edit_line=self.paths["registration"]["edit"],
-                display_text="Select registration file",
-            )
-        )
+            load_options_layout.addWidget(opts_widget)
+            load_data["opts_ref"].setVisible(False)
 
-        return form
+        return load_options
 
-    def _on_load_option_changed(self, index: int):
-
-        self.selector_load_from.setCurrentIndex(index)
-        # self.selector_load_from.setCurrentText(self.state.logging_level)
-
-    def _build_form_data_paths_single(self) -> QFormLayout:
-        form = QFormLayout()
-
-        self.paths = {}
-
-        for name, info in paths.items():
-            if "single" not in info["mode"]:
-                continue
-            self.paths[name] = {}
-
-            self.paths[name]["edit"] = QLineEdit(
-                self.defaults[f"{name}_{info['type']}"]
-            )
-            self.paths[name]["button"] = QPushButton("...")
-            self.paths[name]["button"].setFixedWidth(50)
-
-            entry_layout = QHBoxLayout()
-            if name == "results":
-                self.paths[name]["button_wildcard"] = QPushButton(".*")
-                self.paths[name]["button_wildcard"].setFixedWidth(30)
-                entry_layout.addWidget(self.paths[name]["button_wildcard"])
-                self.paths[name]["button_wildcard"].clicked.connect(
-                    self.load_from_wildcard
-                )
-                self.paths[name]["button"].setText("Load")
-                # self.paths[name]["button"].setVisible(False)
-                # self.paths[name]["edit"].setVisible(False)
-
-            entry_layout.addWidget(self.paths[name]["edit"])
-            entry_layout.addWidget(self.paths[name]["button"])
-            form.addRow(f"{info['label']}:", entry_layout)
+    def build_load_options(self, key, options, add_option=False) -> QHBoxLayout:
 
         entry_layout = QHBoxLayout()
-        self.load_options = ["Session", ".* (glob)", "Tracked"]
-        self.selector_load_from = QComboBox()
-        self.selector_load_from.addItems(self.load_options)
-        self.selector_load_from.currentIndexChanged.connect(
-            self._on_load_option_changed
+
+        self.loader[key] = {}
+        self.loader[key]["options"] = options
+        self.loader[key]["selector"] = QComboBox()
+        self.loader[key]["selector"].setFixedWidth(155)
+        if add_option:
+            options.append("Load ...")
+        self.loader[key]["selector"].addItems(options)
+        entry_layout.addWidget(self.loader[key]["selector"])
+
+        if key == "session":
+            self.loader[key]["selector"].setFixedWidth(100)
+
+            self.loader[key]["button"] = QPushButton("...")
+            self.loader[key]["button"].setFixedWidth(50)
+            entry_layout.addWidget(self.loader[key]["button"])
+
+            self.loader[key]["button"].clicked.connect(lambda: None)
+        if key == "model":
+            self.loader[key]["selector"].setFixedWidth(100)
+
+            self.loader[key]["button"] = QPushButton("Fit")
+            self.loader[key]["button"].setFixedWidth(50)
+            entry_layout.addWidget(self.loader[key]["button"])
+
+            def on_fit_clicked():
+                print("fit clicked!")
+                for session in self.data.sessions:
+                    if not session.status["registered_to_model"]:
+                        self.data.update_model_with_data(from_session_index=session.id)
+                self.data.fit_to_model()
+                print("Model fitted to data.")
+
+            self.loader[key]["button"].clicked.connect(on_fit_clicked)
+
+        # else:
+        #     entry_layout.addWidget(self.loader[key]["button"])
+
+        # self._on_load_option_changed(key, 0)
+        self.loader[key]["selector"].currentIndexChanged.connect(
+            lambda index, key=key: self._on_load_option_changed(key, index)
         )
+        return entry_layout
 
-        self._on_load_option_changed(0)
-        entry_layout.addWidget(self.selector_load_from)
+    def _on_load_option_changed(self, key, index: int):
 
-        # currentTextChanged.connect(self.change_logging_level)
-
-        form.addRow(f"Load from", entry_layout)
-
-        self.checkbox_quality_load = QCheckBox("Load quality on registration")
-        self.checkbox_quality_load.setChecked(True)
-        form.addRow(self.checkbox_quality_load)
-
-        self.checkbox_traces_load = QCheckBox("Load traces on registration")
-        self.checkbox_traces_load.setChecked(False)
-        form.addRow(self.checkbox_traces_load)
-
-        ## Button connections
-        self.paths["root"]["button"].clicked.connect(
-            lambda: self.choose_path(
-                pick_dir=True,
-                edit_line=self.paths["root"]["edit"],
-                display_text="Select root folder",
+        if key == "session":
+            opt = self.loader[key]["options"][index]
+            self.form.setRowVisible(
+                self.loader[key]["additional_options"], opt == ".* (glob)"
             )
+            # self.loader[key]["additional_options"].setVisible(False)
+            self.loader[key]["button"].clicked.disconnect()
+            if opt == "Detection":
+                self.loader[key]["button"].clicked.connect(
+                    lambda: self.choose_path(
+                        pick_dir=False,
+                        init_path=self.root["path"],
+                        display_text="Select session file",
+                        add_to_pending=True,
+                    )
+                )
+
+            elif opt == ".* (glob)":
+                self.loader["session"]["button"].clicked.connect(
+                    self.choose_sessions_from_glob
+                )
+
+            elif opt == "Tracked":
+                self.loader[key]["button"].clicked.connect(
+                    lambda: self.choose_path(
+                        pick_dir=False,
+                        init_path=self.root["path"],
+                        display_text="Select tracked session file",
+                    )
+                )
+
+        elif key == "model":
+            if self.loader[key]["options"][index].startswith("Load"):
+                load_path = self.choose_path(
+                    pick_dir=False,
+                    init_path=self.root["path"],
+                    # only_tail=True,
+                    # edit_line=self.paths["model"]["edit"],
+                    display_text="Select model file",
+                )
+                print("Selected model file:", load_path)
+                print("Loading ...")
+                self.loader[key]["selector"].setCurrentIndex(0)
+            else:
+                self.loader[key]["selector"].setCurrentIndex(index)
+
+        elif key == "registration":
+            if self.loader[key]["options"][index].startswith("Load"):
+                load_path = self.choose_path(
+                    pick_dir=False,
+                    init_path=self.root["path"],
+                    # only_tail=True,
+                    # edit_line=self.paths["registration"]["edit"],
+                    display_text="Select registration file",
+                )
+                print("Selected registration file:", load_path)
+                print("Loading ...")
+                self.loader[key]["selector"].setCurrentIndex(0)
+            else:
+                self.loader[key]["selector"].setCurrentIndex(index)
+        # self.selector_load_from.setCurrentText(self.state.logging_level)
+
+    def choose_sessions_from_glob(self):
+        root = Path(self.root["path"])
+        pattern = self.loader["session"]["edit"].text()
+        paths = list(root.glob(pattern))
+
+        # show warning / empty result dialog
+        if not paths:
+            return
+
+        dialog = GlobReviewDialog(
+            paths,
+            parent=self,
         )
-        # self.paths["session"]["button"].clicked.connect(
-        #     lambda: self.choose_path(
-        #         pick_dir=True,
-        #         init_path=self.root_folder,
-        #         only_tail=True,
-        #         edit_line=self.paths["session"]["edit"],
-        #         display_text="Select session folder",
-        #     )
-        # )
 
-        # self.paths["results"]["button"].clicked.connect(
-        #     lambda: self.choose_path(
-        #         pick_dir=False,
-        #         init_path=self.root_folder,
-        #         only_tail=True,
-        #         edit_line=self.paths["results"]["edit"],
-        #         display_text="Select results file",
-        #         add_to_pending=True
-        #     )
-        # )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        paths = dialog.paths()
+        if paths is None:
+            return
 
-        # self.paths["footprints"]["button"].clicked.connect(
-        #     lambda: self.choose_path(
-        #         pick_dir=False,
-        #         init_path=self.session_folder,
-        #         only_tail=True,
-        #         edit_line=self.paths["footprints"]["edit"],
-        #         display_text="Select footprints file",
-        #     )
-        # )
-
-        # self.paths["field_results"]["button"].clicked.connect(
-        #     lambda: self.on_choose_field(self.results_file, self.paths["field_results"]["edit"])
-        # )
-        # self.paths["field_footprints"]["button"].clicked.connect(
-        #     lambda: self.on_choose_field(
-        #         self.footprints_path, self.paths["field_footprints"]["edit"]
-        #     )
-        # )
-        # ## toggle enable etc
-        # toggle_enable(
-        #     [
-        #         self.path_session_edit,
-        #         self.path_session_button,
-        #         self.path_results_edit,
-        #         self.path_results_button,
-        #         # self.field_background_edit,
-        #         # self.field_background_button,
-        #         # self.path_footprints_edit,
-        #         # self.path_footprints_button,
-        #         # self.field_footprints_edit,
-        #         # self.field_footprints_button,
-        #     ],
-        #     False,
-        # )
-
-        ## logic to enable/disable based on existing paths
-        # self.paths["root"]["edit"].textChanged.connect(
-        #     lambda: toggle_enable(
-        #         [
-        #             self.paths["session"]["edit"],
-        #             self.paths["session"]["button"],
-        #         ],
-        #         Path(self.root_folder).is_dir(),
-        #     )
-        # )
-
-        # self.paths["session"]["edit"].textChanged.connect(
-        #     lambda: toggle_enable(
-        #         [
-        #             self.paths["results"]["edit"],
-        #             self.paths["results"]["button"],
-        #         ],
-        #         Path(self.session_folder).is_dir(),
-        #     )
-        # )
-
-        # self.paths["results"]["edit"].textChanged.connect(
-        #     lambda: toggle_enable(
-        #         [
-        #             self.paths["field_results"]["edit"],
-        #             self.paths["field_results"]["button"],
-        #         ],
-        #         Path(self.results_file).is_file(),
-        #     )
-        # )
-
-        # self.paths["footprints"]["edit"].textChanged.connect(
-        #     lambda: toggle_enable(
-        #         [
-        #             self.paths["field_footprints"]["edit"],
-        #             self.paths["field_footprints"]["button"],
-        #         ],
-        #         Path(self.footprints_path).is_file(),
-        #     )
-        # )
-
-        return form
-
-    def load_from_wildcard(self):
-        print("load from wildcard ...")
-        # self.paths[name]["button"].setVisible(False)
-        self.paths["results"]["edit"].setVisible(False)
+        for path in paths:
+            self.data.register_session(
+                fields_to_load={},
+                from_file=str(path),
+            )
+        return
 
     def choose_path(
         self,
@@ -663,112 +536,19 @@ class MainMenu(QFrame):
                 "HDF5 files (*.hdf5 *.h5);;MATLAB files (*.mat);;All files (*)",
             )
 
-        relative_path = str(Path(path).relative_to(init_path)) if only_tail else path
-
         if add_to_pending:
             session_id = self.data.register_session(
+                fields_to_load={},
                 from_file=str(path),
-                load_content=[],
             )
-            self.state.session_color = (session_id, self.session_colors.next())
 
         if path and edit_line is not None:
+            relative_path = (
+                str(Path(path).relative_to(init_path)) if only_tail else path
+            )
             edit_line.setText(relative_path)
         elif path:
-            return relative_path
-
-    @property
-    def root_folder(self) -> str:
-        return self.paths["root"]["edit"].text().strip()
-
-    # @property
-    # def session_folder(self) -> str:
-    #     if (
-    #         not self.root_folder
-    #         or "session" not in self.paths
-    #         or not isValid(self.paths["session"]["edit"])
-    #     ):
-    #         return ""
-    #     # def _get_session_folder(self) -> str:
-    #     # root_folder = self.path_root_edit.text().strip()
-    #     session_folder = self.paths["session"]["edit"].text().strip()
-    #     if not session_folder:
-    #         return ""
-    #     return str(Path(self.root_folder) / session_folder)
-
-    @property
-    def results_file(self) -> str:
-        if (
-            not self.root_folder
-            or "results" not in self.paths
-            or not isValid(self.paths["results"]["edit"])
-        ):
-            return ""
-        results_file = self.paths["results"]["edit"].text().strip()
-        if not results_file:
-            return ""
-        return str(Path(self.root_folder) / results_file)
-
-    @property
-    def model_file(self) -> str:
-        if (
-            not self.root_folder
-            or "model" not in self.paths
-            or not isValid(self.paths["model"]["edit"])
-        ):
-            return ""
-        model_file = self.paths["model"]["edit"].text().strip()
-        if not model_file:
-            return ""
-        return str(Path(self.root_folder) / model_file)
-
-    @property
-    def registration_file(self) -> str:
-        if (
-            not self.root_folder
-            or "registration" not in self.paths
-            or not isValid(self.paths["registration"]["edit"])
-        ):
-            return ""
-        registration_file = self.paths["registration"]["edit"].text().strip()
-        if not registration_file:
-            return ""
-        return str(Path(self.root_folder) / registration_file)
-
-    # @property
-    # def footprints_field(self) -> str:
-    #     return self.field_footprints_edit.text().strip()
-
-    def on_choose_field(self, path: str, edit_line: QLineEdit):
-        # path = edit_line.text().strip()
-        if not path:
-            QMessageBox.warning(self, "No file", "Please select a results file first.")
-            return
-
-        try:
-            fields = list_file_fields(path)  # List[FieldInfo]
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Error", f"Could not read fields from file:\n{e}"
-            )
-            return
-
-        if not fields:
-            QMessageBox.information(
-                self, "No fields", "No fields/datasets found in this file."
-            )
-            return
-
-        selected_name = FieldSelectDialog.get_field(
-            fields,
-            title="Select field for A",
-            parent=self,
-        )
-        if selected_name is not None:
-
-            # selected = FieldSelectDialog.get_field(fields, title="Select data field", parent=self)
-            # if selected is not None:
-            edit_line.setText(selected_name)
+            return path
 
     ### ------------------------------------------###
     ###    Logic for saving/restoring settings    ###
@@ -779,28 +559,34 @@ class MainMenu(QFrame):
             f"{name}_{info['type']}": self.settings.value(
                 f"paths/{name}_{info['type']}", "", type=str
             )
-            for name, info in paths.items()
+            for name, info in self.config.paths.items()
         }
 
     def _save_settings(self):
+        """
+        this is currently just in a quick patch state - should be fixed!
+        """
+        key = "root_folder"
+        self.settings.setValue(f"paths/{key}", str(self.root["path"]))
 
-        for name, info in paths.items():
-            key = f"{name}_{info['type']}"
-            # try:
-            ## only relative structure is stored
-            # relative = paths[info["root"]]
-            path_key = getattr(self, key, None)
-            if path_key:
-                if info["root"]:
-                    relative_path = Path(path_key).relative_to(
-                        getattr(self, info["root"] + "_folder")
-                    )
-                else:
-                    relative_path = path_key
-                self.settings.setValue(f"paths/{key}", str(relative_path))
-            # except:
-            #     # if mode was not selected, variables wont be set, so just skip
-            #     pass
+        # for name, info in self.config.paths.items():
+        #     key = f"{name}_{info['type']}"
+        #     # try:
+        #     ## only relative structure is stored
+        #     # relative = paths[info["root"]]
+        #     path_key = getattr(self, key, None)
+        #     print(f"Saving setting for key: {key}, path: {path_key}")
+        #     if path_key:
+        #         if info["root"]:
+        #             relative_path = Path(path_key).relative_to(
+        #                 getattr(self, info["root"] + "_folder")
+        #             )
+        #         else:
+        #             relative_path = path_key
+        #         self.settings.setValue(f"paths/{key}", str(relative_path))
+        #     # except:
+        #     #     # if mode was not selected, variables wont be set, so just skip
+        #     #     pass
 
         self.settings.sync()  # flush to disk
 
@@ -811,3 +597,183 @@ class MainMenu(QFrame):
 
 #         if not enabled and isinstance(w, (QLineEdit, QLabel)):
 #             w.setText("")
+
+
+def checkbox_with_options(load_data: dict, callback: Callable) -> QWidget:
+    label = load_data["title"]
+    opts_ref = load_data["opts_ref"]
+
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(2)
+
+    header = QWidget()
+    header_layout = QHBoxLayout(header)
+    header_layout.setContentsMargins(0, 0, 0, 0)
+    header_layout.setSpacing(4)
+
+    chk = QCheckBox(label)
+    chk.setChecked(load_data["load"])
+    chk.stateChanged.connect(
+        lambda state: callback(state == Qt.CheckState.Checked.value)
+    )
+
+    toggle_button = QToolButton()
+    toggle_button.setCheckable(True)
+    toggle_button.setChecked(False)
+    toggle_button.setAutoRaise(True)
+    toggle_button.setFixedWidth(22)
+
+    header_layout.addWidget(chk)
+    header_layout.addStretch()
+    header_layout.addWidget(toggle_button)
+
+    layout.addWidget(header)
+
+    # Indented child area
+    options_container = QWidget()
+    options_layout = QHBoxLayout(options_container)
+    options_layout.setContentsMargins(18, 0, 0, 4)
+    options_layout.addWidget(opts_ref)
+
+    layout.addWidget(options_container)
+
+    def toggle_options(expanded: bool):
+        options_container.setVisible(expanded)
+        toggle_button.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+
+    toggle_button.toggled.connect(toggle_options)
+    toggle_options(False)
+
+    return container
+
+
+class OptionList(QWidget):
+
+    def __init__(
+        self,
+        key: str,
+        load_data: dict,
+        callback: Callable,
+    ):
+        # container = QWidget()
+        # structure_path = QLineEdit("/estimates")
+        # layout.addWidget(structure_path)
+        super().__init__()
+
+        self.key = key
+        self.list_type = load_data["type"]
+
+        self.callback = callback
+
+        if load_data["type"] == "static":
+            layout = QGridLayout(self)
+            layout.setContentsMargins(0, 2, 0, 2)
+            layout.setHorizontalSpacing(6)
+            layout.setVerticalSpacing(3)
+            self.list_layout = layout
+
+        elif load_data["type"] == "dynamic":
+            self.list_layout = FlowLayout(self)
+
+        else:
+            raise ValueError(f"Unknown load_data type: {load_data['type']}")
+
+        self.rebuild(load_data)
+
+    def rebuild(self, load_data):
+
+        if self.list_type != load_data["type"]:
+            raise ValueError(
+                f"Cannot rebuild OptionList of type {self.list_type} with load_data of type {load_data['type']}"
+            )
+        if load_data["type"] == "static":
+            self.rebuild_static_options(load_data)
+        elif load_data["type"] == "dynamic":
+            self.rebuild_dynamic_options(load_data)
+        else:
+            raise ValueError(f"Unknown load_data type: {load_data['type']}")
+
+    def clear_chips(self):
+
+        # Clear existing chips
+        while (child := self.list_layout.takeAt(0)) is not None:
+            if child.widget() is not None:
+                child.widget().deleteLater()
+
+    def rebuild_static_options(self, load_data):
+
+        if not isinstance(self.list_layout, QGridLayout):
+            raise ValueError("Cannot rebuild static options on non-grid layout.")
+
+        self.clear_chips()
+
+        self.edit = {}
+
+        for row, (label, key) in enumerate(load_data["opts"].items()):
+            self.edit[label] = QLineEdit(key)
+
+            browse = QToolButton()
+            browse.setText("…")
+            browse.setToolTip(f"Find {label.lower()} field")
+            browse.setFixedWidth(25)
+            browse.clicked.connect(
+                lambda _, key=self.key, label=label: self.callback(
+                    key, label, method="edit"
+                )
+            )
+
+            self.list_layout.addWidget(
+                QLabel(label),
+                row,
+                0,
+            )
+            self.list_layout.addWidget(
+                self.edit[label],
+                row,
+                1,
+            )
+            self.list_layout.addWidget(
+                browse,
+                row,
+                2,
+            )
+
+            # self.spatial_edits[label.lower()] = edit
+        self.list_layout.setColumnStretch(1, 1)
+
+    def rebuild_dynamic_options(self, load_data):
+
+        if not isinstance(self.list_layout, FlowLayout):
+            raise ValueError("Cannot rebuild dynamic options on non-flow layout.")
+
+        self.clear_chips()
+
+        opts = (
+            load_data["opts"].items()
+            if isinstance(load_data["opts"], dict)
+            else load_data["opts"]
+        )
+        for opt in opts:
+            chip = FieldChip(opt)
+            self.list_layout.addWidget(chip)
+
+            chip.field_button.clicked.connect(
+                lambda _, key=self.key, label=chip.label: self.callback(
+                    key, label, method="rename"
+                )
+            )
+            chip.remove_requested.connect(
+                lambda chip_label, key=self.key: self.callback(
+                    key, chip_label, method="remove"
+                )
+            )
+
+        add_button = QToolButton()
+        add_button.setText("+")
+        add_button.setToolTip(f"Add {self.key} field")
+        add_button.clicked.connect(lambda _, label=None: self.callback(self.key, label))
+        self.list_layout.addWidget(add_button)

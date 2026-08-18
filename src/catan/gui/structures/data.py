@@ -1,11 +1,11 @@
 from typing import Dict, Optional, Tuple, List
-
 import numpy as np
 from scipy import sparse
 
+from . import AppState, NeuronComponent, ConfigData
 from catan.core.structures import SessionData
-from catan.gui.structures.state import NeuronComponent
 from pathlib import Path
+from catan.gui.plots.colors import CyclicColorMap
 
 # from catan.gui.background_tasks import TaskContext
 from catan import Tracking
@@ -22,11 +22,14 @@ class Neurons:
 
 class Data(Tracking):
 
-    def __init__(self, state):
+    def __init__(self, state: AppState, config: ConfigData):
 
         super().__init__()
         self.state = state
+        self.config = config
         self.current_session: Optional[SessionData] = None
+
+        self.session_colors = CyclicColorMap(n_colors=20, cmap_name="twilight")
 
         self.state.current_session_changed.connect(self._on_current_session_changed)
 
@@ -35,10 +38,10 @@ class Data(Tracking):
         self.state.data_changed.emit(change)
 
     def _on_current_session_changed(self, session_id: int):
-        if len(self.sessions)==0:
+        if len(self.sessions) == 0:
             self.current_session = None
             return
-        
+
         if session_id < 0 or session_id >= len(self.sessions):
             raise ValueError(f"Invalid session_id {session_id}")
 
@@ -46,49 +49,55 @@ class Data(Tracking):
 
         # self.change_trace_presence(session_id, True)
 
-    def change_spatial_presence(self, session_id: int, to_present: Optional[bool]=None):
+    def change_spatial_presence(
+        self, session_id: int, to_present: Optional[bool] = None, **kwargs
+    ):
         """
-            does it even make sense to unload 
-             - no use for session anymore
-             - not much data volume in there)
+        does it even make sense to unload
+         - no use for session anymore
+         - not much data volume in there)
         """
         session = self.sessions[session_id]
         if to_present is None:
             to_present = not session.status["spatial_loaded"]
 
         if to_present:
-            self.state.tasks.start(
-                f"Loading footprints for {getattr(session, 'name', f'Session {session_id}')}",
-                lambda ctx: session.load_data(["spatial"], self.alignment_template, ctx=ctx),
-                finished=lambda id=session_id: self._on_data_changed(("session", id)),
+            fields_to_load = {"spatial": self.config.fields["spatial"]}
+            session.load_data(
+                fields_to_load,
+                self.alignment_template,
+                force_load=True,
+                ctx=kwargs.get("ctx", None),
             )
+            self._on_data_changed(("session", session_id))
         else:
             self.state.logger.WARNING("Unloading footprints doesnt make much sense!")
 
-    def change_trace_presence(self, session_id: int, to_present: Optional[bool] = None):
+    def change_trace_presence(
+        self, session_id: int, to_present: Optional[bool] = None, **kwargs
+    ):
         """
         should be realized by session structure directly
         """
         session = self.sessions[session_id]
-        ## default to "toggle" if nothing provided
         if to_present is None:
+            ## default to "toggle" if nothing provided
             to_present = not session.status["traces_loaded"]
 
         if session.status["traces_loaded"] == to_present:
             return
 
         if to_present:
-            self.state.tasks.start(
-                f"Loading traces for {getattr(session, 'name', f'Session {session_id}')}",
-                lambda ctx: session.load_data(["temporal"], ctx=ctx),
-                finished=lambda id=session_id: self._on_data_changed(("traces", id)),
+            fields_to_load = {"traces": self.config.fields["traces"]}
+            session.load_data(
+                fields_to_load, force_load=True, ctx=kwargs.get("ctx", None)
             )
         else:
             session.clean_traces()
-            self._on_data_changed(("traces", session_id))
+        self._on_data_changed(("traces", session_id))
 
     def change_quality_presence(
-        self, session_id: int, to_present: Optional[bool] = None
+        self, session_id: int, to_present: Optional[bool] = None, **kwargs
     ):
         """
         should be realized by session structure directly
@@ -102,35 +111,75 @@ class Data(Tracking):
             return
 
         if to_present:
-            session.load_data(["quality"])
+            fields_to_load = {"quality": self.config.fields["quality"]}
+            session.load_data(
+                fields_to_load, force_load=True, ctx=kwargs.get("ctx", None)
+            )
+            self._on_data_changed(("quality", session_id))
         else:
             session.clean_quality()
 
         self._on_data_changed(("quality", session_id))
 
+    def load_data(self, session_id: int, fields_to_load: dict, **kwargs):
+
+        session = self.sessions[session_id]
+        session.load_data(fields_to_load, self.alignment_template, **kwargs)
+        if self.state.current_session_id is None:
+            self.state.current_session_id = session_id
+
+    def update_model_with_data(
+        self,
+        from_file: Optional[str | Path] = None,
+        from_data: Optional[SessionData] = None,
+        from_session_index: Optional[int] = None,
+        align_to_reference=True,
+        **kwargs,
+    ):
+        super().update_model_with_data(
+            from_file=from_file,
+            from_data=from_data,
+            from_session_index=from_session_index,
+            align_to_reference=align_to_reference,
+        )
+
+    def fit_to_model(self, **kwargs):
+        super().fit_to_model()
+
     def move_session(self, old_session_id: int, new_session_id: int):
         super().move_session(old_session_id, new_session_id)
         self.state.assignments = self.assignments
 
-        ## adjust selected components to reflect the new session IDs
-        components = set()
-        for component in self.state.selected_components:
+        order_translation = list(range(len(self.sessions)))
+        id = order_translation.pop(new_session_id)
+        order_translation.insert(old_session_id, id)
 
-            if component.session_id == old_session_id:
+        ## adjust selected components to reflect the new session IDs
+        if self.state.selected_components is not None:
+            components = set()
+            for component in self.state.selected_components:
                 components.add(
                     NeuronComponent(
-                        neuron_id=component.neuron_id, session_id=new_session_id
+                        neuron_id=component.neuron_id,
+                        session_id=order_translation[component.session_id],
                     )
                 )
-            elif component.session_id == new_session_id:
-                components.add(
-                    NeuronComponent(
-                        neuron_id=component.neuron_id, session_id=old_session_id
-                    )
-                )
-            else:
-                components.add(component)
-        self.state.update_selected_components(list(components))
+
+                # if component.session_id == old_session_id:
+                #     components.add(
+                #         NeuronComponent(
+                #             neuron_id=component.neuron_id, session_id=new_session_id
+                #         )
+                #     )
+                # elif component.session_id == new_session_id:
+                #     components.add(
+                #         NeuronComponent(
+                #             neuron_id=component.neuron_id, session_id=old_session_id
+                #         )
+                #     )
+                # else:
+                #     components.add(component)
+            self.state.update_selected_components(list(components))
 
         if self.current_session is not None:
             self.state.current_session_id = self.current_session.id
@@ -139,29 +188,32 @@ class Data(Tracking):
 
     def register_session(
         self,
+        fields_to_load: Optional[dict] = None,
         from_file: Optional[str | Path] = None,
         name: Optional[str] = None,
-        load_content: List[str] = ["spatial", "temporal", "quality"],
         align=True,
         **kwargs,
     ) -> int:
-        """ """
+
         session_id = super().register_session(
-            from_file, name, load_content, align, **kwargs
+            fields_to_load, from_file, name, align, **kwargs
         )
+        self.state.session_color = (session_id, self.session_colors.next())
         # Notify that sessions have changed
         self._on_data_changed(("sessions", session_id))
         return session_id
 
     def remove_session(self, session_id: int):
 
-        super().remove_session(session_id)
+        super().move_session(session_id, -1)
         self.state.assignments = self.assignments
 
         self.adjust_selected_components_after_data_change(session_id, -1)
 
         if self.current_session is not None:
-            self.state.current_session_id = self.current_session.id if len(self.sessions)>0 else None
+            self.state.current_session_id = (
+                self.current_session.id if len(self.sessions) > 0 else None
+            )
 
         self._on_data_changed(("assignments", -1))  # Notify that sessions have changed
 
@@ -169,16 +221,17 @@ class Data(Tracking):
         self,
         from_file: Optional[str | Path] = None,
         from_data: Optional[SessionData] = None,
-        from_session_id: Optional[int] = None,
+        from_session_index: Optional[int] = None,
         align_to_reference: bool = True,
         clean_traces: bool = True,
         p_thr=[0.5, 0.3],
+        **kwargs,
     ):
         """ """
         super().register_neurons(
             from_file=from_file,
             from_data=from_data,
-            from_session_id=from_session_id,
+            from_session_index=from_session_index,
             align_to_reference=align_to_reference,
             clean_traces=clean_traces,
             p_thr=p_thr,
@@ -203,7 +256,7 @@ class Data(Tracking):
         ## adjust selected components to reflect the new session IDs
         if self.state.selected_components is None:
             return
-        
+
         components = set()
         for component in self.state.selected_components:
             if component.session_id == session_id:
@@ -225,11 +278,10 @@ class Data(Tracking):
                             neuron_id=component.neuron_id, session_id=other_sessions[0]
                         )
                     )
-        if len(components)>0:
+        if len(components) > 0:
             self.state.update_selected_components(list(components))
         else:
             self.state.update_selected_components(None)
-
 
     def load_registration(self, path_registration: str | Path):
         super().load_registration(path_registration)

@@ -62,12 +62,19 @@ def get_footprint_id_from_mouse_pos(canvas, pos, centroids) -> Optional[int]:
     return footprint_id
 
 
-def print_debug(state, data):
+def print_debug(state, data, config):
 
     print("Current session:", state.current_session_id)
     print("Sessions:", data.sessions)
-    print("Sesssion:",data.current_session.name)
-    print("Sesssion:",data.current_session.path)
+    print("config:", config.fields)
+    # print("ids:",data.session_order)
+    # print("Session names:", [s.name for s in data.sessions])
+    # print("Session order:", [(s.id,s.name) for s in data.sessions])
+    # print("Session neuron numbers:", [s.n_neurons for s in data.sessions])
+    # print("Selected components:", state.selected_components)
+    # print("Session colors:", state._session_colors)
+    # print("Sesssion:",data.current_session.name)
+    # print("Sesssion:",data.current_session.path)
 
     # print(f"current session traces:", data.current_session.status["traces_loaded"])
     # print(f"current session traces:", data.current_session.traces)

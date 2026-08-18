@@ -81,9 +81,11 @@ class BaseCanvas(scene.SceneCanvas):
                     "size": int((A > A.max() * 0.01).sum()),
                 }
                 if session.status["quality_loaded"]:
-                    metrics["SNR"] = session.quality["SNR_comp"][fp_id]
-                    metrics["r-value"] = session.quality["r_values"][fp_id]
-                    metrics["CNN"] = session.quality["cnn_preds"][fp_id]
+                    for key, q_val in session.quality.items():
+                        metrics[key] = q_val[fp_id]
+                    # metrics["SNR"] = session.quality["SNR_comp"][fp_id]
+                    # metrics["r-value"] = session.quality["r_values"][fp_id]
+                    # metrics["CNN"] = session.quality["cnn_preds"][fp_id]
 
                 text = "Neuron ID: {}\n{} \n".format(component.neuron_id, session_name)
                 text += "\n".join(

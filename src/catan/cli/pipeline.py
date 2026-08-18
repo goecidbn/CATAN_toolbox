@@ -322,7 +322,7 @@ def run_matching(
         unit="session",
     ):
         tracking.update_model_with_data(
-            from_session_id=session_id,
+            from_session_index=session_id,
         )
 
     tracking.fit_to_model(
@@ -336,7 +336,7 @@ def run_matching(
         unit="session",
     ):
         tracking.register_neurons(
-            from_session_id=session_id,
+            from_session_index=session_id,
         )
 
     save_matching_results(

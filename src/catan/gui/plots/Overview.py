@@ -235,7 +235,7 @@ class Display(BasePlot.BaseCanvas):
             colors=self.plotting["data"][session_id].color,
             edge_width=0,
         )
-        print("updating style for session", session_id, "with style", plot_options)
+        # print("updating style for session", session_id, "with style", plot_options)
 
         self.plotting["visuals"][session_id].set_data(
             self.plotting["data"][session_id].pos, **plot_options

@@ -113,12 +113,13 @@ class Tracking:
             "same": np.zeros((self.params["nbins"], self.params["nbins"]), int),
             "cross": np.zeros((self.params["nbins"], self.params["nbins"], 3), int),
         }
+        self.model_fitted = False
 
     def register_session(
         self,
+        fields_to_load: Optional[dict] = None,
         from_file: Optional[str | Path] = None,
         name: Optional[str] = None,
-        load_content: List[str] = ["quality", "spatial", "temporal"],
         align=True,
         **kwargs,
     ) -> int:
@@ -135,7 +136,7 @@ class Tracking:
 
             Optional name for this session
 
-        - load_content: list[str] = ["spatial", "temporal", "quality"]
+        - fields_to_load: list[str] = ["spatial", "traces", "quality"]
 
             Specifies which data should be loaded and can be either combination of the three above - but setting all is strongly encouraged.
 
@@ -156,12 +157,11 @@ class Tracking:
                 id=len(self.sessions),
             )
             this_data.load_data(
-                which=load_content,
+                fields_to_load=fields_to_load,
                 alignment_template=self.alignment_template if align else None,
                 **kwargs,
             )
             self.sessions.append(this_data)
-
         else:
             raise ValueError(
                 "from_file must be provided for session registration for now - registration from raw data to be implemented later"
@@ -174,63 +174,62 @@ class Tracking:
         if len(self.sessions) == 0:
             return None
 
-        aligned_sessions = [session for session in self.sessions if session.status["aligned"]]
+        aligned_sessions = [
+            session for session in self.sessions if session.status["aligned"]
+        ]
         if len(aligned_sessions) == 0:
             return None
 
         alignment_window = min(len(aligned_sessions), 10)
 
         return np.stack(
-            [
-                session.Cn
-                for session in aligned_sessions[-alignment_window:]
-            ],
+            [session.Cn for session in aligned_sessions[-alignment_window:]],
             axis=0,
         )
 
-    def batch_update_model(
-        self,
-        root_path=".",
-        path_glob="*/neuron_detection_*",
-        s_specific=None,
-        align_to_reference=True,
-    ):
-        paths = sorted(Path(root_path).glob(path_glob))
-        self.progress = tqdm(enumerate(paths), total=len(paths))
-        for s, path in self.progress:
-            if s_specific is not None and s not in s_specific:
-                continue
-            self.progress.set_description(f"Processing session {s}, {path.name}")
-            # print(f"Processing {path}...")
-            self.update_model_with_data(
-                from_file=path, align_to_reference=align_to_reference
-            )
-        self.fit_to_model()
+    # def batch_update_model(
+    #     self,
+    #     root_path=".",
+    #     path_glob="*/neuron_detection_*",
+    #     s_specific=None,
+    #     align_to_reference=True,
+    # ):
+    #     paths = sorted(Path(root_path).glob(path_glob))
+    #     self.progress = tqdm(enumerate(paths), total=len(paths))
+    #     for s, path in self.progress:
+    #         if s_specific is not None and s not in s_specific:
+    #             continue
+    #         self.progress.set_description(f"Processing session {s}, {path.name}")
+    #         # print(f"Processing {path}...")
+    #         self.update_model_with_data(
+    #             from_file=path, align_to_reference=align_to_reference
+    #         )
+    #     self.fit_to_model()
 
-    def batch_register_neurons(
-        self,
-        root_path=".",
-        path_glob="*/neuron_detection_*",
-        s_specific=None,
-        align_to_reference=True,
-    ):
+    # def batch_register_neurons(
+    #     self,
+    #     root_path=".",
+    #     path_glob="*/neuron_detection_*",
+    #     s_specific=None,
+    #     align_to_reference=True,
+    # ):
 
-        paths = sorted(Path(root_path).glob(path_glob))
-        self.progress = tqdm(enumerate(paths), total=len(paths))
-        for s, path in self.progress:
-            if s_specific is not None and s not in s_specific:
-                continue
-            sz_union = self.union.n_neurons
-            self.progress.set_description(
-                f"Registering session {s} to {sz_union} neurons, {path.name}"
-            )
-            self.register_neurons(from_file=path, align_to_reference=align_to_reference)
+    #     paths = sorted(Path(root_path).glob(path_glob))
+    #     self.progress = tqdm(enumerate(paths), total=len(paths))
+    #     for s, path in self.progress:
+    #         if s_specific is not None and s not in s_specific:
+    #             continue
+    #         sz_union = self.union.n_neurons
+    #         self.progress.set_description(
+    #             f"Registering session {s} to {sz_union} neurons, {path.name}"
+    #         )
+    #         self.register_neurons(from_file=path, align_to_reference=align_to_reference)
 
     def update_model_with_data(
         self,
         from_file: Optional[str | Path] = None,
         from_data: Optional[SessionData] = None,
-        from_session_id: Optional[int] = None,
+        from_session_index: Optional[int] = None,
         align_to_reference=True,
     ):
         """
@@ -239,12 +238,14 @@ class Tracking:
         this_data = self.from_data(
             from_file=from_file,
             from_data=from_data,
-            from_session_id=from_session_id,
+            from_session_index=from_session_index,
             align_to_reference=align_to_reference,
         )
 
         if not this_data.status["aligned"]:
-            print(f"Session {from_file} did not pass quality criteria, skipping.")
+            print(
+                f"[model update] Session {this_data.id} ({this_data.path}) did not pass quality criteria, skipping."
+            )
             return
 
         # build both models: self and cross (nNN from self and NN from cross)
@@ -261,7 +262,7 @@ class Tracking:
         self,
         from_file: Optional[str | Path] = None,
         from_data: Optional[SessionData] = None,
-        from_session_id: Optional[int] = None,
+        from_session_index: Optional[int] = None,
         align_to_reference=True,
     ) -> SessionData:
         if from_file is not None:
@@ -281,17 +282,17 @@ class Tracking:
                 from_data, SessionData
             ), "from_data must be a SessionData instance"
             this_data = from_data
-        elif from_session_id is not None:
+        elif from_session_index is not None:
             assert isinstance(
-                from_session_id, int
-            ), "from_session_id must be an integer"
+                from_session_index, int
+            ), "from_session_index must be an integer"
             assert (
-                0 <= from_session_id < len(self.sessions)
-            ), "from_session_id is out of range"
-            this_data = self.sessions[from_session_id]
+                0 <= from_session_index < len(self.sessions)
+            ), "from_session_index is out of range"
+            this_data = self.sessions[from_session_index]
         else:
             raise ValueError(
-                "Either from_file, from_data, or from_session_id must be provided."
+                "Either from_file, from_data, or from_session_index must be provided."
             )
         return this_data
 
@@ -427,6 +428,11 @@ class Tracking:
         """
         Currently takes over h almost as provided - add weights to  improve fit, or fit to NN-distr specifically?
         """
+        if self.counts["cross"][..., 0].sum() < 100:
+            print(
+                "Not enough data to fit model - at least 100 counts in cross histogram required."
+            )
+            return
 
         p_init, bounds = self.get_parameter_estimates()
 
@@ -532,6 +538,7 @@ class Tracking:
         self.distance_cutoff = max(
             10, self.params["arrays"]["distance_bounds"][idx_cutoff] * 1.5
         )  ## make sure, also half-detected ones have a chance!
+        self.model_fitted = True
 
     def get_f_same(self, model="joint"):
 
@@ -646,7 +653,7 @@ class Tracking:
         self,
         from_file: Optional[str | Path] = None,
         from_data: Optional[SessionData] = None,
-        from_session_id: Optional[int] = None,
+        from_session_index: Optional[int] = None,
         align_to_reference=True,
         clean_traces=True,
         p_thr=[0.5, 0.3],
@@ -655,13 +662,17 @@ class Tracking:
         this_data = self.from_data(
             from_file=from_file,
             from_data=from_data,
-            from_session_id=from_session_id,
+            from_session_index=from_session_index,
             align_to_reference=align_to_reference,
         )
+        # index = self.session_order.index(this_data.id)
+        # assert from_session_index == index, "Session index mismatch!"
 
         if not this_data.status["aligned"] or this_data.A is None:
 
-            print(f"Session {this_data.path} did not pass quality criteria, skipping.")
+            print(
+                f"[register] Session {this_data.path} did not pass quality criteria, skipping."
+            )
             self.assignments = pad_axis(self.assignments, [0, 1], -1)
             self.tracking["p_matched"] = pad_axis(
                 self.tracking["p_matched"], (0, 1, 0), np.nan
@@ -883,34 +894,6 @@ class Tracking:
         #     print("double match!")
         #     return
 
-    def move_session(self, old_session_id: int, new_session_id: int):
-        """
-        Moves a session's data from one session ID to another, updating assignments and tracking accordingly.
-        """
-        if old_session_id < 0 or old_session_id >= self.assignments.shape[1]:
-            raise ValueError(
-                "Invalid old_session_id. It must be within the range of existing sessions."
-            )
-        if new_session_id < 0 or new_session_id >= self.assignments.shape[1]:
-            raise ValueError(
-                "Invalid new_session_id. It must be within the range of existing sessions."
-            )
-
-        session = self.sessions.pop(old_session_id)
-        self.sessions.insert(new_session_id, session)
-        self.reindex_sessions_after_order_change()
-
-        # Move the session's data in assignments and tracking
-        self.assignments[:, [old_session_id, new_session_id]] = self.assignments[
-            :, [new_session_id, old_session_id]
-        ]
-        self.tracking["p_matched"][:, [old_session_id, new_session_id], :] = (
-            self.tracking["p_matched"][:, [new_session_id, old_session_id], :]
-        )
-        self.tracking["shifts"][:, [old_session_id, new_session_id], :] = self.tracking[
-            "shifts"
-        ][:, [new_session_id, old_session_id], :]
-
     def unregister_neurons(self, session_id: int):
         """
         Removes a session's neurons from the union data and updates assignments and tracking accordingly.
@@ -919,7 +902,8 @@ class Tracking:
             raise ValueError(
                 "Invalid session_id. It must be within the range of existing sessions."
             )
-        self.sessions[session_id].status["matched"] = False  
+        # session_id = self.session_order[session_index]
+        self.sessions[session_id].status["matched"] = False
 
         if len(self.sessions) == 1:
             self.reset_registration()
@@ -934,38 +918,94 @@ class Tracking:
         self.updating_neuron_presence()  # Update neuron presence and clean union data
         # Mark the session as unmatched
 
-    def remove_session(self, session_id: int):
+    def move_session(self, session_id: int, new_session_id: int):
         """
-        Removes a session from the union data and updates assignments and tracking accordingly.
+        (Re)Moves a session's data from one session ID to another, updating assignments and tracking accordingly.
         """
-        if session_id < 0 or session_id > len(self.sessions):
+        if session_id < 0 or session_id >= len(self.sessions):
             raise ValueError(
                 "Invalid session_id. It must be within the range of existing sessions."
             )
-        if len(self.sessions)==1:
-            ## when last session is removed
-            self.reset_registration()
-            self.reset_data()
-            return
-        
-        self.sessions.pop(session_id)
-        
-        if session_id >= self.assignments.shape[1]:
+        if new_session_id >= len(self.sessions):
             raise ValueError(
-                "Session has not been registered yet."
+                "Invalid new_session_id. It must be within the range of existing sessions."
             )
 
-        # print(f"Session {session_id} has been unregistered. Updating union data...")
+        session = self.sessions.pop(session_id)
+        n_assigned = self.assignments.shape[1]
 
-        # Mark assignments and tracking stats in this session as unassigned
-        self.assignments = np.delete(self.assignments, session_id, axis=1)
-        self.tracking["p_matched"] = np.delete(
-            self.tracking["p_matched"], session_id, axis=1
-        )
-        self.tracking["shifts"] = np.delete(self.tracking["shifts"], session_id, axis=1)
+        if new_session_id >= 0:
+            self.sessions.insert(new_session_id, session)
+            self.reindex_sessions_after_order_change()
+
+            if session_id >= n_assigned or new_session_id >= n_assigned:
+                return
+
+            # Move the session's data in assignments and tracking
+            self.assignments = move_single_row(
+                self.assignments, session_id, new_session_id
+            )
+            self.tracking["p_matched"] = move_single_row(
+                self.tracking["p_matched"], session_id, new_session_id
+            )
+            self.tracking["shifts"] = move_single_row(
+                self.tracking["shifts"], session_id, new_session_id
+            )
+        else:
+            # remove the session
+            self.reindex_sessions_after_order_change()
+
+            if len(self.sessions) == 0:
+                ## when last session is removed
+                self.reset_registration()
+                self.reset_data()
+                return
+
+            if session_id >= n_assigned or new_session_id >= n_assigned:
+                return
+
+            self.assignments = np.delete(self.assignments, session_id, axis=1)
+            self.tracking["p_matched"] = np.delete(
+                self.tracking["p_matched"], session_id, axis=1
+            )
+            self.tracking["shifts"] = np.delete(
+                self.tracking["shifts"], session_id, axis=1
+            )
 
         self.updating_neuron_presence()  # Update neuron presence and clean union data
-        self.reindex_sessions_after_order_change()  # Reindex sessions after removal
+
+    # def remove_session(self, session_id: int):
+    #     """
+    #     Removes a session from the union data and updates assignments and tracking accordingly.
+    #     """
+    #     if session_id < 0 or session_id > len(self.sessions):
+    #         raise ValueError(
+    #             "Invalid session_id. It must be within the range of existing sessions."
+    #         )
+    #     if len(self.sessions)==1:
+    #         ## when last session is removed
+    #         self.reset_registration()
+    #         self.reset_data()
+    #         return
+
+    #     self.sessions.pop(session_id)
+
+    #     if session_id >= self.assignments.shape[1]:
+    #         raise ValueError(
+    #             "Session has not been registered yet."
+    #         )
+
+    #     # print(f"Session {session_id} has been unregistered. Updating union data...")
+
+    #     # Mark assignments and tracking stats in this session as unassigned
+    #     self.assignments = np.delete(self.assignments, session_id, axis=1)
+    #     self.tracking["p_matched"] = np.delete(
+    #         self.tracking["p_matched"], session_id, axis=1
+    #     )
+    #     self.tracking["shifts"] = np.delete(self.tracking["shifts"], session_id, axis=1)
+
+    #     self.updating_neuron_presence()  # Update neuron presence and clean union data
+    #     self.reindex_sessions_after_order_change()  # Reindex sessions after removal
 
     def updating_neuron_presence(self):
 
@@ -989,12 +1029,17 @@ class Tracking:
         # print(f"Updated union data now contains {self.union.n_neurons} neurons.")
 
     def reindex_sessions_after_order_change(self):
+        # print("Reindexing sessions after order change...")
         for session_id, session in enumerate(self.sessions):
 
             if session is None:
                 continue
-
+            # print(f"Reindexing session {session.id} to new index {session_id}")
             session.id = session_id
+
+        # for session_id, session in enumerate(self.sessions):
+
+    #         session.id = session_id
 
     # def get_variable_by_cluster(self, var, c=None):
     #     """
@@ -1094,7 +1139,6 @@ class Tracking:
 
         status[sStart:sEnd] = True
         for session in self.sessions:
-
             session.evaluate_alignment_status()
             status[session.id] = session.status["aligned"]
         ## check for coherence with other sessions (low shift, high correlation)
@@ -1316,7 +1360,7 @@ class Tracking:
             dataIn["A"] = ld["A"][:, n_idx]
             # dataIn["A"] = alignment["A"][str(s)][:, n_idx]
 
-            ## load temporal components of active cells from session s
+            ## load trace components of active cells from session s
             T1 = ld["C"].shape[1]  # adjusted for a session, where T != T1
             dataIn["C"][: idxes["in"]["nActive"], :T1] = ld["C"][n_idx, :]
 
@@ -1592,6 +1636,24 @@ class Tracking:
         ]
         common_path = os.path.commonpath([str(path) for path in candidate_paths])
         return Path(common_path) / "matching"
+
+
+def move_single_row(a, old_index, new_index):
+    """
+    could be changed to using "np.take" instead of slicing
+    """
+    if old_index < new_index:
+        a[:, old_index:new_index], a[:, new_index] = (
+            a[:, old_index + 1 : new_index + 1],
+            a[:, old_index].copy(),
+        )
+    elif new_index < old_index:
+        a[:, new_index + 1 : old_index + 1], a[:, new_index] = (
+            a[:, new_index:old_index],
+            a[:, old_index].copy(),
+        )
+
+    return a
 
 
 def mean_of_trunc_lognorm(mu, sigma, trunc_loc):

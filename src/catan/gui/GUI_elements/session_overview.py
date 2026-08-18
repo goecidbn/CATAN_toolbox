@@ -1,6 +1,7 @@
 from PySide6.QtCore import Qt, Signal, QPoint
 from PySide6.QtGui import QColor, QAction
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QWidget,
     QFrame,
     QLabel,
@@ -16,17 +17,15 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QColorDialog,
     QMessageBox,
+    QWidgetAction,
 )
 
 from catan.gui.structures import AppState, Data
-from catan.gui.data.utils import move_index_along_axis
 
 from .fragments.IconButton import (
     make_icon_button,
     set_button_icon,
 )
-
-# print("Reloading session_overview.py")
 
 
 class SessionRowWidget(QFrame):
@@ -38,41 +37,26 @@ class SessionRowWidget(QFrame):
     editOffsetRequested = Signal(int)
     changeColorRequested = Signal(int)
 
+    loadRequested = Signal(int)  # session_id
     traceToggled = Signal(int)
     qualityToggled = Signal(int)
     spatialToggled = Signal(int)
 
     removeRequested = Signal(int)
 
-    def __init__(self, session_id: int, session, parent=None):
+    def __init__(self, session_id: int, session, current=False, parent=None):
         super().__init__(parent)
 
-        self.session_id = session_id
+        self.index = session_id
         self.session = session
 
         self.setObjectName("SessionRowWidget")
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._open_context_menu)
 
-        self.up_button = QToolButton()
-        self.up_button.setText("▲")
-        self.up_button.setFixedSize(20, 16)
-        self.up_button.clicked.connect(
-            lambda: self.moveRequested.emit(self.session_id, -1)
-        )
-
-        self.down_button = QToolButton()
-        self.down_button.setText("▼")
-        self.down_button.setFixedSize(20, 16)
-        self.down_button.clicked.connect(
-            lambda: self.moveRequested.emit(self.session_id, +1)
-        )
-
         order_layout = QVBoxLayout()
         order_layout.setContentsMargins(0, 0, 0, 0)
         order_layout.setSpacing(0)
-        order_layout.addWidget(self.up_button)
-        order_layout.addWidget(self.down_button)
 
         self.active_checkbox = QCheckBox()
         self.active_checkbox.stateChanged.connect(self._on_active_changed)
@@ -85,9 +69,37 @@ class SessionRowWidget(QFrame):
         self.offset_label.setObjectName("SessionOffsetLabel")
         self.offset_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        self.load_fields_button = QToolButton(self)
+        self.load_fields_button.setText("Load")
+        self.load_fields_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup
+        )
+
+        self.load_fields_button.clicked.connect(
+            lambda: self.loadRequested.emit(self.index)
+        )
+
+        menu = QMenu(self.load_fields_button)
+
+        container = QWidget(menu)
+        layout_menu = QHBoxLayout(container)
+        layout_menu.setContentsMargins(6, 6, 6, 6)
+        layout_menu.setSpacing(4)
+
         self.trace_button = make_icon_button()
         self.quality_button = make_icon_button()
         self.spatial_button = make_icon_button()
+
+        layout_menu.addWidget(self.trace_button)
+        layout_menu.addWidget(self.quality_button)
+        layout_menu.addWidget(self.spatial_button)
+
+        widget_action = QWidgetAction(menu)
+        widget_action.setDefaultWidget(container)
+
+        menu.addAction(widget_action)
+
+        self.load_fields_button.setMenu(menu)
 
         self.delete_button = make_icon_button(
             ("fa6s.ban", "fa5s.ban"),
@@ -97,21 +109,19 @@ class SessionRowWidget(QFrame):
         )
 
         # self.trace_button = QPushButton()
-        self.trace_button.clicked.connect(
-            lambda: self.traceToggled.emit(self.session_id)
-        )
+        self.trace_button.clicked.connect(lambda: self.traceToggled.emit(self.index))
         self.quality_button.clicked.connect(
-            lambda: self.qualityToggled.emit(self.session_id)
+            lambda: self.qualityToggled.emit(self.index)
         )
 
         # self.spatial_button = QPushButton()
         self.spatial_button.clicked.connect(
-            lambda: self.spatialToggled.emit(self.session_id)
+            lambda: self.spatialToggled.emit(self.index)
         )
 
         # self.data_button = QPushButton()
         self.delete_button.clicked.connect(
-            lambda: self.removeRequested.emit(self.session_id)
+            lambda: self.removeRequested.emit(self.index)
         )
 
         layout = QHBoxLayout(self)
@@ -123,15 +133,16 @@ class SessionRowWidget(QFrame):
         layout.addWidget(self.name_edit)
         layout.addWidget(self.offset_label)
         layout.addStretch()
-        layout.addWidget(self.trace_button)
-        layout.addWidget(self.quality_button)
-        layout.addWidget(self.spatial_button)
+        layout.addWidget(self.load_fields_button)
+        # layout.addWidget(self.trace_button)
+        # layout.addWidget(self.quality_button)
+        # layout.addWidget(self.spatial_button)
         layout.addWidget(self.delete_button)
 
-        self.refresh()
+        self.refresh(current=current)
 
-    def refresh(self):
-        name = getattr(self.session, "name", f"Session{self.session_id:02d}")
+    def refresh(self, current=False):
+        name = getattr(self.session, "name", f"Session{self.index:02d}")
         path = getattr(self.session, "path", "")
         active = getattr(self.session, "active", True)
         offset = getattr(self.session, "time_offset", 0)
@@ -154,7 +165,7 @@ class SessionRowWidget(QFrame):
             self.offset_label.setVisible(False)
 
         self._update_buttons()
-        self._update_background()
+        self._update_background(current=current)
 
     def _update_buttons(self):
 
@@ -162,7 +173,7 @@ class SessionRowWidget(QFrame):
         if not spatial_loaded:
             set_button_icon(
                 self.spatial_button,
-                ("fa6s.layer","fa5s.layer"),
+                ("fa6s.layer", "fa5s.layer"),
                 color="white",
                 tooltip="Load footprint data",
                 fallback_theme_icon="applications-games",
@@ -205,8 +216,10 @@ class SessionRowWidget(QFrame):
             ),
         )
 
-    def _update_background(self):
-        color = getattr(self.session, "color", QColor("#555555"))
+    def _update_background(self, current=False):
+        color = getattr(self.session, "color", QColor("#888888"))
+        if current:
+            color = getattr(self.session, "color", QColor("#333333"))
 
         if not isinstance(color, QColor):
             color = QColor(str(color))
@@ -214,8 +227,9 @@ class SessionRowWidget(QFrame):
         # Soft translucent background, so text remains readable.
         r, g, b, _ = color.getRgb()
         self.setStyleSheet(f"""
-            QFrame#SessionRowWidget {{
+            QFrame#SessionRowWidget {{21
                 background-color: rgba({r}, {g}, {b}, 55);
+                border: {"2px solid rgba(255, 255, 255, 55)" if current else "1px solid rgba(255, 255, 255, 35)"};
                 border-radius: 4px;
             }}
 
@@ -235,58 +249,82 @@ class SessionRowWidget(QFrame):
 
     def _on_active_changed(self, state):
         self.activeChanged.emit(
-            self.session_id,
+            self.index,
             state == Qt.CheckState.Checked.value,
         )
 
     def _on_name_finished(self):
-        self.nameChanged.emit(self.session_id, self.name_edit.text().strip())
+        self.nameChanged.emit(self.index, self.name_edit.text().strip())
 
     def _open_context_menu(self, pos: QPoint):
         menu = QMenu(self)
 
         menu.addAction(
             "Set current session",
-            lambda: self.setCurrentRequested.emit(self.session_id),
+            lambda: self.setCurrentRequested.emit(self.index),
         )
         menu.addSeparator()
 
         menu.addAction(
-            "Edit time offset…", lambda: self.editOffsetRequested.emit(self.session_id)
+            "Edit time offset…", lambda: self.editOffsetRequested.emit(self.index)
         )
         menu.addAction(
-            "Change color…", lambda: self.changeColorRequested.emit(self.session_id)
+            "Change color…", lambda: self.changeColorRequested.emit(self.index)
         )
 
         menu.addSeparator()
         menu.addAction(
-            self.trace_button.text(), lambda: self.traceToggled.emit(self.session_id)
+            self.trace_button.text(), lambda: self.traceToggled.emit(self.index)
         )
         menu.addAction(
-            self.quality_button.text(), lambda: self.qualityToggled.emit(self.session_id)
+            self.quality_button.text(), lambda: self.qualityToggled.emit(self.index)
         )
         menu.addAction(
-            self.spatial_button.text(), lambda: self.spatialToggled.emit(self.session_id)
+            self.spatial_button.text(), lambda: self.spatialToggled.emit(self.index)
         )
 
         menu.addSeparator()
         remove_action = QAction("Remove session", menu)
-        remove_action.triggered.connect(
-            lambda: self.removeRequested.emit(self.session_id)
-        )
+        remove_action.triggered.connect(lambda: self.removeRequested.emit(self.index))
         menu.addAction(remove_action)
 
         menu.exec(self.mapToGlobal(pos))
 
 
+class SessionList(QListWidget):
+    drag_n_dropped = Signal(int, int)  # old_index, new_index
+
+    def __init__(self, parent: "SessionOverview"):
+        super().__init__(parent)
+        # self.parent = parent
+
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+    def dropEvent(self, event):
+        item = self.currentItem()
+        old_index = self.row(item)
+        super().dropEvent(event)
+        new_index = self.row(item)
+
+        if old_index == new_index:
+            return
+
+        self.drag_n_dropped.emit(old_index, new_index)
+
+
 class SessionOverview(QWidget):
+    load_requested = Signal(int)  # session_id
+
     def __init__(self, parent):
         super().__init__(parent)
 
         self.data: Data = parent.data
         self.state: AppState = parent.state
 
-        self.list_widget = QListWidget()
+        self.list_widget = SessionList(parent=self)
         self.list_widget.setSpacing(3)
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
 
@@ -294,24 +332,34 @@ class SessionOverview(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.list_widget)
 
+        self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
+
         self._row_widgets: dict[int, SessionRowWidget] = {}
 
         self.state.data_changed.connect(self._on_data_changed)
-
+        self.state.current_session_changed.connect(self._on_current_session_changed)
+        self.list_widget.drag_n_dropped.connect(self.move_session)
         self.rebuild()
 
     def rebuild(self):
         self.list_widget.clear()
         self._row_widgets.clear()
 
-        for session_id, session in enumerate(self.data.sessions):
-            self._add_session_row(session_id, session)
+        for session in self.data.sessions:
+            # print("Adding session row:", session.id, getattr(session, "name", None))
+            self._add_session_row(session.id, session)
 
     def _add_session_row(self, session_id: int, session):
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, session_id)
 
-        row = SessionRowWidget(session_id, session, parent=self.list_widget)
+        row = SessionRowWidget(
+            session_id,
+            session,
+            current=session_id == self.state.current_session_id,
+            parent=self.list_widget,
+        )
 
         row.moveRequested.connect(self.move_session)
         row.activeChanged.connect(self.set_session_active)
@@ -321,6 +369,7 @@ class SessionOverview(QWidget):
         row.editOffsetRequested.connect(self.edit_time_offset)
         # row.changeColorRequested.connect(self.change_session_color)
 
+        row.loadRequested.connect(lambda id=session_id: self.load_requested.emit(id))
         row.traceToggled.connect(self.toggle_traces)
         row.qualityToggled.connect(self.toggle_quality)
         row.spatialToggled.connect(self.toggle_spatial)
@@ -333,21 +382,27 @@ class SessionOverview(QWidget):
 
         self._row_widgets[session_id] = row
 
-    def _on_data_changed(self,input):
+    def _on_data_changed(self, input):
         data_type, data_var = input
-        if data_type in ["session"]:
+        if data_type in ["sessions", "assignments"]:
             self.rebuild()
         else:
             self.refresh_rows()
+
+    def _on_current_session_changed(self):
+        self.refresh_rows()
 
     def refresh_rows(self):
         """
         Use this when session properties changed but the order did not.
         """
-        for session_id, row in self._row_widgets.items():
-            row.session_id = session_id
-            row.session = self.data.sessions[session_id]
-            row.refresh()
+        for index, row in self._row_widgets.items():
+            row.index = index
+            # session_id = row.session.id
+            # session_id = self.data.sessions[index].id
+            row.session = self.data.sessions[index]
+
+            row.refresh(current=index == self.state.current_session_id)
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         session_id = item.data(Qt.ItemDataRole.UserRole)
@@ -420,25 +475,46 @@ class SessionOverview(QWidget):
     #     if hasattr(self.state, "data_changed"):
     #         self.state.data_changed.emit()
 
-    def toggle_traces(self, session_id: int):
+    # def load_fields(self, session_id: int):
+    #     self.data.load_data(session_id, ["spatial", "traces", "quality"])
+    #     self.refresh_rows()
 
-        self.data.change_trace_presence(session_id)
-        self.refresh_rows()
+    def toggle_traces(self, session_id: int):
+        session = self.data.sessions[session_id]
+        print(f"Toggling trace data for {session.name} (ID {session_id})")
+        self.state.tasks.start(
+            "loading",
+            f"Toggling trace data for {session.name}",
+            lambda ctx: self.data.change_trace_presence(session_id, ctx=ctx),
+            finished=self.refresh_rows,
+        )
 
     def toggle_quality(self, session_id: int):
-        self.data.change_quality_presence(session_id)
-        self.refresh_rows()
+        session = self.data.sessions[session_id]
+        self.state.tasks.start(
+            "loading",
+            f"Toggling quality data for {session.name}",
+            lambda ctx: self.data.change_quality_presence(session_id, ctx=ctx),
+            finished=self.refresh_rows,
+        )
 
     def toggle_spatial(self, session_id: int):
-        
-        if not self.data.sessions[session_id].status["spatial_loaded"]:
-            self.data.change_spatial_presence(session_id,True)
+        session = self.data.sessions[session_id]
+        if not session.status["spatial_loaded"]:
+            self.state.tasks.start(
+                "loading",
+                f"Loading data for {session.name}",
+                lambda ctx: self.data.change_spatial_presence(
+                    session_id, True, ctx=ctx
+                ),
+                finished=self.refresh_rows,
+            )
             return
 
         if self.data.sessions[session_id].status["matched"]:
             self.data.unregister_neurons(session_id)
         else:
-            self.data.register_neurons(from_session_id=session_id)
+            self.data.register_neurons(from_session_index=session_id)
 
     def remove_session(self, session_id: int):
         session = self.data.sessions[session_id]
@@ -457,10 +533,17 @@ class SessionOverview(QWidget):
         # in assignments, plots, tracking arrays, caches, etc.
         self.data.remove_session(session_id)
 
-    def move_session(self, session_id: int, delta: int):
-        new_id = session_id + delta
+    def move_session(self, session_index: int, new_session_index: int):
+        # new_id = session_index + delta
 
-        if new_id < 0 or new_id >= len(self.data.sessions):
+        if new_session_index < 0 or new_session_index >= len(self.data.sessions):
             return
 
-        self.data.move_session(session_id, new_id)
+        print(f"Moving session {session_index} to {new_session_index}")
+        self.data.move_session(session_index, new_session_index)
+        # print(f"New session order: {[s.id for s in self.data.sessions]}")
+
+        # currentItem = self.list_widget.takeItem(session_index)
+        # self.list_widget.insertItem(new_session_index, currentItem)
+
+        # self.list_widget.setCurrentRow(new_session_index)

@@ -320,6 +320,7 @@ class Display(BasePlot.BaseCanvas):
             component = NeuronComponent(session.id, neuron)
 
             fp_id = self.state.get_footprint_from_component(component)
+
             if fp_id is None or fp_id < 0:
                 continue
 
@@ -329,8 +330,8 @@ class Display(BasePlot.BaseCanvas):
             z_offset = float(session.id) * z_stretch
 
             v, f, c, pick_points = footprint_to_mesh(
-                self.data.sessions[session.id].A[:, fp_id],
-                self.data.sessions[session.id].dims,
+                session.A[:, fp_id],
+                session.dims,
                 z_offset=z_offset,
                 z_scale=z_stretch,
                 z_thr=thr,
@@ -801,7 +802,7 @@ class Controller(BasePlot.CanvasController):
         # )
 
     def _on_data_changed(self, input: Tuple[str, int]):
-        if input[0] == "assignments":
+        if input[0] in ["sessions", "assignments"]:
             self.replot_neurons()
 
     def initialize_display(self):

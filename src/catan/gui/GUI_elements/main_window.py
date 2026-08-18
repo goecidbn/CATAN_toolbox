@@ -15,7 +15,8 @@ from catan.gui.resources import (
     combine_stylesheets,
     load_stylesheet,
 )
-from catan.gui.structures import AppState, Data
+
+from catan.gui.structures import AppState, Data, ConfigData
 from catan.gui.interaction import click_events
 
 from .display_area import DisplayArea
@@ -30,7 +31,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.data: Data = Data(self.state)
+        self.config: ConfigData = ConfigData(self)
+        self.data: Data = Data(self.state,self.config)
+        self.state.tasks.start_queue_timer()
 
         # self.settings = QSettings()
         self._restore_settings()
@@ -103,7 +106,7 @@ class MainWindow(QMainWindow):
 
     def print_debug_info(self):
 
-        click_events.print_debug(self.state, self.data)
+        click_events.print_debug(self.state, self.data, self.config)
 
     def closeEvent(self, event):
         self._save_settings()

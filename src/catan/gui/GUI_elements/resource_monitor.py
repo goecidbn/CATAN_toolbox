@@ -26,7 +26,7 @@ class ResourceMonitor(QWidget):
 
         tasks = self.state.tasks
 
-        tasks.task_progress.connect(self.progress_bar.setValue)
+        # tasks.task_progress.connect(self.progress_bar.setValue)
 
         tasks.task_message.connect(self.status_label.setText)
 

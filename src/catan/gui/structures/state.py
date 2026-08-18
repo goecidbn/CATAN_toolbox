@@ -50,6 +50,9 @@ class AppState(QObject):
         # self._current_display = 0
         self._current_session_id = None
 
+        self._model_fitted = False
+        self._busy = False
+
         self._session_colors = []
         self._session_active = []
 
@@ -81,6 +84,15 @@ class AppState(QObject):
 
         self.time_ref = time()
 
+    @property
+    def model_fitted(self) -> bool:
+        return self._model_fitted
+
+    @model_fitted.setter
+    def model_fitted(self, val: bool):
+        self._model_fitted = val
+        self.data_changed.emit(("model_fitted", -1))
+    
     @property
     def busy(self):
         return self._busy
