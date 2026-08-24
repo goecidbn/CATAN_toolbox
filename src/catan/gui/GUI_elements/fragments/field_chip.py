@@ -1,5 +1,5 @@
+from typing import Optional
 from PySide6.QtWidgets import (
-    QLabel,
     QWidget,
     QHBoxLayout,
     QToolButton,
@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
 )
 from PySide6.QtCore import Signal
+from catan.core.structures.load_config import FieldSpec
 
 class FieldChip(QWidget):
 
@@ -14,23 +15,25 @@ class FieldChip(QWidget):
 
     def __init__(
         self,
-        opt: str,
+        name: str,
+        spec: Optional[FieldSpec] = None,
         parent=None,
     ):
         super().__init__(parent)
-        print("FieldChip init", opt)
 
-        if isinstance(opt, str):
-            self.label = self.key = opt
-        if isinstance(opt, tuple):
-            self.label, self.key = opt
+        self.name = name
+        if spec is None:
+            self.field_path = name
+        else:
+            self.field_path = spec.path
+        
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         self.field_button = QToolButton()
-        self.field_button.setText(self.label)
+        self.field_button.setText(self.name)
         self.field_button.setChecked(True)
 
         self.set_name()
@@ -38,7 +41,7 @@ class FieldChip(QWidget):
         self.remove_button = QToolButton()
         self.remove_button.setText("×")
         self.remove_button.setAutoRaise(True)
-        self.remove_button.setToolTip(f"Remove {self.label}")
+        self.remove_button.setToolTip(f"Remove {self.name}")
 
         self.remove_button.setFixedWidth(18)
 
@@ -46,7 +49,7 @@ class FieldChip(QWidget):
         layout.addWidget(self.remove_button)
 
         self.remove_button.clicked.connect(
-            lambda: self.remove_requested.emit(self.label)
+            lambda: self.remove_requested.emit(self.name)
         )
 
         self.setSizePolicy(
@@ -55,8 +58,8 @@ class FieldChip(QWidget):
         )
 
     def set_name(self):
-        self.field_button.setText(self.label)
-        if self.label != self.key:
-            self.field_button.setToolTip(f"{self.label} ({self.key})")
+        self.field_button.setText(self.name)
+        if self.name != self.field_path:
+            self.field_button.setToolTip(f"{self.name} ({self.field_path})")
         else:
-            self.field_button.setToolTip(self.label)
+            self.field_button.setToolTip(self.name)

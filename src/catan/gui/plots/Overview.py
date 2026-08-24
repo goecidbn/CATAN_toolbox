@@ -70,7 +70,7 @@ class Display(BasePlot.BaseCanvas):
             self.plotting["background"].parent = None
             del self.plotting["background"]
 
-        background = self.data.current_session.Cn
+        background = self.data.current_session.background
         if background is None:
             return
 
@@ -101,14 +101,14 @@ class Display(BasePlot.BaseCanvas):
     def build_neuron_visuals_union(self):
 
         roi_pos, neuron_ids, roi_vals = sparse_A_to_points(
-            self.data.union.A, self.data.sessions[0].dims, thr=0.5
+            self.data.assignments.union.footprints, self.data.sessions[0].dims, thr=0.5
         )
 
         self.plotting["data"]["union"] = OverviewRecord(
             pos=roi_pos,
             ids=neuron_ids,
             vals=roi_vals,
-            n_rois=self.data.union.n_neurons,
+            n_rois=self.data.assignments.union.n_neurons,
             color=None,
         )
 
@@ -135,11 +135,11 @@ class Display(BasePlot.BaseCanvas):
             n_rois = len(neuron_ids)
         else:
             roi_pos, roi_ids, roi_vals = sparse_A_to_points(
-                self.data.sessions[session_id].A,
+                self.data.sessions[session_id].footprints,
                 self.data.sessions[session_id].dims,
                 thr=thr,
             )
-            n_rois = self.data.sessions[session_id].A.shape[1]
+            n_rois = self.data.sessions[session_id].footprints.shape[1]
 
             footprint_to_component = np.array(
                 [self.state.get_component_from_footprint(i) for i in range(n_rois)]
@@ -293,7 +293,7 @@ class Display(BasePlot.BaseCanvas):
         if (
             self.data.current_session is None
             or "background" not in self.plotting
-            or self.data.union.centroids is None
+            or self.data.assignments.union.centroids is None
         ):
             return None
 
@@ -302,7 +302,7 @@ class Display(BasePlot.BaseCanvas):
         )
 
         # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
-        union_centroids = self.data.union.centroids
+        union_centroids = self.data.assignments.union.centroids
         # find closest footprint
         distances = (union_centroids[:, 0] - mouse_pos[0]) ** 2 + (
             union_centroids[:, 1] - mouse_pos[1]

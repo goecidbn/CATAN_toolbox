@@ -62,11 +62,32 @@ def get_footprint_id_from_mouse_pos(canvas, pos, centroids) -> Optional[int]:
     return footprint_id
 
 
-def print_debug(state, data, config):
+def print_debug(state, data):
 
     print("Current session:", state.current_session_id)
     print("Sessions:", data.sessions)
-    print("config:", config.fields)
+
+    print("Load config:", data.load_configs.current)
+    # print("session traces:", data.sessions[0].traces.keys())
+    # print("session traces:", data.sessions[0].quality.keys())
+
+    # print("")
+    # print("Session data: ", data.sessions[0].name, data.sessions[0].path)
+    # print("Session status:", data.sessions[0].status)
+
+    # for session in data.sessions:
+    #     print(f"Session {session.id} ({session.name}) status: {session.status}")    
+    #     print("session idx_eval:", session.idx_eval.shape)
+    # print("Session footprints:", data.sessions[0].footprints)
+    # print("Session background:", data.sessions[0].background)
+    # print("Session quality:", data.sessions[0].quality)
+    # print("Session traces:", data.sessions[0].traces)
+
+    # print("config:", config.fields)
+    # print("counts:", data.counts)
+    # print("counts sum:", data.counts["cross"][...,0].sum())
+    # print("model:", data.model)
+    # print("evaluate f_same: ", data.model.f_same(1., 0.9))
     # print("ids:",data.session_order)
     # print("Session names:", [s.name for s in data.sessions])
     # print("Session order:", [(s.id,s.name) for s in data.sessions])

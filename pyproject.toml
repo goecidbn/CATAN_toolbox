@@ -109,6 +109,7 @@ include = ["catan*"]
     "defaults/*.yaml",
     "defaults/*.toml",
 ]
+catan = ["resources/load_configs/*.json"]
 
 [tool.setuptools_scm]
 version_file = "src/catan/_version.py"

@@ -1,5 +1,4 @@
 import importlib
-from importlib.resources import files
 
 from PySide6.QtCore import QCoreApplication, QSettings
 from PySide6.QtGui import QAction, QFont, Qt
@@ -32,7 +31,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.config: ConfigData = ConfigData(self)
-        self.data: Data = Data(self.state,self.config)
+        self.data: Data = Data(self.state)
         self.state.tasks.start_queue_timer()
 
         # self.settings = QSettings()
@@ -106,7 +105,7 @@ class MainWindow(QMainWindow):
 
     def print_debug_info(self):
 
-        click_events.print_debug(self.state, self.data, self.config)
+        click_events.print_debug(self.state, self.data)
 
     def closeEvent(self, event):
         self._save_settings()

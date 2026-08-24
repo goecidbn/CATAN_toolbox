@@ -69,6 +69,17 @@ class AppState(QObject):
 
         self.time_ref = None
 
+    def issue(self, level, title, message):
+        from PySide6.QtWidgets import QMessageBox
+        if level == "info":
+            QMessageBox.information(None, title, message)
+        elif level == "warning":
+            QMessageBox.warning(None, title, message)
+        elif level == "error":
+            QMessageBox.critical(None, title, message)
+        else:
+            raise ValueError(f"Unknown issue level: {level}")
+
     def set_logging_level(self, level: str):
         self.logging_level = level
         self.logger.setLevel(getattr(logging, self.logging_level))

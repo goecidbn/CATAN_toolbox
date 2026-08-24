@@ -1,3 +1,5 @@
+from typing import Optional
+
 from PySide6.QtCore import Qt, Signal, QPoint
 from PySide6.QtGui import QColor, QAction
 from PySide6.QtWidgets import (
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from catan.gui.structures import AppState, Data
+from catan.core.structures import sessiondata_type
 
 from .fragments.IconButton import (
     make_icon_button,
@@ -38,10 +41,13 @@ class SessionRowWidget(QFrame):
     changeColorRequested = Signal(int)
 
     loadRequested = Signal(int)  # session_id
+
     traceToggled = Signal(int)
     qualityToggled = Signal(int)
     spatialToggled = Signal(int)
 
+    modelRequested = Signal(int)
+    assignmentRequested = Signal(int)
     removeRequested = Signal(int)
 
     def __init__(self, session_id: int, session, current=False, parent=None):
@@ -63,14 +69,22 @@ class SessionRowWidget(QFrame):
 
         self.name_edit = QLineEdit()
         self.name_edit.setObjectName("SessionNameEdit")
+        self.name_edit.setMinimumWidth(120)
         self.name_edit.editingFinished.connect(self._on_name_finished)
 
         self.offset_label = QLabel()
         self.offset_label.setObjectName("SessionOffsetLabel")
         self.offset_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.load_fields_button = QToolButton(self)
-        self.load_fields_button.setText("Load")
+        self.load_fields_button = make_icon_button(
+            "folder-open",
+            color="white",
+            tooltip="Process session data",
+            fallback_theme_icon="system-run",
+        )
+        self.load_fields_button.setMinimumWidth(50)
+        # QToolButton(self)
+        # self.load_fields_button.setText("Process")
         self.load_fields_button.setPopupMode(
             QToolButton.ToolButtonPopupMode.MenuButtonPopup
         )
@@ -79,6 +93,7 @@ class SessionRowWidget(QFrame):
             lambda: self.loadRequested.emit(self.index)
         )
 
+        ## define submenu for load_fields_button
         menu = QMenu(self.load_fields_button)
 
         container = QWidget(menu)
@@ -101,25 +116,43 @@ class SessionRowWidget(QFrame):
 
         self.load_fields_button.setMenu(menu)
 
+        self.trace_button.clicked.connect(
+            lambda: self.traceToggled.emit(self.index)
+        )
+        self.quality_button.clicked.connect(
+            lambda: self.qualityToggled.emit(self.index)
+        )
+        self.spatial_button.clicked.connect(
+            lambda: self.spatialToggled.emit(self.index)
+        )
+
+
+        ## define further buttons
+        self.register_model_button = make_icon_button(
+            "plus",
+            color="white",
+            tooltip="Register neurons across sessions",
+            fallback_theme_icon="system-run",
+        )
+        self.assignments_button = make_icon_button(
+            "layer-group",
+            color="white",
+            tooltip="View assignments",
+            fallback_theme_icon="system-run",
+        )
         self.delete_button = make_icon_button(
-            ("fa6s.ban", "fa5s.ban"),
+            "ban",
             color="red",
             tooltip="Remove session data",
             fallback_theme_icon="edit-delete",
         )
 
-        # self.trace_button = QPushButton()
-        self.trace_button.clicked.connect(lambda: self.traceToggled.emit(self.index))
-        self.quality_button.clicked.connect(
-            lambda: self.qualityToggled.emit(self.index)
+        self.register_model_button.clicked.connect(
+            lambda: self.modelRequested.emit(self.index)
         )
-
-        # self.spatial_button = QPushButton()
-        self.spatial_button.clicked.connect(
-            lambda: self.spatialToggled.emit(self.index)
+        self.assignments_button.clicked.connect(
+            lambda: self.assignmentRequested.emit(self.index)
         )
-
-        # self.data_button = QPushButton()
         self.delete_button.clicked.connect(
             lambda: self.removeRequested.emit(self.index)
         )
@@ -134,9 +167,9 @@ class SessionRowWidget(QFrame):
         layout.addWidget(self.offset_label)
         layout.addStretch()
         layout.addWidget(self.load_fields_button)
-        # layout.addWidget(self.trace_button)
-        # layout.addWidget(self.quality_button)
-        # layout.addWidget(self.spatial_button)
+        
+        layout.addWidget(self.register_model_button)
+        layout.addWidget(self.assignments_button)
         layout.addWidget(self.delete_button)
 
         self.refresh(current=current)
@@ -170,51 +203,54 @@ class SessionRowWidget(QFrame):
     def _update_buttons(self):
 
         spatial_loaded = self.session.status["spatial_loaded"]
-        if not spatial_loaded:
-            set_button_icon(
-                self.spatial_button,
-                ("fa6s.layer", "fa5s.layer"),
-                color="white",
-                tooltip="Load footprint data",
-                fallback_theme_icon="applications-games",
-            )
-        else:
-            matched = self.session.status["matched"]
-            set_button_icon(
-                self.spatial_button,
-                ("fa6s.layer-group", "fa5s.layer-group"),
-                color="white" if not matched else "red",
-                tooltip=("Add to matching" if not matched else "Remove from matching"),
-                fallback_theme_icon=(
-                    "applications-games" if not matched else "edit-delete"
-                ),
-            )
-
+        set_button_icon(
+            self.spatial_button,
+            "paw",
+            color="white" if not spatial_loaded else "red",
+            tooltip="Load footprint data",
+            fallback_theme_icon="square",
+        )
+        
         trace_loaded = self.session.status["traces_loaded"]
         set_button_icon(
             self.trace_button,
-            ("fa6s.chart-line", "fa5s.chart-line"),
+            "chart-line",
             color="white" if not trace_loaded else "red",
             tooltip=("Load traces" if not trace_loaded else "Unload traces"),
-            fallback_theme_icon=(
-                "media-playback-start" if not trace_loaded else "edit-delete"
-            ),
+            fallback_theme_icon="spinner",
         )
 
         quality_loaded = self.session.status["quality_loaded"]
         set_button_icon(
             self.quality_button,
-            ("fa6s.chart-column", "fa5s.chart-column"),
+            "chart-column",
             color="white" if not quality_loaded else "red",
             tooltip=(
                 "Load quality parameters"
                 if not quality_loaded
                 else "Remove quality parameters"
             ),
-            fallback_theme_icon=(
-                "document-open" if not quality_loaded else "edit-delete"
-            ),
+            fallback_theme_icon="spinner",
         )
+
+        registered = self.session.status["registered_to_model"]
+        set_button_icon(
+            self.register_model_button,
+            "plus",
+            color="white" if not registered else "red",
+            tooltip=("Register neurons to model" if not registered else "Unregister neurons from model"),
+            fallback_theme_icon="spinner",
+        )
+
+        matched = self.session.status["matched"]
+        set_button_icon(
+            self.assignments_button,
+            "layer-group",
+            color="white" if not matched else "red",
+            tooltip=("Add to matching" if not matched else "Remove from matching"),
+            fallback_theme_icon="spinner",
+        )
+
 
     def _update_background(self, current=False):
         color = getattr(self.session, "color", QColor("#888888"))
@@ -227,7 +263,7 @@ class SessionRowWidget(QFrame):
         # Soft translucent background, so text remains readable.
         r, g, b, _ = color.getRgb()
         self.setStyleSheet(f"""
-            QFrame#SessionRowWidget {{21
+            QFrame#SessionRowWidget {{
                 background-color: rgba({r}, {g}, {b}, 55);
                 border: {"2px solid rgba(255, 255, 255, 55)" if current else "1px solid rgba(255, 255, 255, 35)"};
                 border-radius: 4px;
@@ -270,17 +306,6 @@ class SessionRowWidget(QFrame):
         )
         menu.addAction(
             "Change color…", lambda: self.changeColorRequested.emit(self.index)
-        )
-
-        menu.addSeparator()
-        menu.addAction(
-            self.trace_button.text(), lambda: self.traceToggled.emit(self.index)
-        )
-        menu.addAction(
-            self.quality_button.text(), lambda: self.qualityToggled.emit(self.index)
-        )
-        menu.addAction(
-            self.spatial_button.text(), lambda: self.spatialToggled.emit(self.index)
         )
 
         menu.addSeparator()
@@ -370,9 +395,12 @@ class SessionOverview(QWidget):
         # row.changeColorRequested.connect(self.change_session_color)
 
         row.loadRequested.connect(lambda id=session_id: self.load_requested.emit(id))
-        row.traceToggled.connect(self.toggle_traces)
-        row.qualityToggled.connect(self.toggle_quality)
-        row.spatialToggled.connect(self.toggle_spatial)
+        row.traceToggled.connect(lambda id, which="traces": self.toggle_session_data(id,which))
+        row.qualityToggled.connect(lambda id, which="quality": self.toggle_session_data(id,which))
+        row.spatialToggled.connect(lambda id, which="spatial": self.toggle_session_data(id,which))
+
+        row.modelRequested.connect(self.toggle_model)
+        row.assignmentRequested.connect(self.toggle_assignments)
         row.removeRequested.connect(self.remove_session)
 
         item.setSizeHint(row.sizeHint())
@@ -479,42 +507,31 @@ class SessionOverview(QWidget):
     #     self.data.load_data(session_id, ["spatial", "traces", "quality"])
     #     self.refresh_rows()
 
-    def toggle_traces(self, session_id: int):
-        session = self.data.sessions[session_id]
-        print(f"Toggling trace data for {session.name} (ID {session_id})")
-        self.state.tasks.start(
-            "loading",
-            f"Toggling trace data for {session.name}",
-            lambda ctx: self.data.change_trace_presence(session_id, ctx=ctx),
-            finished=self.refresh_rows,
-        )
-
-    def toggle_quality(self, session_id: int):
+    def toggle_session_data(self, session_id: int, which: Optional[sessiondata_type] = None):
         session = self.data.sessions[session_id]
         self.state.tasks.start(
             "loading",
-            f"Toggling quality data for {session.name}",
-            lambda ctx: self.data.change_quality_presence(session_id, ctx=ctx),
+            f"Loading {which} data for {session.name}",
+            lambda ctx: self.data.toggle_session_data(session_id, which, ctx=ctx),
             finished=self.refresh_rows,
         )
+        
 
-    def toggle_spatial(self, session_id: int):
-        session = self.data.sessions[session_id]
-        if not session.status["spatial_loaded"]:
-            self.state.tasks.start(
-                "loading",
-                f"Loading data for {session.name}",
-                lambda ctx: self.data.change_spatial_presence(
-                    session_id, True, ctx=ctx
-                ),
-                finished=self.refresh_rows,
-            )
-            return
+    def toggle_model(self, session_id: int):
 
-        if self.data.sessions[session_id].status["matched"]:
-            self.data.unregister_neurons(session_id)
-        else:
-            self.data.register_neurons(from_session_index=session_id)
+        self.data.queue_update_model(
+            session_id,
+            to_present=not self.data.sessions[session_id].status["registered_to_model"],
+            callback=self.refresh_rows
+        )
+
+    def toggle_assignments(self, session_id: int):
+
+        self.data.queue_assign_neurons(
+            session_id, 
+            to_present=not self.data.sessions[session_id].status["matched"],
+            callback=self.refresh_rows
+        )
 
     def remove_session(self, session_id: int):
         session = self.data.sessions[session_id]

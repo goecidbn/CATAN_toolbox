@@ -34,8 +34,6 @@ from catan.gui.plots.helper.cameras import (
 
 from catan.gui.data import analysis
 
-# , statistics
-# from data import statistics as stats
 from catan.gui.data.statistics import (
     plotdata_scatter,
 )
@@ -1370,9 +1368,6 @@ class Controller(BasePlot.CanvasController):
         #     raise ValueError(f"Invalid changes_on_click value: {self.changes_on_click}")
 
     def deactivate(self):
-        for key in self.controls:
-            self.controls[key].requires_update.disconnect()
-            self.controls[key].changed_statistic.disconnect()
 
         super().deactivate()
 

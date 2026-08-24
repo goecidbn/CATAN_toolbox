@@ -8,12 +8,13 @@ from scipy import sparse
 import cv2
 
 from catan.core.image_correlation import calculate_img_correlation
+from catan.core.structures.load_config import LoadConfig
 from catan.core.alignment import (
     get_session_remap,
     _build_remap,
     _shift_sparse_bilinear,
 )
-from catan.core.io import write_optional_array, write_optional_attr, read_optional_array, read_optional_attr
+from catan.core.io import load_hdf5, write_optional_array, write_optional_attr
 
 MatrixT = TypeVar("MatrixT", sparse.csc_matrix, np.ndarray)
 
@@ -321,8 +322,9 @@ class Remapping:
         )
 
     @classmethod
-    def from_hdf5(cls, group: h5py.Group) -> "Remapping":
-        object_type = group.attrs.get("object_type", "")
+    def from_hdf5(cls, h5ref: h5py.Group) -> "Remapping":
+
+        object_type = h5ref.attrs.get("object_type", "")
 
         if isinstance(object_type, bytes):
             object_type = object_type.decode("utf-8")
@@ -332,38 +334,13 @@ class Remapping:
                 f"Expected Remapping group, got {object_type!r}"
             )
 
-        version = int(group.attrs.get("schema_version", 1))
+        version = int(h5ref.attrs.get("schema_version", 1))
 
         if version != 1:
             raise ValueError(
                 f"Unsupported Remapping schema version: {version}"
             )
 
-        shift = read_optional_array(
-            group,
-            "shift",
-        )
-        c_max = read_optional_array(
-            group,
-            "c_max",
-        )
-
-        c_zscored = read_optional_array(
-            group,
-            "c_zscored",
-        )
-
-        flow = read_optional_array(
-            group,
-            "flow",
-        )
-
-        transpose = bool(group.attrs.get("transpose", False))
-
-        return cls(
-            shift=shift,
-            c_max=c_max,
-            c_zscored=c_zscored,
-            flow=flow,
-            transpose=transpose,
-        )
+        fields_to_load = LoadConfig.fields_from_resource("catan_remap.json")
+        data = load_hdf5(h5ref, fields_to_load=fields_to_load)
+        return cls(**data["stats"])

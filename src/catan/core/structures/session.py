@@ -1,6 +1,7 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any, Literal
 
 import inspect
+from catan.core.io.matlab import load_mat
 import h5py
 import numpy as np
 from scipy import sparse
@@ -8,17 +9,15 @@ from pathlib import Path
 
 from .remap import Remapping
 
-from .load_config import LoadConfig
 from catan.core.data import center_of_mass
 from catan.core.io import (
+    load_hdf5,
     write_sparse_matrix,
     write_optional_attr,
     write_optional_array,
-    read_sparse_matrix,
-    read_optional_attr,
-    read_optional_array,
-    read_hdf5_field,
 )
+
+sessiondata_type = Literal["spatial", "traces", "quality"]
 
 component_quality_default = {
     "SNR_lowest": 1.0,
@@ -58,29 +57,24 @@ class SessionData:
     session_color: Optional[str] = None
     use_kde: bool = False
 
-    # scheduled_for_loading: bool = False
     status: Dict[str, bool] = {}
 
     ## loaded fields (from input)
     # spatial
-    _spatial_fields = ["dims", "A", "Cn"]
     dims: Tuple[int, int] = (512, 512)  #
-    A: sparse.csc_matrix  # = None  #
-    Cn: Optional[np.ndarray] = None  #
+    footprints: sparse.csc_matrix  # = None  #
+    background: Optional[np.ndarray] = None  #
     # traces
-    # _trace_fields = ["C", "F_dff", "F_dff_dec", "S", "S_dff"]
-    _trace_fields = ["C", "F_dff_dec", "S_dff"]
     _traces: dict[str, np.ndarray] = {}
     _default_trace: Optional[str] = None
     # other
-    _quality_fields = ["SNR_comp", "r_values", "cnn_preds"]
     quality: dict[str, np.ndarray] = {}  #
 
     ## to be calculated (from input)
     remap: Optional[Remapping] = None  #
     n_neurons: int = -1  #
     centroids: np.ndarray  #
-    idx_eval: np.ndarray  #
+    idx_eval: Optional[np.ndarray] = None  #
     ## to be calculated (with additional information)
     idx_kde: np.ndarray
 
@@ -93,9 +87,6 @@ class SessionData:
         **kwargs,
     ):
         """ """
-        self.fields_scheduled_for_loading = {}
-
-        self.default_fields = LoadConfig().fields
 
         self.name = name
         self.id = kwargs.get("id", -1)
@@ -103,9 +94,6 @@ class SessionData:
 
         self.status = {
             # load status flags
-            "scheduled_spatial": False,
-            "scheduled_traces": False,
-            "scheduled_quality": False,
             "spatial_loaded": False,
             "traces_loaded": False,
             "quality_loaded": False,
@@ -117,43 +105,14 @@ class SessionData:
 
         self.set_parameters(**kwargs)
 
-        if np.isin(self.default_fields["spatial"]["opts"], list(kwargs.keys())).any():
-            self.schedule_spatial_load(self.default_fields["spatial"]["opts"])
-            self.register_spatial(alignment_template=alignment_template, **kwargs)
+        ## if some elements are provided in kwargs, which fit
+        ## the general fields to be loaded, register them
+        self.register_data(alignment_template=alignment_template, **kwargs)
 
-        if np.isin(self.default_fields["traces"]["opts"], list(kwargs.keys())).any():
-            self.schedule_traces_load(self.default_fields["traces"]["opts"])
-            self.register_traces(**kwargs)
+        if alignment_template is None:
+            self.remap = kwargs.get("remap", None)
+        self.evaluate_alignment_status()
 
-        if np.isin(self.default_fields["quality"]["opts"], list(kwargs.keys())).any():
-            self.schedule_quality_load(self.default_fields["quality"]["opts"])
-            self.register_quality(**kwargs)
-
-        self.remap = kwargs.get("remap", None)
-        if self.remap is not None:
-            self.status["aligned"] = True
-
-    @staticmethod
-    def from_dict(data_dict: dict, params={}, **kwargs) -> "SessionData":
-        alignment_template = kwargs.get("alignment_template", None)
-
-        out = SessionData(
-            params=params,
-            alignment_template=alignment_template,
-        )
-        out.register_traces(**data_dict)
-        out.register_spatial(alignment_template=alignment_template, **data_dict)
-        out.register_quality(**data_dict)
-        return out
-
-    @staticmethod
-    def from_file(
-        path: str, which=["quality", "spatial", "traces"], params={}
-    ) -> "SessionData":
-        out = SessionData(params=params)
-        out.path = path
-        out.load_data(which=which)
-        return out
 
     def set_parameters(self, **input):
 
@@ -173,132 +132,119 @@ class SessionData:
             if key in input:
                 self.params[key] = input[key]
 
-    ### ============================================================================== ###
-    ### ================================ LOAD METHODS ================================ ###
-    ### ============================================================================== ###
+    ### ========================================================= ###
+    ### ====================== LOAD METHODS ===================== ###
+    ### ========================================================= ###
 
-    def load_data(
-        self,
-        fields_to_load: Optional[dict] = None,
-        alignment_template: Optional[np.ndarray] = None,
-        force_load: bool = False,
-        ctx: Optional[object] = None,
-    ):
-        if fields_to_load is None:
-            fields_to_load = LoadConfig().fields
+    @staticmethod
+    def from_file(path: str, fields_to_load: Optional[dict] = None, alignment_template=None, **kwargs) -> "SessionData":
+        """
+        manages creation of a new SessionData object from a file, and loading and registering the requested fields
+        """
+        this_data = SessionData(path=path, **kwargs)
 
-        # for key in ["spatial", "traces", "quality"]:
-        for key, field_info in fields_to_load.items():
-            if (field_info["load"] or force_load) and not self.status[
-                f"scheduled_{key}"
-            ]:
-                self.fields_scheduled_for_loading[key] = field_info["opts"]
-                self.status[f"scheduled_{key}"] = True
+        if not fields_to_load:
+            this_data.name = Path(path).parent.name
+            return this_data
+        
+        this_data.load_data(fields_to_load,alignment_template=alignment_template, **kwargs)
+        return this_data
 
-        # if "spatial" in fields_to_load and fields_to_load["spatial"]["load"]:
-        #     self.schedule_spatial_load(fields_to_load["spatial"]["opts"])
-        # if "traces" in fields_to_load and fields_to_load["traces"]["load"]:
-        #     self.schedule_traces_load(fields_to_load["traces"]["opts"])
-        # if "quality" in fields_to_load and fields_to_load["quality"]["load"]:
-        #     self.schedule_quality_load(fields_to_load["quality"]["opts"])
+    def load_data(self, fields_to_load: Optional[dict] = None, alignment_template=None, **kwargs):
+        """
+        Loads data from the SessionData.path as specified in fields_to_load and registers it to the current object.
 
-        self.execute_load(alignment_template=alignment_template, ctx=ctx)
+        If alignment_template is provided, spatial data will be aligned to it.
+        """
 
-        # self.postprocess_data()
+        assert self.path is not None and Path(self.path).exists(), "No (valid) path provided for session, cannot load data."
 
-    def execute_load(
-        self,
-        alignment_template: Optional[np.ndarray] = None,
-        ctx: Optional[object] = None,
-    ):
+        ext = Path(self.path).suffix
 
-        assert (
-            self.path is not None
-        ), "No path provided for session, cannot reload traces."
-        assert Path(
-            self.path
-        ).exists(), f"Path {self.path} does not exist, cannot reload traces."
-        if len(self.fields_scheduled_for_loading) == 0:
-            # print("No fields scheduled for loading.")
-            return
+        data = {}
+        if ext in [".h5", ".hdf5"]:
 
-        with h5py.File(self.path, "r") as f:
-            # f = f["/estimates"]
-            if not isinstance(f, h5py.Group):
-                raise ValueError(
-                    f"Expected '/estimates' group in HDF5 file, but got {type(f)}"
-                )
+            with h5py.File(self.path, "r") as h5ref:
+                data = self.from_hdf5(h5ref, fields_to_load=fields_to_load)
+        elif ext == ".mat":
+            data = self.from_mat(self.path, fields_to_load=fields_to_load)
+        self.register_data(alignment_template=alignment_template, **data)
 
-            if self.status["scheduled_spatial"]:
-                A, Cn, dims = self.spatial_from_hdf5(
-                    f,
-                    fields=self.fields_scheduled_for_loading.get("spatial", {}),
-                    ctx=ctx,
-                )
-                if ctx is not None:
-                    ctx.progress(10)
-                self.register_spatial(
-                    alignment_template=alignment_template, A=A, Cn=Cn, dims=dims
-                )
-                self.status["scheduled_spatial"] = False
+    @staticmethod
+    def from_hdf5(h5ref: h5py.Group | h5py.File, fields_to_load: Optional[dict]=None) -> dict[str, Any]:
+        """
+        Loads data from an hdf5 file or group and returns it as a dictionary for registration.
+        """
+        
+        version = int(h5ref.attrs.get("schema_version", 1))
+        if version != 1:
+            raise ValueError(f"Unsupported SessionData schema version: {version}")
 
-            if self.status["scheduled_traces"]:
-                traces = self.data_batch_from_hdf5(
-                    f,
-                    fields=self.fields_scheduled_for_loading.get("traces", []),
-                    ctx=ctx,
-                )
-                if ctx is not None:
-                    ctx.progress(20)
-                self.register_traces(traces=traces)
-                self.status["scheduled_traces"] = False
+        data = load_hdf5(h5ref, fields_to_load)
+        
+        if "remapping" in h5ref:
+            remap_group = h5ref["remapping"]
+            if isinstance(remap_group, h5py.Group):
+                data["remap"] = Remapping.from_hdf5(remap_group)
+                
+        return data
 
-            if self.status["scheduled_quality"]:
-                quality = self.data_batch_from_hdf5(
-                    f,
-                    fields=self.fields_scheduled_for_loading.get("quality", []),
-                    ctx=ctx,
-                )
-                if ctx is not None:
-                    ctx.progress(30)
-                self.register_quality(quality=quality)
-                self.status["scheduled_quality"] = False
+    @staticmethod
+    def from_mat(fname: str, fields_to_load: Optional[dict] = None):
+        """
+        Loads data from a .mat file and registers it to the current object.
+        """
+        assert fname is not None and Path(fname).exists(), "No (valid) path provided for session, cannot load data."
 
-    def schedule_spatial_load(self, fields):
-        if not self.status["scheduled_spatial"]:
-            self.fields_scheduled_for_loading["spatial"] = fields
-            self.status["scheduled_spatial"] = True
+        data = load_mat(fname, fields_to_load=fields_to_load)
+        # Note: alignment_template is set to None since static method does not have access to instance
+        return data
 
-    def schedule_traces_load(self, fields):
-        if not self.status["scheduled_traces"]:
-            self.fields_scheduled_for_loading["traces"] = fields
-            self.status["scheduled_traces"] = True
+    
+    def register_data(self, alignment_template: Optional[np.ndarray] = None, **data):
+        """
+        Registers data from kwargs 'data' input to SessionData object. Requires 'data' to contain the keys 'spatial', 'traces', and 'quality' with the corresponding data keys to be registered. 
+        
+        If alignment_template is provided, spatial data will be aligned to it.
+        """
+        self.register_spatial(alignment_template=alignment_template, **data.get("spatial",{}))
+        self.register_traces(**data.get("traces",{}))
+        self.register_quality(**data.get("quality",{}))
+        self.register_metadata(**data.get("metadata",{}))
 
-    def schedule_quality_load(self, fields):
-        if not self.status["scheduled_quality"]:
-            self.fields_scheduled_for_loading["quality"] = fields
-            self.status["scheduled_quality"] = True
+        if "remap" in data:
+            self.remap = data["remap"]
 
-    def clean_data(self):
+    def register_metadata(self, **data):
+        for key, value in data.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+            else:
+                print(f"Warning: SessionData has no attribute '{key}' to register metadata.")
 
-        self.clean_traces()
-        self.clean_spatial()
-        self.clean_quality()
+    def clean_data(self, which_in: Optional[str] = None):
+        """
+        Cleans the specified data type(s) from the session. If which_in is None, cleans all data types.
+        """
+        if which_in is None:
+            which = ["spatial", "traces", "quality"]
+        else:
+            which = [which_in]
 
-        self.idx_eval = np.bool([])
+        if "traces" in which:
+            self._clean_traces()
+        if "spatial" in which:
+            self._clean_spatial()
+        if "quality" in which:
+            self._clean_quality()
 
-    ### ============================================================================= ###
-    ### ============================= QUALITY METHODS =============================== ###
-    ### ============================================================================= ###
+    ### ========================================================== ###
+    ### ==================== QUALITY METHODS ===================== ###
+    ### ========================================================== ###
 
     def register_quality(self, **data):
 
-        # self.quality = {
-        #     key: data[key]
-        #     for key in data
-        #     if key in self.fields_scheduled_for_loading.get("quality", [])
-        # }
-        self.quality = data.get("quality", {})
+        self.quality = data if data else {}
 
         if self.quality:
             self.status["quality_loaded"] = True
@@ -316,7 +262,7 @@ class SessionData:
             * idx_eval boolean array
         """
         if not self.status["quality_loaded"] or self.quality is None:
-            print("no quality info provided, skipping quality-based filtering")
+            # print("no quality info provided, skipping quality-based filtering")
             return
 
         # if self.n_neurons is None:
@@ -325,7 +271,10 @@ class SessionData:
             isinstance(self.n_neurons, int) and self.n_neurons > 0
         ), "n_neurons must be a positive integer"
 
-        # if self.idx_eval is None:
+        if self.idx_eval is not None:
+            ## dont overwrite if idx_eval already exists
+            return
+        
         # self.idx_eval = np.ones(self.n_neurons, dtype=bool)
 
         ## provide dummy values if not provided
@@ -350,14 +299,13 @@ class SessionData:
         )
         self.idx_eval &= idx_eval
 
-    def clean_quality(self):
+    def _clean_quality(self):
         self.quality = {}
         self.status["quality_loaded"] = False
-        self.status["scheduled_quality"] = False
 
-    ### ============================================================================== ###
-    ### ================================= TRACE METHODS ============================== ###
-    ### ============================================================================== ###
+    ### ========================================================== ###
+    ### ===================== TRACE METHODS ====================== ###
+    ### ========================================================== ###
 
     @property
     def traces(self):
@@ -369,63 +317,55 @@ class SessionData:
             return None
         return self._traces.get(self._default_trace, None)
 
-    # @traces.setter
-    # def traces(self, value):
-    #     if not isinstance(value, dict):
-    #         raise ValueError(
-    #             "Traces must be provided as a dictionary with keys corresponding to trace types (e.g., 'F_dff', 'C')."
-    #         )
-    #     self._traces = value
-    #     self._default_trace = "F_dff" if "F_dff" in self._traces else "C"
-
-    def clean_traces(self):
-        # print("Cleaning traces for session. Current traces:", self._traces.keys())
-        self._traces = {}
-        self._default_trace = None
-        self.status["traces_loaded"] = False
-        self.status["scheduled_traces"] = False
-
     def register_traces(self, **data):
-        # self._traces = {
-        #     key: data[key]
-        #     for key in data
-        #     if key in self.fields_scheduled_for_loading.get("traces", [])
-        # }
-        self._traces = data.get("traces", {})
+
+        self._traces = data if data else {}
+
         self._default_trace = "F_dff" if "F_dff" in self._traces else "C"
         if self._traces:
             self.status["traces_loaded"] = True
 
-    ### ============================================================================== ###
-    ### ================================ SPATIAL METHODS ============================= ###
-    ### ============================================================================== ###
+    def _clean_traces(self):
+        # print("Cleaning traces for session. Current traces:", self._traces.keys())
+        self._traces = {}
+        self._default_trace = None
+        self.status["traces_loaded"] = False
+
+    ### ========================================================== ###
+    ### ===================== SPATIAL METHODS ==================== ###
+    ### ========================================================== ###
 
     def register_spatial(self, alignment_template: Optional[np.ndarray] = None, **data):
-        self.dims = data.get("dims", self.dims)
-        self.A = data.get("A", sparse.csc_matrix((0, 0)))
-        self.Cn = data.get("Cn", None)
 
-        if self.A is not None:
-            self.status["spatial_loaded"] = True
+        if "footprints" not in data or data["footprints"] is None:
+            # print("No footprints provided, skipping spatial registration.")
+            return
+        
+        self.footprints = data.get("footprints", sparse.csc_matrix((0, 0)))
+        self.background = data.get("background", None)
 
-        # dims = Cn.shape if Cn is not None else dims
-        # assert dims is not None, "Either Cn or dims must be provided to prepare_background"
+        if self.footprints is None:
+            return
+        
+        self.status["spatial_loaded"] = True
 
-        A_proj = self.A.sum(axis=1).reshape(self.dims)
-        if self.Cn is None:
-            ## return projection image if no Cn available
-            self.Cn = np.array(A_proj).astype(np.float32)
+        self.dims = data.get("dims", self.dims) if self.background is None else self.background.shape        # assert dims is not None, "Either background or dims must be provided to prepare_background"
+
+        footprints_proj = self.footprints.sum(axis=1).reshape(self.dims)
+        if self.background is None:
+            ## return projection image if no background available
+            self.background = np.array(footprints_proj).astype(np.float32)
         else:
-            ## check if A and Cn are consistent (e.g. transposition) and adjust if needed
-            # print("testing for transpose of Cn relative to A...")
+            ## check if footprints and background are consistent (e.g. transposition) and adjust if needed
+            # print("testing for transpose of background relative to footprints...")
             remap = Remapping(
-                template=A_proj,
-                template_reference=self.Cn,
+                template=footprints_proj,
+                template_reference=self.background,
                 use_optical_flow=False,
                 evaluate=False,
             )
-            remap.test_transpose(A_proj, self.Cn)
-            self.Cn = remap.fix_transpose(self.Cn)
+            remap.test_transpose(footprints_proj, self.background)
+            self.background = remap.fix_transpose(self.background)
 
         if alignment_template is not None:
             # print("align to reference template")
@@ -438,82 +378,84 @@ class SessionData:
         self.evaluate_alignment_status()
 
     def postprocess_spatial_data(self):
-        if self.A is None:
+        if self.footprints is None:
             raise ValueError(
-                "Spatial data (A and Cn) must be loaded before postprocessing."
+                "Spatial data (footprints and background) must be loaded before postprocessing."
             )
 
-        self.n_neurons = self.A.get_shape()[1]
+        self.n_neurons = self.footprints.get_shape()[1]
 
         self.centroids = center_of_mass(
-            self.A, *self.dims, convert=self.params.get("pxtomu", 1.0)
+            self.footprints, *self.dims, convert=self.params.get("pxtomu", 1.0)
         )
         self.get_idx_eval_from_footprints()
         self.get_idx_kde()
 
-    def get_idx_eval_from_footprints(self, A_thr=10):
+    def get_idx_eval_from_footprints(self, footprints_thr=10):
         """
         function to create idx_eval boolean array based on component size thresholds
 
         requires:
-            * self.A containing spatial footprints
+            * self.footprints containing spatial footprints
 
         returns:
             * idx_eval boolean array
         """
 
-        if not self.status["spatial_loaded"] or self.A is None:
-            raise ValueError(
-                "Spatial data must be loaded before calculating idx_eval from sizes."
-            )
+        if not self.status["spatial_loaded"] or self.footprints is None:
+            # print(
+            #     "Spatial data must be loaded before calculating idx_eval from sizes."
+            # )
+            return
         ## finding non-empty rows in sparse array (https://mike.place/2015/sparse/)
         # idx_eval = np.ones(nA, bool)
-        # idx_eval = np.diff(A.indptr) != 0
+        # idx_eval = np.diff(footprints.indptr) != 0
 
-        # if self.idx_eval is None:
+        if self.idx_eval is not None:
+            ## dont overwrite if idx_eval already exists
+            return
+
         self.idx_eval = np.ones(self.n_neurons, dtype=bool)
 
         ## only footprints above a certain size should be considered for evaluation
-        idx_eval = self.A.getnnz(axis=0) > A_thr
+        idx_eval = self.footprints.getnnz(axis=0) > footprints_thr
         self.idx_eval &= idx_eval
 
-    def clean_spatial(self):
+    def _clean_spatial(self):
         self.dims = (512, 512)
-        self.A = sparse.csc_matrix((0, 0))
-        self.Cn = None
+        self.footprints = sparse.csc_matrix((0, 0))
+        self.background = None
+        self.idx_eval = None
         self.status["spatial_loaded"] = False
-        self.status["scheduled_spatial"] = False
 
-    ### =============================================================================== ###
-    ### ================================ SAVE METHODS ================================= ###
-    ### =============================================================================== ###
+    ### ========================================================== ###
+    ### ======================= SAVE METHODS ===================== ###
+    ### ========================================================== ###
 
     def to_hdf5(self, group: h5py.Group, exclude_fields=["traces"]) -> None:
         group.attrs["object_type"] = "SessionData"
         group.attrs["schema_version"] = self.HDF5_VERSION
 
+        ## general attributes
         write_optional_attr(group, "name", self.name)
         write_optional_attr(
             group, "path", str(self.path) if self.path is not None else None
         )
-        group.attrs["id"] = self.id
-
-        group.attrs["active"] = self.active
-        group.attrs["time_offset"] = self.time_offset
+        write_optional_attr(group, "id", self.id)
 
         ## spatial group
-        group.attrs["dims"] = self.dims
+        write_optional_attr(group, "dims", self.dims)
 
-        A_group = group.create_group("A")
-        write_sparse_matrix(A_group, self.A)
-
-        write_optional_array(group, "Cn", self.Cn, compression="gzip")
+        footprints_group = group.create_group("footprints")
+        write_sparse_matrix(footprints_group, self.footprints)
+        write_optional_array(group, "background", self.background, compression="gzip")
+        write_optional_array(group, "idx_eval", self.idx_eval, compression="gzip")
 
         ## trace group
-        if "traces" not in exclude_fields:
-            traces_group = group.create_group("traces")
-            for key, value in self.traces.items():
-                traces_group.create_dataset(key, data=value, compression="gzip")
+        # if "traces" not in exclude_fields:
+        traces_group = group.create_group("traces")
+        for key, value in self.traces.items():
+            write_optional_array(traces_group, key, value, compression="gzip")
 
         ## quality group
         quality_group = group.create_group("quality")
@@ -525,159 +467,10 @@ class SessionData:
             remapping_group = group.create_group("remapping")
             self.remap.to_hdf5(remapping_group)
 
-        write_optional_array(group, "idx_eval", self.idx_eval, compression="gzip")
 
-    @classmethod
-    def from_hdf5(cls, group: h5py.Group | h5py.File = None) -> "SessionData":
-
-        version = int(group.attrs.get("schema_version", 1))
-        if version != 1:
-            raise ValueError(f"Unsupported SessionData schema version: {version}")
-
-        name = read_optional_attr(group, "name")
-        path = read_optional_attr(group, "path")
-        id = int(group.attrs.get("id", -1))
-
-        active = bool(group.attrs.get("active", True))
-        time_offset = float(group.attrs.get("time_offset", 0.0))
-
-        A, Cn, dims = cls.spatial_from_hdf5(cls, group)
-        traces = cls.traces_from_hdf5(cls, group)
-        quality = cls.quality_from_hdf5(cls, group)
-
-        ## remap substructure
-        remap = None
-        if "remapping" in group:
-            remap_group = group["remapping"]
-            if isinstance(remap_group, h5py.Group):
-                remap = Remapping.from_hdf5(remap_group)
-
-        idx_eval = read_optional_array(group, "idx_eval")
-
-        out = cls(
-            name=name,
-            path=path,
-            id=id,
-            active=active,
-            time_offset=time_offset,
-            dims=dims,
-            A=A,
-            Cn=Cn,
-            remap=remap,
-            idx_eval=idx_eval,
-            **{traces | quality},
-        )
-        # if A is not None:
-        #     out.postprocess_spatial_data()
-        # if quality:
-        #     out.get_idx_eval_from_quality_params()
-
-        return out
-
-    # * throw together loading for all:
-    # * hand over group path for each field and iteratively go deeper
-    # * define different options for reading based on being a dataset or a group (sparse)
-    def spatial_from_hdf5(
-        self, h5ref: h5py.File, fields: dict, ctx: Optional[object] = None
-    ) -> Tuple[sparse.csc_matrix, Optional[np.ndarray], Tuple[int, int]]:
-        """
-        Load spatial data from an HDF5 group or file.
-
-        Parameters:
-            group (h5py.Group | h5py.File): The HDF5 group or file to read from.
-            ctx (Optional[object]): Optional context for progress reporting and cancellation.
-        Returns:
-            Tuple[sparse.csc_matrix, Optional[np.ndarray], Tuple[int, int]]: A tuple containing the loaded spatial data (A, Cn, dims).
-        """
-
-        fields = {"A": "/estimates/A", "Cn": "/estimates/Cn", "dims": "/estimates/dims"}
-        output = []
-        for key, field in fields.items():
-            output.append(read_hdf5_field(h5ref, field))
-
-        # dims = tuple(group.attrs.get("dims", (512, 512)))
-
-        # A = (
-        #     read_sparse_matrix(group["A"])
-        #     if "A" in group
-        #     else sparse.csc_matrix((0, 0))
-        # )
-        # Cn = read_optional_array(group, "Cn")
-        return tuple(output)  # A, Cn, dims
-
-    def data_batch_from_hdf5(
-        self,
-        h5ref: h5py.File,
-        fields: dict,
-        # fields: List[str] = ["C", "F_dff", "F_dff_dec", "S", "S_dff"],
-        ctx: Optional[object] = None,
-    ) -> dict:
-        """
-        Load trace data from an HDF5 group or file.
-
-        Parameters:
-            group (h5py.Group | h5py.File): The HDF5 group or file to read from.
-            ctx (Optional[object]): Optional context for progress reporting and cancellation.
-        Returns:
-            dict: A dictionary containing the loaded trace data.
-        """
-
-        data_batch = {}
-        # if np.isin(fields, list(h5ref.keys())).any():
-        for key, field in fields.items():
-            # if field not in group:
-            #     print(f"Warning: key '{key}' not found in HDF5 group.")
-            #     continue
-            value = read_hdf5_field(h5ref, field)
-            # value = read_optional_array(group, key)
-            if value is not None:
-                data_batch[key] = value
-        return data_batch
-
-    # def quality_from_hdf5(
-    #     self,
-    #     group: h5py.Group | h5py.File,
-    #     fields: List[str] = ["SNR_comp", "r_values", "cnn_preds"],
-    #     ctx: Optional[object] = None,
-    # ) -> dict:
-    #     """
-    #     Load quality data from an HDF5 group or file.
-
-    #     Parameters:
-    #         group (h5py.Group | h5py.File): The HDF5 group or file to read from.
-    #         ctx (Optional[object]): Optional context for progress reporting and cancellation.
-    #     Returns:
-    #         dict: A dictionary containing the loaded quality data.
-    #     """
-
-    #     quality = {}
-    #     if np.isin(fields, list(group.keys())).any():
-    #         for key in fields:
-    #             if key not in group:
-    #                 print(f"Warning: Quality key '{key}' not found in HDF5 group.")
-    #                 continue
-
-    #             value = read_optional_array(group, key)
-    #             if value is not None:
-    #                 quality[key] = value
-
-    #     return quality
-
-    # def cast_to_dict(self, fields=None):
-
-    #     if fields is None:
-    #         # set default values
-    #         fields = ["name","path","id","active","time_offset",*self._spatial_fields, "quality","remap","n_neurons","centroids","idx_eval"]
-
-    #     out = {}
-    #     for field in fields:
-    #         assert hasattr(self,field), "SessionData object is missing field {field} for converting to dict"
-    #         out[field] = getattr(self, field)
-    #     return out
-
-    ### ============================================================================== ###
-    ### ================================ ALIGNMENT METHODS =========================== ###
-    ### ============================================================================== ###
+    ### ========================================================= ###
+    ### ==================== ALIGNMENT METHODS ================== ###
+    ### ========================================================= ###
 
     def align_to_reference(self, alignment_template, use_optical_flow=True):
         """
@@ -690,21 +483,21 @@ class SessionData:
             * remap dict with keys 'shift' and 'idx_ref' for each neuron in this session
         """
 
-        if not self.status["spatial_loaded"] or self.A is None or self.Cn is None:
+        if not self.status["spatial_loaded"] or self.footprints is None or self.background is None:
             raise ValueError("Spatial data must be loaded before alignment.")
 
         ## first, calculate remap structure
         self.remap = Remapping(
-            template=self.Cn,
+            template=self.background,
             template_reference=alignment_template,
             use_optical_flow=use_optical_flow,
-            # self.A.sum(axis=1).reshape(self.dims),
+            # self.footprints.sum(axis=1).reshape(self.dims),
             # reference=alignment_template,
             # use_optical_flow=use_optical_flow,
         )
         # print("shift:", self.remap.shift)
-        self.A = self.remap.apply_remap(self.A, use_optical_flow=use_optical_flow)
-        self.Cn = self.remap.apply_remap(self.Cn, use_optical_flow=use_optical_flow)
+        self.footprints = self.remap.apply_remap(self.footprints, use_optical_flow=use_optical_flow)
+        self.background = self.remap.apply_remap(self.background, use_optical_flow=use_optical_flow)
 
         self.postprocess_spatial_data()
 
@@ -715,10 +508,16 @@ class SessionData:
         """
 
         # print(f"Evaluating alignment status for session {self.name}...")
+        self.status["aligned"] = False
+        if not self.status["spatial_loaded"]:
+            # assert self.status["spatial_loaded"], "Spatial data must be loaded before evaluating alignment status."
+            return
+        
         if self.remap is None:
             ## if no remapping was done, assume this is the first session (and include it!)
             self.status["aligned"] = True
             return
+        
         params = params or self.params
         max_shift = params.get("max_session_shift", 50.0)
         min_corr = params.get("min_session_correlation", 0.3)
@@ -731,38 +530,32 @@ class SessionData:
 
         ## check for coherence with other sessions (low shift, high correlation)
         if self.remap.shift is None:
-            self.status["aligned"] = False
             return
         abs_shift = np.sqrt(self.remap.shift[0] ** 2 + self.remap.shift[1] ** 2)
         if np.isnan(abs_shift) or (abs_shift > max_shift):
-            self.status["aligned"] = False
             return  ## huge shift
 
         if self.remap.c_max is None:
-            self.status["aligned"] = False
             return
         if (
             np.all(np.isnan(self.remap.c_max))
             or np.nanmedian(self.remap.c_max) < min_corr
         ):
-            self.status["aligned"] = False
             return
 
         if self.remap.c_zscored is None:
-            self.status["aligned"] = False
             return
         if (
             np.all(np.isnan(self.remap.c_zscored))
             or np.nanmedian(self.remap.c_zscored) < min_zscore
         ):
-            self.status["aligned"] = False
             return
 
         self.status["aligned"] = True
 
-    ### ============================================================================== ###
-    ### =========================== KERNEL DENSITY ESTIMATE ========================== ###
-    ### ============================================================================== ###
+    ### ================================================================== ###
+    ### ===================== KERNEL DENSITY ESTIMATE ==================== ###
+    ### ================================================================== ###
 
     def get_idx_kde(self, params=None, qtl=[0.05, 0.95]):
         """
@@ -797,28 +590,3 @@ class SessionData:
         self.idx_kde = (kde_at_com > np.quantile(kde_kernel, qtl[0])) & (
             kde_at_com < np.quantile(kde_kernel, qtl[1])
         )
-
-
-# def prepare_background(
-#     A, Cn=None, dims: Optional[Tuple[int, int]] = None
-# ) -> np.ndarray:
-#     """
-#     Prepare background image from loaded data
-#     - use A projection if Cn is not provided
-#     - check for consistency of A and Cn (e.g. transposition) and adjust if needed
-#     """
-#     dims = Cn.shape if Cn is not None else dims
-#     assert dims is not None, "Either Cn or dims must be provided to prepare_background"
-
-#     import matplotlib.pyplot as plt
-
-#     A_proj = A.sum(axis=1).reshape(
-#         dims,
-#     )
-#     if Cn is None:
-#         ## return projection image if no Cn available
-#         return A_proj
-#     Cn = Cn.astype(np.float32)
-
-#     remap = Remapping(A_proj, Cn, use_optical_flow=False, evaluate=False)
-#     remap.test_transpose(A_proj, Cn)

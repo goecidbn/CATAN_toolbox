@@ -76,16 +76,13 @@ class BaseCanvas(scene.SceneCanvas):
             session = self.data.sessions[component.session_id]
             session_name = session.name
             if fp_id is not None and fp_id >= 0:
-                A = session.A[:, fp_id]
+                A = session.footprints[:, fp_id]
                 metrics = {
                     "size": int((A > A.max() * 0.01).sum()),
                 }
                 if session.status["quality_loaded"]:
                     for key, q_val in session.quality.items():
                         metrics[key] = q_val[fp_id]
-                    # metrics["SNR"] = session.quality["SNR_comp"][fp_id]
-                    # metrics["r-value"] = session.quality["r_values"][fp_id]
-                    # metrics["CNN"] = session.quality["cnn_preds"][fp_id]
 
                 text = "Neuron ID: {}\n{} \n".format(component.neuron_id, session_name)
                 text += "\n".join(

@@ -1,0 +1,34 @@
+{
+    "format_version": 1,
+    "name": "CATAN assignments",
+    "source_type": "assignments",
+    "public": false,
+    "groups": {
+        "assignments": {
+            "title": "Assignment IDs",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+                "ids": {
+                    "path": "/IDs",
+                    "required": true,
+                    "source": "dataset",
+                    "attribute": null
+                }
+            }
+        },
+        "stats": {
+            "title": "Assignment stats",
+            "type": "dynamic",
+            "enabled": true,
+            "fields": {
+                "stats": {
+                    "path": "/stats/*",
+                    "required": false,
+                    "source": "dataset",
+                    "attribute": null
+                }
+            }
+        }
+    }
+}

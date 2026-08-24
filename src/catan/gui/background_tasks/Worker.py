@@ -1,8 +1,15 @@
-from PySide6.QtCore import QObject, Signal, QRunnable, Slot
+from __future__ import annotations
+
 import traceback
 
 from dataclasses import dataclass
 from typing import Callable
+
+from PySide6.QtCore import QObject, QRunnable, Signal, Slot
+
+
+class TaskCancelled(Exception):
+    """Raised when a worker notices that cancellation was requested."""
 
 
 @dataclass
@@ -11,8 +18,17 @@ class TaskContext:
     progress: Callable[[int], None]
     message: Callable[[str], None]
 
-    def cancelled(self):
+    def cancelled(self) -> bool:
         return self.cancel_check()
+
+    def check_cancelled(self) -> None:
+        """
+        Raise TaskCancelled if cancellation was requested.
+
+        Long-running jobs can call this periodically to stop cleanly.
+        """
+        if self.cancelled():
+            raise TaskCancelled()
 
 
 class WorkerSignals(QObject):
@@ -31,15 +47,25 @@ class Worker(QRunnable):
         self.args = args
         self.kwargs = kwargs
 
-        self.cancelled = False
+        self._cancelled = False
+        self._failed = False
 
         self.signals = WorkerSignals()
 
-    def cancel(self):
-        self.cancelled = True
+    def cancel(self) -> None:
+        """
+        Request cooperative cancellation.
 
-    def is_cancelled(self):
-        return self.cancelled
+        The running function must periodically check ctx.cancelled()
+        or call ctx.check_cancelled().
+        """
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def is_failed(self) -> bool:
+        return self._failed
 
     @Slot()
     def run(self):
@@ -50,7 +76,11 @@ class Worker(QRunnable):
             message=self.signals.message.emit,
         )
 
+        result = None
+
         try:
+            # Catch cancellation requested before execution actually starts.
+            ctx.check_cancelled()
 
             result = self.fn(
                 *self.args,
@@ -58,9 +88,17 @@ class Worker(QRunnable):
                 **self.kwargs,
             )
 
-            if not self.cancelled:
-                self.signals.finished.emit(result)
+        except TaskCancelled:
+            self._cancelled = True
 
         except Exception:
+            self._failed = True
+            self.signals.error.emit(
+                traceback.format_exc()
+            )
 
-            self.signals.error.emit(traceback.format_exc())
+        finally:
+            # "finished" here means:
+            # the runnable has stopped executing,
+            # regardless of success/cancellation/failure.
+            self.signals.finished.emit(result)

@@ -1,0 +1,72 @@
+{
+    "format_version": 1,
+    "name": "CATAN session",
+    "source_type": "session",
+    "public": true,
+    "groups": {
+        "metadata": {
+            "title": "Metadata",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+                "path": {
+                    "path": "/",
+                    "source": "attribute",
+                    "attribute": "path",
+                    "required": false
+                }
+            }
+        },
+        "spatial": {
+            "title": "Spatial data",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+                "footprints": {
+                    "path": "/footprints",
+                    "required": true,
+                    "source": "dataset",
+                    "attribute": null
+                },
+                "background": {
+                    "path": "/background",
+                    "required": false,
+                    "source": "dataset",
+                    "attribute": null
+                },
+                "idx_eval": {
+                    "path": "/idx_eval",
+                    "required": false,
+                    "source": "dataset",
+                    "attribute": null
+                }
+            }
+        },
+        "quality": {
+            "title": "Quality data",
+            "type": "dynamic",
+            "enabled": true,
+            "fields": {
+                "*": {
+                    "path": "/quality/*",
+                    "source": "dataset",
+                    "attribute": null,
+                    "required": false
+                }
+            }
+        },
+        "traces": {
+            "title": "Trace data",
+            "type": "dynamic",
+            "enabled": false,
+            "fields": {
+                "*": {
+                    "path": "/traces/*",
+                    "source": "dataset",
+                    "attribute": null,
+                    "required": false
+                }
+            }
+        }
+    }
+}

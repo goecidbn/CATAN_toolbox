@@ -153,7 +153,7 @@ class Display(BasePlot.BaseCanvas):
             to_plot_neurons = []
             if adjacent_radius > 1e-2:
                 # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
-                union_centroids = self.data.union.centroids
+                union_centroids = self.data.assignments.union.centroids
                 distances = np.linalg.norm(
                     union_centroids - union_centroids[this_neuron],
                     axis=1,
@@ -248,7 +248,7 @@ class Display(BasePlot.BaseCanvas):
         # union_centroids = np.nanmean(
         #     self.data.neurons.centroids[displayed_neurons, ...], axis=1
         # )
-        union_centroids = self.data.union.centroids[displayed_neurons, ...]
+        union_centroids = self.data.assignments.union.centroids[displayed_neurons, ...]
 
         centroid_min = np.nanmin(union_centroids, axis=0)
         centroid_max = np.nanmax(union_centroids, axis=0)
@@ -330,7 +330,7 @@ class Display(BasePlot.BaseCanvas):
             z_offset = float(session.id) * z_stretch
 
             v, f, c, pick_points = footprint_to_mesh(
-                session.A[:, fp_id],
+                session.footprints[:, fp_id],
                 session.dims,
                 z_offset=z_offset,
                 z_scale=z_stretch,
@@ -430,7 +430,7 @@ class Display(BasePlot.BaseCanvas):
         self, component: NeuronComponent
     ) -> tuple[np.ndarray, np.ndarray]:
         # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
-        union_centroids = self.data.union.centroids
+        union_centroids = self.data.assignments.union.centroids
         neuron_id = component.neuron_id
         d = np.linalg.norm(union_centroids - union_centroids[neuron_id], axis=1)
         try:
@@ -543,8 +543,8 @@ class Display(BasePlot.BaseCanvas):
 
         ## calculate the statistics
         similarity, _, shift = calculate_img_correlation(
-            A1=self.data.sessions[this_component.session_id].A[:, this_fp_id],
-            A2=self.data.sessions[ref_component.session_id].A[:, ref_fp_id],
+            A1=self.data.sessions[this_component.session_id].footprints[:, this_fp_id],
+            A2=self.data.sessions[ref_component.session_id].footprints[:, ref_fp_id],
             dims=self.data.sessions[this_component.session_id].dims,
             crop=True,
             binary=False,
@@ -554,7 +554,7 @@ class Display(BasePlot.BaseCanvas):
             shift_optimized=True,
         )
         d_shift = np.sqrt(np.sum([s**2 for s in shift]))
-        p_same = self.data.f_same(d_shift, similarity)[0]
+        p_same = self.data.model.f_same(d_shift, similarity)[0]
         return similarity, d_shift, p_same, ref_session_id
 
     def add_info_str(

@@ -31,15 +31,15 @@ def calculate_statistics(
 
     """
 
-    if this_data.A is None or reference_data.A is None:
+    if this_data.footprints is None or reference_data.footprints is None:
         raise ValueError("Both this_data and reference_data must have A attribute set.")
 
     if (
-        this_data.A.shape == reference_data.A.shape
-        and len(this_data.A.indices) == len(reference_data.A.indices)
-        and np.all(this_data.A.indices == reference_data.A.indices)
-        and np.all(this_data.A.indptr == reference_data.A.indptr)
-        and np.allclose(this_data.A.data, reference_data.A.data)
+        this_data.footprints.shape == reference_data.footprints.shape
+        and len(this_data.footprints.indices) == len(reference_data.footprints.indices)
+        and np.all(this_data.footprints.indices == reference_data.footprints.indices)
+        and np.all(this_data.footprints.indptr == reference_data.footprints.indptr)
+        and np.allclose(this_data.footprints.data, reference_data.footprints.data)
     ):
         mode = "same"
     else:
@@ -74,11 +74,11 @@ def calculate_statistics(
             if not this_data.idx_eval[j] or j in idx_remove:
                 continue
 
-            A_ref = reference_data.A[:, i]  # .toarray()
+            A_ref = reference_data.footprints[:, i]  # .toarray()
 
             ## calculate pairwise correlation between reference and current set of neuron footprints
             local_correlations[j], _, local_shifts[j, :] = calculate_img_correlation(
-                this_data.A[:, j],  # .toarray(),
+                this_data.footprints[:, j],  # .toarray(),
                 A_ref,
                 crop=True,
                 shift=True,  # (key == "shifted"),

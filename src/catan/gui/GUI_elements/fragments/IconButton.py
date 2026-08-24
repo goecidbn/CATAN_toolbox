@@ -3,11 +3,12 @@ from PySide6.QtWidgets import QToolButton
 from PySide6.QtGui import QIcon
 from typing import Optional
 
+from catan.gui.resources.get_icon import get_fa_icon
 import qtawesome as qta
 
 
 def make_icon_button(
-    icon_names: Optional[tuple[str, ...]] = None,
+    icon_name: Optional[str] = None,
     color: str = "white",
     *,
     tooltip: str = "",
@@ -21,14 +22,10 @@ def make_icon_button(
     button.setIconSize(QSize(icon_size, icon_size))
     button.setAutoRaise(True)
 
-    if icon_names is None:
+    if icon_name is None:
         return button
 
-    icon = None
-
-    # if qta is not None:
-    for name in icon_names:
-        icon = qta.icon(name, color=color)
+    icon = get_fa_icon(icon_name,color) if icon_name is not None else None
 
     if icon is None and fallback_theme_icon is not None:
         icon = QIcon.fromTheme(fallback_theme_icon)
@@ -41,21 +38,15 @@ def make_icon_button(
 
 def set_button_icon(
     button: QToolButton,
-    icon_names: tuple[str, ...],
+    icon_name: str,
     color: str = "white",
     *,
     tooltip: str,
     fallback_theme_icon: str | None = None,
 ):
-    icon = None
+    # icon = None
 
-    if qta is not None:
-        for name in icon_names:
-            try:
-                icon = qta.icon(name, color=color)
-                break
-            except Exception:
-                pass
+    icon = get_fa_icon(icon_name,color) if icon_name is not None else None
 
     if icon is None and fallback_theme_icon is not None:
         icon = QIcon.fromTheme(fallback_theme_icon)

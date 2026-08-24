@@ -20,19 +20,28 @@ class TaskItemWidget(QWidget):
         task_id: str,
         name: str,
         running: bool = False,
+        cancelling: bool = False,
         parent=None,
     ):
         super().__init__(parent)
 
         self.task_id = task_id
 
-        status = "●" if running else "○"
+        if cancelling:
+            status = "◐"
+            text = f"{status} {name} — Cancelling..."
+        else:
+            status = "●" if running else "○"
+            text = f"{status} {name}"
 
-        self.label = QLabel(f"{status} {name}")
+        self.label = QLabel(text)
 
         self.cancel_button = QPushButton("×")
         self.cancel_button.setFixedWidth(28)
         self.cancel_button.setToolTip("Cancel task")
+
+        if cancelling:
+            self.cancel_button.setEnabled(False)
 
         self.cancel_button.clicked.connect(
             lambda: self.cancel_requested.emit(self.task_id)
@@ -44,7 +53,6 @@ class TaskItemWidget(QWidget):
         layout.addWidget(self.label)
         layout.addStretch()
         layout.addWidget(self.cancel_button)
-
 
 
 class ReorderableTaskList(QListWidget):
@@ -81,8 +89,6 @@ class ReorderableTaskList(QListWidget):
             )
 
 
-
-
 class TaskQueueDisplay(QWidget):
     def __init__(
         self,
@@ -97,8 +103,17 @@ class TaskQueueDisplay(QWidget):
 
         self.title = QLabel(group.capitalize())
 
-        self.current_label = QLabel("Idle")
+        # Current task area
+        self.current_container = QWidget()
+        self.current_layout = QVBoxLayout(
+            self.current_container
+        )
+        self.current_layout.setContentsMargins(
+            0, 0, 0, 0
+        )
+        self.current_layout.setSpacing(0)
 
+        # Queued tasks
         self.queue_list = ReorderableTaskList()
 
         self.queue_list.task_moved.connect(
@@ -109,32 +124,45 @@ class TaskQueueDisplay(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         layout.addWidget(self.title)
-        layout.addWidget(self.current_label)
+        layout.addWidget(self.current_container)
         layout.addWidget(self.queue_list)
+
+        # ---- TaskManager signals ----
 
         self.task_manager.queue_changed.connect(
             self._queue_changed
         )
 
         self.task_manager.task_started.connect(
-            self._task_started
+            self._task_changed
         )
 
         self.task_manager.task_finished.connect(
-            self._task_finished
+            self._task_changed
+        )
+
+        self.task_manager.task_cancelled.connect(
+            self._task_changed
+        )
+
+        self.task_manager.task_failed.connect(
+            self._task_changed
         )
 
         self.refresh()
 
-    def _queue_changed(self, group: str):
+    def _queue_changed(
+        self,
+        group: str,
+    ):
         if group == self.group:
             self.refresh()
 
-    def _task_started(self, group: str, task_id: str):
-        if group == self.group:
-            self.refresh()
-
-    def _task_finished(self, group: str, task_id: str):
+    def _task_changed(
+        self,
+        group: str,
+        task_id: str,
+    ):
         if group == self.group:
             self.refresh()
 
@@ -149,18 +177,55 @@ class TaskQueueDisplay(QWidget):
             new_index,
         )
 
+    def _clear_layout(
+        self,
+        layout,
+    ):
+        while layout.count():
+            item = layout.takeAt(0)
+
+            widget = item.widget()
+
+            if widget is not None:
+                widget.deleteLater()
+
     def refresh(self):
+        # ============================================================
+        # Current task
+        # ============================================================
+
         current = self.task_manager.current_task(
             self.group
         )
 
+        self._clear_layout(
+            self.current_layout
+        )
+
         if current is None:
-            self.current_label.setText("Idle")
+            self.current_layout.addWidget(
+                QLabel("Idle")
+            )
 
         else:
-            self.current_label.setText(
-                f"● {current.name}"
+            current_widget = TaskItemWidget(
+                task_id=current.id,
+                name=current.name,
+                running=True,
+                cancelling=current.worker.is_cancelled(),
             )
+
+            current_widget.cancel_requested.connect(
+                self.task_manager.cancel
+            )
+
+            self.current_layout.addWidget(
+                current_widget
+            )
+
+        # ============================================================
+        # Queued tasks
+        # ============================================================
 
         self.queue_list.clear()
 
@@ -175,9 +240,10 @@ class TaskQueueDisplay(QWidget):
             )
 
             widget = TaskItemWidget(
-                task.id,
-                task.name,
+                task_id=task.id,
+                name=task.name,
                 running=False,
+                cancelling=False,
             )
 
             widget.cancel_requested.connect(
@@ -189,6 +255,7 @@ class TaskQueueDisplay(QWidget):
             )
 
             self.queue_list.addItem(item)
+
             self.queue_list.setItemWidget(
                 item,
                 widget,
@@ -207,7 +274,12 @@ class TaskOverviewDisplay(QWidget):
 
         self.summary_label = QLabel()
 
+        # ============================================================
+        # Expand/collapse button
+        # ============================================================
+
         self.toggle_button = QToolButton()
+
         self.toggle_button.setCheckable(True)
         self.toggle_button.setChecked(False)
 
@@ -219,12 +291,29 @@ class TaskOverviewDisplay(QWidget):
             self._toggle_details
         )
 
+        # ============================================================
+        # Header
+        # ============================================================
+
         header = QHBoxLayout()
 
-        header.addWidget(QLabel("Tasks"))
-        header.addWidget(self.summary_label)
+        header.addWidget(
+            QLabel("Tasks")
+        )
+
+        header.addWidget(
+            self.summary_label
+        )
+
         header.addStretch()
-        header.addWidget(self.toggle_button)
+
+        header.addWidget(
+            self.toggle_button
+        )
+
+        # ============================================================
+        # Detailed task queues
+        # ============================================================
 
         self.details = QWidget()
 
@@ -232,43 +321,46 @@ class TaskOverviewDisplay(QWidget):
             self.details
         )
 
-        self.loading_widget = TaskQueueDisplay(
-            task_manager,
-            "loading",
+        details_layout.setContentsMargins(
+            0, 0, 0, 0
         )
 
-        self.model_update_widget = TaskQueueDisplay(
-            task_manager,
-            "model update",
-        )
+        self.queue_displays = {}
 
-        self.calculating_widget = TaskQueueDisplay(
-            task_manager,
-            "calculating",
-        )
+        for group in self.task_manager.GROUPS:
+            display = TaskQueueDisplay(
+                task_manager,
+                group,
+            )
 
-        details_layout.addWidget(
-            self.loading_widget
-        )
+            self.queue_displays[group] = display
 
-        details_layout.addWidget(
-            self.model_update_widget
-        )
-
-        details_layout.addWidget(
-            self.calculating_widget
-        )
+            details_layout.addWidget(
+                display
+            )
 
         self.details.setVisible(False)
 
+        # ============================================================
+        # Main layout
+        # ============================================================
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+
+        layout.setContentsMargins(
+            0, 0, 0, 0
+        )
 
         layout.addLayout(header)
         layout.addWidget(self.details)
 
+        # ============================================================
+        # TaskManager signals
+        # ============================================================
+
         self.task_manager.queue_changed.connect(
-            lambda group: self.refresh_summary()
+            lambda group:
+                self.refresh_summary()
         )
 
         self.task_manager.task_started.connect(
@@ -281,13 +373,25 @@ class TaskOverviewDisplay(QWidget):
                 self.refresh_summary()
         )
 
+        self.task_manager.task_cancelled.connect(
+            lambda group, task_id:
+                self.refresh_summary()
+        )
+
+        self.task_manager.task_failed.connect(
+            lambda group, task_id:
+                self.refresh_summary()
+        )
+
         self.refresh_summary()
 
     def _toggle_details(
         self,
         expanded: bool,
     ):
-        self.details.setVisible(expanded)
+        self.details.setVisible(
+            expanded
+        )
 
         self.toggle_button.setArrowType(
             Qt.ArrowType.DownArrow
@@ -296,26 +400,32 @@ class TaskOverviewDisplay(QWidget):
         )
 
     def refresh_summary(self):
-        loading = self.task_manager.group_summary(
-            "loading"
-        )
+        parts = []
 
-        calculating = self.task_manager.group_summary(
-            "calculating"
-        )
+        for group in self.task_manager.GROUPS:
 
-        loading_text = (
-            f"Loading: "
-            f"{'1 running' if loading['running'] else 'idle'}, "
-            f"{loading['queued_count']} queued"
-        )
+            summary = (
+                self.task_manager.group_summary(
+                    group
+                )
+            )
 
-        calc_text = (
-            f"Calculating: "
-            f"{'1 running' if calculating['running'] else 'idle'}, "
-            f"{calculating['queued_count']} queued"
-        )
+            if summary["running"]:
+                if summary[
+                    "current_cancelling"
+                ]:
+                    state = "cancelling"
+                else:
+                    state = "1 running"
+            else:
+                state = "idle"
+
+            parts.append(
+                f"{group.capitalize()}: "
+                f"{state}, "
+                f"{summary['queued_count']} queued"
+            )
 
         self.summary_label.setText(
-            f"{loading_text}   |   {calc_text}"
+            "   |   ".join(parts)
         )
