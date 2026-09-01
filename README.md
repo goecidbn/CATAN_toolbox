@@ -54,10 +54,12 @@ pip install catan-toolbox
 ## Running CATAN
 
 ```bash
+catan-gui
+```
+or in GUI-less mode:
+```bash
 catan
 ```
-
-or
 
 ```python
 from catan.gui.app import main

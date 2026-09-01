@@ -234,10 +234,13 @@ class OptionList(QWidget):
                 self.group_name, chip_field_name, method="remove"
             )
         )
+        chip.change_path_requested.connect(
+            lambda field_name=chip.name : self.callback(self.group_name, field_name, method="edit_path")
+        )
         chip.setEnabled(enabled)
         self.option[name] = chip
 
-    def refresh(self, name: str, path: str):
+    def refresh(self, name: str, path: Optional[str]=None):
 
         if name not in self.group_spec.fields:
             self.option[name].deleteLater()
@@ -343,6 +346,10 @@ class FieldSelector(QWidget):
                 group_name,
                 field_name,
             )
+            self.field_options[group_name].refresh(field_name)
+                    
+            self.fields_changed.emit()
+            return
 
         if method == "rename":
             new_name, ok = QInputDialog.getText(

@@ -28,19 +28,18 @@ from catan.gui.plots.helper.cameras import (
     XOnlyLockedPanZoomCamera,
 )
 
+# @dataclass
+# class TraceMeta:
+#     #     session_id: int
+#     #     cluster_id: int
+#     color: Tuple[float, float, float, float]
 
-@dataclass
-class TraceMeta:
-    #     session_id: int
-    #     cluster_id: int
-    color: Tuple[float, float, float, float]
 
-
-@dataclass
-class TraceVisualRecord:
-    visual: object  # SurfacePlot / Mesh visual
-    # pick_points: np.ndarray  # (N, 2) array of (x,y) points for picking
-    metadata: TraceMeta
+# @dataclass
+# class TraceVisualRecord:
+#     visual: object  # SurfacePlot / Mesh visual
+#     # pick_points: np.ndarray  # (N, 2) array of (x,y) points for picking
+#     metadata: TraceMeta
 
 
 class Display(BasePlot.BaseCanvas):
@@ -216,7 +215,6 @@ class Display(BasePlot.BaseCanvas):
 
         f = 15.0  # sampling frequency - could be specified in GUI
         self.state.logger.debug(f"Updating traces for current neurons")
-
         t_start = time.time()
         self.clear_traces()
 
@@ -225,17 +223,25 @@ class Display(BasePlot.BaseCanvas):
             or self.data.current_session is None
             or self.state.selected_components is None
             or len(self.labels) == 0
+            or self.data.assignments is None
         ):
             return
 
         time_lim = [np.inf, -np.inf]
 
         if single:
-            to_plot_components = (
-                [self.state.focused_component]
-                if self.state.focused_component is not None
-                else None
-            )
+            if self.state.focused_component is None:
+                to_plot_components = None
+            else:
+                neuron_id = self.state.focused_component.neuron_id
+                session_presence = np.where(
+                    self.data.assignments.ids[neuron_id, :] >= 0
+                )
+
+                to_plot_components = [
+                    NeuronComponent(session_id=s, neuron_id=neuron_id)
+                    for s in session_presence[0]
+                ]
         else:
             to_plot_components = self.state.selected_components
 

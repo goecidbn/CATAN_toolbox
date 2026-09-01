@@ -14,6 +14,7 @@ from .types import (
     check_structure_compatibility,
 )
 
+
 class FileInspector:
     """Single-file metadata cache used by the field browser and validation.
 
@@ -43,8 +44,9 @@ class FileInspector:
             return self._structure
 
         backend = get_backend(path)
-        with backend.open_read(path) as ref:
-            structure = backend.inspect(ref, root=root)
+        structure = backend.inspect_file(path)
+        # with backend.open_read(path) as ref:
+        #     structure = backend.inspect(ref, root=root)
 
         self._cache_key = key
         self._structure = structure

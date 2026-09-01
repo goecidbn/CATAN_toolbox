@@ -5,13 +5,15 @@ from PySide6.QtWidgets import (
     QToolButton,
     QSizePolicy,
     QInputDialog,
+    QMenu,
 )
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from catan.core.structures.load_config import FieldSpec
 
 class FieldChip(QWidget):
 
     remove_requested = Signal(str)
+    change_path_requested = Signal()
 
     name: str
     field_path: str
@@ -33,6 +35,9 @@ class FieldChip(QWidget):
         self.field_button.setText(name)
         self.field_button.setChecked(True)
 
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._open_context_menu)
+
         self.set(name=name, path=name if spec is None else spec.path)
 
         self.remove_button = QToolButton()
@@ -53,6 +58,19 @@ class FieldChip(QWidget):
             QSizePolicy.Policy.Maximum,
             QSizePolicy.Policy.Fixed,
         )
+
+    def _open_context_menu(self, pos):
+
+        menu = QMenu(self)
+
+        # menu.addAction(
+        #     "Set current session",
+        #     lambda: self.setCurrentRequested.emit(self.index),
+        # )
+        # menu = self.field_button.createStandardContextMenu()
+        menu.addSeparator()
+        menu.addAction("Edit field path...", lambda: self.change_path_requested.emit())
+        menu.exec(self.mapToGlobal(pos))
 
     def set(self, *, name: Optional[str] = None, path: Optional[str] = None):
         if name is not None:

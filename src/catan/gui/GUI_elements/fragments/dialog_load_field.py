@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 from catan.core.io.inspection import browse_file_fields
+
 # import h5py
 import numpy as np
 from pathlib import Path, PurePosixPath
+
 # from scipy.io import loadmat
 from typing import List, Optional, Tuple
 from PySide6.QtWidgets import (
@@ -49,9 +51,7 @@ class FieldSelectDialog(QDialog):
         self.tree_widget = QTreeWidget()
 
         self.tree_widget.setColumnCount(3)
-        self.tree_widget.setHeaderLabels(
-            ["Field", "Shape", "dtype"]
-        )
+        self.tree_widget.setHeaderLabels(["Field", "Shape", "dtype"])
 
         self.tree_widget.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
@@ -77,8 +77,6 @@ class FieldSelectDialog(QDialog):
             QHeaderView.ResizeMode.ResizeToContents,
         )
 
-
-
         # self.list_widget = QListWidget()
         # self.list_widget.setSelectionMode(
         #     QListWidget.SelectionMode.SingleSelection
@@ -87,8 +85,7 @@ class FieldSelectDialog(QDialog):
         layout.addWidget(self.tree_widget)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel,
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             parent=self,
         )
 
@@ -97,9 +94,7 @@ class FieldSelectDialog(QDialog):
 
         layout.addWidget(buttons)
 
-        self.tree_widget.itemDoubleClicked.connect(
-            self._item_double_clicked
-        )
+        self.tree_widget.itemDoubleClicked.connect(self._item_double_clicked)
 
         self._populate()
 
@@ -115,9 +110,7 @@ class FieldSelectDialog(QDialog):
     def _populate(self):
         self.tree_widget.clear()
 
-        self.path_label.setText(
-            f"Path: {self.current_path}"
-        )
+        self.path_label.setText(f"Path: {self.current_path}")
 
         fields = browse_file_fields(
             self.path,
@@ -132,9 +125,7 @@ class FieldSelectDialog(QDialog):
 
         # Add '..' first
         if self.current_path != "/":
-            item = QTreeWidgetItem(
-                ["📁  ..", "", ""]
-            )
+            item = QTreeWidgetItem(["📁  ..", "", ""])
 
             item.setData(
                 0,
@@ -190,21 +181,14 @@ class FieldSelectDialog(QDialog):
 
             self.tree_widget.addTopLevelItem(item)
 
-            if (
-                self.initial_key is not None
-                and field.name == self.initial_key
-            ):
+            if self.initial_key is not None and field.name == self.initial_key:
                 selected_item = item
 
         if selected_item is not None:
-            self.tree_widget.setCurrentItem(
-                selected_item
-            )
+            self.tree_widget.setCurrentItem(selected_item)
             selected_item.setSelected(True)
 
-            self.tree_widget.scrollToItem(
-                selected_item
-            )
+            self.tree_widget.scrollToItem(selected_item)
 
     def _item_double_clicked(
         self,
@@ -219,9 +203,6 @@ class FieldSelectDialog(QDialog):
         kind = data["kind"]
         name = data["name"]
 
-        print(f"Double-clicked on {kind}: {name}")
-        print("data:", data)
-
         if kind == "parent":
             self._go_up()
 
@@ -235,9 +216,7 @@ class FieldSelectDialog(QDialog):
         if self.current_path == "/":
             self.current_path = f"/{name}"
         else:
-            self.current_path = (
-                f"{self.current_path}/{name}"
-            )
+            self.current_path = f"{self.current_path}/{name}"
 
         # Preselection should only apply initially
         self.initial_key = None
@@ -245,10 +224,8 @@ class FieldSelectDialog(QDialog):
         self._populate()
 
     def _go_up(self):
-        
-        path = PurePosixPath(
-            self.current_path
-        )
+
+        path = PurePosixPath(self.current_path)
 
         parent = str(path.parent)
 
@@ -274,7 +251,7 @@ class FieldSelectDialog(QDialog):
         if data["kind"] != "field":
             return
 
-        path = PurePosixPath(self.current_path,data["name"])
+        path = PurePosixPath(self.current_path, data["name"])
         self.selected_field = str(path)
 
         # if self.current_path == "/":
@@ -309,6 +286,7 @@ class FieldSelectDialog(QDialog):
             return dlg.selected_field
 
         return None
+
 
 # @dataclass
 # class FieldInfo:

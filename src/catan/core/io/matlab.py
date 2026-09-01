@@ -11,11 +11,17 @@ import numpy as np
 from scipy import sparse
 from scipy.io import loadmat as scipy_loadmat
 from scipy.io import savemat as scipy_savemat
+from scipy.io import whosmat as scipy_whosmat
 
 from catan.core.structures.load_config import FieldSpec
 
 from .base import IOBackend
-from .common import nested_dict_get, nested_dict_group, nested_dict_set, normalize_scalar
+from .common import (
+    nested_dict_get,
+    nested_dict_group,
+    nested_dict_set,
+    normalize_scalar,
+)
 from .hdf5 import HDF5Backend
 from .types import (
     FieldInfo,
@@ -45,7 +51,9 @@ class MatPre73Backend(IOBackend):
     def open_write(self, path: str | Path) -> Iterator[dict[str, Any]]:
         data: dict[str, Any] = {}
         yield data
-        scipy_savemat(path, _prepare_mat_tree(data), do_compression=True, long_field_names=True)
+        scipy_savemat(
+            path, _prepare_mat_tree(data), do_compression=True, long_field_names=True
+        )
 
     def read_field(
         self,
@@ -113,7 +121,9 @@ class MatPre73Backend(IOBackend):
         spec = entry.spec
         if normalized_source(spec.source) == "attribute":
             if spec.attribute is None:
-                raise ValueError(f"Attribute field {entry.label!r} has no attribute name")
+                raise ValueError(
+                    f"Attribute field {entry.label!r} has no attribute name"
+                )
             target = nested_dict_group(base, spec.path)
             attrs = target.setdefault(MAT_ATTRS_KEY, {})
             if not isinstance(attrs, dict):
@@ -134,6 +144,38 @@ class MatPre73Backend(IOBackend):
             raise TypeError(f"Logical MAT root {root!r} is not a struct")
         structure = FileStructure(self.file_format, root=normalize_path(root))
         _inspect_mapping(base, structure, logical_path="/")
+        return structure
+
+    def inspect_file(
+        self,
+        path: str | Path,
+        *,
+        root: str = "/",
+    ) -> FileStructure:
+
+        if normalize_path(root) != "/":
+            # fallback for now
+            return super().inspect_file(
+                path,
+                root=root,
+            )
+
+        structure = FileStructure(
+            self.file_format,
+            root="/",
+        )
+
+        for name, shape, mat_class in scipy_whosmat(path):
+            structure.add(
+                FieldInfo(
+                    name=name,
+                    path=join_path("/", name),
+                    kind="group" if mat_class == "struct" else "field",
+                    shape=tuple(shape),
+                    dtype=mat_class,
+                )
+            )
+
         return structure
 
     def get_attribute(
@@ -176,7 +218,8 @@ class MatPre73Backend(IOBackend):
         if not isinstance(base, Mapping):
             return []
         return [
-            str(name) for name, value in base.items()
+            str(name)
+            for name, value in base.items()
             if name != MAT_ATTRS_KEY and isinstance(value, Mapping)
         ]
 
@@ -364,7 +407,9 @@ def _mat_to_dict(obj: Any) -> Any:
     if isinstance(obj, tuple):
         return tuple(_mat_to_dict(v) for v in obj)
     if isinstance(obj, np.ndarray) and obj.dtype == object:
-        return np.array([_mat_to_dict(v) for v in obj.flat], dtype=object).reshape(obj.shape)
+        return np.array([_mat_to_dict(v) for v in obj.flat], dtype=object).reshape(
+            obj.shape
+        )
     return normalize_mat_value(obj)
 
 
@@ -446,6 +491,7 @@ def _inspect_mapping(
                     dtype=dtype,
                 )
             )
+
 
 def resolve_mat_path(
     ref: dict[str, Any],

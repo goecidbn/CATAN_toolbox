@@ -76,6 +76,19 @@ class IOBackend(ABC):
     def inspect(self, ref: Any, *, root: str = "/") -> FileStructure:
         ...
 
+    def inspect_file(
+        self,
+        path: str | Path,
+        *,
+        root: str = "/",
+    ) -> FileStructure:
+
+        with self.open_read(path) as ref:
+            return self.inspect(
+                ref,
+                root=root,
+            )
+
     @abstractmethod
     def get_attribute(
         self,

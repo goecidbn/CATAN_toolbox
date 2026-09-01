@@ -9,21 +9,16 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QHBoxLayout,
-    QMessageBox,
     QLabel,
     QFrame,
     QVBoxLayout,
     QCheckBox,
-    QFileDialog,
     QSizePolicy,
     QComboBox,
     QToolButton,
-    QWidgetAction,
-    QSplitter,
 )
 from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal
-from PySide6.QtGui import QAction, QCursor
-from .fragments.field_selector import FieldSelector
+from PySide6.QtGui import QAction
 from shiboken6 import isValid
 
 from pathlib import Path
@@ -32,25 +27,18 @@ from catan.gui.structures import data, state, config
 
 from .resource_monitor import ResourceMonitor
 from .fragments import (
-    TaskOverviewDisplay, 
-    ToggleOption,
-    make_icon_button, 
+    TaskOverviewDisplay,
+    make_icon_button,
     set_button_icon,
-    choose_path
+    choose_path,
 )
 from . import session_overview
 
 selector_options = {
     "model": ["Load ..."],
     "assignments": ["Create new", "Load ..."],
-    # {
-    #     "load": "Load...",
-    # },
-    # "assignments": {
-    #     "new": "Create new",
-    #     "load": "Load...",
-    # }
 }
+
 
 class MainMenu(QFrame):
     """
@@ -58,7 +46,9 @@ class MainMenu(QFrame):
     Contains file path selectors, load/save buttons, and mode checkboxes.
     """
 
-    load_config_changed = Signal(int)  # signal to indicate that the load configuration has changed
+    load_config_changed = Signal(
+        int
+    )  # signal to indicate that the load configuration has changed
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -97,15 +87,18 @@ class MainMenu(QFrame):
 
         ## session buttons
 
-
-        self.button_save_sessions = make_icon_button("floppy-disk", tooltip=f"Save sessions data", size=28, icon_size=22)
+        self.button_save_sessions = make_icon_button(
+            "floppy-disk", tooltip=f"Save sessions data", size=28, icon_size=22
+        )
         self.button_save_sessions.setFixedWidth(35)
         self.button_save_sessions.setEnabled(False)
-        layout.addWidget(self.button_save_sessions,alignment=Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(
+            self.button_save_sessions, alignment=Qt.AlignmentFlag.AlignRight
+        )
 
         self.button_save_sessions.clicked.connect(lambda: self.save_data("sessions"))
-        
-        layout.addWidget(paths_menu:=QWidget())
+
+        layout.addWidget(paths_menu := QWidget())
         self.paths_layout = QVBoxLayout(paths_menu)
 
         self.build_app_mode_menu()
@@ -147,7 +140,7 @@ class MainMenu(QFrame):
 
         if self.checkbox_update_model.isChecked():
             self.data.queue_update_model(session_id)
-        
+
         if self.checkbox_assign_neurons.isChecked():
             self.data.queue_assign_neurons(session_id)
 
@@ -157,7 +150,7 @@ class MainMenu(QFrame):
 
     def _on_data_changed(self, input: tuple[str, int]):
         """
-            updates GUI element availability based on the current state of the data
+        updates GUI element availability based on the current state of the data
         """
         ## disable changing root path, when sessions are loaded,
         ## to avoid path inconsistencies
@@ -167,20 +160,26 @@ class MainMenu(QFrame):
         self.edit_root_path.setEnabled(not sessions_loaded)
 
         self.button_save_sessions.setEnabled(sessions_loaded)
-        
 
         ## model buttons
         local_model = (self.data.model is not None) and (not self.data.model.loaded)
-        model_fit_possible = local_model and sum([session.status["aligned"] for session in self.data.sessions]) > 1
+        model_fit_possible = (
+            local_model
+            and sum([session.status["aligned"] for session in self.data.sessions]) > 1
+        )
         self.loader["model"]["button_execute"].setEnabled(model_fit_possible)
 
         model_fitted = self.data.model is not None and self.data.model.fitted
         self.loader["model"]["button_save"].setEnabled(model_fitted)
 
         ## registration buttons
-        self.loader["assignments"]["button_execute"].setEnabled(sessions_loaded and model_fitted)
+        self.loader["assignments"]["button_execute"].setEnabled(
+            sessions_loaded and model_fitted
+        )
 
-        any_assigned = any([session.status["matched"] for session in self.data.sessions])
+        any_assigned = any(
+            [session.status["matched"] for session in self.data.sessions]
+        )
         self.loader["assignments"]["button_save"].setEnabled(any_assigned)
 
     def build_app_mode_menu(self):
@@ -203,7 +202,6 @@ class MainMenu(QFrame):
         self.form = form
 
         ## add connected path loading and editing option for root path
-        
 
         form.addRow(QLabel("Data paths:"), QLabel(""))
 
@@ -212,17 +210,24 @@ class MainMenu(QFrame):
         ## model data loading options
         form.addRow(
             QLabel("Model"),
-            self.build_load_options("model", self.data.available_models, add_options=selector_options["model"]),
+            self.build_load_options(
+                "model",
+                self.data.available_models,
+                add_options=selector_options["model"],
+            ),
         )
 
         ### assignment data loading options
         form.addRow(
             QLabel("Assignments"),
-            self.build_load_options("assignments", self.data.available_assignments, add_options=selector_options["assignments"]),
+            self.build_load_options(
+                "assignments",
+                self.data.available_assignments,
+                add_options=selector_options["assignments"],
+            ),
         )
 
         self.paths_layout.addWidget(formFrame, alignment=Qt.AlignmentFlag.AlignTop)
-
 
         self.checkbox_update_model = QCheckBox("Register to model after loading")
         self.checkbox_update_model.setChecked(True)
@@ -236,7 +241,9 @@ class MainMenu(QFrame):
         ## default processing
         self.button_process = QToolButton(self)
         self.button_process.setText("Process data")
-        self.button_process.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.button_process.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup
+        )
         self.button_process.clicked.connect(self.on_process_all)
 
         ## alternative processing
@@ -250,7 +257,6 @@ class MainMenu(QFrame):
 
         self.button_save = QPushButton("Save results")
         self.paths_layout.addWidget(self.button_save)
-
 
         # self.checkbox_auto_advance = QCheckBox("Auto-advance to next cluster")
         # self.checkbox_skip_processed_side = QCheckBox("Skip processed in navigation")
@@ -277,6 +283,7 @@ class MainMenu(QFrame):
                 choose_path(
                     self,
                     pick_dir=True,
+                    init_path=self.data.root,
                     edit_line=self.edit_root_path,
                     display_text="Select root folder",
                     only_existing=True,
@@ -286,9 +293,14 @@ class MainMenu(QFrame):
         )
         self.edit_root_path.editingFinished.connect(on_root_path_changed)
         return widget
-        
 
-    def build_load_options(self, key, options, add_options: Optional[list[str]] = None, add_widgets: List[QWidget]=[]) -> QHBoxLayout:
+    def build_load_options(
+        self,
+        key,
+        options,
+        add_options: Optional[list[str]] = None,
+        add_widgets: List[QWidget] = [],
+    ) -> QHBoxLayout:
 
         entry_layout = QHBoxLayout()
 
@@ -306,26 +318,36 @@ class MainMenu(QFrame):
         entry_layout.addWidget(self.loader[key]["selector"])
 
         ## load / execute button
-        self.loader[key]["button_execute"] = make_icon_button("folder-open", tooltip=f"Load {key} data", size=28, icon_size=22)
+        self.loader[key]["button_execute"] = make_icon_button(
+            "folder-open", tooltip=f"Load {key} data", size=28, icon_size=22
+        )
         self.loader[key]["button_execute"].setFixedWidth(25)
         entry_layout.addWidget(self.loader[key]["button_execute"])
 
         ## save button
-        self.loader[key]["button_save"] = make_icon_button("floppy-disk", tooltip=f"Save {key} data", size=28, icon_size=22)
+        self.loader[key]["button_save"] = make_icon_button(
+            "floppy-disk", tooltip=f"Save {key} data", size=28, icon_size=22
+        )
         self.loader[key]["button_save"].setFixedWidth(35)
         self.loader[key]["button_save"].setEnabled(False)
         entry_layout.addWidget(self.loader[key]["button_save"])
 
-        self.loader[key]["button_save"].clicked.connect(lambda method=key : self.save_data(key))
+        self.loader[key]["button_save"].clicked.connect(
+            lambda method=key: self.save_data(key)
+        )
 
         if key == "model":
-            set_button_icon(self.loader["model"]["button_execute"], "play", tooltip=f"Run model fitting")
+            set_button_icon(
+                self.loader["model"]["button_execute"],
+                "play",
+                tooltip=f"Run model fitting",
+            )
 
             def on_button_click():
 
                 if self.data.model is not None and self.data.model.loaded:
                     self.state.issue(
-                        "warning", 
+                        "warning",
                         "Model registration not allowed",
                         f"Model '{self.data.current_model_name}' was loaded from file and cannot be updated. Please create a new model to fit to data.",
                     )
@@ -336,7 +358,11 @@ class MainMenu(QFrame):
             self.loader[key]["button_execute"].clicked.connect(on_button_click)
             self.loader[key]["button_execute"].setEnabled(False)
         if key == "assignments":
-            set_button_icon(self.loader["assignments"]["button_execute"], "play", tooltip=f"Run neuron registration")
+            set_button_icon(
+                self.loader["assignments"]["button_execute"],
+                "play",
+                tooltip=f"Run neuron registration",
+            )
 
             def on_button_click():
                 for session in self.data.sessions:
@@ -349,7 +375,6 @@ class MainMenu(QFrame):
             entry_layout.addWidget(widget)
         return entry_layout
 
-        
     def save_data(self, key):
 
         save_path = choose_path(
@@ -361,7 +386,7 @@ class MainMenu(QFrame):
         )
         if save_path is None:
             return
-        
+
         if key == "sessions":
             self.data.save_sessions(save_path)
 
@@ -371,7 +396,6 @@ class MainMenu(QFrame):
         if key == "assignments":
             self.data.save_assignments(save_path)
 
-        
     def _on_load_option_changed(self, key, opt: str):
 
         if not opt:
@@ -380,7 +404,7 @@ class MainMenu(QFrame):
         if key == "model":
             if opt in selector_options["model"]:
                 load_path = None
-                if opt=="Load ...":
+                if opt == "Load ...":
                     load_path = choose_path(
                         self,
                         pick_dir=False,
@@ -391,12 +415,18 @@ class MainMenu(QFrame):
                     if not load_path:
                         self.loader[key]["selector"].setCurrentIndex(0)
                         return
-                    
-                name, ok = QInputDialog.getText(self, "Model name", "Enter a name for the model:")
+
+                name, ok = QInputDialog.getText(
+                    self, "Model name", "Enter a name for the model:"
+                )
                 if ok and isinstance(name, str):
-                    self.data.add_model(name,load_path)
-                    
-                    self.rebuild_selector(key, self.data.available_models, add_options=selector_options[key])
+                    self.data.add_model(name, load_path)
+
+                    self.rebuild_selector(
+                        key,
+                        self.data.available_models,
+                        add_options=selector_options[key],
+                    )
                     index = self.data.available_models.index(name)
                 else:
                     index = 0
@@ -408,23 +438,29 @@ class MainMenu(QFrame):
         elif key == "assignments":
             if opt in selector_options["assignments"]:
                 load_path = None
-                if opt=="Load ...":
+                if opt == "Load ...":
                     load_path = choose_path(
                         self,
                         pick_dir=False,
                         init_path=self.data.root,
                         display_text="Select assignment file",
-                        only_existing=True
+                        only_existing=True,
                     )
                     if not load_path:
                         self.loader[key]["selector"].setCurrentIndex(0)
                         return
-                
-                name, ok = QInputDialog.getText(self, "Assignment name", "Enter a name for the assignment:")
-                if ok and isinstance(name, str):
-                    self.data.add_assignments(name,load_path)
 
-                    self.rebuild_selector(key, self.data.available_assignments, add_options=selector_options[key])
+                name, ok = QInputDialog.getText(
+                    self, "Assignment name", "Enter a name for the assignment:"
+                )
+                if ok and isinstance(name, str):
+                    self.data.add_assignments(name, load_path)
+
+                    self.rebuild_selector(
+                        key,
+                        self.data.available_assignments,
+                        add_options=selector_options[key],
+                    )
 
                     if name in self.data.available_assignments:
                         index = self.data.available_assignments.index(name)
@@ -438,8 +474,9 @@ class MainMenu(QFrame):
             else:
                 self.data.change_assignments(opt)
 
-    def rebuild_selector(self, key: str, options: list[str], 
-    add_options: Optional[list[str]] = None):
+    def rebuild_selector(
+        self, key: str, options: list[str], add_options: Optional[list[str]] = None
+    ):
         selector = self.loader[key]["selector"]
         assert isinstance(selector, QComboBox), "Selector must be a QComboBox"
 
@@ -451,7 +488,6 @@ class MainMenu(QFrame):
 
         selector.addItems([opt for opt in options])
         selector.blockSignals(False)
-
 
     ### ------------------------------------------###
     ###    Logic for saving/restoring settings    ###
@@ -501,4 +537,3 @@ class MainMenu(QFrame):
 
 #         if not enabled and isinstance(w, (QLineEdit, QLabel)):
 #             w.setText("")
-
