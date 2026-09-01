@@ -1,5 +1,6 @@
 {
     "format_version": 1,
+    "uid": "catan-native-remap",
     "name": "CATAN remapping",
     "source_type": "remapping",
     "public": false,
@@ -12,25 +13,25 @@
                 "shift": {
                     "path": "/shift",
                     "required": true,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 },
                 "c_max": {
                     "path": "/c_max",
                     "required": false,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 },
                 "c_zscored": {
                     "path": "/c_zscored",
                     "required": false,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 },
                 "flow": {
                     "path": "/flow",
                     "required": false,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 },
                 "transpose": {
@@ -41,5 +42,6 @@
                 }
             }
         }
-    }
+    },
+    "native": true
 }

@@ -67,7 +67,13 @@ def print_debug(state, data):
     print("Current session:", state.current_session_id)
     print("Sessions:", data.sessions)
 
-    print("Load config:", data.load_configs.current)
+    print("session config:", data.sessions[0].source_config)
+
+    # print("union data:", data.assignments.union)
+    # print("union data:", data.assignments.union.footprints)
+    # print("union data:", data.assignments.union.centroids)
+
+    # print("Load config:", data.load_configs.current)
     # print("session traces:", data.sessions[0].traces.keys())
     # print("session traces:", data.sessions[0].quality.keys())
 

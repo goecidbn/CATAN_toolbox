@@ -1,8 +1,9 @@
 {
     "format_version": 1,
+    "uid": "catan-native-session",
     "name": "CATAN session",
     "source_type": "session",
-    "public": true,
+    "public": false,
     "groups": {
         "metadata": {
             "title": "Metadata",
@@ -25,19 +26,19 @@
                 "footprints": {
                     "path": "/footprints",
                     "required": true,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 },
                 "background": {
                     "path": "/background",
                     "required": false,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 },
                 "idx_eval": {
                     "path": "/idx_eval",
                     "required": false,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 }
             }
@@ -49,7 +50,7 @@
             "fields": {
                 "*": {
                     "path": "/quality/*",
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null,
                     "required": false
                 }
@@ -62,11 +63,19 @@
             "fields": {
                 "*": {
                     "path": "/traces/*",
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null,
                     "required": false
                 }
             }
         }
-    }
+    },
+    "subconfigs": {
+        "remap": {
+            "path": "/remap",
+            "config": "catan_remap.json",
+            "required": false
+        }
+    },
+    "native": true
 }

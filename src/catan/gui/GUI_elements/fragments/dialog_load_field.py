@@ -1,8 +1,9 @@
 from dataclasses import dataclass
-import h5py
+from catan.core.io.inspection import browse_file_fields
+# import h5py
 import numpy as np
 from pathlib import Path, PurePosixPath
-from scipy.io import loadmat
+# from scipy.io import loadmat
 from typing import List, Optional, Tuple
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -118,10 +119,14 @@ class FieldSelectDialog(QDialog):
             f"Path: {self.current_path}"
         )
 
-        fields = list_file_fields(
+        fields = browse_file_fields(
             self.path,
             subpath=self.current_path,
         )
+        # list_file_fields(
+        #     self.path,
+        #     subpath=self.current_path,
+        # )
 
         selected_item = None
 
@@ -169,8 +174,8 @@ class FieldSelectDialog(QDialog):
                 item = QTreeWidgetItem(
                     [
                         field.name,
-                        field.shape,
-                        field.dtype,
+                        field.display_shape,
+                        field.display_dtype,
                     ]
                 )
 
@@ -214,13 +219,16 @@ class FieldSelectDialog(QDialog):
         kind = data["kind"]
         name = data["name"]
 
+        print(f"Double-clicked on {kind}: {name}")
+        print("data:", data)
+
         if kind == "parent":
             self._go_up()
 
         elif kind == "group":
             self._enter_group(name)
 
-        elif kind == "dataset":
+        elif kind == "field":
             self.accept()
 
     def _enter_group(self, name: str):
@@ -263,7 +271,7 @@ class FieldSelectDialog(QDialog):
             Qt.ItemDataRole.UserRole,
         )
 
-        if data["kind"] != "dataset":
+        if data["kind"] != "field":
             return
 
         path = PurePosixPath(self.current_path,data["name"])
@@ -302,114 +310,114 @@ class FieldSelectDialog(QDialog):
 
         return None
 
-@dataclass
-class FieldInfo:
-    name: str
-    kind: str          # "group" or "dataset"
-    shape: str = ""
-    dtype: str = ""
+# @dataclass
+# class FieldInfo:
+#     name: str
+#     kind: str          # "group" or "dataset"
+#     shape: str = ""
+#     dtype: str = ""
 
-def list_hdf5_datasets(path: str, subpath: str = "/") -> List[FieldInfo]:
-    """
-    Return a list of (name, shape, dtype) for an HDF5 file.
+# def list_hdf5_datasets(path: str, subpath: str = "/") -> List[FieldInfo]:
+#     """
+#     Return a list of (name, shape, dtype) for an HDF5 file.
 
-    Special case:
-      - Groups that look like CaImAn sparse matrices (with datasets
-        'indptr', 'indices', 'data', 'shape') are shown as a *single*
-        logical field with:
-            name  = group name (e.g. "A")
-            shape = tuple from 'shape' dataset
-            dtype = dtype of 'data' dataset
+#     Special case:
+#       - Groups that look like CaImAn sparse matrices (with datasets
+#         'indptr', 'indices', 'data', 'shape') are shown as a *single*
+#         logical field with:
+#             name  = group name (e.g. "A")
+#             shape = tuple from 'shape' dataset
+#             dtype = dtype of 'data' dataset
 
-      - Other groups: we list their immediate datasets as 'group/dset'.
-      - Top-level datasets are listed as usual.
-    """
-    fields = []
+#       - Other groups: we list their immediate datasets as 'group/dset'.
+#       - Top-level datasets are listed as usual.
+#     """
+#     fields = []
 
-    with h5py.File(path, "r") as f:
-        group = f[subpath]
+#     with h5py.File(path, "r") as f:
+#         group = f[subpath]
 
-        if not isinstance(group, h5py.Group):
-            raise ValueError(
-                f"{subpath!r} is not an HDF5 group."
-            )
+#         if not isinstance(group, h5py.Group):
+#             raise ValueError(
+#                 f"{subpath!r} is not an HDF5 group."
+#             )
 
-        for name, obj in group.items():
+#         for name, obj in group.items():
 
-            if isinstance(obj, h5py.Group):
+#             if isinstance(obj, h5py.Group):
 
-                # CaImAn sparse matrix:
-                # treat the whole group as one selectable logical field
-                if all(
-                    key in obj
-                    for key in ("indptr", "indices", "data", "shape")
-                ):
-                    shape_ds = obj["shape"][()]
-                    shape_tuple = tuple(
-                        int(x)
-                        for x in np.atleast_1d(shape_ds)
-                    )
+#                 # CaImAn sparse matrix:
+#                 # treat the whole group as one selectable logical field
+#                 if all(
+#                     key in obj
+#                     for key in ("indptr", "indices", "data", "shape")
+#                 ):
+#                     shape_ds = obj["shape"][()]
+#                     shape_tuple = tuple(
+#                         int(x)
+#                         for x in np.atleast_1d(shape_ds)
+#                     )
 
-                    fields.append(
-                        FieldInfo(
-                            name=name,
-                            kind="dataset",
-                            shape=str(shape_tuple),
-                            dtype=str(obj["data"].dtype),
-                        )
-                    )
+#                     fields.append(
+#                         FieldInfo(
+#                             name=name,
+#                             kind="dataset",
+#                             shape=str(shape_tuple),
+#                             dtype=str(obj["data"].dtype),
+#                         )
+#                     )
 
-                else:
-                    fields.append(
-                        FieldInfo(
-                            name=name,
-                            kind="group",
-                        )
-                    )
+#                 else:
+#                     fields.append(
+#                         FieldInfo(
+#                             name=name,
+#                             kind="group",
+#                         )
+#                     )
 
-            elif isinstance(obj, h5py.Dataset):
-                fields.append(
-                    FieldInfo(
-                        name=name,
-                        kind="dataset",
-                        shape=str(obj.shape),
-                        dtype=str(obj.dtype),
-                    )
-                )
+#             elif isinstance(obj, h5py.Dataset):
+#                 fields.append(
+#                     FieldInfo(
+#                         name=name,
+#                         kind="dataset",
+#                         shape=str(obj.shape),
+#                         dtype=str(obj.dtype),
+#                     )
+#                 )
 
-    return fields
-
-
-def list_mat_fields(path: str, subpath="/") -> List[FieldInfo]:
-    """Return top-level variables (name, shape, dtype) from a MAT file."""
-    data = loadmat(path)
-    fields: List[FieldInfo] = []
-    for k, v in data.items():
-        if k.startswith("__"):
-            continue
-        if isinstance(v, np.ndarray):
-            shape_str = str(v.shape)
-            dtype_str = str(v.dtype)
-        else:
-            shape_str = "-"
-            dtype_str = type(v).__name__
-        fields.append(
-            FieldInfo(
-                name=k,
-                kind="dataset",
-                shape=shape_str,
-                dtype=dtype_str,
-            )
-        )
-    return fields
+#     return fields
 
 
-def list_file_fields(path: str, subpath="/") -> List[FieldInfo]:
-    """Dispatch depending on extension (.h5/.hdf5/.mat)."""
-    ext = Path(path).suffix.lower()
-    if ext in (".h5", ".hdf5"):
-        return list_hdf5_datasets(path, subpath)
-    elif ext == ".mat":
-        return list_mat_fields(path, subpath)
-    else:
-        raise ValueError(f"Unsupported file type for field listing: {ext}")
+# def list_mat_fields(path: str, subpath="/") -> List[FieldInfo]:
+#     """Return top-level variables (name, shape, dtype) from a MAT file."""
+#     data = loadmat(path)
+#     fields: List[FieldInfo] = []
+#     for k, v in data.items():
+#         if k.startswith("__"):
+#             continue
+#         if isinstance(v, np.ndarray):
+#             shape_str = str(v.shape)
+#             dtype_str = str(v.dtype)
+#         else:
+#             shape_str = "-"
+#             dtype_str = type(v).__name__
+#         fields.append(
+#             FieldInfo(
+#                 name=k,
+#                 kind="dataset",
+#                 shape=shape_str,
+#                 dtype=dtype_str,
+#             )
+#         )
+#     return fields
+
+
+# def list_file_fields(path: str, subpath="/") -> List[FieldInfo]:
+#     """Dispatch depending on extension (.h5/.hdf5/.mat)."""
+#     ext = Path(path).suffix.lower()
+#     if ext in (".h5", ".hdf5"):
+#         return list_hdf5_datasets(path, subpath)
+#     elif ext == ".mat":
+#         return list_mat_fields(path, subpath)
+#     else:
+#         raise ValueError(f"Unsupported file type for field listing: {ext}")

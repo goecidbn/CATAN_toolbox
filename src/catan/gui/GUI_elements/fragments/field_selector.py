@@ -1,8 +1,9 @@
-from typing import Callable
+from typing import Callable, Optional
 from pathlib import Path, PurePosixPath
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QSizePolicy,
     QWidget,
     QVBoxLayout,
     QLabel,
@@ -14,12 +15,66 @@ from PySide6.QtWidgets import (
     QHBoxLayout
 )
 
-from catan.core.structures.load_config import FieldGroupSpec, LoadConfig
-from catan.gui.structures import data, state
-from catan.gui.GUI_elements.utils.FlowLayout import FlowLayout
+from catan.core.io.inspection import check_file_compatibility
+from catan.core.structures.load_config import FieldGroupSpec, FieldSpec, LoadConfig
+from catan.gui.structures import SessionData, data, state
+from catan.gui.GUI_elements.utils.FlowLayout import FlowLayout, QSizePolicy
 
 from .field_chip import FieldChip
 from .dialog_load_field import FieldSelectDialog
+
+
+COMPAT_COLORS = {
+    "available": "#4F7F5A",        # muted green
+    "optional_missing": "#8A7040", # muted amber
+    "required_missing": "#8A4F52", # muted red
+}
+# green  = "#3F6548"
+# amber  = "#6F5B35"
+# red    = "#6F4144"
+COMPAT_BORDERS = {
+    "available": "#6A9A74",
+    "optional_missing": "#A88A52",
+    "required_missing": "#A8676B",
+}
+TEXT_COLOR = "#E8E8E8"
+
+
+class FieldEditor(QLineEdit):
+    name: str
+    _field_path: str
+    
+    def __init__(
+        self,
+        name: str,
+        spec: FieldSpec,
+    ):
+        super().__init__(spec.path)
+
+        self.name = name
+        self.set(path=spec.path)
+
+        # self.setText(self.field_path)
+    
+    @property
+    def field_path(self) -> str:
+        return self.text()
+
+    @field_path.setter
+    def field_path(self, value: str):
+        self._field_path = value
+        self.setText(value)
+        self.setToolTip(f"{self.name}: {value}")
+        
+    
+    def set(self, *, name: Optional[str] = None, path: Optional[str] = None):
+        
+        if name is not None:
+            self.name = name
+        if path is not None:
+            self.field_path = path
+    
+
 
 
 class OptionList(QWidget):
@@ -33,6 +88,7 @@ class OptionList(QWidget):
         group_name: str,
         group_spec: FieldGroupSpec,
         callback: Callable,
+        enabled: bool = True,
     ):
         # container = QWidget()
         # structure_path = QLineEdit("/estimates")
@@ -41,6 +97,12 @@ class OptionList(QWidget):
 
         self.group_name = group_name
         self.list_type = group_spec.type
+        self.group_spec = group_spec
+
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, 
+            QSizePolicy.Policy.Expanding
+        )
 
         self.callback = callback
 
@@ -53,88 +115,102 @@ class OptionList(QWidget):
 
         elif self.list_type == "dynamic":
             self.list_layout = FlowLayout(self)
-
         else:
             raise ValueError(f"Unknown load_data type: {self.list_type}")
 
-        self.rebuild(group_spec)
+        self.rebuild(group_spec, enabled=enabled)
 
-    def rebuild(self, group_spec: FieldGroupSpec):
-
+    def rebuild(self, group_spec: FieldGroupSpec, enabled: bool = True):
+        self.group_spec = group_spec
         if self.list_type != group_spec.type:
             raise ValueError(
                 f"Cannot rebuild OptionList of type {self.list_type} with group_spec of type {group_spec.type}"
             )
         if group_spec.type == "static":
-            self.rebuild_static_options(group_spec)
+            self.rebuild_static_options(group_spec, enabled=enabled)
         elif group_spec.type == "dynamic":
-            self.rebuild_dynamic_options(group_spec)
+            self.rebuild_dynamic_options(group_spec, enabled=enabled)
         else:
             raise ValueError(f"Unknown group_spec type: {group_spec.type}")
 
-    def clear_chips(self):
+    def clear_options(self):
 
         # Clear existing chips
         while (child := self.list_layout.takeAt(0)) is not None:
             if child.widget() is not None:
                 child.widget().deleteLater()
 
-    def rebuild_static_options(self, group_spec: FieldGroupSpec):
+        self.option: dict[str, FieldEditor | FieldChip] = {}
+
+    def rebuild_static_options(self, group_spec: FieldGroupSpec, enabled: bool = True):
 
         if not isinstance(self.list_layout, QGridLayout):
             raise ValueError("Cannot rebuild static options on non-grid layout.")
 
-        self.clear_chips()
-
-        self.edit = {}
+        self.clear_options()
 
         for row, (name, spec) in enumerate(group_spec.fields.items()):
-            self.edit[name] = QLineEdit(spec.path)
+            self.add_editor(row, name, spec, enabled=enabled)
 
-            browse = QToolButton()
-            browse.setText("…")
-            browse.setToolTip(f"Find {name.lower()} field")
-            browse.setFixedWidth(25)
-            browse.clicked.connect(
-                lambda _, label=name: self.callback(
-                    self.group_name, label, method="edit"
-                )
-            )
-
-            self.list_layout.addWidget(
-                QLabel(name.capitalize() + ":"),row,0,
-            )
-            self.list_layout.addWidget(
-                self.edit[name],row,1,
-            )
-            self.list_layout.addWidget(
-                browse,row,2,
-            )
-
-            # self.spatial_edits[label.lower()] = edit
         self.list_layout.setColumnStretch(1, 1)
 
-    def rebuild_dynamic_options(self, group_spec: FieldGroupSpec):
+    def add_editor(self, row: int, name: str, spec: FieldSpec, enabled: bool = True):
+        path_edit = FieldEditor(name, spec)
+        # self.option[name] = QLineEdit(spec.path)
+        path_edit.setMinimumWidth(50)
+        path_edit.editingFinished.connect(
+            lambda field_name=name: self.callback(
+                self.group_name, field_name, method="edit_path", field_path=path_edit.field_path
+            )
+        )
+
+        browse = QToolButton()
+        browse.setText("…")
+        browse.setToolTip(f"Find {name.lower()} field")
+        browse.setFixedWidth(25)
+        browse.clicked.connect(
+            lambda _, label=name: self.callback(
+                self.group_name, label, method="edit_path"
+            )
+        )
+
+        self.list_layout.addWidget(
+            QLabel(name.capitalize() + ":"),row,0,
+        )
+        self.list_layout.addWidget(
+            path_edit,row,1,
+        )
+
+        self.list_layout.addWidget(
+            browse,row,2,
+        )
+        path_edit.setEnabled(enabled)
+        self.option[name] = path_edit
+
+    def rebuild_dynamic_options(self, group_spec: FieldGroupSpec, enabled: bool = True):
 
         if not isinstance(self.list_layout, FlowLayout):
             raise ValueError("Cannot rebuild dynamic options on non-flow layout.")
 
-        self.clear_chips()
+        self.clear_options()
 
         for name, spec in group_spec.fields.items():
-            chip = FieldChip(name, spec)
-            self.list_layout.addWidget(chip)
+            self.add_chip(name, spec, enabled)
+            # chip = FieldChip(name, spec)
+            # self.list_layout.addWidget(chip)
 
-            chip.field_button.clicked.connect(
-                lambda _, field_name=chip.name: self.callback(
-                    self.group_name, field_name, method="rename"
-                )
-            )
-            chip.remove_requested.connect(
-                lambda chip_field_name : self.callback(
-                    self.group_name, chip_field_name, method="remove"
-                )
-            )
+            # chip.field_button.clicked.connect(
+            #     lambda _, field_name=chip.name: self.callback(
+            #         self.group_name, field_name, method="rename"
+            #     )
+            # )
+            # chip.remove_requested.connect(
+            #     lambda chip_field_name : self.callback(
+            #         self.group_name, chip_field_name, method="remove"
+            #     )
+            # )
+            # chip.setEnabled(enabled) 
+            # self.option[name] = chip
 
         add_button = QToolButton()
         add_button.setText("+")
@@ -142,14 +218,48 @@ class OptionList(QWidget):
         add_button.clicked.connect(lambda _, field_name=None: self.callback(self.group_name, field_name, method="add"))
         self.list_layout.addWidget(add_button)
 
+    def add_chip(self, name: str, spec: FieldSpec, enabled: bool = True):
+
+        assert isinstance(self.list_layout, FlowLayout), "Cannot add chip to non-flow layout."
+        chip = FieldChip(name, spec)
+        self.list_layout.insertBeforeLast(chip)
+
+        chip.field_button.clicked.connect(
+            lambda _, field_name=chip.name: self.callback(
+                self.group_name, field_name, method="rename"
+            )
+        )
+        chip.remove_requested.connect(
+            lambda chip_field_name : self.callback(
+                self.group_name, chip_field_name, method="remove"
+            )
+        )
+        chip.setEnabled(enabled)
+        self.option[name] = chip
+
+    def refresh(self, name: str, path: str):
+
+        if name not in self.group_spec.fields:
+            self.option[name].deleteLater()
+            del self.option[name]
+            return
+
+        self.option[name].set(name=name,path=path)
+
+    def update_style(self, name, status):
+
+        self.option[name].setStyleSheet(f"background-color: {COMPAT_COLORS[status]}; color: {TEXT_COLOR}; border: 1px solid {COMPAT_BORDERS[status]}; border-radius: 3px; padding: 2px;")
 
 class FieldSelector(QWidget):
     """
     Widget to manage field selection for different groups. Provides an interface to edit, add, rename, and remove fields.
     """
+    fields_changed = Signal()
+    loading_possible = bool
     
-    def __init__(self, parent, config: LoadConfig):
+    def __init__(self, parent, session: SessionData, config: LoadConfig):
         super().__init__(parent)
+        self.session = session
 
         self.state: state.AppState = parent.state
         self.data: data.Data = parent.data
@@ -159,66 +269,77 @@ class FieldSelector(QWidget):
         self.opts_layout.setContentsMargins(4, 4, 4, 4)
         self.opts_layout.setSpacing(3)
 
-        self.rebuild(config)
-        self.state.data_changed.connect(self._on_data_changed)
+        self.fields_changed.connect(self._on_fields_changed)
+        self.rebuild()
+        # self.state.data_changed.connect(self._on_data_changed)
 
-    def rebuild(self, config: LoadConfig):
-        self.config = config
-
+    def rebuild(self):
+        
         self.clear()
 
         # self.opts_layout.addWidget(QLabel("Load options on registration:"))
 
         ## loading options
-        if self.config is None:
-            raise ValueError("Load config is not initialized.")
+        assert self.session.source_config is not None, "Load config is not initialized."
 
-        for group_name, group_spec in self.config.groups.items():
-            self.field_options[group_name] = OptionList(group_name, group_spec, self.manipulate_fields)
+        for group_name, group_spec in self.session.source_config.groups.items():
+            self.field_options[group_name] = OptionList(
+                group_name, 
+                group_spec, 
+                self.manipulate_fields, 
+                enabled=not self.session.status.get(f"{group_name}_loaded", False)
+            )
 
             opts_widget = checkbox_with_options(
                 group_spec,
                 self.field_options[group_name],
-                self.config.groups[group_name].enabled,
-                lambda checked, group_name=group_name: self.config.set_group_enabled(group_name,checked)
+                self.session.source_config.groups[group_name].enabled,
+                lambda checked, group_name=group_name: self.session.source_config.set_group_enabled(group_name,checked)
                 )
             self.opts_layout.addWidget(opts_widget)
-        self._on_data_changed(("config",-1))
+
+        self.fields_changed.emit()
 
     def clear(self):
         while (child := self.opts_layout.takeAt(0)) is not None:
             if child.widget() is not None:
                 child.widget().deleteLater()
 
-    def _on_data_changed(self, input: tuple[str, int]):
-        """
-            updates GUI element availability based on the current state of the data
-        """
-        ## disable changing root path, when sessions are loaded,
-        ## to avoid path inconsistencies
-        if input[0] not in ["sessions", "config"]:
+    def _on_fields_changed(self):
+
+        if self.session.path is None or self.session.source_config is None:
             return
-        sessions_loaded = len(self.data.sessions) > 0
+        
+        report = check_file_compatibility(self.session.path, self.session.source_config.get_fields_to_load(list(self.session.source_config.groups.keys())))
 
-        for opt in self.field_options.values():
-            opt.setEnabled(sessions_loaded)
+        loading_possible = True
+        for field in report.fields:
+            if not field.available and field.spec.required:
+                loading_possible &= False
+                status = "required_missing"
+            elif not field.available and not field.spec.required:
+                status = "optional_missing"
+            else:
+                status = "available"
+
+            self.field_options[field.group].update_style(field.label, status)
+                
+            
+
+        # also, finally color current session properly!!
+        self.loading_possible = loading_possible
+
+
     
-    def manipulate_fields(self, group_name: str, field_name: str, method="edit"):
+    def manipulate_fields(self, group_name: str, field_name: str, method="edit", **kwargs):
 
-        if self.data.current_session is None:
-            path = self.data.sessions[0].path
-        else:
-            path = self.data.current_session.path
+        assert self.session.path is not None, "Path is not set."
+        assert self.session.source_config is not None, "Load config is not initialized."
 
-        assert isinstance(
-            path, str | Path
-        ), "No valid session path found for field selection."
-
-        assert self.config is not None, "Load config is not initialized."
-
+        field_path = None
 
         if method == "remove":
-            self.config.remove_field(
+            self.session.source_config.remove_field(
                 group_name,
                 field_name,
             )
@@ -230,55 +351,101 @@ class FieldSelector(QWidget):
                 "Enter new title:",
                 text=field_name,
             )
-            if ok and new_name:
-                self.config.rename_field(
+            if not ok or not new_name:
+                return
+            try:
+                self.session.source_config.rename_field(
                     group_name,
                     field_name,
                     new_name=new_name,
                 )
+            except KeyError as e:
+                self.state.issue(
+                    "warning",
+                    "Renaming field is not possible",
+                    str(e),
+                )
+                return
+            if new_name != field_name:
+                self.field_options[group_name].option[new_name] = self.field_options[group_name].option.pop(field_name)
+                field_name = new_name
+    
+                
+        if method == "edit_path":
 
-        if method in ["edit", "add"]:
-            field_path = FieldSelectDialog.get_field(path=path, key=field_name)
+            if (field_path := kwargs.get("field_path")) is None:
+                field_path = FieldSelectDialog.get_field(path=self.session.path, key=field_name)
+                if field_path is None:
+                    return
+            assert isinstance(field_path, str), "Field path must be a string."
+
+            self.session.source_config.update_field(
+                group_name,
+                field_name,
+                path=field_path,
+            )
+
+        if method == "add":
+            # if self.session.source_config.get_group(group_name).type == "dynamic":
+            field_path = FieldSelectDialog.get_field(path=self.session.path, key=field_name)
             if field_path is None:
                 return
+            # else:
+            #     field_path = self.field_options[group_name].option[field_name].field_path
 
-            if method == "edit":
-                self.config.update_field(
-                    group_name,
-                    field_name,
-                    path=field_path,
-                )
+            # if method == "edit":
+            #     self.session.source_config.update_field(
+            #         group_name,
+            #         field_name,
+            #         path=field_path,
+            #     )
             
-            if method == "add":
-                ## check, if a field with the same path already exists in the group
-                fields_to_load = self.config.get_fields_to_load([group_name])
-                if field_path in [field.path for field in fields_to_load[group_name].values()]:
-                    self.state.issue(
-                        "warning",
-                        "Adding field is not possible",
-                        f"Field {field_path} already exists in load options for {group_name}.",
-                    )
-                    return
+            # if method == "add":
+            ## check, if a field with the same path already exists in the group
+            fields_to_load = self.session.source_config.get_fields_to_load([group_name])
+            if field_path in [field.path for field in fields_to_load[group_name].values()]:
+                self.state.issue(
+                    "warning",
+                    "Adding field is not possible",
+                    f"Field {field_path} already exists in load options for {group_name}.",
+                )
+                return
 
-                field_name = QInputDialog.getText(
-                    self,
-                    "Add new field",
-                    "Enter field title:",
-                    text=PurePosixPath(field_path).name,
-                )[0]
-                if not field_name:
-                    field_name = PurePosixPath(field_path).name
-                
-                self.config.add_field(
+            field_name = QInputDialog.getText(
+                self,
+                "Add new field",
+                "Enter field title:",
+                text=PurePosixPath(field_path).name,
+            )[0]
+            if not field_name:
+                field_name = PurePosixPath(field_path).name
+
+            try:
+                self.session.source_config.add_field(
                     group_name,
                     field_name,
                     path=field_path,
                 )
+            except KeyError as e:
+                self.state.issue(
+                    "warning",
+                    "Adding field is not possible",
+                    f"Field with name {field_name} already exists in load options for {group_name}.",
+                )
+                return
+            self.field_options[group_name].add_chip(
+                field_name, 
+                self.session.source_config.groups[group_name].fields[field_name], 
+                enabled=not self.session.status.get(f"{group_name}_loaded", False)
+            )
 
-        self.state.data_changed.emit(("config",-1))
-        self.field_options[group_name].rebuild(
-            self.config.groups[group_name]
-        )
+        field_path = field_path or self.session.source_config.groups[group_name].fields[field_name].path
+        self.field_options[group_name].refresh(field_name,field_path)
+        self.fields_changed.emit()
+        # self.field_options[group_name].rebuild(
+        #     self.session.source_config.groups[group_name],
+        #     enabled=not self.session.status[f"{group_name}_loaded"]
+        # )
 
 
 def checkbox_with_options(group_spec: FieldGroupSpec, opts_ref: QWidget, active: bool, callback: Callable) -> QWidget:
@@ -300,35 +467,35 @@ def checkbox_with_options(group_spec: FieldGroupSpec, opts_ref: QWidget, active:
         lambda state: callback(state == Qt.CheckState.Checked.value)
     )
 
-    toggle_button = QToolButton()
-    toggle_button.setCheckable(True)
-    toggle_button.setChecked(False)
-    toggle_button.setAutoRaise(True)
-    toggle_button.setFixedWidth(22)
+    # toggle_button = QToolButton()
+    # toggle_button.setCheckable(True)
+    # toggle_button.setChecked(False)
+    # toggle_button.setAutoRaise(True)
+    # toggle_button.setFixedWidth(22)
 
     header_layout.addWidget(chk)
     header_layout.addStretch()
-    header_layout.addWidget(toggle_button)
+    # header_layout.addWidget(toggle_button)
 
     layout.addWidget(header)
 
     # Indented child area
     options_container = QWidget()
     options_layout = QHBoxLayout(options_container)
-    options_layout.setContentsMargins(18, 0, 0, 4)
+    options_layout.setContentsMargins(14, 0, 0, 4)
     options_layout.addWidget(opts_ref)
     # opts_ref.setVisible(False)
 
     layout.addWidget(options_container)
 
-    def toggle_options(expanded: bool):
-        options_container.setVisible(expanded)
-        toggle_button.setArrowType(
-            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
-        )
+    # def toggle_options(expanded: bool):
+    #     options_container.setVisible(expanded)
+    #     toggle_button.setArrowType(
+    #         Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+    #     )
 
-    toggle_button.toggled.connect(toggle_options)
-    toggle_options(False)
+    # toggle_button.toggled.connect(toggle_options)
+    # toggle_options(False)
 
     return container
 

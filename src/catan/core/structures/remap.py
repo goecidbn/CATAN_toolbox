@@ -1,6 +1,6 @@
-from typing import Optional, Tuple, TypeVar
+from typing import Literal, Optional, Tuple, TypeVar
 from dataclasses import dataclass
-
+from pathlib import Path
 import h5py
 import h5py
 import numpy as np
@@ -8,13 +8,13 @@ from scipy import sparse
 import cv2
 
 from catan.core.image_correlation import calculate_img_correlation
-from catan.core.structures.load_config import LoadConfig
 from catan.core.alignment import (
     get_session_remap,
     _build_remap,
     _shift_sparse_bilinear,
 )
-from catan.core.io import load_hdf5, write_optional_array, write_optional_attr
+from catan.core.io import load_file, save_file, NATIVE_REMAP_CONFIG
+from catan.core.structures.load_config import LoadConfig, FieldSpec
 
 MatrixT = TypeVar("MatrixT", sparse.csc_matrix, np.ndarray)
 
@@ -45,34 +45,58 @@ class Remapping:
     def is_valid(self):
         return self.c_zscored is not None and self.shift is not None
 
+    @staticmethod
+    def _from_file(
+        path: str | Path,
+        fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
+    ) -> "Remapping":
+        fields_to_load = fields_to_load or LoadConfig.fields_from_resource(
+            NATIVE_REMAP_CONFIG, 
+            enabled_only=False
+        )
+        data = load_file(path, fields_to_load)
+        return Remapping._from_dict(data)
+
+    @staticmethod
+    def _from_dict(data: dict) -> "Remapping":
+        remapping = Remapping()
+        remapping.register_data(**data)
+        return remapping
+    
+    
     def __init__(
         self,
-        shift: Optional[np.ndarray] = None,
-        c_max: Optional[np.ndarray] = None,
-        c_zscored: Optional[np.ndarray] = None,
-        flow: Optional[np.ndarray] = None,
-        transpose: bool = False,
-
-        template: Optional[np.ndarray] = None,
-        template_reference: Optional[np.ndarray] = None,
-        use_optical_flow: bool = True,
-        evaluate: bool = True,
+        template=None,
+        template_reference=None,
+        use_optical_flow=True,
+        evaluate=True,
     ):
-        if shift is not None or flow is not None:
-            ## if remapping is provided, populate class directly
-            self.shift = shift
-            self.c_max = c_max
-            self.c_zscored = c_zscored
-            self.flow = flow
-            self.transpose = transpose
+
+        self.success = False
+
+        if (
+            evaluate
+            and template is not None
+            and template_reference is not None
+        ):
+            self.evaluate(
+                template,
+                template_reference,
+                use_optical_flow=use_optical_flow,
+            )
+
+    def register_data(self, **data):
+        self.shift = data.get("shift")
+        self.c_max = data.get("c_max")
+        self.c_zscored = data.get("c_zscored")
+        self.flow = data.get("flow")
+        self.transpose = data.get("transpose", False)
+
+        if self.shift is not None or self.flow is not None:
             self.success = True
             return
 
-        if evaluate and template is not None and template_reference is not None:
-            ## if templates are provided, evaluate remapping
-            self.success = False
-            self.evaluate(template, template_reference, use_optical_flow=use_optical_flow)
-
+        
     def evaluate(
         self,
         template: np.ndarray,
@@ -284,63 +308,90 @@ class Remapping:
             )
         return A
 
-    def to_hdf5(self, group: h5py.Group) -> None:
+    
+    def save(
+        self,
+        path: str | Path,
+        *,
+        mat_version: Literal["pre73", "7.3"] = "7.3",
+    ) -> None:
+        """Save one or several sessions as a CATAN-native session container.
+
+        If ``fields_to_save`` is omitted, the packaged ``catan_session.json``
+        structure is used.
         """
-        Store this Remapping object in an existing empty HDF5 group.
-        """
-        group.attrs["object_type"] = "Remapping"
-        group.attrs["schema_version"] = self.HDF5_VERSION
-
-        write_optional_array(
-            group,
-            "shift",
-            self.shift,
-        )
-        write_optional_array(
-            group,
-            "c_max",
-            self.c_max,
+        
+        fields_to_save = LoadConfig.fields_from_resource(
+            NATIVE_REMAP_CONFIG,
+            enabled_only=False,
         )
 
-        write_optional_array(
-            group,
-            "c_zscored",
-            self.c_zscored,
+        save_file(
+            path, 
+            self, 
+            fields_to_save, 
+            mat_version=mat_version,
+            root_attributes={"object_type": "Remapping", "format_version": 1},
+            root="/"
         )
 
-        write_optional_array(
-            group,
-            "flow",
-            self.flow,
-            compression="gzip",
-        )
+    # def to_hdf5(self, group: h5py.Group) -> None:
+    #     """
+    #     Store this Remapping object in an existing empty HDF5 group.
+    #     """
+    #     group.attrs["object_type"] = "Remapping"
+    #     group.attrs["schema_version"] = self.HDF5_VERSION
 
-        write_optional_attr(
-            group,
-            "transpose",
-            self.transpose,
-        )
+    #     write_optional_array(
+    #         group,
+    #         "shift",
+    #         self.shift,
+    #     )
+    #     write_optional_array(
+    #         group,
+    #         "c_max",
+    #         self.c_max,
+    #     )
 
-    @classmethod
-    def from_hdf5(cls, h5ref: h5py.Group) -> "Remapping":
+    #     write_optional_array(
+    #         group,
+    #         "c_zscored",
+    #         self.c_zscored,
+    #     )
 
-        object_type = h5ref.attrs.get("object_type", "")
+    #     write_optional_array(
+    #         group,
+    #         "flow",
+    #         self.flow,
+    #         compression="gzip",
+    #     )
 
-        if isinstance(object_type, bytes):
-            object_type = object_type.decode("utf-8")
+    #     write_optional_attr(
+    #         group,
+    #         "transpose",
+    #         self.transpose,
+    #     )
 
-        if object_type and object_type != "Remapping":
-            raise ValueError(
-                f"Expected Remapping group, got {object_type!r}"
-            )
+    # @classmethod
+    # def from_hdf5(cls, h5ref: h5py.Group) -> "Remapping":
 
-        version = int(h5ref.attrs.get("schema_version", 1))
+    #     object_type = h5ref.attrs.get("object_type", "")
 
-        if version != 1:
-            raise ValueError(
-                f"Unsupported Remapping schema version: {version}"
-            )
+    #     if isinstance(object_type, bytes):
+    #         object_type = object_type.decode("utf-8")
 
-        fields_to_load = LoadConfig.fields_from_resource("catan_remap.json")
-        data = load_hdf5(h5ref, fields_to_load=fields_to_load)
-        return cls(**data["stats"])
+    #     if object_type and object_type != "Remapping":
+    #         raise ValueError(
+    #             f"Expected Remapping group, got {object_type!r}"
+    #         )
+
+    #     version = int(h5ref.attrs.get("schema_version", 1))
+
+    #     if version != 1:
+    #         raise ValueError(
+    #             f"Unsupported Remapping schema version: {version}"
+    #         )
+
+    #     fields_to_load = LoadConfig.fields_from_resource("catan_remap.json")
+    #     data = load_hdf5(h5ref, fields_to_load=fields_to_load)
+    #     return cls(**data["stats"])

@@ -1,4 +1,57 @@
-from .io import fix_suffix
-from .hdf5 import load_hdf5, write_sparse_matrix, write_optional_attr, write_optional_array
-from .matlab import load_mat
+from .api import (
+    detect_file_format,
+    get_backend,
+    load_file,
+    load_from_config,
+    save_file,
+    save_from_config,
+    NATIVE_SESSION_OBJECT_TYPES,
+    NATIVE_SESSION_CONFIG,
+    NATIVE_REMAP_CONFIG,
+    NATIVE_MODEL_CONFIG,
+    NATIVE_ASSIGNMENTS_CONFIG,
+    # load_session_data,
+    # save_session_data,
+    # load_assignment_data,
+    # save_assignment_data,
+    # load_remap_data,
+    # save_remap_data,
+)
+from .inspection import (
+    FileInspector,
+    inspect_file,
+    browse_file_fields,
+    check_file_compatibility,
+    clear_inspection_cache,
+)
+from .types import (
+    CompatibilityReport,
+    FieldCompatibility,
+    FieldInfo,
+    FileFormat,
+    FileStructure,
+)
 
+__all__ = [
+    "detect_file_format",
+    "get_backend",
+    "load_file",
+    "load_from_config",
+    "save_file",
+    "save_from_config",
+    "NATIVE_SESSION_OBJECT_TYPES",
+    "NATIVE_SESSION_CONFIG",
+    "NATIVE_REMAP_CONFIG",
+    "NATIVE_MODEL_CONFIG",
+    "NATIVE_ASSIGNMENTS_CONFIG",
+    "FileInspector",
+    "inspect_file",
+    "browse_file_fields",
+    "check_file_compatibility",
+    "clear_inspection_cache",
+    "CompatibilityReport",
+    "FieldCompatibility",
+    "FieldInfo",
+    "FileFormat",
+    "FileStructure",
+]

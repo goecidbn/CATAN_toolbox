@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QSizePolicy, QToolButton, QWidget
 class ToggleOption(QToolButton):
     def __init__(
         self,
-        container: QWidget,
+        container: QWidget | None = None,
         *,
         text: str = "",
         icon_name: str | None = None,
@@ -19,13 +19,13 @@ class ToggleOption(QToolButton):
     ):
         super().__init__(parent)
 
-        self.container = container
         self._base_text = text
 
         self.setCheckable(True)
+        self.set_expanded(False)
+
         self.setAutoRaise(True)
 
-        # Do not force a fixed width:
         # let the button remain only as wide as necessary.
         self.setSizePolicy(
             QSizePolicy.Policy.Maximum,
@@ -34,7 +34,6 @@ class ToggleOption(QToolButton):
 
         icon = get_fa_icon(icon_name) if icon_name is not None else None
         if icon is not None:
-            
             self.setIcon(icon)
             self.setIconSize(
                 QSize(icon_size, icon_size)
@@ -48,11 +47,14 @@ class ToggleOption(QToolButton):
             Qt.ToolButtonStyle.ToolButtonTextBesideIcon
         )
 
+        # if container is not None:
+        self.set_container(container)
+
+
         self.toggled.connect(
             self.toggle_visibility
         )
 
-        self.setChecked(expanded)
 
         # Explicit call is useful if expanded=False,
         # because setChecked(False) may emit nothing.
@@ -63,8 +65,10 @@ class ToggleOption(QToolButton):
         expanded: bool,
     ) -> None:
 
-        self.container.setVisible(expanded)
-
+        if self.container is not None:
+            self.container.setVisible(expanded)
+        expanded = expanded and self.container is not None
+        
         arrow = "▾" if expanded else "▸"
 
         if self._base_text:
@@ -78,13 +82,14 @@ class ToggleOption(QToolButton):
         self,
         expanded: bool,
     ) -> None:
+        
+        expanded = expanded and self.container is not None
         self.setChecked(expanded)
 
     def set_container(
         self,
-        container: QWidget,
+        container: QWidget | None = None,
     ) -> None:
         self.container = container
-        self.container.setVisible(
-            self.isChecked()
-        )
+        if self.container is not None:
+            self.container.setVisible(self.isChecked())

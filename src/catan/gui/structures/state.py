@@ -6,6 +6,9 @@ from typing import Literal, Tuple, Optional, List
 import logging
 
 from catan.gui.background_tasks import TaskManager
+from catan.core.structures.load_config import LoadConfig, LoadConfigManager
+from platformdirs import user_config_dir
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +66,13 @@ class AppState(QObject):
 
         self.tasks = TaskManager()
 
+        self.config_manager = LoadConfigManager(
+            user_dir = (
+                Path(user_config_dir("CATAN"))
+                / "load_configs"
+            )
+        )
+
         self.logger = logging.getLogger("GUI")
         self.set_logging_level("ERROR")
         # logging.basicConfig(level=getattr(logging, self.logging_level))
@@ -94,6 +104,10 @@ class AppState(QObject):
             self.logger.debug("--- Timer reset ---")
 
         self.time_ref = time()
+
+    @property
+    def load_config(self) -> LoadConfig:
+        return self.config_manager.current
 
     @property
     def model_fitted(self) -> bool:

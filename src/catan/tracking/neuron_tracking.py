@@ -14,17 +14,17 @@ last updated on January 28th, 2024
 """
 
 import os
-from typing import Callable, Dict, Optional, Tuple, List, Union
+from typing import Any, Dict, Optional, Tuple, List, Union, Literal
 import sys, copy, logging, time, numbers, warnings
 
-from catan.core.structures.load_config import LoadConfig
-from catan.core.structures.load_config_manager import LoadConfigManager
-from platformdirs import user_config_dir
-
-import h5py
+# from catan.core.structures.load_config import LoadConfig
+# from catan.core.structures.load_config_manager import LoadConfigManager
+# from platformdirs import user_config_dir
 
 from pathlib import Path
 
+from catan.core.io import NATIVE_SESSION_CONFIG, get_backend
+from catan.core.structures.load_config.config import LoadConfig, FieldSpec
 import numpy as np
 from scipy import sparse
 from scipy.optimize import linear_sum_assignment
@@ -33,16 +33,12 @@ from catan.core.structures import SessionData
 from catan.core.analysis import calculate_statistics, calculate_p
 from catan.core.alignment import _shift_sparse_bilinear
 
-from catan.core.io import load_hdf5, fix_suffix
-
 from .structures import Model, Assignments
 
 logging.basicConfig(level=logging.INFO)
 
 
 class Tracking:
-
-    union: SessionData
 
     _model: Dict[str, Model] = {}
     _current_model: Optional[str] = None
@@ -99,13 +95,13 @@ class Tracking:
 
         self._update_bins(bins)
 
-        self.load_configs = LoadConfigManager(
-            user_dir=(
-                Path(user_config_dir("CATAN"))
-                / "load_configs"
-            ),
-            default_config="CaImAn",
-        )
+        # self.load_configs = LoadConfigManager(
+        #     user_dir=(
+        #         Path(user_config_dir("CATAN"))
+        #         / "load_configs"
+        #     ),
+        #     default_config="CaImAn",
+        # )
 
         # self.kernel = {"idxes": {}, "kde": {}}
         self.reference_data = None
@@ -145,7 +141,7 @@ class Tracking:
         if model is None:
             model = Model(params=self.params)
         elif isinstance(model, str):
-            model = Model.load(fname=model, params=self.params)
+            model = Model._from_file(path=model, params=self.params)
 
         if not isinstance(model, Model):
             raise ValueError("model must be an instance of Model class or a path to a saved model.")
@@ -180,9 +176,9 @@ class Tracking:
 
     def add_assignments(self, name: str, assignments: Optional[str|Assignments]=None):
         if assignments is None:
-            assignments = Assignments(params=self.params)
+            assignments = Assignments()
         elif isinstance(assignments, str):
-            assignments = Assignments.load(fname=assignments, params=self.params)
+            assignments = Assignments._from_file(path=assignments)
 
         if not isinstance(assignments, Assignments):
             raise ValueError("assignments must be an instance of Assignments class or a path to a saved assignments.")
@@ -337,8 +333,14 @@ class Tracking:
                 from_data, SessionData
             ), "from_data must be a SessionData instance"
             this_data = from_data
-            if this_data.name is None and this_data.path is not None:
-                this_data.name = name if name is not None else Path(this_data.path).parent.name
+            if name is None:
+                if this_data.name is None:
+                    if this_data.path is None:
+                        this_data.name = f"Session{len(self.sessions):03d}"
+                    else:
+                        this_data.name = Path(this_data.path).parent.name
+            else:
+                this_data.name = name
         else:
             raise ValueError(
                 "Either from_file or from_data must be provided."
@@ -400,6 +402,7 @@ class Tracking:
                 f"[model update] Session {this_data.id} ({this_data.path}) did not pass quality criteria, skipping."
             )
             return
+        
         if this_data.status["registered_to_model"]:
             # print(
             #     f"[model update] Session {this_data.id} ({this_data.path}) already registered to model, skipping."
@@ -763,7 +766,7 @@ class Tracking:
         ## ... and finalize!
         this_data.status["matched"] = True
         if clean_traces:
-            this_data.clean_traces()
+            this_data.clean_data("traces")
 
         # if np.any(np.all(self.tracking["p_matched"] > 0.9, axis=2)):
         #     print("double match!")
@@ -794,7 +797,7 @@ class Tracking:
                 return False
         
         ## check session vs union centroids
-        warnings.warn("to be implemented: check if union centroids match session centroids (after alignment)")
+        # warnings.warn("to be implemented: check if union centroids match session centroids (after alignment)")
 
         return True
     
@@ -1192,112 +1195,176 @@ class Tracking:
             params=self.params,
         )
 
-    ### ------------------------------------------------------------ ###
-    """
-        ------------------------------------------------------------
-        ---------------- saving and loading methods ----------------
-        ------------------------------------------------------------
-    """
+    ### ======================================================== ###
+    ### ============== saving and loading methods ============== ###
+    ### ======================================================== ###
+    
+    def load_session_data(
+        self,
+        path: str | Path,
+        fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
+        *,
+        # mat_version: Literal["pre73", "7.3"] = "7.3",
+        test_object_type: str = "SessionData",
+    ) -> list[dict[str, Any]]:
+        """Load a CATAN-native session container."""
+        data = []
 
-    ### ------------------------------------------------------------ ###
+        backend = get_backend(path, for_write=False)
+        with backend.open_read(path) as ref:
+            object_type = backend.get_attribute(ref, "/", "object_type")
+            if object_type == test_object_type:
+            #     raise ValueError(
+            #         f"Invalid object type: expected 'SessionData', got '{object_type}'"
+            #     )
+
+                fields_to_load = LoadConfig.fields_from_resource(
+                    NATIVE_SESSION_CONFIG,
+                    enabled_only=False,
+                )
+                n_sessions = backend.get_attribute(ref, "/", "n_sessions")
+                for s in range(n_sessions):
+                    data.append(backend.load(ref, fields_to_load, root=f"/session_{s:03d}"))
+
+            else:
+                if fields_to_load is None:
+                    fields_to_load = LoadConfig.fields_from_resource(
+                        NATIVE_SESSION_CONFIG,
+                        enabled_only=False,
+                    )
+                data_out = backend.load(ref, fields_to_load)
+                if data_out.get("metadata") is None:
+                    data_out["metadata"] = {}
+                if data_out["metadata"].get("path") is None:
+                    data_out["metadata"]["path"] = str(path)
+                data.append(data_out)
+        
+        return data
 
     def save_sessions(
         self,
-        output_fname: Optional[str | Path] = None,
-        suffix: str = "",
-        ext: str = ".hdf5",
-    ):
-        if output_fname is None:
-            output_fname = self.get_result_directory() / f"catan_model{fix_suffix(suffix)}{ext}"
-        else:
-            self.get_result_directory(Path(output_fname).parent)
+        path: str | Path,
+        *,
+        mat_version: Literal["pre73", "7.3"] = "7.3",
+        object_type: str = "SessionData",
+    ) -> None:
+        """Save one or several sessions as a CATAN-native session container.
 
-        print(f"Saving session data to {output_fname}...")
-
-        if ext in [".h5", ".hdf5"]:
-            with h5py.File(
-                output_fname, "w"
-            ) as f:
-                self.save_sessions_to_hdf5(f)
-        else:
-            raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
-        print(f"Saved session data to {output_fname}")
-
-
-    def save_sessions_to_hdf5(self, h5ref: h5py.Group | h5py.File) -> None:
-        print("Saving session data to HDF5...")
-        h5ref.attrs["object_type"] = "SessionData"
-        h5ref.attrs["schema_version"] = self.HDF5_VERSION
-
-        # sessions_group = group.create_group("sessions")
-        h5ref.attrs["n_sessions"] = len(self.sessions)
-
-        for session in self.sessions:
-            session_group = h5ref.create_group(f"session_{session.id:03d}")
-            session.to_hdf5(session_group)
+        If ``fields_to_save`` is omitted, the packaged ``catan_session.json``
+        structure is used. A single SessionData object is still stored below
+        ``session_000`` so the native container layout remains uniform.
+        """
         
-    def load_session_data(self, fname: str | Path, fields_to_load: Optional[dict] = None) -> List[SessionData]:
-        """
-        Triggers loading data from a file. Depending on the provided file, it either loads a single session or multiple sessions (informed by hdf5 attributes).
-        """
-        ext = Path(fname).suffix
-        if ext in [".h5", ".hdf5"]:
-            with h5py.File(fname, "r") as h5ref:
+        fields_to_save = LoadConfig.fields_from_resource(
+            NATIVE_SESSION_CONFIG,
+            enabled_only=False,
+        )
+        backend = get_backend(path, for_write=True, mat_version=mat_version)
+
+        with backend.open_write(path) as ref:
+            backend.set_attribute(ref, "/", "object_type", object_type)
+            backend.set_attribute(ref, "/", "format_version", 1)
+
+            for session in self.sessions:
+                backend.write(ref, session, fields_to_save, root=f"/session_{session.id:03d}")
                 
-                if h5ref.attrs.get("object_type") == "SessionData":
-                    return self.load_sessions_from_hdf5(h5ref)
-                else:
-                    this_data = SessionData(path=fname)
-                    this_data.from_hdf5(h5ref, fields_to_load=fields_to_load)
-                    if this_data.path is None:
-                        this_data.path = str(fname)
-                    return [this_data]
-        elif ext == ".mat":
-            this_data = SessionData(path=fname)
-            this_data.from_mat(str(fname), fields_to_load=fields_to_load)
-            # load_mat(fname, fields_to_load=fields_to_load)
-            return [this_data]
-        else:
-            raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
+    # def save_sessions(
+    #     self,
+    #     output_fname: Optional[str | Path] = None,
+    #     suffix: str = "",
+    #     ext: str = ".hdf5",
+    # ):
+    #     if output_fname is None:
+    #         output_fname = self.get_result_directory() / f"catan_model{fix_suffix(suffix)}{ext}"
+    #     else:
+    #         self.get_result_directory(Path(output_fname).parent)
+
+    #     print(f"Saving session data to {output_fname}...")
+
+    #     if ext in [".h5", ".hdf5"]:
+    #         with h5py.File(
+    #             output_fname, "w"
+    #         ) as f:
+    #             self.save_sessions_to_hdf5(f)
+    #     else:
+    #         raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
+    #     print(f"Saved session data to {output_fname}")
+
+
+    # def save_sessions_to_hdf5(self, h5ref: h5py.Group | h5py.File) -> None:
+    #     print("Saving session data to HDF5...")
+    #     h5ref.attrs["object_type"] = "SessionData"
+    #     h5ref.attrs["schema_version"] = self.HDF5_VERSION
+
+    #     # sessions_group = group.create_group("sessions")
+    #     h5ref.attrs["n_sessions"] = len(self.sessions)
+
+    #     for session in self.sessions:
+    #         session_group = h5ref.create_group(f"session_{session.id:03d}")
+    #         session.to_hdf5(session_group)
         
-    def load_sessions_from_hdf5(
-        self, h5ref: h5py.Group | h5py.File
-    ) -> List[SessionData]:
-        """
-        Loads and returns session data from an HDF5 group
-        """
-        if h5ref.attrs.get("object_type") != "SessionData":
-            raise ValueError(
-                "The provided HDF5 group does not contain a SessionData object."
-            )
-
-        if h5ref.attrs.get("schema_version") != self.HDF5_VERSION:
-            raise ValueError(
-                f"Schema version mismatch: expected {self.HDF5_VERSION}, found {h5ref.attrs.get('schema_version')}"
-            )
-
-        ## define fields as found in saved hdf5 structure
-        # self.load_configs.select("CATAN session")
-        # assert self.load_configs.current is not None, "No load configuration found for 'CATAN session'."
-        fields_to_load = LoadConfig.fields_from_resource("catan_session.json")
-
-        n_sessions = h5ref.attrs["n_sessions"]
-        assert isinstance(n_sessions, numbers.Integral), "Number of sessions should be an integer"
-
-        sessions = []
-        for s in range(n_sessions):
-            session_group = h5ref[f"session_{s:03d}"]
-            assert isinstance(
-                session_group, h5py.Group
-            ), f"Session group for session {s} is not a valid HDF5 group"
-            session = SessionData()
-            data = session.from_hdf5(session_group, fields_to_load)
-            # print("fields_to_load:", fields_to_load)
-            # print("\n\t data keys: ", data.keys())
-            session.register_data(self.alignment_template,**data)
-            sessions.append(session)
+    # def load_session_data(self, fname: str | Path, fields_to_load: Optional[dict] = None) -> List[SessionData]:
+    #     """
+    #     Triggers loading data from a file. Depending on the provided file, it either loads a single session or multiple sessions (informed by hdf5 attributes).
+    #     """
+    #     ext = Path(fname).suffix
+    #     if ext in [".h5", ".hdf5"]:
+    #         with h5py.File(fname, "r") as h5ref:
+                
+    #             if h5ref.attrs.get("object_type") == "SessionData":
+    #                 return self.load_sessions_from_hdf5(h5ref)
+    #             else:
+    #                 this_data = SessionData(path=fname)
+    #                 this_data.from_hdf5(h5ref, fields_to_load=fields_to_load)
+    #                 if this_data.path is None:
+    #                     this_data.path = str(fname)
+    #                 return [this_data]
+    #     elif ext == ".mat":
+    #         this_data = SessionData(path=fname)
+    #         this_data.from_mat(str(fname), fields_to_load=fields_to_load)
+    #         # load_mat(fname, fields_to_load=fields_to_load)
+    #         return [this_data]
+    #     else:
+    #         raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
         
-        return sessions
+    # def load_sessions_from_hdf5(
+    #     self, h5ref: h5py.Group | h5py.File
+    # ) -> List[SessionData]:
+    #     """
+    #     Loads and returns session data from an HDF5 group
+    #     """
+    #     if h5ref.attrs.get("object_type") != "SessionData":
+    #         raise ValueError(
+    #             "The provided HDF5 group does not contain a SessionData object."
+    #         )
+
+    #     if h5ref.attrs.get("schema_version") != self.HDF5_VERSION:
+    #         raise ValueError(
+    #             f"Schema version mismatch: expected {self.HDF5_VERSION}, found {h5ref.attrs.get('schema_version')}"
+    #         )
+
+    #     ## define fields as found in saved hdf5 structure
+    #     # self.load_configs.select("CATAN session")
+    #     # assert self.load_configs.current is not None, "No load configuration found for 'CATAN session'."
+    #     fields_to_load = LoadConfig.fields_from_resource("catan_session.json")
+
+    #     n_sessions = h5ref.attrs["n_sessions"]
+    #     assert isinstance(n_sessions, numbers.Integral), "Number of sessions should be an integer"
+
+    #     sessions = []
+    #     for s in range(n_sessions):
+    #         session_group = h5ref[f"session_{s:03d}"]
+    #         assert isinstance(
+    #             session_group, h5py.Group
+    #         ), f"Session group for session {s} is not a valid HDF5 group"
+    #         session = SessionData()
+    #         data = session.from_hdf5(session_group, fields_to_load)
+    #         # print("fields_to_load:", fields_to_load)
+    #         # print("\n\t data keys: ", data.keys())
+    #         session.register_data(self.alignment_template,**data)
+    #         sessions.append(session)
+        
+    #     return sessions
 
     ### ================================================= ###
     ### === HANDOVER FUNCTIONS FOR SAVING AND LOADING === ###

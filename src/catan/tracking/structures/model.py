@@ -1,10 +1,13 @@
 from functools import partial
-import h5py
+
+from typing import Any, Literal
+from pathlib import Path
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from scipy import interpolate
-from catan.core.io import write_optional_array
-from catan.core.io.hdf5 import read_optional_array, read_optional_attr
+
+from catan.core.io import load_file, save_file
+from catan.core.structures.load_config import LoadConfig, FieldSpec
 from catan.core.utils import nangauss_filter
 
 from catan.tracking.analytics.fit_model_theoretical import (
@@ -13,15 +16,24 @@ from catan.tracking.analytics.fit_model_theoretical import (
 )
 from catan.tracking.utils_new.counts import scale_down_counts
 
+NATIVE_MODEL_CONFIG = "catan_model.json"
+
 class Model:
 
     loaded = False          # tag, whether model was loaded from file
     HDF5_VERSION = "1.0"
 
-    def __init__(self, params):
+    def __init__(self, params = None):
 
-
-        self.params = params
+        ## clean this up!
+        self.params = params if params else {
+            "neighbor_distance": 25.0,
+            "bins": 64,
+            "n_threads": 1,
+            "use_kde": False,
+            "pxtomu": 1.0,
+            "L": 512,
+        }
         self.reset()
 
     def reset(self):
@@ -36,6 +48,22 @@ class Model:
         self.distance_cutoff = 0.
 
         self.fitted: bool = False
+        self.build_arrays()
+
+    def build_arrays(self):
+
+        nbins = self.params["bins"]
+        self.arrays = {}
+        self.arrays["distance_bounds"] = np.linspace(
+            0, self.params["neighbor_distance"], nbins + 1
+        )
+        self.arrays["correlation_bounds"] = np.linspace(0, 1, nbins + 1)
+
+        distance_step = self.params["neighbor_distance"] / nbins
+        correlation_step = 1.0 / nbins
+
+        self.arrays["distance"] = self.arrays["distance_bounds"][:-1] + distance_step / 2
+        self.arrays["correlation"] = self.arrays["correlation_bounds"][:-1] + correlation_step / 2
 
 
     def scale_counts(self, counts, times=0):
@@ -55,7 +83,7 @@ class Model:
             return
         bin_counts = counts[..., 0].sum()
         if bin_counts < 100:
-            raise ValueError(
+            raise Exception(
                 f"Not enough data to fit model - at least 100 counts in cross histogram required (currently: {bin_counts})."
             )
 
@@ -71,7 +99,7 @@ class Model:
             match_model,
             lambda_=lambda_,
             R_cut=self.params["neighbor_distance"],
-            nbins=self.params["nbins"],
+            nbins=self.params["bins"],
             L=self.params["L"],
         )
 
@@ -117,7 +145,7 @@ class Model:
 
         idx_min = np.argmin(gaussian_filter(H.sum(axis=1), sigma=2))
         # print("idx_min:", idx_min)
-        p_init["h"] = self.params["arrays"]["distance_bounds"][idx_min] * 1.5
+        p_init["h"] = self.arrays["distance_bounds"][idx_min] * 1.5
         # print(p_init["h"], "initial h estimate based on distance histogram")
 
         bounds = {
@@ -130,7 +158,7 @@ class Model:
             "c_same_sd": (1e-3, 0.5),
         }
 
-        c_bounds = self.params["arrays"]["correlation_bounds"]
+        c_bounds = self.arrays["correlation_bounds"]
         c_centers = (c_bounds[:-1] + c_bounds[1:]) / 2
 
         # Get the midpoint row index (upper half of distance dimension)
@@ -156,7 +184,7 @@ class Model:
             c_centers, counts[mid_row:, :, 2]
         )
 
-        low_dist_bin = np.where(self.params["arrays"]["distance_bounds"] > p_init["h"])[
+        low_dist_bin = np.where(self.arrays["distance_bounds"] > p_init["h"])[
             0
         ][0]
         p_init["c_same_mean"], p_init["c_same_sd"] = weighted_stats(
@@ -224,10 +252,20 @@ class Model:
 
         self.set_f_same("joint")
 
-        p_same = self.f_same(self.params["arrays"]["distance_bounds"], 1.0)
-        idx_cutoff = np.where(p_same < 0.05)[0][0]
+        p_same = self.f_same(self.arrays["distance_bounds"], 1.0)
+
+        p_thr = 0.05
+        found = False 
+        while not found:
+            idx_low_prob = np.where(p_same < p_thr)[0]
+            if len(idx_low_prob) > 0:
+                idx_cutoff = idx_low_prob[0]
+                found = True
+
+            p_thr += 0.05
+        
         self.distance_cutoff = max(
-            10, self.params["arrays"]["distance_bounds"][idx_cutoff] * 1.5
+            10, self.arrays["distance_bounds"][idx_cutoff] * 1.5
         )  ## make sure, also half-detected ones have a chance!
         self.fitted = True
 
@@ -236,8 +274,8 @@ class Model:
         if model == "joint":
             self.f_same = lambda distance, correlation: interpolate.interpn(
                 (
-                    self.params["arrays"]["distance"],
-                    self.params["arrays"]["correlation"],
+                    self.arrays["distance"],
+                    self.arrays["correlation"],
                 ),
                 self.p_same["joint"],
                 (distance, correlation),
@@ -247,59 +285,106 @@ class Model:
         else:
 
             self.f_same = interpolate.interp1d(
-                self.params["arrays"][model],
+                self.arrays[model],
                 self.p_same[model],
                 # x,
                 # bounds_error=False,
                 fill_value="extrapolate",
             )
 
-
-    def save(self, fname: str):
-
-        if fname.endswith(".h5") or fname.endswith(".hdf5"):
-            with h5py.File(fname, "w") as f:
-                self._save_to_hdf5(f)
-        else:
-            raise ValueError(f"Unsupported file extension: {fname}. Use '.h5' or '.hdf5'.")
-
-        print(f"Saved model data to {fname}")
-
-    def _save_to_hdf5(self, h5ref: h5py.File) -> None:
-        h5ref.attrs["object_type"] = "TrackingModel"
-        h5ref.attrs["schema_version"] = self.HDF5_VERSION
-
-        # model_group = h5ref.create_group("model")
-        h5ref.attrs["parameter_names"] = np.array(list(self.parameters.keys()), dtype="S")
-        write_optional_array(h5ref, "parameters", np.array(list(self.parameters.values())), compression="gzip")
-
+    @staticmethod
+    def _from_file(
+        path: str | Path,
+        fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
+        params: dict | None = None,
+    ) -> "Model":
+        data = load_file(path, fields_to_load, config_name=NATIVE_MODEL_CONFIG, root="/")
+        return Model._from_dict(data, params=params)
 
     @staticmethod
-    def load(fname: str, params: dict) -> "Model":
-
-        model = Model(params)
-        if fname.endswith(".h5") or fname.endswith(".hdf5"):
-            with h5py.File(fname, "r") as f:
-                model._load_from_hdf5(f)
-        else:
-            raise ValueError(f"Unsupported file extension: {fname}. Use '.h5' or '.hdf5'.")
-
-        model.build_from_parameters(use_cdf=True)
-        model.loaded = True
-
+    def _from_dict(data: dict, params: dict | None = None) -> "Model":
+        model = Model(params=params)
+        model.register_data(**data)
         return model
 
-    def _load_from_hdf5(self, h5ref: h5py.File):
-
-        if h5ref.attrs.get("schema_version") != self.HDF5_VERSION:
-            raise ValueError(
-                f"Schema version mismatch: expected {self.HDF5_VERSION}, found {h5ref.attrs.get('schema_version')}"
-            )
-
-        self.parameters = {
+    def register_data(self, **data):
+        parameters = {
             name.decode("utf-8"): value
             for name, value in zip(
-                read_optional_attr(h5ref, "parameter_names"), read_optional_array(h5ref, "parameters")
+                data["parameters"]["names"], data["parameters"]["values"]
             )
         }
+        self.parameters = parameters
+        self.loaded = True
+        self.build_from_parameters(use_cdf=True)
+
+
+    def save(
+        self,
+        path: str | Path,
+        *,
+        mat_version: Literal["pre73", "7.3"] = "7.3",
+    ) -> None:
+
+        fields_to_save = LoadConfig.fields_from_resource(
+            NATIVE_MODEL_CONFIG,
+            enabled_only=False,
+        )
+        save_file(
+            path, 
+            self, 
+            fields_to_save, 
+            mat_version=mat_version,
+            root_attributes={"object_type": "ModelData", "format_version": 1},
+            root="/"
+        )
+
+
+    # def save(self, fname: str):
+
+    #     if fname.endswith(".h5") or fname.endswith(".hdf5"):
+    #         with h5py.File(fname, "w") as f:
+    #             self._save_to_hdf5(f)
+    #     else:
+    #         raise ValueError(f"Unsupported file extension: {fname}. Use '.h5' or '.hdf5'.")
+
+    #     print(f"Saved model data to {fname}")
+
+    # def _save_to_hdf5(self, h5ref: h5py.File) -> None:
+    #     h5ref.attrs["object_type"] = "TrackingModel"
+    #     h5ref.attrs["schema_version"] = self.HDF5_VERSION
+
+    #     # model_group = h5ref.create_group("model")
+    #     h5ref.attrs["parameter_names"] = np.array(list(self.parameters.keys()), dtype="S")
+    #     write_optional_array(h5ref, "parameters", np.array(list(self.parameters.values())), compression="gzip")
+
+
+    # @staticmethod
+    # def load(fname: str, params: dict) -> "Model":
+
+    #     model = Model(params)
+    #     if fname.endswith(".h5") or fname.endswith(".hdf5"):
+    #         with h5py.File(fname, "r") as f:
+    #             model._load_from_hdf5(f)
+    #     else:
+    #         raise ValueError(f"Unsupported file extension: {fname}. Use '.h5' or '.hdf5'.")
+
+    #     model.build_from_parameters(use_cdf=True)
+    #     model.loaded = True
+
+    #     return model
+
+    # def _load_from_hdf5(self, h5ref: h5py.File):
+
+    #     if h5ref.attrs.get("schema_version") != self.HDF5_VERSION:
+    #         raise ValueError(
+    #             f"Schema version mismatch: expected {self.HDF5_VERSION}, found {h5ref.attrs.get('schema_version')}"
+    #         )
+
+    #     self.parameters = {
+    #         name.decode("utf-8"): value
+    #         for name, value in zip(
+    #             read_optional_attr(h5ref, "parameter_names"), read_optional_array(h5ref, "parameters")
+    #         )
+    #     }
 

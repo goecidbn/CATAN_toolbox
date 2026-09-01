@@ -115,7 +115,6 @@ class TaskQueueDisplay(QWidget):
 
         # Queued tasks
         self.queue_list = ReorderableTaskList()
-
         self.queue_list.task_moved.connect(
             self._move_task
         )
@@ -194,6 +193,30 @@ class TaskQueueDisplay(QWidget):
         # Current task
         # ============================================================
 
+        summary = (
+            self.task_manager.group_summary(
+                self.group
+            )
+        )
+
+        if summary["running"]:
+            if summary[
+                "current_cancelling"
+            ]:
+                state = "cancelling"
+            else:
+                state = "1 running"
+        else:
+            state = "idle"
+
+        label = (
+            f"{self.group.capitalize()}: "
+            f"{state}, "
+            f"{summary['queued_count']} queued"
+        )
+        self.title.setText(label)
+
+
         current = self.task_manager.current_task(
             self.group
         )
@@ -202,10 +225,12 @@ class TaskQueueDisplay(QWidget):
             self.current_layout
         )
 
+        has_current = current is not None
         if current is None:
-            self.current_layout.addWidget(
-                QLabel("Idle")
-            )
+            pass
+            # self.current_layout.addWidget(
+            #     QLabel("Idle")
+            # )
 
         else:
             current_widget = TaskItemWidget(
@@ -228,6 +253,10 @@ class TaskQueueDisplay(QWidget):
         # ============================================================
 
         self.queue_list.clear()
+
+        n_queued = len(self.task_manager.queued_tasks(self.group))
+        has_queued = n_queued > 0
+        self.queue_list.setVisible(has_queued)
 
         for task in self.task_manager.queued_tasks(
             self.group
@@ -261,6 +290,11 @@ class TaskQueueDisplay(QWidget):
                 widget,
             )
 
+        # if not has_current and not has_queued:
+        #     self.title.setText(
+        #         f"{self.group.capitalize()} (idle)"
+        #     )
+
 
 class TaskOverviewDisplay(QWidget):
     def __init__(
@@ -272,7 +306,7 @@ class TaskOverviewDisplay(QWidget):
 
         self.task_manager = task_manager
 
-        self.summary_label = QLabel()
+        # self.summary_label = QLabel()
 
         # ============================================================
         # Expand/collapse button
@@ -301,9 +335,9 @@ class TaskOverviewDisplay(QWidget):
             QLabel("Tasks")
         )
 
-        header.addWidget(
-            self.summary_label
-        )
+        # header.addWidget(
+        #     self.summary_label
+        # )
 
         header.addStretch()
 
@@ -358,32 +392,32 @@ class TaskOverviewDisplay(QWidget):
         # TaskManager signals
         # ============================================================
 
-        self.task_manager.queue_changed.connect(
-            lambda group:
-                self.refresh_summary()
-        )
+        # self.task_manager.queue_changed.connect(
+        #     lambda group:
+        #         self.refresh_summary()
+        # )
 
-        self.task_manager.task_started.connect(
-            lambda group, task_id:
-                self.refresh_summary()
-        )
+        # self.task_manager.task_started.connect(
+        #     lambda group, task_id:
+        #         self.refresh_summary()
+        # )
 
-        self.task_manager.task_finished.connect(
-            lambda group, task_id:
-                self.refresh_summary()
-        )
+        # self.task_manager.task_finished.connect(
+        #     lambda group, task_id:
+        #         self.refresh_summary()
+        # )
 
-        self.task_manager.task_cancelled.connect(
-            lambda group, task_id:
-                self.refresh_summary()
-        )
+        # self.task_manager.task_cancelled.connect(
+        #     lambda group, task_id:
+        #         self.refresh_summary()
+        # )
 
-        self.task_manager.task_failed.connect(
-            lambda group, task_id:
-                self.refresh_summary()
-        )
+        # self.task_manager.task_failed.connect(
+        #     lambda group, task_id:
+        #         self.refresh_summary()
+        # )
 
-        self.refresh_summary()
+        # self.refresh_summary()
 
     def _toggle_details(
         self,
@@ -399,33 +433,33 @@ class TaskOverviewDisplay(QWidget):
             else Qt.ArrowType.RightArrow
         )
 
-    def refresh_summary(self):
-        parts = []
+    # def refresh_summary(self):
+    #     parts = []
 
-        for group in self.task_manager.GROUPS:
+    #     for group in self.task_manager.GROUPS:
 
-            summary = (
-                self.task_manager.group_summary(
-                    group
-                )
-            )
+    #         summary = (
+    #             self.task_manager.group_summary(
+    #                 group
+    #             )
+    #         )
 
-            if summary["running"]:
-                if summary[
-                    "current_cancelling"
-                ]:
-                    state = "cancelling"
-                else:
-                    state = "1 running"
-            else:
-                state = "idle"
+    #         if summary["running"]:
+    #             if summary[
+    #                 "current_cancelling"
+    #             ]:
+    #                 state = "cancelling"
+    #             else:
+    #                 state = "1 running"
+    #         else:
+    #             state = "idle"
 
-            parts.append(
-                f"{group.capitalize()}: "
-                f"{state}, "
-                f"{summary['queued_count']} queued"
-            )
+    #         parts.append(
+    #             f"{group.capitalize()}: "
+    #             f"{state}, "
+    #             f"{summary['queued_count']} queued"
+    #         )
 
-        self.summary_label.setText(
-            "   |   ".join(parts)
-        )
+    #     self.summary_label.setText(
+    #         "\n".join(parts)
+    #     )

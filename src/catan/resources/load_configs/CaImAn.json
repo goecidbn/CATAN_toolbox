@@ -1,0 +1,80 @@
+{
+  "format_version": 1,
+  "uid": "catan-caiman-session",
+  "name": "CaImAn",
+  "source_type": "session",
+  "public": true,
+  "native": true,
+  "groups": {
+    "spatial": {
+      "title": "Spatial data",
+      "type": "static",
+      "enabled": true,
+      "fields": {
+        "footprints": {
+          "path": "/estimates/A",
+          "source": "field",
+          "attribute": null,
+          "required": true
+        },
+        "background": {
+          "path": "/estimates/Cn",
+          "source": "field",
+          "attribute": null,
+          "required": false
+        }
+      }
+    },
+    "quality": {
+      "title": "Quality data",
+      "type": "dynamic",
+      "enabled": true,
+      "fields": {
+        "SNR": {
+          "path": "/estimates/SNR_comp",
+          "source": "field",
+          "attribute": null,
+          "required": false
+        },
+        "CNN": {
+          "path": "/estimates/cnn_preds",
+          "source": "field",
+          "attribute": null,
+          "required": false
+        },
+        "r-values": {
+          "path": "/estimates/r_values",
+          "source": "field",
+          "attribute": null,
+          "required": false
+        }
+      }
+    },
+    "traces": {
+      "title": "Trace data",
+      "type": "dynamic",
+      "enabled": false,
+      "fields": {
+        "C": {
+          "path": "/estimates/C",
+          "source": "field",
+          "attribute": null,
+          "required": false
+        },
+        "F_dff_dec": {
+          "path": "/estimates/F_dff_dec",
+          "source": "dataset",
+          "attribute": null,
+          "required": false
+        },
+        "S_dff": {
+          "path": "/estimates/S_dff",
+          "source": "dataset",
+          "attribute": null,
+          "required": false
+        }
+      }
+    }
+  },
+  "subconfigs": {}
+}

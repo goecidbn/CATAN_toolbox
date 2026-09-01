@@ -13,6 +13,9 @@ class FieldChip(QWidget):
 
     remove_requested = Signal(str)
 
+    name: str
+    field_path: str
+
     def __init__(
         self,
         name: str,
@@ -21,22 +24,16 @@ class FieldChip(QWidget):
     ):
         super().__init__(parent)
 
-        self.name = name
-        if spec is None:
-            self.field_path = name
-        else:
-            self.field_path = spec.path
-        
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         self.field_button = QToolButton()
-        self.field_button.setText(self.name)
+        self.field_button.setText(name)
         self.field_button.setChecked(True)
 
-        self.set_name()
+        self.set(name=name, path=name if spec is None else spec.path)
 
         self.remove_button = QToolButton()
         self.remove_button.setText("×")
@@ -57,7 +54,12 @@ class FieldChip(QWidget):
             QSizePolicy.Policy.Fixed,
         )
 
-    def set_name(self):
+    def set(self, *, name: Optional[str] = None, path: Optional[str] = None):
+        if name is not None:
+            self.name = name
+        if path is not None:
+            self.field_path = path
+        
         self.field_button.setText(self.name)
         if self.name != self.field_path:
             self.field_button.setToolTip(f"{self.name} ({self.field_path})")

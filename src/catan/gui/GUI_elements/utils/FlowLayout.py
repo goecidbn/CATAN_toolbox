@@ -1,5 +1,5 @@
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
-from PySide6.QtWidgets import QLayout, QSizePolicy, QWidgetItem
+from PySide6.QtWidgets import QWidget, QLayout, QSizePolicy, QWidgetItem, QLayoutItem
 
 
 class FlowLayout(QLayout):
@@ -26,6 +26,49 @@ class FlowLayout(QLayout):
 
     def addItem(self, item):
         self._items.append(item)
+
+    def insertItem(
+        self,
+        index: int,
+        item: QLayoutItem,
+    ) -> None:
+
+        index = max(
+            0,
+            min(index, len(self._items)),
+        )
+
+        self._items.insert(
+            index,
+            item,
+        )
+
+        self.invalidate()
+
+    def insertWidget(
+        self,
+        index: int,
+        widget: QWidget,
+    ) -> None:
+
+        self.addChildWidget(widget)
+
+        item = QWidgetItem(widget)
+
+        self.insertItem(
+            index,
+            item,
+        )
+
+    def insertBeforeLast(
+        self,
+        widget: QWidget,
+    ) -> None:
+
+        self.insertWidget(
+            max(0, self.count() - 1),
+            widget,
+        )
 
     def count(self):
         return len(self._items)

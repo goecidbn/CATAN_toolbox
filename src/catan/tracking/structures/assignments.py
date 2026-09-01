@@ -1,10 +1,12 @@
 from pathlib import Path
-from typing import Any, Dict, Optional
-from catan.core.io import load_hdf5, write_optional_array
+from typing import Any, Dict, Optional, Literal
+
+from catan.core.io import load_file, save_file, NATIVE_ASSIGNMENTS_CONFIG
+from catan.core.structures.load_config import LoadConfig, FieldSpec
+
 from catan.core.utils import pad_axis
-from catan.core.structures.load_config import LoadConfig
 from catan.core.structures.session import SessionData
-import h5py
+
 import numpy as np
 from scipy import sparse
 
@@ -15,9 +17,10 @@ class Assignments:
 
     HDF5_VERSION = "1.0"
 
-    def __init__(self, params: Optional[dict] = None):
+    union: Optional[SessionData] = None
 
-        self.params = params if params is not None else {}
+    def __init__(self):
+
         self.reset()
 
 
@@ -31,7 +34,7 @@ class Assignments:
             "shifts": np.zeros((0, 0, 2), float),  # nNeurons x nSessions x 2 (x,y)
         }
 
-        self.union = SessionData(name="union", params=self.params)
+        self.union = SessionData(name="union")
 
     def pad_empty(self, n_neurons: int, n_sessions: int):
         """
@@ -46,6 +49,9 @@ class Assignments:
             self.stats["shifts"], (n_neurons, n_sessions, 0), np.nan
         )
 
+        if self.union is None:
+            return
+        
         self.union.idx_eval = pad_axis(self.union.idx_eval, (n_neurons,), True)
 
     def move_session(self, session_id: int, new_session_id: int):
@@ -106,6 +112,9 @@ class Assignments:
         self.stats["shifts"] = self.stats["shifts"][neuron_presence, :, :]
 
         ## could just rebuild it entirely from the remaining sessions, but for now just remove the columns of empty neurons
+        if self.union is None:
+            return
+        
         footprints_cleaned = sparse.hstack(
             [
                 self.union.footprints[:, i]
@@ -118,77 +127,20 @@ class Assignments:
 
         # print(f"Updated union data now contains {self.union.n_neurons} neurons.")
 
-
-    def save(self, fname: str):
-
-        ext = Path(fname).suffix
-        if ext in [".h5", ".hdf5"]:
-            with h5py.File(
-                fname, "w"
-            ) as f:
-                self._save_to_hdf5(f)
-        else:
-            raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
-        print(f"Saved neuron registration to {fname}")
-
-
-    def _save_to_hdf5(self, h5ref: h5py.File | h5py.Group) -> None:
-        h5ref.attrs["object_type"] = "AssignmentResults"
-        h5ref.attrs["schema_version"] = self.HDF5_VERSION
-
-        write_optional_array(h5ref, "IDs", self.ids, compression="gzip")
-
-        stats_group = h5ref.create_group("stats")
-        for key, value in self.stats.items():
-            write_optional_array(stats_group, key, value, compression="gzip")
-
-        union_group = h5ref.create_group(f"union")
-        self.union.to_hdf5(union_group)
-
+    @staticmethod
+    def _from_file(
+        path: str | Path,
+        fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
+    ) -> "Assignments":
+        data = load_file(path, fields_to_load, config_name=NATIVE_ASSIGNMENTS_CONFIG, root="/")
+        return Assignments._from_dict(data)
 
     @staticmethod
-    def load(fname: str, params: dict) -> "Assignments":
-
-        assignments = Assignments(params)
-
-        ext = Path(fname).suffix
-        if ext in [".h5", ".hdf5"]:
-            with h5py.File(fname, "r") as f:
-                data = assignments._from_hdf5(f)
-        else:
-            raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
-
+    def _from_dict(data: dict) -> "Assignments":
+        assignments = Assignments()
         assignments.register_data(**data)
-
         return assignments
-
-    def _from_hdf5(self, h5ref: h5py.File | h5py.Group, fields_to_load: Optional[dict] = None) -> dict[str, Any]:
-
-        if h5ref.attrs.get("schema_version") != self.HDF5_VERSION:
-            raise ValueError(
-                f"Schema version mismatch: expected {self.HDF5_VERSION}, found {h5ref.attrs.get('schema_version')}"
-            )
-
-        if h5ref.attrs.get("object_type") != "AssignmentResults":
-            raise ValueError(
-                "The provided HDF5 group does not contain an AssignmentResults object."
-            )
-
-        fields_to_load = LoadConfig.fields_from_resource("catan_assignments.json")
-        data = load_hdf5(h5ref, fields_to_load=fields_to_load)
-
-        if "union" in h5ref:
-            union_group = h5ref["union"]
-            assert isinstance(
-                union_group, h5py.Group
-            ), "Union group is not a valid HDF5 group"
-
-            fields_to_load = LoadConfig.fields_from_resource("catan_session.json")
-            data["union"] = SessionData.from_hdf5(union_group, fields_to_load=fields_to_load)
-
-        return data
-
-
+    
     def register_data(self, **data):
 
         ids = data["assignments"].get("ids")
@@ -207,6 +159,27 @@ class Assignments:
             self.union = SessionData()
             self.union.register_data(**data["union"])
 
+    def save(
+        self,
+        path: str | Path,
+        fields_to_save: dict[str, dict[str, FieldSpec]] | None = None,
+        *,
+        mat_version: Literal["pre73", "7.3"] = "7.3",
+    ) -> None:
+        
+        fields_to_save = fields_to_save or LoadConfig.fields_from_resource(
+            NATIVE_ASSIGNMENTS_CONFIG,
+            enabled_only=False,
+        )
+
+        save_file(
+            path, 
+            self, 
+            fields_to_save, 
+            mat_version=mat_version,
+            root_attributes={"object_type": "AssignmentsData", "format_version": 1},
+            root="/"
+        )
 
 
 def move_single_row(a, old_index, new_index):

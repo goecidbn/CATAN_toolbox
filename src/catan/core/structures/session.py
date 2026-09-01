@@ -1,21 +1,14 @@
 from typing import Dict, List, Optional, Tuple, Any, Literal
 
-import inspect
-from catan.core.io.matlab import load_mat
-import h5py
 import numpy as np
 from scipy import sparse
 from pathlib import Path
 
 from .remap import Remapping
 
+from catan.core.io import load_file, save_file, NATIVE_SESSION_CONFIG
+from catan.core.structures.load_config import LoadConfig, FieldSpec
 from catan.core.data import center_of_mass
-from catan.core.io import (
-    load_hdf5,
-    write_sparse_matrix,
-    write_optional_attr,
-    write_optional_array,
-)
 
 sessiondata_type = Literal["spatial", "traces", "quality"]
 
@@ -28,29 +21,13 @@ component_quality_default = {
     "cnn_min": 0.9,
 }
 
-
-def has_property(class_instance, property_name: str) -> bool:
-    return property_name in [
-        key for (key, _) in inspect.getmembers_static(class_instance)
-    ]
-
-
-def cast_dict_to_class_attributes(class_instance, dict, exclude_keys=[]):
-    for key, value in dict.items():
-        if key in exclude_keys:
-            continue
-
-        if has_property(class_instance, key):
-            setattr(class_instance, key, value)
-        # else:
-        #     raise ValueError(f"Unknown field {key} for session_data")
-
-
 class SessionData:
     ## meta data
     name: Optional[str] = None  #
     path: Optional[str] = None  #
     id: int = -1  #
+
+    source_config: LoadConfig | None = None
 
     active: bool = True  #
     time_offset: float = 0.0  #
@@ -73,7 +50,7 @@ class SessionData:
     ## to be calculated (from input)
     remap: Optional[Remapping] = None  #
     n_neurons: int = -1  #
-    centroids: np.ndarray  #
+    centroids: Optional[np.ndarray] = None  #
     idx_eval: Optional[np.ndarray] = None  #
     ## to be calculated (with additional information)
     idx_kde: np.ndarray
@@ -82,14 +59,14 @@ class SessionData:
 
     def __init__(
         self,
-        name="",
+        name: Optional[str] = None,
         alignment_template: Optional[np.ndarray] = None,
         **kwargs,
     ):
         """ """
 
         self.name = name
-        self.id = kwargs.get("id", -1)
+        # self.id = kwargs.get("id", -1)
         self.path = kwargs.get("path", None)
 
         self.status = {
@@ -133,80 +110,78 @@ class SessionData:
                 self.params[key] = input[key]
 
     ### ========================================================= ###
-    ### ====================== LOAD METHODS ===================== ###
+    ### ================= LOAD / SAVE METHODS =================== ###
     ### ========================================================= ###
 
     @staticmethod
-    def from_file(path: str, fields_to_load: Optional[dict] = None, alignment_template=None, **kwargs) -> "SessionData":
-        """
-        manages creation of a new SessionData object from a file, and loading and registering the requested fields
-        """
-        this_data = SessionData(path=path, **kwargs)
-
-        if not fields_to_load:
-            this_data.name = Path(path).parent.name
-            return this_data
+    def _from_file(
+        path: str | Path,
+        fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
+        alignment_template: Optional[np.ndarray] = None,
+    ) -> "SessionData":
+        if fields_to_load is None:
+            fields_to_load = LoadConfig.fields_from_resource(
+                NATIVE_SESSION_CONFIG, enabled_only=False
+            )
         
-        this_data.load_data(fields_to_load,alignment_template=alignment_template, **kwargs)
-        return this_data
-
-    def load_data(self, fields_to_load: Optional[dict] = None, alignment_template=None, **kwargs):
-        """
-        Loads data from the SessionData.path as specified in fields_to_load and registers it to the current object.
-
-        If alignment_template is provided, spatial data will be aligned to it.
-        """
-
-        assert self.path is not None and Path(self.path).exists(), "No (valid) path provided for session, cannot load data."
-
-        ext = Path(self.path).suffix
-
-        data = {}
-        if ext in [".h5", ".hdf5"]:
-
-            with h5py.File(self.path, "r") as h5ref:
-                data = self.from_hdf5(h5ref, fields_to_load=fields_to_load)
-        elif ext == ".mat":
-            data = self.from_mat(self.path, fields_to_load=fields_to_load)
-        self.register_data(alignment_template=alignment_template, **data)
+        data = load_file(path, fields_to_load)
+        return SessionData._from_dict(data, alignment_template=alignment_template)
 
     @staticmethod
-    def from_hdf5(h5ref: h5py.Group | h5py.File, fields_to_load: Optional[dict]=None) -> dict[str, Any]:
-        """
-        Loads data from an hdf5 file or group and returns it as a dictionary for registration.
-        """
+    def _from_dict(data: dict, alignment_template: Optional[np.ndarray] = None) -> "SessionData":
+        session = SessionData()
+        session.register_data(alignment_template=alignment_template, **data)
+        return session
+
+    def load_data(
+        self,
+        fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
+        **kwargs,
+    ) -> None:
+        if self.path is None or not Path(self.path).exists():
+            raise ValueError("No (valid) path provided for session, cannot load data.")
+
+        if fields_to_load is None:
+            fields_to_load = LoadConfig.fields_from_resource(
+                NATIVE_SESSION_CONFIG, enabled_only=False
+            )
+
+        data = load_file(self.path, fields_to_load)
+        self.register_data(alignment_template=kwargs.get("alignment_template", None), **data)
         
-        version = int(h5ref.attrs.get("schema_version", 1))
-        if version != 1:
-            raise ValueError(f"Unsupported SessionData schema version: {version}")
-
-        data = load_hdf5(h5ref, fields_to_load)
+    def save(
+        self,
+        path: str | Path,
+        fields_to_save: dict[str, dict[str, FieldSpec]] | None = None,
+        *,
+        mat_version: Literal["pre73", "7.3"] = "7.3",
+    ) -> None:
         
-        if "remapping" in h5ref:
-            remap_group = h5ref["remapping"]
-            if isinstance(remap_group, h5py.Group):
-                data["remap"] = Remapping.from_hdf5(remap_group)
-                
-        return data
+        fields_to_save = fields_to_save or LoadConfig.fields_from_resource(
+            NATIVE_SESSION_CONFIG,
+            enabled_only=False,
+        )
 
-    @staticmethod
-    def from_mat(fname: str, fields_to_load: Optional[dict] = None):
-        """
-        Loads data from a .mat file and registers it to the current object.
-        """
-        assert fname is not None and Path(fname).exists(), "No (valid) path provided for session, cannot load data."
+        save_file(
+            path, 
+            self, 
+            fields_to_save, 
+            mat_version=mat_version,
+            root_attributes={"object_type": "SessionData", "format_version": 1},
+            root="/"
+        )
 
-        data = load_mat(fname, fields_to_load=fields_to_load)
-        # Note: alignment_template is set to None since static method does not have access to instance
-        return data
+    ### ========================================================= ###
+    ### ================= REGISTRATION METHODS ================== ###
+    ### ========================================================= ###
 
-    
     def register_data(self, alignment_template: Optional[np.ndarray] = None, **data):
         """
         Registers data from kwargs 'data' input to SessionData object. Requires 'data' to contain the keys 'spatial', 'traces', and 'quality' with the corresponding data keys to be registered. 
         
         If alignment_template is provided, spatial data will be aligned to it.
         """
+        
         self.register_spatial(alignment_template=alignment_template, **data.get("spatial",{}))
         self.register_traces(**data.get("traces",{}))
         self.register_quality(**data.get("quality",{}))
@@ -243,6 +218,9 @@ class SessionData:
     ### ========================================================== ###
 
     def register_quality(self, **data):
+
+        if not data:
+            return
 
         self.quality = data if data else {}
 
@@ -319,9 +297,12 @@ class SessionData:
 
     def register_traces(self, **data):
 
+        if not data:
+            return
+
         self._traces = data if data else {}
 
-        self._default_trace = "F_dff" if "F_dff" in self._traces else "C"
+        self._default_trace = "F_dff_dec" if "F_dff_dec" in self._traces else "C"
         if self._traces:
             self.status["traces_loaded"] = True
 
@@ -428,46 +409,6 @@ class SessionData:
         self.idx_eval = None
         self.status["spatial_loaded"] = False
 
-    ### ========================================================== ###
-    ### ======================= SAVE METHODS ===================== ###
-    ### ========================================================== ###
-
-    def to_hdf5(self, group: h5py.Group, exclude_fields=["traces"]) -> None:
-        group.attrs["object_type"] = "SessionData"
-        group.attrs["schema_version"] = self.HDF5_VERSION
-
-        ## general attributes
-        write_optional_attr(group, "name", self.name)
-        write_optional_attr(
-            group, "path", str(self.path) if self.path is not None else None
-        )
-        write_optional_attr(group, "id", self.id)
-
-        ## spatial group
-        write_optional_attr(group, "dims", self.dims)
-
-        footprints_group = group.create_group("footprints")
-        write_sparse_matrix(footprints_group, self.footprints)
-        write_optional_array(group, "background", self.background, compression="gzip")
-        write_optional_array(group, "idx_eval", self.idx_eval, compression="gzip")
-
-        ## trace group
-        # if "traces" not in exclude_fields:
-        traces_group = group.create_group("traces")
-        for key, value in self.traces.items():
-            write_optional_array(traces_group, key, value, compression="gzip")
-
-        ## quality group
-        quality_group = group.create_group("quality")
-        for key, value in self.quality.items():
-            write_optional_array(quality_group, key, value)
-
-        ## remap substructure
-        if self.remap is not None:
-            remapping_group = group.create_group("remapping")
-            self.remap.to_hdf5(remapping_group)
-
-
     ### ========================================================= ###
     ### ==================== ALIGNMENT METHODS ================== ###
     ### ========================================================= ###
@@ -567,6 +508,9 @@ class SessionData:
         if not self.use_kde:
             self.idx_kde = np.ones(self.n_neurons, dtype=bool)
             return
+
+        if self.centroids is None:
+            raise ValueError("Centroids must be calculated before calculating kernel density estimate.")
 
         from scipy import stats
 

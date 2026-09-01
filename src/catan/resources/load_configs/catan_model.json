@@ -1,0 +1,29 @@
+{
+    "format_version": 1,
+    "uid": "catan-native-model",
+    "name": "CATAN model",
+    "source_type": "model",
+    "public": false,
+    "groups": {
+        "parameters": {
+            "title": "Model",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+                "values": {
+                    "path": "/parameters",
+                    "required": true,
+                    "source": "field",
+                    "attribute": null
+                },
+                "names": {
+                    "path": "/",
+                    "required": true,
+                    "source": "attribute",
+                    "attribute": "parameter_names"
+                }
+            }
+        }
+    },
+    "native": true
+}

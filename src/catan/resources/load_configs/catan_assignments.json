@@ -1,5 +1,6 @@
 {
     "format_version": 1,
+    "uid": "catan-native-assignments",
     "name": "CATAN assignments",
     "source_type": "assignments",
     "public": false,
@@ -12,7 +13,7 @@
                 "ids": {
                     "path": "/IDs",
                     "required": true,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 }
             }
@@ -25,10 +26,18 @@
                 "stats": {
                     "path": "/stats/*",
                     "required": false,
-                    "source": "dataset",
+                    "source": "field",
                     "attribute": null
                 }
             }
         }
-    }
+    },
+    "subconfigs": {
+        "union": {
+            "path": "/union",
+            "config": "catan_session.json",
+            "required": false
+        }
+    },
+    "native": true
 }

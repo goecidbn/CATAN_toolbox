@@ -2,8 +2,6 @@ from typing import Dict, Optional, Tuple, List, Callable
 import importlib
 
 from PySide6.QtWidgets import (
-    QDialog,
-    QGridLayout,
     QInputDialog,
     QMenu,
     QWidget,
@@ -21,8 +19,9 @@ from PySide6.QtWidgets import (
     QComboBox,
     QToolButton,
     QWidgetAction,
+    QSplitter,
 )
-from PySide6.QtCore import QSettings, QThreadPool, Qt
+from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal
 from PySide6.QtGui import QAction, QCursor
 from .fragments.field_selector import FieldSelector
 from shiboken6 import isValid
@@ -32,11 +31,13 @@ from pathlib import Path
 from catan.gui.structures import data, state, config
 
 from .resource_monitor import ResourceMonitor
-from .fragments.FileReviewDialog import GlobReviewDialog
-from .fragments.TaskQueueDisplay import TaskOverviewDisplay, TaskQueueDisplay
-from .fragments.IconButton import make_icon_button, set_button_icon
-from .fragments.toggle_option import ToggleOption
-
+from .fragments import (
+    TaskOverviewDisplay, 
+    ToggleOption,
+    make_icon_button, 
+    set_button_icon,
+    choose_path
+)
 from . import session_overview
 
 selector_options = {
@@ -56,6 +57,8 @@ class MainMenu(QFrame):
     Side menu panel for data loading and parameter settings.
     Contains file path selectors, load/save buttons, and mode checkboxes.
     """
+
+    load_config_changed = Signal(int)  # signal to indicate that the load configuration has changed
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -81,25 +84,41 @@ class MainMenu(QFrame):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(8)
 
-        self.logging = QComboBox()
-        self.logging.addItems(["DEBUG", "WARNING", "ERROR"])
-        self.logging.setCurrentText(self.state.logging_level)
-        self.logging.currentTextChanged.connect(self.change_logging_level)
-        layout.addWidget(QLabel("Logging level:"))
-        layout.addWidget(self.logging)
+        # self.logging = QComboBox()
+        # self.logging.addItems(["DEBUG", "WARNING", "ERROR"])
+        # self.logging.setCurrentText(self.state.logging_level)
+        # self.logging.currentTextChanged.connect(self.change_logging_level)
+        # layout.addWidget(QLabel("Logging level:"))
+        # layout.addWidget(self.logging)
+        layout.addWidget(self.build_root_selector())
 
-        self.paths_menu = QWidget()
-        self.paths_layout = QVBoxLayout(self.paths_menu)
+        session_list = session_overview.SessionOverview(self)
+        layout.addWidget(session_list, stretch=1)
+
+        ## session buttons
+
+
+        self.button_save_sessions = make_icon_button("floppy-disk", tooltip=f"Save sessions data", size=28, icon_size=22)
+        self.button_save_sessions.setFixedWidth(35)
+        self.button_save_sessions.setEnabled(False)
+        layout.addWidget(self.button_save_sessions,alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.button_save_sessions.clicked.connect(lambda: self.save_data("sessions"))
+        
+        layout.addWidget(paths_menu:=QWidget())
+        self.paths_layout = QVBoxLayout(paths_menu)
+
         self.build_app_mode_menu()
-        layout.addWidget(self.paths_menu)
 
-        layout.addStretch()  # push everything up, so empty space is at the bottom
+        layout.addStretch()
+
         layout.addWidget(ResourceMonitor(parent=self))
-
         self.task_overview = TaskOverviewDisplay(
             self.state.tasks,
         )
         layout.addWidget(self.task_overview)
+
+        session_list.load_requested.connect(self.process_data_from_session)
 
         self.state.data_changed.connect(self._on_data_changed)
         self.state.busy_changed.connect(self.toggle_busy)
@@ -109,10 +128,10 @@ class MainMenu(QFrame):
         importlib.reload(data)
         importlib.reload(session_overview)
 
-    def change_logging_level(self):
+    # def change_logging_level(self):
 
-        self.state.set_logging_level(self.logging.currentText())
-        print("Logging level changed to:", self.state.logging_level)
+    #     self.state.set_logging_level(self.logging.currentText())
+    #     print("Logging level changed to:", self.state.logging_level)
 
     def toggle_busy(self, busy: bool):
         self.button_process.setEnabled(not busy)
@@ -144,11 +163,11 @@ class MainMenu(QFrame):
         ## to avoid path inconsistencies
         sessions_loaded = len(self.data.sessions) > 0
 
-        self.root["button"].setEnabled(not sessions_loaded)
-        self.root["edit"].setEnabled(not sessions_loaded)
+        self.button_root_path.setEnabled(not sessions_loaded)
+        self.edit_root_path.setEnabled(not sessions_loaded)
 
-        ## session buttons
-        self.loader["session"]["button_save"].setEnabled(sessions_loaded)
+        self.button_save_sessions.setEnabled(sessions_loaded)
+        
 
         ## model buttons
         local_model = (self.data.model is not None) and (not self.data.model.loaded)
@@ -163,13 +182,6 @@ class MainMenu(QFrame):
 
         any_assigned = any([session.status["matched"] for session in self.data.sessions])
         self.loader["assignments"]["button_save"].setEnabled(any_assigned)
-
-        ## field selector
-        modified = self.data.load_configs.modified
-        if self.data.load_configs.current is not None:
-            self.load_config_selector.setEditable(modified)
-            self.load_config_selector.setCurrentText("* " +self.data.load_configs.current.name + (" (modified)" if modified else ""))
-
 
     def build_app_mode_menu(self):
         """
@@ -191,132 +203,25 @@ class MainMenu(QFrame):
         self.form = form
 
         ## add connected path loading and editing option for root path
-        self.root = {
-            "path": self.defaults[f"root_folder"],
-            "edit": QLineEdit(text=self.defaults[f"root_folder"]),
-            "button": QPushButton("..."),
-        }
-        self.root["button"].setFixedWidth(50)
+        
 
-        entry_layout = QHBoxLayout()
-        entry_layout.addWidget(self.root["edit"])
-        entry_layout.addWidget(self.root["button"])
-        form.addRow(f"Root folder:", entry_layout)
-
-        # lambda path: self.root["path"] = path
-        def on_root_path_changed():
-            self.root["path"] = self.root["edit"].text().strip()
-
-        self.root["button"].clicked.connect(
-            lambda: (
-                self.choose_path(
-                    pick_dir=True,
-                    edit_line=self.root["edit"],
-                    display_text="Select root folder",
-                    only_existing=True,
-                ),
-                on_root_path_changed(),
-            )
-        )
-        self.root["edit"].editingFinished.connect(on_root_path_changed)
         form.addRow(QLabel("Data paths:"), QLabel(""))
 
         self.loader = {}
 
-        ## session data loading options
-        
-
-        ## menu for load configuration selection and saving
-        load_config_menu_widget = QWidget()
-        load_config_menu = QHBoxLayout()
-
-        self.load_config_selector = QComboBox()
-        self.load_config_selector.addItems(self.data.load_configs.names())
-
-        self.field_selector = FieldSelector(self, self.data.load_configs.current)
-        def on_load_config_changed(idx):
-            name = self.data.load_configs.names()[idx]
-            self.data.load_configs.select(name)
-            self.field_selector.rebuild(self.data.load_configs.current)
-        self.load_config_selector.currentIndexChanged.connect(
-            lambda idx: on_load_config_changed(idx)
-        )
-        self.load_config_selector.setCurrentText(self.data.load_configs.current.name)
-
-
-    
-        self.load_config_save_button = make_icon_button("floppy-disk", tooltip="Save load configuration", size=28, icon_size=22)
-
-        toggle_config_fields = ToggleOption(self.field_selector)
-        load_config_menu.addWidget(QLabel("Load config preset:"))
-        load_config_menu.addWidget(self.load_config_selector, alignment=Qt.AlignmentFlag.AlignTop)
-        load_config_menu.addWidget(toggle_config_fields, alignment=Qt.AlignmentFlag.AlignTop)
-        load_config_menu.addWidget(self.load_config_save_button, alignment=Qt.AlignmentFlag.AlignTop)
-
-        def on_save_load_config():
-            if self.data.load_configs.current is None:
-                self.state.issue(
-                    "warning",
-                    "No load configuration selected",
-                    "Please select a load configuration to save.",
-                )
-                return
-            name, ok = QInputDialog.getText(
-                self,
-                "Save load configuration",
-                "Enter a name for the load configuration:",
-                text=self.data.load_configs.current.name,
-            )
-            if ok and name:
-                self.data.load_configs.save_current_as(name)
-
-            self.load_config_selector.clear()
-            self.load_config_selector.addItems(self.data.load_configs.names())
-            self.load_config_selector.setCurrentText(self.data.load_configs.current.name)
-
-
-        self.load_config_save_button.clicked.connect(
-            on_save_load_config
-        )
-        load_config_menu_widget.setLayout(load_config_menu)
-
-        toggle_config_option = ToggleOption(load_config_menu_widget,icon_name="gear",tooltip="Show load configuration options",expanded=False)
-
+        ## model data loading options
         form.addRow(
-            QLabel("Session Data"),
-            self.build_load_options("session", ["from file", ".* (glob)"], add_widgets=[toggle_config_option]),
-        )
-        form.addRow(load_config_menu_widget)
-        # self.paths_layout.addWidget(self.field_selector, alignment=Qt.AlignmentFlag.AlignTop)
-        form.addRow(self.field_selector)
-
-
-        opt_row = QHBoxLayout()
-        self.loader["session"]["edit"] = QLineEdit("", placeholderText="regex pattern")
-        self.loader["session"]["edit"].setText("Session0*/neuron*")
-
-        opt_row.addWidget(self.loader["session"]["edit"])
-        form.addRow(opt_row)
-        self.loader["session"]["additional_options"] = opt_row
-        self.form.setRowVisible(self.loader["session"]["additional_options"], False)
-
-        self._on_load_option_changed("session", 0)
-
-        
-
-
-
-        form.addRow(
-            QLabel("Model Data"),
+            QLabel("Model"),
             self.build_load_options("model", self.data.available_models, add_options=selector_options["model"]),
         )
+
+        ### assignment data loading options
         form.addRow(
-            QLabel("Assignment Data"),
+            QLabel("Assignments"),
             self.build_load_options("assignments", self.data.available_assignments, add_options=selector_options["assignments"]),
         )
 
         self.paths_layout.addWidget(formFrame, alignment=Qt.AlignmentFlag.AlignTop)
-
 
 
         self.checkbox_update_model = QCheckBox("Register to model after loading")
@@ -346,17 +251,42 @@ class MainMenu(QFrame):
         self.button_save = QPushButton("Save results")
         self.paths_layout.addWidget(self.button_save)
 
-        self.path_list = session_overview.SessionOverview(self)
-        self.paths_layout.addWidget(self.path_list)
-
-        self.path_list.rebuild()
 
         # self.checkbox_auto_advance = QCheckBox("Auto-advance to next cluster")
         # self.checkbox_skip_processed_side = QCheckBox("Skip processed in navigation")
         # self.paths_layout.addWidget(self.checkbox_auto_advance)
         # self.paths_layout.addWidget(self.checkbox_skip_processed_side)
 
-        self.path_list.load_requested.connect(self.process_data_from_session)
+    def build_root_selector(self) -> QWidget:
+
+        self.edit_root_path = QLineEdit(text=self.data.root)
+        self.button_root_path = QPushButton("...")
+        self.button_root_path.setFixedWidth(50)
+
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.addWidget(QLabel("Root folder:"))
+        layout.addWidget(self.edit_root_path)
+        layout.addWidget(self.button_root_path)
+
+        def on_root_path_changed():
+            self.data.root = self.edit_root_path.text().strip()
+
+        self.button_root_path.clicked.connect(
+            lambda: (
+                choose_path(
+                    self,
+                    pick_dir=True,
+                    edit_line=self.edit_root_path,
+                    display_text="Select root folder",
+                    only_existing=True,
+                ),
+                on_root_path_changed(),
+            )
+        )
+        self.edit_root_path.editingFinished.connect(on_root_path_changed)
+        return widget
+        
 
     def build_load_options(self, key, options, add_options: Optional[list[str]] = None, add_widgets: List[QWidget]=[]) -> QHBoxLayout:
 
@@ -388,9 +318,6 @@ class MainMenu(QFrame):
 
         self.loader[key]["button_save"].clicked.connect(lambda method=key : self.save_data(key))
 
-        if key == "session":
-
-            self.loader[key]["button_execute"].clicked.connect(self.on_register_session)
         if key == "model":
             set_button_icon(self.loader["model"]["button_execute"], "play", tooltip=f"Run model fitting")
 
@@ -421,19 +348,21 @@ class MainMenu(QFrame):
         for widget in add_widgets:
             entry_layout.addWidget(widget)
         return entry_layout
-    
+
+        
     def save_data(self, key):
 
-        save_path = self.choose_path(
+        save_path = choose_path(
+            self,
             pick_dir=False,
-            init_path=str(Path(self.root["path"]) / f"catan_{key}.hdf5"),
+            init_path=str(Path(self.data.root) / f"catan_{key}.hdf5"),
             display_text=f"Select folder to save {key} file to",
             only_existing=False,
         )
         if save_path is None:
             return
-        # save_path = Path(save_path) / "catan"
-        if key == "session":
+        
+        if key == "sessions":
             self.data.save_sessions(save_path)
 
         if key == "model":
@@ -442,49 +371,20 @@ class MainMenu(QFrame):
         if key == "assignments":
             self.data.save_assignments(save_path)
 
-    def on_register_session(self):
-
-        opt = self.loader["session"]["selector"].currentText()
         
-        if opt.lower() == "from file":
-            ## chooses automatically between loading from single detection session or from list of sessions (from hdf5 attribute)
-            path = self.choose_path(
-                pick_dir=False,
-                init_path=self.root["path"],
-                display_text="Select session file",
-                only_existing=True
-            )
-            if path is None:
-                return
-            self.state.tasks.start(
-                "loading",
-                "Loading session data from file...",
-                lambda ctx: self.data.register_session_data(path,fields_to_load={}, ctx=ctx)
-            )
-            
-        elif opt == ".* (glob)":
-            self.choose_sessions_from_glob()
-        else:
-            raise ValueError(f"Unknown option selected: {opt}")
-        
-
     def _on_load_option_changed(self, key, opt: str):
 
         if not opt:
             return
 
-        if key == "session":
-            self.form.setRowVisible(
-                self.loader[key]["additional_options"], opt == ".* (glob)"
-            )
-
-        elif key == "model":
+        if key == "model":
             if opt in selector_options["model"]:
                 load_path = None
                 if opt=="Load ...":
-                    load_path = self.choose_path(
+                    load_path = choose_path(
+                        self,
                         pick_dir=False,
-                        init_path=self.root["path"],
+                        init_path=self.data.root,
                         display_text="Select model file",
                         only_existing=True,
                     )
@@ -509,9 +409,10 @@ class MainMenu(QFrame):
             if opt in selector_options["assignments"]:
                 load_path = None
                 if opt=="Load ...":
-                    load_path = self.choose_path(
+                    load_path = choose_path(
+                        self,
                         pick_dir=False,
-                        init_path=self.root["path"],
+                        init_path=self.data.root,
                         display_text="Select assignment file",
                         only_existing=True
                     )
@@ -552,73 +453,6 @@ class MainMenu(QFrame):
         selector.blockSignals(False)
 
 
-    def choose_sessions_from_glob(self):
-        root = Path(self.root["path"])
-        pattern = self.loader["session"]["edit"].text()
-        paths = list(root.glob(pattern))
-
-        # show warning / empty result dialog
-        if not paths:
-            return
-
-        dialog = GlobReviewDialog(
-            paths,
-            parent=self,
-        )
-
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        paths = dialog.paths()
-        if paths is None:
-            return
-
-        for path in paths:
-            self.data.register_session_data(
-                fname=path,
-                fields_to_load={},
-            )
-        return
-
-    def choose_path(
-        self,
-        pick_dir: bool = False,
-        init_path: str = "",
-        only_tail: bool = False,
-        edit_line: Optional[QLineEdit] = None,
-        display_text: str = "Select file",
-        only_existing: bool = True
-    ) -> Optional[str]:
-        if pick_dir:
-            path = QFileDialog.getExistingDirectory(
-                self,
-                display_text,
-                init_path,  # initial directory ("" = current)
-            )
-        else:
-            opts = (self,
-                display_text,
-                init_path,  # initial directory ("" = current)
-                "HDF5 files (*.hdf5 *.h5);;MATLAB files (*.mat);;All files (*)"
-            )
-            if only_existing:
-                path, _ = QFileDialog.getOpenFileName(
-                *opts
-                )
-            else:
-                path, _ = QFileDialog.getSaveFileName(
-                    *opts
-                )
-        if not path:
-            return
-
-        if path and edit_line is not None:
-            relative_path = (
-                str(Path(path).relative_to(init_path)) if only_tail else path
-            )
-            edit_line.setText(relative_path)
-        elif path:
-            return path
-
     ### ------------------------------------------###
     ###    Logic for saving/restoring settings    ###
     ### ------------------------------------------###
@@ -630,13 +464,14 @@ class MainMenu(QFrame):
             )
             for name, info in self.config.paths.items()
         }
+        self.data.root = str(self.defaults["root_folder"])
 
     def _save_settings(self):
         """
         this is currently just in a quick patch state - should be fixed!
         """
         key = "root_folder"
-        self.settings.setValue(f"paths/{key}", str(self.root["path"]))
+        self.settings.setValue(f"paths/{key}", str(self.data.root))
 
         # for name, info in self.config.paths.items():
         #     key = f"{name}_{info['type']}"
