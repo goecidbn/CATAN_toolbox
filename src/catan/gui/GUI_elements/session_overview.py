@@ -296,11 +296,15 @@ class SessionRowWidget(QFrame):
             on_delete_load_config
         )
 
-        self.load_config_set_default_button.clicked.connect(
-            lambda: self.state.config_manager.set_default_for_format(
+        def on_set_default():
+            self.state.config_manager.set_default_for_format(
                 self.session.path,
                 self.session.source_config
             )
+            self._on_fields_changed()
+
+        self.load_config_set_default_button.clicked.connect(
+            on_set_default
         )
 
 

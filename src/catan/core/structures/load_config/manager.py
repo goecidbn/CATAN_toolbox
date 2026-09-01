@@ -296,6 +296,7 @@ class LoadConfigManager:
     def _load_defaults(self) -> None:
 
         if not self.defaults_file.exists():
+            self.default_by_format = {}
             return
 
         try:
@@ -419,14 +420,14 @@ class LoadConfigManager:
 
         config.name = name
         config.public = True
+        config.native = False
         
-        if config.native is None:
-            config.native = False
+        # if config.native is None:
 
-        if config.public and not config.native:
-            path = self.user_dir / f"{self._safe_filename(name)}.json"
-        else:
-            path = self._builtin_dir() / f"{self._safe_filename(name)}.json"
+        # if config.public and not config.native:
+        path = self.user_dir / f"{self._safe_filename(name)}.json"
+        # else:
+            # path = self._builtin_dir() / f"{self._safe_filename(name)}.json"
 
         # if path.exists() and not overwrite:
         #     raise FileExistsError(f"Config file already exists: {path}")
