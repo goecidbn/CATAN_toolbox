@@ -39,8 +39,8 @@ display_modes = {
     "traces": {
         "title": "Neuron traces",
         "options": {
-            "single_trace": "Neuron activity (single)",
-            "multi_trace": "Neuron activity (multi)",
+            "traces": "Neuron activity",
+            # "multi_trace": "Neuron activity (multi)",
         },
     },
     "population": {
@@ -57,8 +57,7 @@ DISPLAY_CONTROLLERS = {
     "tracked_overview": Overview,
     "single_footprint": Footprints,
     "multi_footprint": Footprints,
-    "single_trace": Traces,
-    "multi_trace": Traces,
+    "traces": Traces,
     "statistics": Statistics,
     "selection_display": SelectionDisplay,
 }

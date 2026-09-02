@@ -345,22 +345,16 @@ class SessionRowWidget(QFrame):
 
     def rebuild_config_selector(self):
         selector = self.load_config_selector
-        # print("current source_config:", self.session.source_config.name)
         selector.blockSignals(True)
         selector.clear()
         selector.addItems(self.state.config_manager.names())
-        print("Rebuilding config selector")
-        print("names:" , self.state.config_manager.names())
-        # selector.setCurrentText(self.session.source_config.name)
         for i, name in enumerate(self.state.config_manager.names()):
             selector.setItemData(
                 i,
                 name,
                 role=Qt.ItemDataRole.ToolTipRole,
             )
-            print("Checking config name:", name, "against current source config name:", self.session.source_config.name)
             if name == self.session.source_config.name:
-                print(f"Setting current index to {i} for config name {name}")
                 selector.setCurrentIndex(i)
         selector.blockSignals(False)
         

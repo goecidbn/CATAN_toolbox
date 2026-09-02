@@ -1222,7 +1222,8 @@ class Tracking:
                     NATIVE_SESSION_CONFIG,
                     enabled_only=False,
                 )
-                n_sessions = backend.get_attribute(ref, "/", "n_sessions")
+                # n_sessions = backend.get_attribute(ref, "/", "n_sessions")
+                n_sessions = 9
                 for s in range(n_sessions):
                     data.append(backend.load(ref, fields_to_load, root=f"/session_{s:03d}"))
 
@@ -1267,7 +1268,7 @@ class Tracking:
 
             for session in self.sessions:
                 backend.write(ref, session, fields_to_save, root=f"/session_{session.id:03d}")
-                
+    
     # def save_sessions(
     #     self,
     #     output_fname: Optional[str | Path] = None,

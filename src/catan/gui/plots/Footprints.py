@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 import importlib
 
+from catan.core.structures import sessiondata_type
 from catan.gui.plots import BasePlot
 from catan.gui.plots.helper import FootprintSlider
 from catan.gui.interaction import click_events
@@ -676,10 +677,22 @@ class Display(BasePlot.BaseCanvas):
             menu.addAction(load_action)
 
             load_action.triggered.connect(
-                lambda: self.data.change_trace_presence(this_component.session_id, True)
+                lambda: self.toggle_session_data(this_component.session_id, "traces"),
             )
 
         menu.exec(QCursor.pos())
+
+    
+    def toggle_session_data(
+        self, session_id: int, which: Optional[sessiondata_type] = None
+    ):
+        session = self.data.sessions[session_id]
+        self.state.tasks.start(
+            "loading",
+            f"Loading {which} data for {session.name}",
+            lambda ctx: self.data.toggle_session_data(session_id, which, ctx=ctx),
+            # finished=self.refresh_rows,
+        )
 
     def change_neuron_assignment_dialog(
         self, component: NeuronComponent, new_neuron: Optional[int] = None

@@ -5,6 +5,7 @@ from scipy import sparse
 from pathlib import Path
 
 from . import AppState, NeuronComponent
+from catan.core.io import inspect_file
 from catan.core.structures import SessionData, sessiondata_type
 from catan.tracking.structures import Assignments
 from catan.gui.plots.colors import CyclicColorMap
@@ -122,9 +123,10 @@ class Data(Tracking):
             ensures the fit is only executed once all current
             processes of session loading have finished
         """
-        
+
+        sessions_loaded = [s.status["spatial_loaded"] for s in self.sessions]
         if (
-            len(self.sessions) < 2
+            np.sum(sessions_loaded) < 2
             or self.state.tasks.current[key] is not None
             or len(self.state.tasks.queues[key]) > 0
         ):
@@ -151,11 +153,15 @@ class Data(Tracking):
         """
         Loads and registers session data from a file `fname`.
         """
-
-        sessions_data = super().load_session_data(from_file, {})
+        structure = inspect_file(from_file)
+        sessions = [key for key,val in structure.entries.items() if (Path(key).name.startswith("session") and val.kind=='group')]
+        if len(sessions):
+            ## dirty way to check between single and multiple session files
+            sessions_data = super().load_session_data(from_file, {})
+        else:
+            sessions_data = [{"metadata": {"path": from_file}}]  # Wrap single session data in a list for uniform processing
 
         for session_data in sessions_data:
-            # try:
             session_id = super().register_session(
                 from_data=SessionData._from_dict(session_data),
                 align=True,
@@ -164,22 +170,6 @@ class Data(Tracking):
             self.sessions[session_id].source_config = self.state.config_manager.suggest_config_for(
                 path=self.sessions[session_id].path
             )
-
-                # add current config (parse filetype for default config?) to session data here
-                # if file type is the same as before, use the same config
-                # if file type is different, use the default config for that file type
-            # except Exception as e:
-            #     self.state.issue(
-            #         "error",
-            #         "Failed to register session",
-            #         e,
-            #     )
-            #     continue
-
-            # self.sessions[session_id].source_config = self.state.config_manager.get(copy=True)
-            # self.sessions[session_id].source_config_name = (
-            #     self.state.load_config.name if self.state.load_config is not None else None
-            # )
 
             if not self.sessions[session_id].name:
                 self.sessions[session_id].name = Path(self.sessions[session_id].path).parent.name
@@ -294,7 +284,7 @@ class Data(Tracking):
         from_data: Optional[SessionData] = None,
         from_session_index: Optional[int] = None,
         align_to_reference: bool = False,
-        clean_traces: bool = True,
+        clean_traces: bool = False,
         force_registration: bool = False,
         p_thr=[0.5, 0.3],
         **kwargs,

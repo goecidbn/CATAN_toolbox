@@ -9,6 +9,7 @@ from vispy.scene import visuals
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QLineEdit,
     QVBoxLayout,
     QLabel,
@@ -211,7 +212,7 @@ class Display(BasePlot.BaseCanvas):
 
         self.plotting["visuals"][component.id] = line
 
-    def plot_neurons(self, single=False, max_components=10):
+    def plot_neurons(self, max_components=10):
 
         f = 15.0  # sampling frequency - could be specified in GUI
         self.state.logger.debug(f"Updating traces for current neurons")
@@ -229,7 +230,8 @@ class Display(BasePlot.BaseCanvas):
 
         time_lim = [np.inf, -np.inf]
 
-        if single:
+        compare_mode = self.controls["compare_mode"].currentText()
+        if compare_mode=="between sessions":
             if self.state.focused_component is None:
                 to_plot_components = None
             else:
@@ -361,6 +363,11 @@ class Controller(BasePlot.CanvasController):
         self.controls["slider"] = FootprintSliderController(self.section)
         self.section.x_options_layout.addWidget(self.controls["slider"])
 
+        self.controls["compare_mode"] = QComboBox()
+        self.section.x_options_layout.addWidget(self.controls["compare_mode"])
+        self.controls["compare_mode"].addItems(["within session", "between sessions"])
+        self.controls["compare_mode"].currentIndexChanged.connect(self.replot_neurons)
+
         self.controls["trace_options"] = TraceOptionsController(self.section)
         self.section.y_options_layout.addWidget(self.controls["trace_options"])
         self.initialize_display()
@@ -391,11 +398,11 @@ class Controller(BasePlot.CanvasController):
         self.canvas.update_labels(
             self.controls["trace_options"].checkbox_traces_options
         )
-        self.canvas.plot_neurons(single=self.single_mode)
+        self.canvas.plot_neurons()
         self.update_styles()
 
     def update_neuron_selection(self):
-        self.canvas.plot_neurons(single=self.single_mode)
+        self.canvas.plot_neurons()
         self.update_styles()
 
 
