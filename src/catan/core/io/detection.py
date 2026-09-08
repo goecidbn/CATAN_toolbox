@@ -28,6 +28,8 @@ def detect_file_format(
         return FileFormat.NPZ
     if suffix == ".zarr" or (path.is_dir() and path.name.lower().endswith(".zarr")):
         return FileFormat.ZARR
-    raise ValueError(
-        f"Unsupported file type {suffix!r}. Supported: {', '.join(SUPPORTED_SUFFIXES)}"
-    )
+
+    return None
+    # raise ValueError(
+    #     f"Unsupported file type {suffix!r}. Supported: {', '.join(SUPPORTED_SUFFIXES)}"
+    # )

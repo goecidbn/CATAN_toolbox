@@ -18,10 +18,14 @@ from catan.tracking.utils_new.counts import scale_down_counts
 
 NATIVE_MODEL_CONFIG = "catan_model.json"
 
+
 class Model:
 
     loaded = False          # tag, whether model was loaded from file
     HDF5_VERSION = "1.0"
+
+    source_type: str = "model"
+    source_config: LoadConfig | None = None
 
     def __init__(self, params = None):
 

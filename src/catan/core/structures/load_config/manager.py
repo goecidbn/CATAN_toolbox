@@ -3,9 +3,10 @@ from __future__ import annotations
 from importlib.resources import files
 from pathlib import Path
 import json
+from typing import Literal, Tuple
 
 from .config import LoadConfig
-from catan.core.io.types import FileFormat
+from catan.core.io.types import FileFormat, SourceTypes
 from catan.core.io.detection import detect_file_format
 
 
@@ -23,8 +24,13 @@ class LoadConfigManager:
     BUILTIN_RESOURCE_PATH = ("resources", "load_configs")
     HIDDEN_BUILTINS_FILE = ".hidden_builtins.json"
 
-    default_fallback: str = "catan-caiman-session"
-    default_by_format: dict[FileFormat, str]
+    default_fallback: dict[SourceTypes,str] = {
+        "session": "catan-caiman-session",
+        "assignments": "catan-assignments",
+        "model": "catan-model",
+        "remapping": "catan-remap",
+    }
+    default_configs: dict[Tuple[SourceTypes,FileFormat], str]
 
     def __init__(self, user_dir: str | Path):
         self.user_dir = Path(user_dir)
@@ -39,14 +45,13 @@ class LoadConfigManager:
         self._inspector = None
 
         self.defaults_file = (
-            self.user_dir.parent
-            / "load_config_defaults.json"
+            self.user_dir / f"load_config_defaults.json"
         )
-
+        
         self.reload_configs()
         self._load_defaults()
                 
-        self.last_used_by_format: dict[FileFormat, LoadConfig] = {}
+        self.last_used_configs: dict[Tuple[SourceTypes,FileFormat], LoadConfig] = {}
 
     # ------------------------------------------------------------------
     # Discovery
@@ -79,6 +84,8 @@ class LoadConfigManager:
         self._hidden_builtins = self._load_hidden_builtins()
         self._load_builtin_configs()
         self._load_user_configs()
+
+        print("loaded configs:",self.configs.keys())
 
     def _builtin_dir(self):
         resource = files(self.BUILTIN_PACKAGE)
@@ -191,13 +198,14 @@ class LoadConfigManager:
     def suggest_config_for(
         self,
         path: str | Path,
+        source_type: SourceTypes,
     ) -> LoadConfig | None:
 
         fmt = detect_file_format(path)
 
         # 1. Previous config for this format
-        previous = self.last_used_by_format.get(
-            fmt
+        previous = self.last_used_configs.get(
+            (source_type,fmt)
         )
 
         if previous is not None:
@@ -206,21 +214,36 @@ class LoadConfigManager:
             )
 
         # 2. Default preset
-        default = self.default_for(fmt)
+        default = self.default_for(fmt,source_type)
 
         if default is not None:
             return default.copy_for_session()
 
         return None
+
+    # def get_default(self,
+    #     file_format: FileFormat,
+    #     source_type: SourceTypes
+    # ) -> LoadConfig | None:
+    #     return self.default_for(
+    #         file_format=file_format,
+    #         source_type=source_type,
+    #     )
     
     def default_for(
         self,
         file_format: FileFormat,
+        source_type: SourceTypes
     ) -> LoadConfig | None:
 
-        uid = self.default_by_format.get(file_format)
+        uid = self.default_configs.get(
+            (source_type, file_format)
+        )
+        
         if uid is None:
-            return self.get_by_uid(self.default_fallback)
+            return self.get_by_uid(
+                self.default_fallback.get(source_type,"session")
+            )
 
         return self.get_by_uid(uid)
 
@@ -229,11 +252,12 @@ class LoadConfigManager:
         file_format: FileFormat,
         config: LoadConfig,
     ) -> None:
-        self.last_used_by_format[file_format] = config.copy(new_identity=False)
+        self.last_used_configs[(config.source_type, file_format)] = config.copy(new_identity=False)
 
     def set_default_for_format(
         self,
         path: str | Path,
+        source_type: SourceTypes,
         config: LoadConfig | str,
     ) -> None:
         """
@@ -256,18 +280,16 @@ class LoadConfigManager:
                 "used as persistent defaults."
             )
 
-        self.default_by_format[file_format] = uid
+        self.default_configs[(source_type,file_format)] = uid
         self._save_defaults()
 
-    def clear_default_for_format(
+    def clear_default(
         self,
         file_format: FileFormat,
+        source_type: SourceTypes,
     ) -> None:
 
-        self.default_by_format.pop(
-            file_format,
-            None,
-        )
+        self.default_configs.pop((source_type,file_format),None)
 
         self._save_defaults()
 
@@ -279,9 +301,9 @@ class LoadConfigManager:
         )
 
         data = {
-            file_format.value: uid
-            for file_format, uid
-            in self.default_by_format.items()
+            f"{source_type},{file_format.value}": uid
+            for (source_type,file_format), uid
+            in self.default_configs.items()
         }
         with self.defaults_file.open(
             "w",
@@ -296,7 +318,7 @@ class LoadConfigManager:
     def _load_defaults(self) -> None:
 
         if not self.defaults_file.exists():
-            self.default_by_format = {}
+            self.default_configs = {}
             return
 
         try:
@@ -311,9 +333,10 @@ class LoadConfigManager:
 
         defaults = {}
 
-        for format_name, uid in data.items():
+        for key, uid in data.items():
 
             try:
+                source_type, format_name = key.split(",", 1)
                 file_format = FileFormat(format_name)
 
             except ValueError:
@@ -327,9 +350,9 @@ class LoadConfigManager:
             except KeyError:
                 continue
 
-            defaults[file_format] = uid
+            defaults[(source_type,file_format)] = uid
 
-        self.default_by_format = defaults
+        self.default_configs = defaults
 
     def is_registered(
         self,
@@ -350,13 +373,13 @@ class LoadConfigManager:
 
     def is_default(
         self,
-        path: str | Path | FileFormat,
-        config: LoadConfig | str,
+        path: str,# | Path | FileFormat,
+        config: LoadConfig,
     ) -> bool:
-        if isinstance(path, (str, Path)):
-            file_format = detect_file_format(path)
-        else:
-            file_format = path
+        # if isinstance(path, (str, Path)):
+        file_format = detect_file_format(path)
+        # else:
+        #     file_format = path
 
         uid = (
             config.preset_uid
@@ -365,7 +388,7 @@ class LoadConfigManager:
         )
 
         return (
-            self.default_by_format.get(file_format)
+            self.default_configs.get((config.source_type,file_format))
             == uid
         )
 

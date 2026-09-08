@@ -41,7 +41,7 @@ def set_button_icon(
     icon_name: str,
     color: str = "white",
     *,
-    tooltip: str,
+    tooltip: Optional[str] = None,
     fallback_theme_icon: str | None = None,
 ):
     # icon = None
@@ -54,4 +54,5 @@ def set_button_icon(
     if icon is not None:
         button.setIcon(icon)
 
-    button.setToolTip(tooltip)
+    if tooltip is not None:
+        button.setToolTip(tooltip)

@@ -1,33 +1,20 @@
 """
-function written by Alexander Schmidt, based on the paper "Sheintuch et al., ...", allowing for complete registration of neuron footprints across several sessions
+function written by Alexander Schmidt, allowing for complete registration of neuron footprints across several sessions
 
-TODO:
-  * write plotting procedure for cluster footprints (3D), to allow manual corrections
-  * save data-attribute / structure after model-building, not only after registration
-  * change save structure, such that all that is needed for further analysis is readily accessible:
-      - filePath of results file
-      - no redundancy in SNR, r_values, cnn saving
-      - 'remap' into 'alignment' structure in results
-      - cm only needed once
-
-last updated on January 28th, 2024
+last updated on September 7th, 2026
 """
 
 import os
+import numpy as np
 from typing import Any, Dict, Optional, Tuple, List, Union, Literal
 import sys, copy, logging, time, numbers, warnings
-
-# from catan.core.structures.load_config import LoadConfig
-# from catan.core.structures.load_config_manager import LoadConfigManager
-# from platformdirs import user_config_dir
+from scipy import sparse
+from scipy.optimize import linear_sum_assignment
 
 from pathlib import Path
 
 from catan.core.io import NATIVE_SESSION_CONFIG, get_backend
 from catan.core.structures.load_config.config import LoadConfig, FieldSpec
-import numpy as np
-from scipy import sparse
-from scipy.optimize import linear_sum_assignment
 
 from catan.core.structures import SessionData
 from catan.core.analysis import calculate_statistics, calculate_p
@@ -174,11 +161,29 @@ class Tracking:
 
         self.update_sessions_with_assignments()
 
+    # def register_assignments(self, path: str, name: str):
+
+    #     # name = QMessageBox.getText(self, "Register Assignments", "Enter a name for the new assignments:")[0]
+    #     assignments = Assignments()
+    #     assignments.source_config = self.state.config_manager.suggest_config_for(
+    #         path=self.sessions[session_id].path, source_type="session"
+    #     )
+
+    #     self._assignments[name] = assignments
+    #     self._current_assignments = name
+        
+    #     pass
+
     def add_assignments(self, name: str, assignments: Optional[str|Assignments]=None):
+        copied = False
         if assignments is None:
             assignments = Assignments()
         elif isinstance(assignments, str):
-            assignments = Assignments._from_file(path=assignments)
+            if assignments in self._assignments:
+                assignments = self._assignments[assignments].copy()
+                copied = True
+            else:
+                assignments = Assignments._from_file(path=assignments)
 
         if not isinstance(assignments, Assignments):
             raise ValueError("assignments must be an instance of Assignments class or a path to a saved assignments.")
@@ -189,7 +194,19 @@ class Tracking:
         self._assignments[name] = assignments
         self._current_assignments = name
 
+        if copied:
+            self.rebuild_union()
         self.update_sessions_with_assignments()
+
+    def remove_assignments(self, name: str):
+        if name == "local":
+            raise ValueError("Cannot remove the 'local' assignments.")
+        if name not in self._assignments:
+            raise ValueError(f"Assignments '{name}' does not exist.")
+
+        del self._assignments[name]
+        if self._current_assignments == name:
+            self.change_assignments("local")
         
     @property
     def available_assignments(self) -> List[str]:
@@ -197,17 +214,17 @@ class Tracking:
 
     def update_sessions_with_assignments(self):
 
-        for session in self.sessions:
-            session.status["matched"] = False
-
         if self.assignments is None:
             return
 
-        for session_id, (session, assignment_ids) in enumerate(zip(self.sessions, self.assignments.ids.T)):
+        for session in self.sessions:
+            self.assignments.matched_status[session.id] = False
+
+        for session, assignment_ids in zip(self.sessions, self.assignments.ids.T):
 
             if np.any(assignment_ids >= 0):
                 # mark session as matched, if it has assignments
-                session.status["matched"] = True
+                self.assignments.matched_status[session.id] = True
 
             update_idx_eval = False
             if session.idx_eval is not None:
@@ -259,7 +276,7 @@ class Tracking:
                 from_file, (str, Path)
             ), "from_file must be a string or Path"
 
-            this_data = SessionData.from_file(
+            this_data = SessionData._from_file(
                 str(from_file),
                 fields_to_load, 
                 self.alignment_template if align_to_reference else None
@@ -326,6 +343,7 @@ class Tracking:
         if from_file is not None:
             this_data = self.get_session(from_file=from_file, fields_to_load=fields_to_load, align_to_reference=align)
 
+            this_data.path = str(from_file)
             this_data.name = name if name is not None else Path(from_file).parent.name
 
         elif from_data is not None:
@@ -539,6 +557,14 @@ class Tracking:
     ### =========== ASSIGNMENT FUNCTIONS =========== ###
     ### ============================================ ###
     
+    def session_assigned(self, session_id):
+        if self.assignments is None:
+            return False
+        if session_id >= len(self.assignments.matched_status):
+            return False
+        return self.assignments.matched_status[session_id]
+    
+
     def assign_neurons(
         self,
         from_file: Optional[str | Path] = None,
@@ -564,7 +590,7 @@ class Tracking:
         if force_registration:
             self.unassign_neurons(this_data.id)
 
-        if this_data.status["matched"]:
+        if self.session_assigned(this_data.id):
             # print(
             #     f"[register] Session {this_data.name} already registered, skipping."
             # )
@@ -581,7 +607,7 @@ class Tracking:
                 this_data.clean_data("traces")
             return
 
-        if not self.assignments.union.status["spatial_loaded"]:
+        if self.assignments.union is None or not self.assignments.union.status["spatial_loaded"]:
             ## first session to be registered, just add all neurons to union and assignments
 
             footprints = this_data.footprints[:, this_data.idx_eval]
@@ -594,11 +620,12 @@ class Tracking:
 
             self.assignments.ids[:, this_data.id] = actually_good
 
-            # first occurence of neuron defined as p_match = 1, shift = 0
-            self.assignments.stats["p_matched"][:, this_data.id, 0] = 1.0
-            self.assignments.stats["shifts"][:, this_data.id, :] = 0.0
+            # # first occurence of neuron defined as p_match = 1, shift = 0
+            # self.assignments.stats["p_matched"][:, this_data.id, 0] = 1.0
+            # self.assignments.stats["shifts"][:, this_data.id, :] = 0.0
+            # self.assignments.stats["fp_corr"][:, this_data.id] = 1.0
 
-            this_data.status["matched"] = True
+            self.assignments.matched_status[this_data.id] = True
             if clean_traces:
                 this_data.clean_data("traces")
             return
@@ -666,51 +693,48 @@ class Tracking:
                 #    print(f'!! neuron {nm} is removed, as it is nonmatched and has high match probability:',p_all)[p_all>0])
                 non_matched = non_matched[non_matched != nm]
 
-        ### =================================================== ###
-        ### ========= update reference data structure ========= ###
-        ### =================================================== ###
-        ### update footprint shapes of matched neurons with 
-        ### A_ref = (1-p/2)*A_ref + p/2*A
-        ### to maintain part or all of original shape, 
-        ### depending on p_matched
-        ### =================================================== ###
+        # ### =================================================== ###
+        # ### ========= update reference data structure ========= ###
+        # ### =================================================== ###
+        # ### update footprint shapes of matched neurons with 
+        # ### A_ref = (1-p/2)*A_ref + p/2*A
+        # ### to maintain part or all of original shape, 
+        # ### depending on p_matched
+        # ### =================================================== ###
 
-        ## shift union footprints to "new" location of neuron to ensure proper union construction
-        shifted = sparse.hstack(
-            [
-                (
-                    _shift_sparse_bilinear(
-                        self.assignments.union.footprints[:, m_ref],  # .reshape(512, 512),
-                        self.assignments.union.dims,
-                        -footprint_shifts[m_ref, m, 0],
-                        -footprint_shifts[m_ref, m, 1],
-                        order="C",
-                        # output_format="csc",
-                    )  # .reshape(-1, 1)
-                    if footprint_distances[m_ref, m] > 0.5
-                    else self.assignments.union.footprints[:, m_ref]
-                ).multiply(1 - footprint_correlations[m_ref, m] / 2)
-                + this_data.footprints[:, m].multiply(footprint_correlations[m_ref, m] / 2)
-                for m_ref, m in zip(matched_ref, matched)
-            ],
-            format="csc",
-        )
+        # ## shift union footprints to "new" location of neuron to ensure proper union construction
+        # shifted = sparse.hstack(
+        #     [
+        #         (
+        #             _shift_sparse_bilinear(
+        #                 self.assignments.union.footprints[:, m_ref],  # .reshape(512, 512),
+        #                 self.assignments.union.dims,
+        #                 -footprint_shifts[m_ref, m, 0],
+        #                 -footprint_shifts[m_ref, m, 1],
+        #                 order="C",
+        #                 # output_format="csc",
+        #             )  # .reshape(-1, 1)
+        #             if footprint_distances[m_ref, m] > 0.5
+        #             else self.assignments.union.footprints[:, m_ref]
+        #         ).multiply(1 - footprint_correlations[m_ref, m] / 2)
+        #         + this_data.footprints[:, m].multiply(footprint_correlations[m_ref, m] / 2)
+        #         for m_ref, m in zip(matched_ref, matched)
+        #     ],
+        #     format="csc",
+        # )
 
-        # self.assignments.union.footprints[:, matched_ref] = self.assignments.union.footprints[:, matched_ref].multiply(
-        #     1 - p_matched[idx_TP] / 2
-        # ) + this_data.footprints[:, matched].multiply(p_matched[idx_TP] / 2)
+        # # self.assignments.union.footprints[:, matched_ref] = self.assignments.union.footprints[:, matched_ref].multiply(
+        # #     1 - p_matched[idx_TP] / 2
+        # # ) + this_data.footprints[:, matched].multiply(p_matched[idx_TP] / 2)
 
-        self.assignments.union.footprints.toarray()[:, matched_ref] = shifted.toarray()
-        ## append new neuron footprints to union
-        footprints_updated = sparse.hstack(
-            [sparse.coo_matrix(self.assignments.union.footprints), this_data.footprints[:, non_matched]],
-            format="csc",
-        )
-        # ## update union data
-        self.assignments.union.register_spatial(footprints=footprints_updated)
-
-        # print(f"union now holds {self.assignments.union.n_neurons} neurons after session {this_data.id} ({this_data.path}) was registered.")
-        # print(f"Shape of footprints: {self.assignments.union.footprints.shape}, shape of idx_eval: {this_data.idx_eval.shape}")
+        # self.assignments.union.footprints.toarray()[:, matched_ref] = shifted.toarray()
+        # ## append new neuron footprints to union
+        # footprints_updated = sparse.hstack(
+        #     [sparse.coo_matrix(self.assignments.union.footprints), this_data.footprints[:, non_matched]],
+        #     format="csc",
+        # )
+        # # ## update union data
+        # self.assignments.union.register_spatial(footprints=footprints_updated)
 
         ### =================================================== ###
         ### ============== store matching results ============= ###
@@ -739,15 +763,17 @@ class Tracking:
         # ... matched neurons are added
         self.assignments.ids[matched_ref, this_data.id] = matched
 
-        self.assignments.stats["p_matched"][matched_ref, this_data.id, 0] = p_matched[idx_TP]
-        self.assignments.stats["shifts"][matched_ref, this_data.id, :] = footprint_shifts[
-            matched_ref, matched
-        ]
+        self.assignments.stats["p_matched"][matched_ref, this_data.id, 0] = \
+            p_matched[idx_TP]
+        self.assignments.stats["shifts"][matched_ref, this_data.id, :] = \
+            footprint_shifts[matched_ref, matched]
+        self.assignments.stats["fp_corr"][matched_ref, this_data.id] = \
+            footprint_correlations[matched_ref, matched]
 
         if N_add>0:
             ## ... and non-matched (new) neurons are appended
             self.assignments.ids[-N_add:, this_data.id] = non_matched
-            self.assignments.stats["p_matched"][-N_add:, this_data.id, 0] = 1.0
+            # self.assignments.stats["p_matched"][-N_add:, this_data.id, 0] = 1.0
 
         ## write best non-matching probability
         p_all = p_same.toarray()
@@ -763,14 +789,135 @@ class Tracking:
             for c in matched_ref
         ]
 
+        self.update_union_footprints(
+            this_data.footprints,
+            self.assignments.ids[:, this_data.id], 
+            weights=self.assignments.stats["fp_corr"][:,this_data.id],
+            shifts=self.assignments.stats["shifts"][:,this_data.id,:],
+        )
+
+
         ## ... and finalize!
-        this_data.status["matched"] = True
+        self.assignments.matched_status[this_data.id] = True
         if clean_traces:
             this_data.clean_data("traces")
 
         # if np.any(np.all(self.tracking["p_matched"] > 0.9, axis=2)):
         #     print("double match!")
         #     return
+
+    def update_union_footprints(
+            self, 
+            footprints_new,
+            assignments_new,
+            weights: Optional[np.ndarray] = None,
+            shifts: Optional[np.ndarray] = None,
+    ):
+        if self.assignments is None:
+            return
+
+        if self.assignments.union is None:
+            self.assignments.union = SessionData()
+        
+        ### =================================================== ###
+        ### ========= update reference data structure ========= ###
+        ### =================================================== ###
+        ### update footprint shapes of matched neurons with 
+        ### A_ref = (1-p/2)*A_ref + p/2*A
+        ### to maintain part or all of original shape, 
+        ### depending on p_matched
+        ### =================================================== ###
+
+        ## get proper references:
+        nA_prev = self.assignments.union.footprints.shape[1]
+        nA_post = len(assignments_new)
+        # print(f"Updating union footprints: nA_prev={nA_prev}, nA_post={nA_post}")
+
+        ## shift union footprints to "new" location of neuron to ensure proper union construction
+        if shifts is None:
+            shifts = np.zeros((nA_post, 2))
+        distances = np.sqrt(np.square(shifts).sum(axis=-1))
+
+        if weights is None:
+            weights = np.full(nA_post, 1.)
+
+        fp_updated: List[sparse.csc_matrix] = []
+        for n_idx, fp_idx in enumerate(assignments_new):
+
+            footprint_existed = n_idx < nA_prev and self.assignments.union.footprints[:, n_idx].sum() > 0
+
+            if fp_idx < 0 and footprint_existed:
+                # print(f"Neuron {n_idx} not present in session, retaining existing footprint.")
+                ## neuron not present in session:
+                ## retain existing footprint
+                fp_updated.append(self.assignments.union.footprints[:, n_idx])
+
+            elif fp_idx < 0 and not footprint_existed:
+                # print(f"Neuron {n_idx} not present in session and not detected before, creating dummy footprint.")
+                ## neuron not present in session and not detected before:
+                ## create dummy entry
+                fp_updated.append(sparse.csc_matrix((footprints_new.shape[0], 1)))
+
+            elif fp_idx >= 0 and footprint_existed:
+                # print(f"Neuron {n_idx} matched to previous, updating footprint.")
+                ## neuron matched to previous:
+                ## update footprint accordingly
+                fp_updated.append(
+                    (
+                        _shift_sparse_bilinear(
+                            self.assignments.union.footprints[:, n_idx],
+                            self.assignments.union.dims,
+                            -shifts[n_idx, 0],
+                            -shifts[n_idx, 1],
+                            order="C",
+                        )
+                        if distances[n_idx] > 0.5
+                        else self.assignments.union.footprints[:, n_idx]
+                    ).multiply(1 - weights[n_idx] / 2)
+                    + footprints_new[:, fp_idx].multiply(weights[n_idx] / 2)
+                )
+
+            elif fp_idx >= 0 and not footprint_existed:
+                # print(f"Neuron {n_idx} new in session, assigning current footprint.")
+                ## neuron new in session:
+                ## assign current footprint
+                fp_updated.append(footprints_new[:, fp_idx])
+
+
+        # ## update union data
+        self.assignments.union.register_spatial(
+            footprints=sparse.hstack(
+                fp_updated,format="csc"
+            )
+        )
+    
+    def rebuild_union(self):
+        
+        if self.assignments is None:
+            return
+
+        self.assignments.matched_status = []
+        
+        self.assignments.union = SessionData(name="union")
+        for session_id, assignment_ids in enumerate(self.assignments.ids.T):
+            weights = self.assignments.stats.get("fp_corr")
+            if weights is not None:
+                weights = weights[:, session_id]
+
+            shifts = self.assignments.stats.get("shifts")
+            if shifts is not None:
+                shifts = shifts[:, session_id]
+
+            self.update_union_footprints(
+                self.sessions[session_id].footprints,
+                assignment_ids,
+                weights,
+                shifts,
+            )
+            self.assignments.matched_status.append(True)
+        # print("union footprint size", self.assignments.union.footprints.shape)
+
+
 
     def check_assignments_compatibility(self, assignments):
 
@@ -844,10 +991,9 @@ class Tracking:
 
     def unassign_neurons(self, session_id: int):
 
-        self.sessions[session_id].status["matched"] = False
-
         if self.assignments is None:
             return
+        self.assignments.matched_status[session_id] = False
 
         if len(self.sessions) == 1:
             self.assignments.reset()

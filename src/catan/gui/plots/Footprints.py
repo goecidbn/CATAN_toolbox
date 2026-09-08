@@ -12,11 +12,9 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QCheckBox,
     QLabel,
-    QHBoxLayout,
     QVBoxLayout,
     QWidget,
     QMenu,
-    QWidgetAction,
     QPushButton,
 )
 
@@ -315,7 +313,7 @@ class Display(BasePlot.BaseCanvas):
         colors_all = []
         for session in self.data.sessions:
 
-            if not session.status["matched"]:
+            if not self.data.session_assigned(session.id):
                 continue
 
             component = NeuronComponent(session.id, neuron)

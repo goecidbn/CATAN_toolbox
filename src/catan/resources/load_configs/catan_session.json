@@ -1,6 +1,6 @@
 {
     "format_version": 1,
-    "uid": "catan-native-session",
+    "uid": "catan-session",
     "name": "CATAN session",
     "source_type": "session",
     "public": false,

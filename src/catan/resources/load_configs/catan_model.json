@@ -1,6 +1,6 @@
 {
     "format_version": 1,
-    "uid": "catan-native-model",
+    "uid": "catan-model",
     "name": "CATAN model",
     "source_type": "model",
     "public": false,

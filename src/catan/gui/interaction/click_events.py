@@ -66,8 +66,15 @@ def print_debug(state, data):
 
     print("Current session:", state.current_session_id)
     print("Sessions:", data.sessions)
+    # print("Footprints:", data.sessions[0].footprints.shape)
+    # print("Footprints:", data.sessions[0].footprints)
 
-    print("session config:", data.sessions[0].source_config)
+    print("Assignments:", data.assignments.ids)
+    # print("Assignments:", data.assignments.ids.shape)
+    # print("Assignments:", data.assignments.union.footprints)
+    # print("tr")
+
+    # print("session config:", data.sessions[0].source_config)
 
     # print("union data:", data.assignments.union)
     # print("union data:", data.assignments.union.footprints)
@@ -75,6 +82,7 @@ def print_debug(state, data):
 
     # print("Load config:", data.load_configs.current)
     # print("session traces:", data.sessions[0].traces.keys())
+    # print("session traces:", data.sessions[0].traces)
     # print("session traces:", data.sessions[0].quality.keys())
 
     # print("")

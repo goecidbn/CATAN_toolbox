@@ -121,7 +121,7 @@ class Display(BasePlot.BaseCanvas):
             or session_id >= len(self.data.sessions)
             or self.data.sessions[session_id] is None
             or not self.data.sessions[session_id].status["spatial_loaded"]
-            or not self.data.sessions[session_id].status["matched"]
+            or not self.data.session_assigned(session_id)
         ):
             return
 

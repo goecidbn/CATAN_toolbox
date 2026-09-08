@@ -27,6 +27,7 @@ from catan.gui.structures import data, state, config
 
 from .resource_monitor import ResourceMonitor
 from .fragments import (
+    FieldConfigConstructor,
     TaskOverviewDisplay,
     make_icon_button,
     set_button_icon,
@@ -64,7 +65,7 @@ class MainMenu(QFrame):
         self.current_worker = None
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setMinimumWidth(300)  # adjust to taste
+        self.setMinimumWidth(350)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
@@ -85,31 +86,15 @@ class MainMenu(QFrame):
         session_list = session_overview.SessionOverview(self)
         layout.addWidget(session_list, stretch=1)
 
-        ## session buttons
-
-        self.button_save_sessions = make_icon_button(
-            "floppy-disk", tooltip=f"Save sessions data", size=28, icon_size=22
-        )
-        self.button_save_sessions.setFixedWidth(35)
-        self.button_save_sessions.setEnabled(False)
-        layout.addWidget(
-            self.button_save_sessions, alignment=Qt.AlignmentFlag.AlignRight
-        )
-
-        self.button_save_sessions.clicked.connect(lambda: self.save_data("sessions"))
-
-        layout.addWidget(paths_menu := QWidget())
-        self.paths_layout = QVBoxLayout(paths_menu)
-
-        self.build_app_mode_menu()
-
+        layout.addWidget(self.build_app_mode_menu())
+        
         layout.addStretch()
 
-        layout.addWidget(ResourceMonitor(parent=self))
         self.task_overview = TaskOverviewDisplay(
             self.state.tasks,
         )
         layout.addWidget(self.task_overview)
+        layout.addWidget(ResourceMonitor(parent=self))
 
         session_list.load_requested.connect(self.process_data_from_session)
 
@@ -159,8 +144,6 @@ class MainMenu(QFrame):
         self.button_root_path.setEnabled(not sessions_loaded)
         self.edit_root_path.setEnabled(not sessions_loaded)
 
-        self.button_save_sessions.setEnabled(sessions_loaded)
-
         ## model buttons
         local_model = (self.data.model is not None) and (not self.data.model.loaded)
         model_fit_possible = (
@@ -177,24 +160,28 @@ class MainMenu(QFrame):
             sessions_loaded and model_fitted
         )
 
-        any_assigned = any(
-            [session.status["matched"] for session in self.data.sessions]
-        )
+        if self.data.assignments is None:
+            return
+        any_assigned = any(self.data.assignments.matched_status)
         self.loader["assignments"]["button_save"].setEnabled(any_assigned)
+        self.update_buttons()
 
-    def build_app_mode_menu(self):
+    def build_app_mode_menu(self) -> QWidget:
         """
         Here, rather build the whole menu inside a subspace of layout and only delete this
         (as right now, deleting the options shifts up th path list)
         """
         ## first, disband previous menu
-        while (child := self.paths_layout.takeAt(0)) is not None:
-            if child.widget() is not None:
-                child.widget().deleteLater()
+        # while (child := self.paths_layout.takeAt(0)) is not None:
+        #     if child.widget() is not None:
+        #         child.widget().deleteLater()
 
         ## then, build new menu
 
         # File paths & fields
+        paths_menu = QWidget()
+        self.paths_layout = QVBoxLayout(paths_menu)
+        
         formFrame = QFrame()
         formFrame.setFrameShape(QFrame.Shape.StyledPanel)
 
@@ -206,7 +193,6 @@ class MainMenu(QFrame):
         form.addRow(QLabel("Data paths:"), QLabel(""))
 
         self.loader = {}
-
         ## model data loading options
         form.addRow(
             QLabel("Model"),
@@ -218,14 +204,19 @@ class MainMenu(QFrame):
         )
 
         ### assignment data loading options
+        self.config_constructor = FieldConfigConstructor(
+            self, self.data.assignments
+        )
         form.addRow(
             QLabel("Assignments"),
             self.build_load_options(
                 "assignments",
                 self.data.available_assignments,
                 add_options=selector_options["assignments"],
+                add_widgets=[self.config_constructor.toggle_config_options],
             ),
         )
+        form.addRow(self.config_constructor.config_options)
 
         self.paths_layout.addWidget(formFrame, alignment=Qt.AlignmentFlag.AlignTop)
 
@@ -257,6 +248,8 @@ class MainMenu(QFrame):
 
         self.button_save = QPushButton("Save results")
         self.paths_layout.addWidget(self.button_save)
+
+        return paths_menu
 
         # self.checkbox_auto_advance = QCheckBox("Auto-advance to next cluster")
         # self.checkbox_skip_processed_side = QCheckBox("Skip processed in navigation")
@@ -336,6 +329,9 @@ class MainMenu(QFrame):
             lambda method=key: self.save_data(key)
         )
 
+        def on_button_click():
+            pass
+
         if key == "model":
             set_button_icon(
                 self.loader["model"]["button_execute"],
@@ -355,21 +351,24 @@ class MainMenu(QFrame):
                 for session in self.data.sessions:
                     self.data.queue_update_model(session.id)
 
-            self.loader[key]["button_execute"].clicked.connect(on_button_click)
-            self.loader[key]["button_execute"].setEnabled(False)
         if key == "assignments":
-            set_button_icon(
-                self.loader["assignments"]["button_execute"],
-                "play",
-                tooltip=f"Run neuron registration",
-            )
+            # set_button_icon(
+            #     self.loader["assignments"]["button_execute"],
+            #     "play",
+            #     tooltip=f"Run neuron registration",
+            # )
 
             def on_button_click():
-                for session in self.data.sessions:
-                    self.data.queue_assign_neurons(session.id)
+                if self.data.assignments is None:
+                    return
+                if self.data.assignments.loaded:
+                    for session in self.data.sessions:
+                        self.data.queue_assign_neurons(session.id)
+                else:
+                    self.data.load_assignments()
 
-            self.loader[key]["button_execute"].clicked.connect(on_button_click)
-            self.loader[key]["button_execute"].setEnabled(False)
+        self.loader[key]["button_execute"].clicked.connect(on_button_click)
+        self.loader[key]["button_execute"].setEnabled(False)
 
         for widget in add_widgets:
             entry_layout.addWidget(widget)
@@ -387,8 +386,8 @@ class MainMenu(QFrame):
         if save_path is None:
             return
 
-        if key == "sessions":
-            self.data.save_sessions(save_path)
+        # if key == "sessions":
+        #     self.data.save_sessions(save_path)
 
         if key == "model":
             self.data.save_model(save_path)
@@ -453,14 +452,17 @@ class MainMenu(QFrame):
                 name, ok = QInputDialog.getText(
                     self, "Assignment name", "Enter a name for the assignment:"
                 )
+                # print("load path obtainned: ", load_path)
                 if ok and isinstance(name, str):
-                    self.data.add_assignments(name, load_path)
+                    self.data.register_assignments(load_path,name)
+                    # self.data.add_assignments(name, load_path)
 
                     self.rebuild_selector(
                         key,
                         self.data.available_assignments,
                         add_options=selector_options[key],
                     )
+                    self.config_constructor.update_source(self.data.assignments)
 
                     if name in self.data.available_assignments:
                         index = self.data.available_assignments.index(name)
@@ -473,6 +475,38 @@ class MainMenu(QFrame):
                 self.loader[key]["selector"].setCurrentIndex(index)
             else:
                 self.data.change_assignments(opt)
+
+            self.update_buttons()
+            
+
+    def update_buttons(self):
+
+        ## update of assignments button
+        if self.data.assignments and self.data.assignments.loaded:
+            set_button_icon(
+                self.loader["assignments"]["button_execute"],
+                "play",
+                tooltip=f"Run neuron registration",
+            )
+        elif self.data.assignments:
+            set_button_icon(
+                self.loader["assignments"]["button_execute"], 
+                "folder-open",
+                tooltip=f"Load assignments",
+            )
+
+        if self.data.assignments is None:
+            enable_button = True
+        else:
+            enable_button = not self.data.assignments.loaded
+            enable_button |= not all(
+                [
+                    not self.data.session_assigned(s.id) and s.status["spatial_loaded"]
+                    for s in self.data.sessions
+                ]
+            )
+        self.loader["assignments"]["button_execute"].setEnabled(enable_button)
+
 
     def rebuild_selector(
         self, key: str, options: list[str], add_options: Optional[list[str]] = None

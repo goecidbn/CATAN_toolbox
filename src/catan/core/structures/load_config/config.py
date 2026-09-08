@@ -8,96 +8,9 @@ from typing import Literal
 import json
 from uuid import uuid4
 
+from catan.core.io.types import SourceTypes, FieldSource, FieldSpec, FieldGroupSpec
 
 
-FieldSource = Literal["dataset", "field", "attribute"]
-GroupType = Literal["static", "dynamic"]
-
-
-@dataclass
-class FieldSpec:
-    path: str
-    # ``dataset`` is kept as the serialized default for backwards
-    # compatibility. The IO layer treats ``dataset`` and ``field`` identically.
-    source: FieldSource = "dataset"
-    attribute: str | None = None
-    required: bool = False
-
-    def to_dict(self) -> dict:
-        return {
-            "path": self.path,
-            "source": self.source,
-            "attribute": self.attribute,
-            "required": self.required,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "FieldSpec":
-        return cls(
-            path=data["path"],
-            source=data.get("source", "dataset"),
-            attribute=data.get("attribute"),
-            required=data.get("required", False),
-        )
-
-
-@dataclass
-class FieldGroupSpec:
-    title: str
-    type: GroupType
-    fields: dict[str, FieldSpec] = field(default_factory=dict)
-    enabled: bool = True
-
-    def add_field(self, name: str, spec: FieldSpec) -> None:
-        if self.type != "dynamic":
-            raise ValueError(f"Cannot add fields to static group {self.title!r}")
-        if name in self.fields:
-            raise KeyError(f"Field {name!r} already exists")
-        self.fields[name] = spec
-
-    def remove_field(self, name: str) -> None:
-        if self.type != "dynamic":
-            raise ValueError(f"Cannot remove fields from static group {self.title!r}")
-        if name not in self.fields:
-            raise KeyError(f"Unknown field {name!r}")
-        del self.fields[name]
-
-    def rename_field(self, old_name: str, new_name: str) -> None:
-        if old_name == new_name:
-            return
-        
-        if self.type != "dynamic":
-            raise ValueError(f"Cannot rename fields in static group {self.title!r}")
-        if old_name not in self.fields:
-            raise KeyError(f"Unknown field {old_name!r}")
-        if new_name in self.fields:
-            raise KeyError(f"Field {new_name!r} already exists")
-        self.fields[new_name] = self.fields.pop(old_name)
-
-    def set_field_path(self, name: str, path: str) -> None:
-        if name not in self.fields:
-            raise KeyError(f"Unknown field {name!r}")
-        self.fields[name].path = path
-
-    def to_dict(self) -> dict:
-        return {
-            "title": self.title,
-            "type": self.type,
-            "enabled": self.enabled,
-            "fields": {name: spec.to_dict() for name, spec in self.fields.items()},
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "FieldGroupSpec":
-        return cls(
-            title=data["title"],
-            type=data["type"],
-            enabled=data.get("enabled", True),
-            fields={
-                name: FieldSpec.from_dict(spec)
-                for name, spec in data.get("fields", {}).items()
-            },
-        )
 
 @dataclass
 class SubConfigSpec:
@@ -128,7 +41,8 @@ class LoadConfig:
     )
     preset_uid: str | None = None
 
-    source_type: str = "session"
+    source_type: SourceTypes = "session"
+
     public: bool = False
     native: bool = False
 

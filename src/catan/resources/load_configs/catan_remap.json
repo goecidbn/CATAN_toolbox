@@ -1,6 +1,6 @@
 {
     "format_version": 1,
-    "uid": "catan-native-remap",
+    "uid": "catan-remap",
     "name": "CATAN remapping",
     "source_type": "remapping",
     "public": false,

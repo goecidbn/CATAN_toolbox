@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, Optional, Literal
+from typing import Any, Dict, Optional, Literal, List
 
 from catan.core.io import load_file, save_file, NATIVE_ASSIGNMENTS_CONFIG
 from catan.core.structures.load_config import LoadConfig, FieldSpec
@@ -16,10 +16,17 @@ class Assignments:
     """
 
     HDF5_VERSION = "1.0"
+    
+    source_type: str = "assignments"
+    source_config: LoadConfig | None = None
 
-    union: Optional[SessionData] = None
+    union: Optional[SessionData]
 
     def __init__(self):
+
+        self.path = ""
+        self.source_config = None
+        self.loaded = False
 
         self.reset()
 
@@ -32,9 +39,28 @@ class Assignments:
         self.stats: Dict[str, np.ndarray] = {
             "p_matched": np.zeros((0, 0, 2), float),
             "shifts": np.zeros((0, 0, 2), float),  # nNeurons x nSessions x 2 (x,y)
+            "fp_corr": np.zeros((0, 0), float),
+        }
+        self.stats_default_value = {
+            "p_matched": 1.,#(1.,0),
+            "shifts": 0.,
+            "fp_corr": 1.,
         }
 
+        self.matched_status: List[bool] = []
+
         self.union = SessionData(name="union")
+
+    def copy(self) -> "Assignments":
+        """
+        Create a deep copy of the Assignments instance.
+        """
+        new_instance = Assignments()
+        new_instance.ids = self.ids.copy()
+        new_instance.stats = {k: v.copy() for k, v in self.stats.items()}
+        new_instance.stats_default_value = self.stats_default_value.copy()
+        # new_instance.union = self.union.copy() if self.union is not None else None
+        return new_instance
 
     def pad_empty(self, n_neurons: int, n_sessions: int):
         """
@@ -42,12 +68,25 @@ class Assignments:
         """
         self.ids = pad_axis(self.ids, (n_neurons, n_sessions), -1)
 
-        self.stats["p_matched"] = pad_axis(
-            self.stats["p_matched"], (n_neurons, n_sessions, 0), np.nan
-        )
-        self.stats["shifts"] = pad_axis(
-            self.stats["shifts"], (n_neurons, n_sessions, 0), np.nan
-        )
+        for key in self.stats.keys():
+            dims = [n_neurons, n_sessions]
+            for _ in range(self.stats[key].ndim-2):
+                dims.append(0)
+            
+            self.stats[key] = pad_axis(
+                self.stats[key], tuple(dims), self.stats_default_value[key] 
+            )
+
+        self.matched_status.extend([False]*n_sessions)
+        # self.stats["p_matched"] = pad_axis(
+        #     self.stats["p_matched"], (n_neurons, n_sessions, 0), np.nan
+        # )
+        # self.stats["shifts"] = pad_axis(
+        #     self.stats["shifts"], (n_neurons, n_sessions, 0), np.nan
+        # )
+        # self.stats["fp_corr"] = pad_axis(
+        #     self.stats["fp_corr"], (n_neurons, n_sessions), np.nan
+        # )
 
         if self.union is None:
             return
@@ -64,24 +103,24 @@ class Assignments:
             self.ids = move_single_row(
                 self.ids, session_id, new_session_id
             )
-            self.stats["p_matched"] = move_single_row(
-                self.stats["p_matched"], session_id, new_session_id
-            )
-            self.stats["shifts"] = move_single_row(
-                self.stats["shifts"], session_id, new_session_id
+            for key in self.stats:
+                self.stats[key] = move_single_row(
+                    self.stats[key], session_id, new_session_id
+                )
+            self.matched_status.insert(
+                new_session_id, 
+                self.matched_status.pop(session_id)
             )
         else:
             self.ids = np.delete(self.ids, session_id, axis=1)
-            self.stats["p_matched"] = np.delete(
-                self.stats["p_matched"], session_id, axis=1
-            )
-            self.stats["shifts"] = np.delete(
-                self.stats["shifts"], session_id, axis=1
-            )
+            for key in self.stats:
+                self.stats[key] = np.delete(
+                    self.stats[key], session_id, axis=1
+                )
+            self.matched_status.pop(session_id)
 
         self.updating_neuron_presence()  # Update neuron presence and clean union data
 
-        pass
 
     def unassign_neurons(self, session_id: int):
         """
@@ -98,9 +137,12 @@ class Assignments:
 
         # Mark assignments and tracking stats in this session as unassigned
         self.ids[:, session_id] = -1
-        self.stats["p_matched"][:, session_id, :] = np.nan
-        self.stats["shifts"][:, session_id, :] = np.nan
 
+        for key in self.stats.keys():
+            self.stats[key][:, session_id, ...] = np.nan
+
+        self.matched_status[session_id] = False
+        
         self.updating_neuron_presence()  # Update neuron presence and clean union data
 
     def updating_neuron_presence(self):
@@ -108,8 +150,9 @@ class Assignments:
         ## remove neurons that are no longer present in any session
         neuron_presence = (self.ids >= 0).sum(axis=1) > 0
         self.ids = self.ids[neuron_presence, :]
-        self.stats["p_matched"] = self.stats["p_matched"][neuron_presence, :, :]
-        self.stats["shifts"] = self.stats["shifts"][neuron_presence, :, :]
+
+        for key in self.stats.keys():
+            self.stats[key] = self.stats[key][neuron_presence, ...]
 
         ## could just rebuild it entirely from the remaining sessions, but for now just remove the columns of empty neurons
         if self.union is None:
@@ -140,8 +183,19 @@ class Assignments:
         assignments = Assignments()
         assignments.register_data(**data)
         return assignments
+
+    def load(self):
+        if self.source_config is None:
+            raise ValueError("Source config is not set.")
+        fields_to_load = self.source_config.get_fields_to_load()
+        data = load_file(self.path, fields_to_load)
+        print("data loaded:", data)
+        self.register_data(**data)
+        
     
     def register_data(self, **data):
+
+        print("registering data:", data.keys())
 
         ids = data["assignments"].get("ids")
         assert ids is not None, "IDs must be provided in the data dictionary"
@@ -156,8 +210,12 @@ class Assignments:
         self.stats = stats
 
         if "union" in data:
-            self.union = SessionData()
+            print("register union data")
+            print("union data:", data["union"].keys(),data["union"])
+            self.union = SessionData(name="union")
             self.union.register_data(**data["union"])
+
+        self.loaded = True
 
     def save(
         self,

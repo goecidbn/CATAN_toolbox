@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from catan.core.io.inspection import check_file_compatibility
 from catan.core.structures.load_config import FieldGroupSpec, FieldSpec, LoadConfig
+from catan.tracking.structures import Assignments
 from catan.gui.structures import SessionData, data, state
 from catan.gui.GUI_elements.utils.FlowLayout import FlowLayout, QSizePolicy
 
@@ -66,7 +67,6 @@ class FieldEditor(QLineEdit):
         self.setText(value)
         self.setToolTip(f"{self.name}: {value}")
         
-    
     def set(self, *, name: Optional[str] = None, path: Optional[str] = None):
         
         if name is not None:
@@ -74,7 +74,6 @@ class FieldEditor(QLineEdit):
         if path is not None:
             self.field_path = path
     
-
 
 
 class OptionList(QWidget):
@@ -157,7 +156,7 @@ class OptionList(QWidget):
     def add_editor(self, row: int, name: str, spec: FieldSpec, enabled: bool = True):
         path_edit = FieldEditor(name, spec)
         # self.option[name] = QLineEdit(spec.path)
-        path_edit.setMinimumWidth(50)
+        path_edit.setMinimumWidth(30)
         path_edit.editingFinished.connect(
             lambda field_name=name: self.callback(
                 self.group_name, field_name, method="edit_path", field_path=path_edit.field_path
@@ -260,44 +259,51 @@ class FieldSelector(QWidget):
     fields_changed = Signal()
     loading_possible = bool
     
-    def __init__(self, parent, session: SessionData, config: LoadConfig):
+    def __init__(self, parent, source: SessionData | Assignments):
         super().__init__(parent)
-        self.session = session
 
         self.state: state.AppState = parent.state
         self.data: data.Data = parent.data
 
+
         self.field_options: dict[str, OptionList] = {}
         self.opts_layout = QVBoxLayout(self)
-        self.opts_layout.setContentsMargins(4, 4, 4, 4)
+        self.opts_layout.setContentsMargins(6,6,6,6)
         self.opts_layout.setSpacing(3)
 
         self.fields_changed.connect(self._on_fields_changed)
-        self.rebuild()
+
+        self.update_source(source)
+        # self.rebuild()
         # self.state.data_changed.connect(self._on_data_changed)
+
+    def update_source(self, source: SessionData | Assignments):
+        self.source = source
+        self.rebuild()
+
 
     def rebuild(self):
         
         self.clear()
 
-        # self.opts_layout.addWidget(QLabel("Load options on registration:"))
+        if self.source is None:
+            return
+        assert self.source.source_config is not None, "Load config is not initialized."
 
         ## loading options
-        assert self.session.source_config is not None, "Load config is not initialized."
-
-        for group_name, group_spec in self.session.source_config.groups.items():
+        for group_name, group_spec in self.source.source_config.groups.items():
             self.field_options[group_name] = OptionList(
                 group_name, 
                 group_spec, 
                 self.manipulate_fields, 
-                enabled=not self.session.status.get(f"{group_name}_loaded", False)
+                # enabled=not self.source.status.get(f"{group_name}_loaded", False)
             )
 
             opts_widget = checkbox_with_options(
                 group_spec,
                 self.field_options[group_name],
-                self.session.source_config.groups[group_name].enabled,
-                lambda checked, group_name=group_name: self.session.source_config.set_group_enabled(group_name,checked)
+                self.source.source_config.groups[group_name].enabled,
+                lambda checked, group_name=group_name: self.source.source_config.set_group_enabled(group_name,checked)
                 )
             self.opts_layout.addWidget(opts_widget)
 
@@ -310,10 +316,10 @@ class FieldSelector(QWidget):
 
     def _on_fields_changed(self):
 
-        if self.session.path is None or self.session.source_config is None:
+        if not self.source.path or self.source.source_config is None:
             return
         
-        report = check_file_compatibility(self.session.path, self.session.source_config.get_fields_to_load(list(self.session.source_config.groups.keys())))
+        report = check_file_compatibility(self.source.path, self.source.source_config.get_fields_to_load(list(self.source.source_config.groups.keys())))
 
         loading_possible = True
         for field in report.fields:
@@ -326,9 +332,7 @@ class FieldSelector(QWidget):
                 status = "available"
 
             self.field_options[field.group].update_style(field.label, status)
-                
-            
-
+        
         # also, finally color current session properly!!
         self.loading_possible = loading_possible
 
@@ -336,13 +340,13 @@ class FieldSelector(QWidget):
     
     def manipulate_fields(self, group_name: str, field_name: str, method="edit", **kwargs):
 
-        assert self.session.path is not None, "Path is not set."
-        assert self.session.source_config is not None, "Load config is not initialized."
+        assert self.source.path is not None, "Path is not set."
+        assert self.source.source_config is not None, "Load config is not initialized."
 
         field_path = None
 
         if method == "remove":
-            self.session.source_config.remove_field(
+            self.source.source_config.remove_field(
                 group_name,
                 field_name,
             )
@@ -361,7 +365,7 @@ class FieldSelector(QWidget):
             if not ok or not new_name:
                 return
             try:
-                self.session.source_config.rename_field(
+                self.source.source_config.rename_field(
                     group_name,
                     field_name,
                     new_name=new_name,
@@ -381,35 +385,24 @@ class FieldSelector(QWidget):
         if method == "edit_path":
 
             if (field_path := kwargs.get("field_path")) is None:
-                field_path = FieldSelectDialog.get_field(path=self.session.path, key=field_name)
+                field_path = FieldSelectDialog.get_field(path=self.source.path, key=field_name)
                 if field_path is None:
                     return
             assert isinstance(field_path, str), "Field path must be a string."
 
-            self.session.source_config.update_field(
+            self.source.source_config.update_field(
                 group_name,
                 field_name,
                 path=field_path,
             )
 
         if method == "add":
-            # if self.session.source_config.get_group(group_name).type == "dynamic":
-            field_path = FieldSelectDialog.get_field(path=self.session.path, key=field_name)
+            field_path = FieldSelectDialog.get_field(path=self.source.path, key=field_name)
             if field_path is None:
                 return
-            # else:
-            #     field_path = self.field_options[group_name].option[field_name].field_path
 
-            # if method == "edit":
-            #     self.session.source_config.update_field(
-            #         group_name,
-            #         field_name,
-            #         path=field_path,
-            #     )
-            
-            # if method == "add":
             ## check, if a field with the same path already exists in the group
-            fields_to_load = self.session.source_config.get_fields_to_load([group_name])
+            fields_to_load = self.source.source_config.get_fields_to_load([group_name])
             if field_path in [field.path for field in fields_to_load[group_name].values()]:
                 self.state.issue(
                     "warning",
@@ -428,7 +421,7 @@ class FieldSelector(QWidget):
                 field_name = PurePosixPath(field_path).name
 
             try:
-                self.session.source_config.add_field(
+                self.source.source_config.add_field(
                     group_name,
                     field_name,
                     path=field_path,
@@ -442,17 +435,13 @@ class FieldSelector(QWidget):
                 return
             self.field_options[group_name].add_chip(
                 field_name, 
-                self.session.source_config.groups[group_name].fields[field_name], 
-                enabled=not self.session.status.get(f"{group_name}_loaded", False)
+                self.source.source_config.groups[group_name].fields[field_name], 
+                # enabled=not self.source.status.get(f"{group_name}_loaded", False)
             )
 
-        field_path = field_path or self.session.source_config.groups[group_name].fields[field_name].path
+        field_path = field_path or self.source.source_config.groups[group_name].fields[field_name].path
         self.field_options[group_name].refresh(field_name,field_path)
         self.fields_changed.emit()
-        # self.field_options[group_name].rebuild(
-        #     self.session.source_config.groups[group_name],
-        #     enabled=not self.session.status[f"{group_name}_loaded"]
-        # )
 
 
 def checkbox_with_options(group_spec: FieldGroupSpec, opts_ref: QWidget, active: bool, callback: Callable) -> QWidget:

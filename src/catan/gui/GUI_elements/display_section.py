@@ -40,7 +40,6 @@ display_modes = {
         "title": "Neuron traces",
         "options": {
             "traces": "Neuron activity",
-            # "multi_trace": "Neuron activity (multi)",
         },
     },
     "population": {

@@ -1,4 +1,5 @@
 from typing import Dict, Optional, Tuple, List, Union
+from catan.core.io.inspection import check_file_compatibility
 from catan.tracking.structures.model import Model
 import numpy as np
 from scipy import sparse
@@ -70,7 +71,9 @@ class Data(Tracking):
         session.load_data(
             fields_to_load, alignment_template=self.alignment_template, ctx=kwargs.get("ctx", None)
         )
-        self._on_data_changed((which, session_id))
+        self._on_data_changed(("session", session_id))
+        if "traces" in fields_to_load:
+            self._on_data_changed(("traces", session_id))
 
     def queue_load_data(self, session_id: int):
         session = self.sessions[session_id]
@@ -79,7 +82,7 @@ class Data(Tracking):
             f"Loading data for {session.name}",
             self.toggle_session_data,
             session_id=session_id,
-            to_present=True
+            to_present=True,
         )
 
     def queue_update_model(self, session_id: int, to_present: bool = True, callback=None):
@@ -168,7 +171,7 @@ class Data(Tracking):
                 **kwargs
             )
             self.sessions[session_id].source_config = self.state.config_manager.suggest_config_for(
-                path=self.sessions[session_id].path
+                path=self.sessions[session_id].path, source_type="session"
             )
 
             if not self.sessions[session_id].name:
@@ -236,18 +239,42 @@ class Data(Tracking):
     def change_model(self, name: str):
         super().change_model(name)
         self._on_data_changed(("model", -1))  # Notify that model has changed
+
+    def register_assignments(self, path: str, name: str):
+
+        # print("Registering assignments with path:", path, "and name:", name)
+        assignments = Assignments()
+        assignments.path = path
+        assignments.source_config = self.state.config_manager.suggest_config_for(
+            path=path, source_type="assignments"
+        )
+        assert assignments.source_config is not None, "Failed to determine source config for the assignments file."
+
+        self._assignments[name] = assignments
+        self._current_assignments = name
+
+    def load_assignments(self):
+        if self.assignments is not None:
+            self.assignments.load()
+        self.rebuild_union()
+
+        self._on_data_changed(("assignments", -1))
     
     def add_assignments(self, name: str, assignments: Optional[str|Assignments] = None):
-        try:
-            super().add_assignments(name, assignments)
-        except Exception as e:
-            self.state.issue(
-                "error",
-                "Failed to add assignments",
-                f"{e}",
-                # f"Could not add assignments '{name}'. Most common reasons are that the loaded session data and assignments file are not compatible. This could be due to too few sessions being loaded, or the sessions containing an incompatible number of neurons. Please check the assignments file and the loaded session data.",
-            )
-            return
+        # try:
+        super().add_assignments(name, assignments)
+        self.assignments.source_config = self.state.config_manager.suggest_config_for(
+            path=self.assignments.path, source_type="assignments"
+        )
+
+        # except Exception as e:
+        #     self.state.issue(
+        #         "error",
+        #         "Failed to add assignments",
+        #         f"{e}",
+        #         # f"Could not add assignments '{name}'. Most common reasons are that the loaded session data and assignments file are not compatible. This could be due to too few sessions being loaded, or the sessions containing an incompatible number of neurons. Please check the assignments file and the loaded session data.",
+        #     )
+        #     return
         if self.assignments is None:
             raise ValueError("No assignments file was added. Please provide valid assignments.")
         self.state.assignments = self.assignments.ids

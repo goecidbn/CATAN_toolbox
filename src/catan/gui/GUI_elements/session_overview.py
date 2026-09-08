@@ -1,7 +1,7 @@
 from typing import Optional
 from unicodedata import name
 
-from PySide6.QtCore import QTimer, Qt, Signal, QPoint
+from PySide6.QtCore import QSize, QTimer, Qt, Signal, QPoint
 from PySide6.QtGui import QColor, QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -28,13 +28,12 @@ from PySide6.QtWidgets import (
 
 from pathlib import Path
 
-from catan.gui.GUI_elements.fragments.field_selector import FieldSelector
 from catan.gui.structures import AppState, Data, SessionData
 from catan.core.structures import sessiondata_type
 
 from .fragments import (
+    FieldConfigConstructor,
     GlobReviewDialog,
-    ToggleOption,
     make_icon_button,
     set_button_icon,
     choose_path,
@@ -83,6 +82,7 @@ class SessionRowWidget(QFrame):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,  # or minimum
         )
+        self.setFixedWidth(300)
 
         self.setObjectName("SessionRowWidget")
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -200,171 +200,20 @@ class SessionRowWidget(QFrame):
 
         layout.addWidget(self.delete_button)
 
-        self.toggle_config_fields = ToggleOption(
-            icon_name="cog", tooltip="Select fields to load", expanded=False
-        )
+        self.config_constructor = FieldConfigConstructor(self, self.session)
 
-        def on_toggle_config_fields():
-            self.expanded_changed.emit()
-
-        self.toggle_config_fields.toggled.connect(on_toggle_config_fields)
-        layout.addWidget(self.toggle_config_fields)
-
+        layout.addWidget(self.config_constructor.toggle_config_options)
         stacked_layout.addLayout(layout)
-
-        self.layout_config_file = QHBoxLayout()
-
-        self.load_config_selector = QComboBox()
-        self.load_config_selector.setMaximumWidth(120)
-        self.rebuild_config_selector()
-
-        self.load_config_save_button = make_icon_button(
-            "floppy-disk", tooltip="Save load configuration", size=28, icon_size=22
-        )
-
-        self.load_config_delete_button = make_icon_button(
-            "trash", tooltip="Delete load configuration", size=28, icon_size=22
-        )
-
-        ext = Path(self.session.path).suffix
-        self.load_config_set_default_button = make_icon_button(
-            "file-circle-check",
-            tooltip=f"Set load configuration as default for {ext} filetype.",
-            size=28,
-            icon_size=22,
-        )
-
-        self.layout_config_file.addWidget(QLabel("Load config:"))
-        self.layout_config_file.addWidget(
-            self.load_config_selector, alignment=Qt.AlignmentFlag.AlignTop
-        )
-        self.layout_config_file.addWidget(
-            self.load_config_save_button, alignment=Qt.AlignmentFlag.AlignTop
-        )
-        self.layout_config_file.addWidget(
-            self.load_config_delete_button, alignment=Qt.AlignmentFlag.AlignTop
-        )
-        self.layout_config_file.addWidget(
-            self.load_config_set_default_button, alignment=Qt.AlignmentFlag.AlignTop
-        )
-
-        config_menu = QWidget()
-        config_layout = QVBoxLayout(config_menu)
-        config_layout.addLayout(self.layout_config_file)
-
-        def on_save_load_config():
-
-            if self.session.source_config is None:
-                self.state.issue(
-                    "warning",
-                    "No load configuration selected",
-                    "Please select a load configuration to save.",
-                )
-                return
-            new_name, ok = QInputDialog.getText(
-                self,
-                "Save load configuration",
-                "Enter a name for the load configuration:",
-                text=self.session.source_config.name or "",
-            )
-            if ok and new_name:
-                print("saving source_config:", self.session.source_config.name)
-                self.state.config_manager.save_config(
-                    self.session.source_config, new_name
-                )
-
-            self.rebuild_config_selector()
-
-        self.load_config_save_button.clicked.connect(on_save_load_config)
-
-        def on_delete_load_config():
-            if self.session.source_config is None:
-                self.state.issue(
-                    "warning",
-                    "No load configuration selected",
-                    "Please select a load configuration to delete.",
-                )
-                return
-            if self.state.config_manager.modified(self.session.source_config):
-                self.state.issue(
-                    "warning",
-                    "Modified load configuration",
-                    "The load configuration has been modified. You can only delete unmodified configurations.",
-                )
-                return
-            if self.session.source_config.native:
-                self.state.issue(
-                    "warning",
-                    "Native load configuration",
-                    "CATAN-native load configurations cannot be deleted.",
-                )
-                return
-
-            name = self.session.source_config.name
-            reply = QMessageBox.question(
-                self,
-                "Delete load configuration",
-                f"Are you sure you want to delete the load configuration '{name}'?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.state.config_manager.delete(name)
-                self.rebuild_config_selector()
-
-        self.load_config_delete_button.clicked.connect(on_delete_load_config)
-
-        def on_set_default():
-            self.state.config_manager.set_default_for_format(
-                self.session.path, self.session.source_config
-            )
-            self._on_fields_changed()
-
-        self.load_config_set_default_button.clicked.connect(on_set_default)
-
-        self.field_selector = FieldSelector(
-            self, self.session, self.session.source_config
-        )
-        config_layout.addWidget(self.field_selector)
-
-        stacked_layout.addWidget(config_menu)
-        self.toggle_config_fields.set_container(config_menu)
-        self.field_selector.fields_changed.connect(self._on_fields_changed)
-
-        def load_config_changed(idx):
-            name = self.state.config_manager.names()[idx]
-            self.session.source_config = self.state.config_manager.select(name)
-
-            self.field_selector.rebuild()
-            self.expanded_changed.emit()
-
-        self.load_config_selector.currentIndexChanged.connect(
-            lambda idx: load_config_changed(idx)
-        )
+        stacked_layout.addWidget(self.config_constructor.config_options)
 
         self.refresh(current=current)
 
-    def rebuild_config_selector(self):
-        selector = self.load_config_selector
-        selector.blockSignals(True)
-        selector.clear()
-        selector.addItems(self.state.config_manager.names())
-        for i, name in enumerate(self.state.config_manager.names()):
-            selector.setItemData(
-                i,
-                name,
-                role=Qt.ItemDataRole.ToolTipRole,
-            )
-            if name == self.session.source_config.name:
-                selector.setCurrentIndex(i)
-        selector.blockSignals(False)
-        
-        # selector.setCurrentText(self.session.source_config.name)
 
     def _on_data_changed(self, input):
 
         data_type, data_var = input
         if data_type == "sessions" and data_var == self.session.id:
-            self.field_selector.rebuild()
+            self.config_constructor.config_field_options.rebuild()
 
     def refresh(self, current=False):
         name = getattr(self.session, "name", f"Session{self.index:02d}")
@@ -391,7 +240,7 @@ class SessionRowWidget(QFrame):
 
         self._update_buttons()
         self._update_background(current=current)
-        self._on_fields_changed()
+        self.config_constructor._on_fields_changed()
 
     def _update_buttons(self):
 
@@ -439,7 +288,9 @@ class SessionRowWidget(QFrame):
             fallback_theme_icon="spinner",
         )
 
-        matched = self.session.status["matched"]
+        if self.data.assignments is None:
+            return
+        matched = self.data.session_assigned(self.session.id)
         set_button_icon(
             self.assignments_button,
             "layer-group",
@@ -481,33 +332,6 @@ class SessionRowWidget(QFrame):
             }}
             """)
 
-    def _on_fields_changed(self):
-
-        self.expanded_changed.emit()
-        if self.session.source_config is None:
-            return
-        is_default = self.state.config_manager.is_default(
-            self.session.path, self.session.source_config
-        )
-        is_modified = self.state.config_manager.modified(self.session.source_config)
-
-        self.load_config_set_default_button.setEnabled(
-            not is_default and not is_modified
-        )
-
-        self.load_config_selector.setEditable(is_modified)
-        self.load_config_selector.setCurrentText(
-            "* "
-            + self.session.source_config.name
-            + (" (modified)" if is_modified else "")
-        )
-
-        # loading_possible = self.field_selector.loading_possible
-
-    def on_load_config_changed(self, idx):
-        ## rebuild the field selector with the new configuration
-        # print("load config changed")
-        pass
 
     def _on_active_changed(self, state):
         self.activeChanged.emit(
@@ -592,9 +416,43 @@ class LoadSessionRowWidget(QFrame):
         self.selector_load_mode.currentTextChanged.connect(
             lambda text: self.edit_load_glob.setVisible(text == ".* (glob)")
         )
+        
+        ## save button for sessions data
+        self.button_save_sessions = make_icon_button(
+            "floppy-disk", tooltip=f"Save sessions data", size=28, icon_size=22
+        )
+        self.button_save_sessions.setFixedWidth(35)
+        self.button_save_sessions.setEnabled(False)
+        layout.addWidget(
+            self.button_save_sessions, alignment=Qt.AlignmentFlag.AlignRight
+        )
+        self.button_save_sessions.clicked.connect(lambda: self.save_data("sessions"))
+
+        self.state.data_changed.connect(self._on_data_changed)
 
         # layout.addStretch()
         self._update_background()
+
+    def _on_data_changed(self, input):
+        # data_type, data_var = input
+        # if data_type == "sessions":
+        sessions_loaded = len(self.data.sessions) > 0
+        self.button_save_sessions.setEnabled(sessions_loaded)
+
+    def save_data(self, key):
+
+        save_path = choose_path(
+            self,
+            pick_dir=False,
+            init_path=str(Path(self.data.root) / f"catan_{key}.hdf5"),
+            display_text=f"Select folder to save {key} file to",
+            only_existing=False,
+        )
+        if save_path is None:
+            return
+
+        # if key == "sessions":
+        self.data.save_sessions(save_path)
 
     def _update_background(self):
 
@@ -784,7 +642,7 @@ class SessionOverview(QWidget):
         row.assignmentRequested.connect(self.toggle_assignments)
         row.removeRequested.connect(self.remove_session)
 
-        row.expanded_changed.connect(
+        row.config_constructor.expanded_changed.connect(
             lambda: QTimer.singleShot(0, lambda: self.update_row_height(item, row))
         )
         item.setSizeHint(row.sizeHint())
@@ -915,7 +773,7 @@ class SessionOverview(QWidget):
 
         self.data.queue_assign_neurons(
             session_id,
-            to_present=not self.data.sessions[session_id].status["matched"],
+            to_present=not self.data.session_assigned(session_id),
             callback=self.refresh_rows,
         )
 

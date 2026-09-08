@@ -27,6 +27,7 @@ class SessionData:
     path: Optional[str] = None  #
     id: int = -1  #
 
+    source_type: str = "session"
     source_config: LoadConfig | None = None
 
     active: bool = True  #
@@ -39,7 +40,7 @@ class SessionData:
     ## loaded fields (from input)
     # spatial
     dims: Tuple[int, int] = (512, 512)  #
-    footprints: sparse.csc_matrix  # = None  #
+    footprints: sparse.csc_matrix  = sparse.csc_matrix((0,0))  #
     background: Optional[np.ndarray] = None  #
     # traces
     _traces: dict[str, np.ndarray] = {}
@@ -129,8 +130,8 @@ class SessionData:
 
     @staticmethod
     def _from_dict(data: dict, alignment_template: Optional[np.ndarray] = None) -> "SessionData":
-        session = SessionData()
-        session.register_data(alignment_template=alignment_template, **data)
+        session = SessionData(alignment_template=alignment_template,**data)
+        # session.register_data(alignment_template=alignment_template, **data)
         return session
 
     def load_data(
@@ -212,6 +213,37 @@ class SessionData:
             self._clean_spatial()
         if "quality" in which:
             self._clean_quality()
+
+    # def copy(self) -> "SessionData":
+    #     """
+    #     Creates a copy of the SessionData object. Note that this is a shallow copy; mutable attributes will still reference the same objects.
+    #     """
+    #     new_session = SessionData(
+    #         name=self.name,
+    #         alignment_template=None,  # Do not align to any template in the copy
+    #         path=self.path,
+    #         id=self.id,
+    #         source_type=self.source_type,
+    #         source_config=self.source_config,
+    #         active=self.active,
+    #         time_offset=self.time_offset,
+    #         session_color=self.session_color,
+    #         use_kde=self.use_kde,
+    #     )
+    #     new_session.status = self.status.copy()
+    #     new_session.dims = self.dims
+    #     new_session.footprints = self.footprints.copy() if self.footprints is not None else None
+    #     new_session.background = self.background.copy() if self.background is not None else None
+    #     new_session._traces = {k: v.copy() for k, v in self._traces.items()}
+    #     new_session._default_trace = self._default_trace
+    #     new_session.quality = {k: v.copy() for k, v in self.quality.items()}
+    #     new_session.remap = self.remap  # Assuming Remapping is immutable or handled elsewhere
+    #     new_session.n_neurons = self.n_neurons
+    #     new_session.centroids = self.centroids.copy() if self.centroids is not None else None
+    #     new_session.idx_eval = self.idx_eval.copy() if self.idx_eval is not None else None
+    #     new_session.idx_kde = self.idx_kde.copy() if hasattr(self, 'idx_kde') and self.idx_kde is not None else None
+
+    #     return new_session
 
     ### ========================================================== ###
     ### ==================== QUALITY METHODS ===================== ###
@@ -319,7 +351,7 @@ class SessionData:
     def register_spatial(self, alignment_template: Optional[np.ndarray] = None, **data):
 
         if "footprints" not in data or data["footprints"] is None:
-            # print("No footprints provided, skipping spatial registration.")
+            print("No footprints provided, skipping spatial registration.")
             return
         
         self.footprints = data.get("footprints", sparse.csc_matrix((0, 0)))

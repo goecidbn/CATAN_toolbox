@@ -22,6 +22,9 @@ MatrixT = TypeVar("MatrixT", sparse.csc_matrix, np.ndarray)
 @dataclass
 class Remapping:
 
+    source_type: str = "remapping"
+    source_config: LoadConfig | None = None
+
     shift: Optional[np.ndarray] = None
     c_max: Optional[np.ndarray] = None
     c_zscored: Optional[np.ndarray] = None

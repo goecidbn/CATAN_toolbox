@@ -117,7 +117,7 @@ class AppState(QObject):
     def model_fitted(self, val: bool):
         self._model_fitted = val
         self.data_changed.emit(("model_fitted", -1))
-    
+
     @property
     def busy(self):
         return self._busy
