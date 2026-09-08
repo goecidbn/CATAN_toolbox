@@ -67,10 +67,7 @@ class AppState(QObject):
         self.tasks = TaskManager()
 
         self.config_manager = LoadConfigManager(
-            user_dir = (
-                Path(user_config_dir("CATAN"))
-                / "load_configs"
-            )
+            user_dir=(Path(user_config_dir("CATAN")) / "load_configs")
         )
 
         self.logger = logging.getLogger("GUI")
@@ -81,6 +78,7 @@ class AppState(QObject):
 
     def issue(self, level, title, message):
         from PySide6.QtWidgets import QMessageBox
+
         if level == "info":
             QMessageBox.information(None, title, message)
         elif level == "warning":
@@ -296,6 +294,15 @@ class AppState(QObject):
 
         if component.session_id is None or component.neuron_id is None:
             print("Warning: trying to get footprint with invalid neuron_id:", component)
+            return None
+
+        if component.neuron_id >= self.assignments.shape[0]:
+            print("Warning: trying to get footprint with invalid neuron_id:", component)
+            return None
+        if component.session_id >= self.assignments.shape[1]:
+            print(
+                "Warning: trying to get footprint with invalid session_id:", component
+            )
             return None
 
         return self.assignments[component.neuron_id, component.session_id]

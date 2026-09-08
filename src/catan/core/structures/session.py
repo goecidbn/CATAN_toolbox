@@ -21,6 +21,7 @@ component_quality_default = {
     "cnn_min": 0.9,
 }
 
+
 class SessionData:
     ## meta data
     name: Optional[str] = None  #
@@ -40,7 +41,7 @@ class SessionData:
     ## loaded fields (from input)
     # spatial
     dims: Tuple[int, int] = (512, 512)  #
-    footprints: sparse.csc_matrix  = sparse.csc_matrix((0,0))  #
+    footprints: sparse.csc_matrix = sparse.csc_matrix((0, 0))  #
     background: Optional[np.ndarray] = None  #
     # traces
     _traces: dict[str, np.ndarray] = {}
@@ -91,7 +92,6 @@ class SessionData:
             self.remap = kwargs.get("remap", None)
         self.evaluate_alignment_status()
 
-
     def set_parameters(self, **input):
 
         self.params = {
@@ -124,13 +124,15 @@ class SessionData:
             fields_to_load = LoadConfig.fields_from_resource(
                 NATIVE_SESSION_CONFIG, enabled_only=False
             )
-        
+
         data = load_file(path, fields_to_load)
         return SessionData._from_dict(data, alignment_template=alignment_template)
 
     @staticmethod
-    def _from_dict(data: dict, alignment_template: Optional[np.ndarray] = None) -> "SessionData":
-        session = SessionData(alignment_template=alignment_template,**data)
+    def _from_dict(
+        data: dict, alignment_template: Optional[np.ndarray] = None
+    ) -> "SessionData":
+        session = SessionData(alignment_template=alignment_template, **data)
         # session.register_data(alignment_template=alignment_template, **data)
         return session
 
@@ -148,8 +150,10 @@ class SessionData:
             )
 
         data = load_file(self.path, fields_to_load)
-        self.register_data(alignment_template=kwargs.get("alignment_template", None), **data)
-        
+        self.register_data(
+            alignment_template=kwargs.get("alignment_template", None), **data
+        )
+
     def save(
         self,
         path: str | Path,
@@ -157,19 +161,19 @@ class SessionData:
         *,
         mat_version: Literal["pre73", "7.3"] = "7.3",
     ) -> None:
-        
+
         fields_to_save = fields_to_save or LoadConfig.fields_from_resource(
             NATIVE_SESSION_CONFIG,
             enabled_only=False,
         )
 
         save_file(
-            path, 
-            self, 
-            fields_to_save, 
+            path,
+            self,
+            fields_to_save,
             mat_version=mat_version,
             root_attributes={"object_type": "SessionData", "format_version": 1},
-            root="/"
+            root="/",
         )
 
     ### ========================================================= ###
@@ -178,15 +182,17 @@ class SessionData:
 
     def register_data(self, alignment_template: Optional[np.ndarray] = None, **data):
         """
-        Registers data from kwargs 'data' input to SessionData object. Requires 'data' to contain the keys 'spatial', 'traces', and 'quality' with the corresponding data keys to be registered. 
-        
+        Registers data from kwargs 'data' input to SessionData object. Requires 'data' to contain the keys 'spatial', 'traces', and 'quality' with the corresponding data keys to be registered.
+
         If alignment_template is provided, spatial data will be aligned to it.
         """
-        
-        self.register_spatial(alignment_template=alignment_template, **data.get("spatial",{}))
-        self.register_traces(**data.get("traces",{}))
-        self.register_quality(**data.get("quality",{}))
-        self.register_metadata(**data.get("metadata",{}))
+
+        self.register_spatial(
+            alignment_template=alignment_template, **data.get("spatial", {})
+        )
+        self.register_traces(**data.get("traces", {}))
+        self.register_quality(**data.get("quality", {}))
+        self.register_metadata(**data.get("metadata", {}))
 
         if "remap" in data:
             self.remap = data["remap"]
@@ -196,7 +202,9 @@ class SessionData:
             if hasattr(self, key):
                 setattr(self, key, value)
             else:
-                print(f"Warning: SessionData has no attribute '{key}' to register metadata.")
+                print(
+                    f"Warning: SessionData has no attribute '{key}' to register metadata."
+                )
 
     def clean_data(self, which_in: Optional[str] = None):
         """
@@ -284,7 +292,7 @@ class SessionData:
         if self.idx_eval is not None:
             ## dont overwrite if idx_eval already exists
             return
-        
+
         # self.idx_eval = np.ones(self.n_neurons, dtype=bool)
 
         ## provide dummy values if not provided
@@ -353,16 +361,20 @@ class SessionData:
         if "footprints" not in data or data["footprints"] is None:
             print("No footprints provided, skipping spatial registration.")
             return
-        
+
         self.footprints = data.get("footprints", sparse.csc_matrix((0, 0)))
         self.background = data.get("background", None)
 
         if self.footprints is None:
             return
-        
+
         self.status["spatial_loaded"] = True
 
-        self.dims = data.get("dims", self.dims) if self.background is None else self.background.shape        # assert dims is not None, "Either background or dims must be provided to prepare_background"
+        self.dims = (
+            data.get("dims", self.dims)
+            if self.background is None
+            else self.background.shape
+        )  # assert dims is not None, "Either background or dims must be provided to prepare_background"
 
         footprints_proj = self.footprints.sum(axis=1).reshape(self.dims)
         if self.background is None:
@@ -456,7 +468,11 @@ class SessionData:
             * remap dict with keys 'shift' and 'idx_ref' for each neuron in this session
         """
 
-        if not self.status["spatial_loaded"] or self.footprints is None or self.background is None:
+        if (
+            not self.status["spatial_loaded"]
+            or self.footprints is None
+            or self.background is None
+        ):
             raise ValueError("Spatial data must be loaded before alignment.")
 
         ## first, calculate remap structure
@@ -469,8 +485,12 @@ class SessionData:
             # use_optical_flow=use_optical_flow,
         )
         # print("shift:", self.remap.shift)
-        self.footprints = self.remap.apply_remap(self.footprints, use_optical_flow=use_optical_flow)
-        self.background = self.remap.apply_remap(self.background, use_optical_flow=use_optical_flow)
+        self.footprints = self.remap.apply_remap(
+            self.footprints, use_optical_flow=use_optical_flow
+        )
+        self.background = self.remap.apply_remap(
+            self.background, use_optical_flow=use_optical_flow
+        )
 
         self.postprocess_spatial_data()
 
@@ -485,15 +505,15 @@ class SessionData:
         if not self.status["spatial_loaded"]:
             # assert self.status["spatial_loaded"], "Spatial data must be loaded before evaluating alignment status."
             return
-        
+
         if self.remap is None:
             ## if no remapping was done, assume this is the first session (and include it!)
             self.status["aligned"] = True
             return
-        
+
         params = params or self.params
         max_shift = params.get("max_session_shift", 50.0)
-        min_corr = params.get("min_session_correlation", 0.3)
+        min_corr = params.get("min_session_correlation", 0.1)
         min_zscore = params.get("min_session_correlation_zscore", 4.0)
 
         ## check if data can be loaded properly
@@ -542,7 +562,9 @@ class SessionData:
             return
 
         if self.centroids is None:
-            raise ValueError("Centroids must be calculated before calculating kernel density estimate.")
+            raise ValueError(
+                "Centroids must be calculated before calculating kernel density estimate."
+            )
 
         from scipy import stats
 

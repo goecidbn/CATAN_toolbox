@@ -69,7 +69,22 @@ def print_debug(state, data):
     # print("Footprints:", data.sessions[0].footprints.shape)
     # print("Footprints:", data.sessions[0].footprints)
 
-    print("Assignments:", data.assignments.ids)
+    if print_remap := True:
+        print("Remapping:")
+        for session in data.sessions:
+            print(f"\nSession {session.id} ({session.name})")
+            if session.remap:
+                print(f"Remap - transposed: {session.remap.transpose}")
+                print(f"Remap - c_max: {session.remap.c_max}")
+                print(f"Remap - c_zscored: {session.remap.c_zscored}")
+                print(f"Remap - shift: {session.remap.shift}")
+                print(f"Remap - total shift: {session.remap.total_shift}")
+
+            session.evaluate_alignment_status()
+            print("aligned:", session.status["aligned"])
+
+    # print("Assignments:", data.assignments.ids)
+    # print("Assignments (state):", state.assignments)
     # print("Assignments:", data.assignments.ids.shape)
     # print("Assignments:", data.assignments.union.footprints)
     # print("tr")
@@ -90,18 +105,14 @@ def print_debug(state, data):
     # print("Session status:", data.sessions[0].status)
 
     # for session in data.sessions:
-    #     print(f"Session {session.id} ({session.name}) status: {session.status}")    
-    #     print("session idx_eval:", session.idx_eval.shape)
-    # print("Session footprints:", data.sessions[0].footprints)
-    # print("Session background:", data.sessions[0].background)
-    # print("Session quality:", data.sessions[0].quality)
-    # print("Session traces:", data.sessions[0].traces)
+    #     print(f"Session {session.id} ({session.name}) status: {session.status}")
 
-    # print("config:", config.fields)
-    # print("counts:", data.counts)
-    # print("counts sum:", data.counts["cross"][...,0].sum())
-    # print("model:", data.model)
-    # print("evaluate f_same: ", data.model.f_same(1., 0.9))
+    # # print("config:", config.fields)
+    # print("model reference_data:", data.reference_data.id, data.reference_data.name)
+    # # print("counts:", data.counts)
+    # print("counts sum:", data.counts["cross"][..., 0].sum())
+    print("model:", data.model)
+    print("evaluate f_same: ", data.model.f_same(1.0, 0.9))
     # print("ids:",data.session_order)
     # print("Session names:", [s.name for s in data.sessions])
     # print("Session order:", [(s.id,s.name) for s in data.sessions])

@@ -13,6 +13,7 @@ from catan.gui.plots.colors import CyclicColorMap
 
 from catan import Tracking
 
+
 class Neurons:
 
     n: int = 0
@@ -27,9 +28,9 @@ class Data(Tracking):
     def __init__(self, state: AppState):
 
         self.state = state
-        
+
         super().__init__()
-        
+
         self.current_session: Optional[SessionData] = None
 
         self.session_colors = CyclicColorMap(n_colors=20, cmap_name="twilight")
@@ -50,9 +51,14 @@ class Data(Tracking):
 
         self.current_session = self.sessions[session_id]
 
+    def toggle_session_data(
+        self,
+        session_id: int,
+        which: Optional[sessiondata_type] = None,
+        to_present: Optional[bool] = None,
+        **kwargs,
+    ):
 
-    def toggle_session_data(self, session_id: int, which: Optional[sessiondata_type]=None, to_present: Optional[bool] = None, **kwargs):
-        
         session = self.sessions[session_id]
         if session.source_config is None:
             raise ValueError("No load configuration selected.")
@@ -61,15 +67,17 @@ class Data(Tracking):
             fields_to_load = session.source_config.get_fields_to_load()
         else:
             fields_to_load = session.source_config.get_fields_to_load([which])
-            
+
             if to_present is None:
                 ## default to "toggle" if nothing provided
                 to_present = not session.status[f"{which}_loaded"]
-            
+
             if not to_present:
                 session.clean_data(which)
         session.load_data(
-            fields_to_load, alignment_template=self.alignment_template, ctx=kwargs.get("ctx", None)
+            fields_to_load,
+            alignment_template=self.alignment_template,
+            ctx=kwargs.get("ctx", None),
         )
         self._on_data_changed(("session", session_id))
         if "traces" in fields_to_load:
@@ -85,10 +93,12 @@ class Data(Tracking):
             to_present=True,
         )
 
-    def queue_update_model(self, session_id: int, to_present: bool = True, callback=None):
+    def queue_update_model(
+        self, session_id: int, to_present: bool = True, callback=None
+    ):
         if self.model is not None and self.model.loaded:
             self.state.issue(
-                "warning", 
+                "warning",
                 "Model registration not allowed",
                 f"Model '{self.current_model_name}' was loaded from file and cannot be updated. Please create a new model to fit to data.",
             )
@@ -108,7 +118,7 @@ class Data(Tracking):
             finished=when_finished,
             ready=lambda session=session: session.status["aligned"],
         )
-    
+
     def update_counts(
         self,
         session_id: Optional[int] = None,
@@ -120,11 +130,10 @@ class Data(Tracking):
         )
         self._on_data_changed(("model", session_id))
 
-
     def fit_after_loading(self, key: str = "model update"):
         """
-            ensures the fit is only executed once all current
-            processes of session loading have finished
+        ensures the fit is only executed once all current
+        processes of session loading have finished
         """
 
         sessions_loaded = [s.status["spatial_loaded"] for s in self.sessions]
@@ -147,7 +156,6 @@ class Data(Tracking):
         self.model.fit_model_to_counts(self.counts["cross"])
         self._on_data_changed(("assignments", -1))  # Notify that model has changed
 
-
     def register_session(
         self,
         from_file: str | Path,
@@ -157,25 +165,33 @@ class Data(Tracking):
         Loads and registers session data from a file `fname`.
         """
         structure = inspect_file(from_file)
-        sessions = [key for key,val in structure.entries.items() if (Path(key).name.startswith("session") and val.kind=='group')]
+        sessions = [
+            key
+            for key, val in structure.entries.items()
+            if (Path(key).name.startswith("session") and val.kind == "group")
+        ]
         if len(sessions):
             ## dirty way to check between single and multiple session files
             sessions_data = super().load_session_data(from_file, {})
         else:
-            sessions_data = [{"metadata": {"path": from_file}}]  # Wrap single session data in a list for uniform processing
+            sessions_data = [
+                {"metadata": {"path": from_file}}
+            ]  # Wrap single session data in a list for uniform processing
 
         for session_data in sessions_data:
             session_id = super().register_session(
-                from_data=SessionData._from_dict(session_data),
-                align=True,
-                **kwargs
+                from_data=SessionData._from_dict(session_data), align=True, **kwargs
             )
-            self.sessions[session_id].source_config = self.state.config_manager.suggest_config_for(
-                path=self.sessions[session_id].path, source_type="session"
+            self.sessions[session_id].source_config = (
+                self.state.config_manager.suggest_config_for(
+                    path=self.sessions[session_id].path, source_type="session"
+                )
             )
 
             if not self.sessions[session_id].name:
-                self.sessions[session_id].name = Path(self.sessions[session_id].path).parent.name
+                self.sessions[session_id].name = Path(
+                    self.sessions[session_id].path
+                ).parent.name
 
             self.state.session_color = (session_id, self.session_colors.next())
 
@@ -200,11 +216,13 @@ class Data(Tracking):
                 self.current_session.id if len(self.sessions) > 0 else None
             )
 
-        self._on_data_changed(("session_removed", session_id))  # Notify that sessions have changed
+        self._on_data_changed(
+            ("session_removed", session_id)
+        )  # Notify that sessions have changed
 
     def move_session(self, session_id: int, new_session_id: int):
         """
-            behavior should be off on session removing - check that!
+        behavior should be off on session removing - check that!
         """
 
         super().move_session(session_id, new_session_id)
@@ -230,9 +248,11 @@ class Data(Tracking):
         if self.current_session is not None:
             self.state.current_session_id = self.current_session.id
 
-        self._on_data_changed(("session_moved", -1))  # Notify that sessions have changed
+        self._on_data_changed(
+            ("session_moved", -1)
+        )  # Notify that sessions have changed
 
-    def add_model(self, name: str, model: Optional[str|Model] = None):
+    def add_model(self, name: str, model: Optional[str | Model] = None):
         super().add_model(name, model)
         self._on_data_changed(("model", -1))  # Notify that model has changed
 
@@ -248,51 +268,70 @@ class Data(Tracking):
         assignments.source_config = self.state.config_manager.suggest_config_for(
             path=path, source_type="assignments"
         )
-        assert assignments.source_config is not None, "Failed to determine source config for the assignments file."
+        assert (
+            assignments.source_config is not None
+        ), "Failed to determine source config for the assignments file."
 
         self._assignments[name] = assignments
         self._current_assignments = name
 
     def load_assignments(self):
-        if self.assignments is not None:
-            self.assignments.load()
+        if self.assignments is None:
+            return
+
+        self.assignments.load()
         self.rebuild_union()
 
+        self.state.assignments = self.assignments.ids
         self._on_data_changed(("assignments", -1))
-    
-    def add_assignments(self, name: str, assignments: Optional[str|Assignments] = None):
-        # try:
-        super().add_assignments(name, assignments)
+
+    def add_assignments(
+        self, name: str, assignments: Optional[str | Assignments] = None
+    ):
+        try:
+            super().add_assignments(name, assignments)
+            if self.assignments is None:
+                raise ValueError(
+                    "Failed to add assignments. The assignments object is None."
+                )
+        except Exception as e:
+            self.state.issue(
+                "error",
+                "Failed to add assignments",
+                f"{e}",
+                # f"Could not add assignments '{name}'. Most common reasons are that the loaded session data and assignments file are not compatible. This could be due to too few sessions being loaded, or the sessions containing an incompatible number of neurons. Please check the assignments file and the loaded session data.",
+            )
+            return
+
         self.assignments.source_config = self.state.config_manager.suggest_config_for(
             path=self.assignments.path, source_type="assignments"
         )
 
-        # except Exception as e:
-        #     self.state.issue(
-        #         "error",
-        #         "Failed to add assignments",
-        #         f"{e}",
-        #         # f"Could not add assignments '{name}'. Most common reasons are that the loaded session data and assignments file are not compatible. This could be due to too few sessions being loaded, or the sessions containing an incompatible number of neurons. Please check the assignments file and the loaded session data.",
-        #     )
-        #     return
         if self.assignments is None:
-            raise ValueError("No assignments file was added. Please provide valid assignments.")
+            raise ValueError(
+                "No assignments file was added. Please provide valid assignments."
+            )
         self.state.assignments = self.assignments.ids
-        self._on_data_changed(("assignments", -1))  # Notify that assignments have changed
+        self._on_data_changed(
+            ("assignments", -1)
+        )  # Notify that assignments have changed
 
     def change_assignments(self, name: str):
         super().change_assignments(name)
         self.state.assignments = self.assignments.ids
-        self._on_data_changed(("assignments", -1))  # Notify that assignments have changed
-
+        self._on_data_changed(
+            ("assignments", -1)
+        )  # Notify that assignments have changed
 
     def queue_assign_neurons(self, session_id: int, to_present=True, callback=None):
         session = self.sessions[session_id]
 
-        if to_present: 
-            fn = lambda ctx: self.assign_neurons(from_session_index=session_id, clean_traces=False,ctx=ctx)
+        if to_present:
+            fn = lambda ctx: self.assign_neurons(
+                from_session_index=session_id, clean_traces=False, ctx=ctx
+            )
         else:
-            fn = lambda ctx: self.unassign_neurons(session_id,ctx=ctx)
+            fn = lambda ctx: self.unassign_neurons(session_id, ctx=ctx)
 
         self.state.tasks.start(
             "calculating",
@@ -339,12 +378,11 @@ class Data(Tracking):
         self.adjust_selected_components_after_data_change(session_id, -1)
         self._on_data_changed(("assignments", -1))
 
-
     def adjust_selected_components_after_data_change(
         self, session_id: int, new_session_id: int
     ):
         """
-            this is (and should) only be called on session removal! 
+        this is (and should) only be called on session removal!
         """
 
         ## adjust selected components to reflect the new session IDs

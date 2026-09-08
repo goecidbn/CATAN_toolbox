@@ -100,14 +100,13 @@ class Tracking:
             "cross": np.zeros((self.params["nbins"], self.params["nbins"], 3), int),
         }
 
-
         self.add_model("local")
         self.add_assignments("local")
 
     ### ============================================ ###
     ### ============== MODEL FUNCTIONS ============= ###
     ### ============================================ ###
-    
+
     @property
     def model(self) -> Optional[Model]:
         if self._current_model is None:
@@ -123,7 +122,7 @@ class Tracking:
             raise ValueError(f"Model '{name}' does not exist.")
         self._current_model = name
 
-    def add_model(self, name: str, model: Optional[str|Model] = None):
+    def add_model(self, name: str, model: Optional[str | Model] = None):
 
         if model is None:
             model = Model(params=self.params)
@@ -131,8 +130,10 @@ class Tracking:
             model = Model._from_file(path=model, params=self.params)
 
         if not isinstance(model, Model):
-            raise ValueError("model must be an instance of Model class or a path to a saved model.")
-        
+            raise ValueError(
+                "model must be an instance of Model class or a path to a saved model."
+            )
+
         self._model[name] = model
         self._current_model = name
 
@@ -171,10 +172,12 @@ class Tracking:
 
     #     self._assignments[name] = assignments
     #     self._current_assignments = name
-        
+
     #     pass
 
-    def add_assignments(self, name: str, assignments: Optional[str|Assignments]=None):
+    def add_assignments(
+        self, name: str, assignments: Optional[str | Assignments] = None
+    ):
         copied = False
         if assignments is None:
             assignments = Assignments()
@@ -186,11 +189,15 @@ class Tracking:
                 assignments = Assignments._from_file(path=assignments)
 
         if not isinstance(assignments, Assignments):
-            raise ValueError("assignments must be an instance of Assignments class or a path to a saved assignments.")
+            raise ValueError(
+                "assignments must be an instance of Assignments class or a path to a saved assignments."
+            )
 
         ok = self.check_assignments_compatibility(assignments)
         if not ok:
-            raise ValueError("The provided assignments are not compatible with the current model and sessions.")
+            raise ValueError(
+                "The provided assignments are not compatible with the current model and sessions."
+            )
         self._assignments[name] = assignments
         self._current_assignments = name
 
@@ -207,7 +214,7 @@ class Tracking:
         del self._assignments[name]
         if self._current_assignments == name:
             self.change_assignments("local")
-        
+
     @property
     def available_assignments(self) -> List[str]:
         return list(self._assignments.keys())
@@ -218,6 +225,14 @@ class Tracking:
             return
 
         for session in self.sessions:
+            if session.id >= (n_status := len(self.assignments.matched_status)):
+                self.assignments.matched_status.extend(
+                    [False] * (session.id - n_status + 1)
+                )
+                # print(
+                #     "Warning: trying to update matched_status with invalid session_id:", session.id
+                # )
+                # continue
             self.assignments.matched_status[session.id] = False
 
         for session, assignment_ids in zip(self.sessions, self.assignments.ids.T):
@@ -231,13 +246,17 @@ class Tracking:
                 idx_assigned_from_session = np.where(session.idx_eval)[0]
                 idx_assigned_from_assignments = assignment_ids[assignment_ids >= 0]
 
-                assignment_in_session = np.isin(idx_assigned_from_assignments, idx_assigned_from_session)
+                assignment_in_session = np.isin(
+                    idx_assigned_from_assignments, idx_assigned_from_session
+                )
                 if not assignment_in_session.all():
                     # warnings.warn(f"Session {session_id} has neurons in 'assignments' that are not marked as valid in the session data (idx_eval).")
                     # warnings.warn(f"Neurons in assignments but not in session idx_eval: {idx_assigned_from_assignments[~assignment_in_session]}")
                     update_idx_eval = True
-                
-                session_in_assignment = np.isin(idx_assigned_from_session, idx_assigned_from_assignments)
+
+                session_in_assignment = np.isin(
+                    idx_assigned_from_session, idx_assigned_from_assignments
+                )
                 if not session_in_assignment.all():
                     # warnings.warn(f"Session {session_id} has neurons marked as valid in the session data (idx_eval) that are not present in 'assignments'.")
                     # warnings.warn(f"Neurons in session idx_eval but not in assignments: {idx_assigned_from_session[~session_in_assignment]}")
@@ -263,14 +282,14 @@ class Tracking:
         align_to_reference=True,
     ) -> SessionData:
         """
-        Returns a SessionData object based on the provided input. The session can be loaded 
+        Returns a SessionData object based on the provided input. The session can be loaded
         * `from_file`: a path to the session file stored on disk. Requires additional `fields_to_load` argument to specify which data to load. If `align_to_reference` is True and a reference session exists, the session will be aligned to the reference session's alignment template.
         * `from_data`: an existing SessionData object
         * `from_session_index`: an index to retrieve the session from the list of registered sessions
 
-        
+
         """
-        
+
         if from_file is not None:
             assert isinstance(
                 from_file, (str, Path)
@@ -278,8 +297,8 @@ class Tracking:
 
             this_data = SessionData._from_file(
                 str(from_file),
-                fields_to_load, 
-                self.alignment_template if align_to_reference else None
+                fields_to_load,
+                self.alignment_template if align_to_reference else None,
             )
         elif from_data is not None:
             assert isinstance(
@@ -338,10 +357,13 @@ class Tracking:
             Flag for aligning the spatial components to prior registered sessions (using rigid and non-rigid correction). Highly encouraged to leave this enabled, unless sessions are already aligned. For further details see demo notebook `alignment.ipynb`
 
         """
-        
 
         if from_file is not None:
-            this_data = self.get_session(from_file=from_file, fields_to_load=fields_to_load, align_to_reference=align)
+            this_data = self.get_session(
+                from_file=from_file,
+                fields_to_load=fields_to_load,
+                align_to_reference=align,
+            )
 
             this_data.path = str(from_file)
             this_data.name = name if name is not None else Path(from_file).parent.name
@@ -360,15 +382,11 @@ class Tracking:
             else:
                 this_data.name = name
         else:
-            raise ValueError(
-                "Either from_file or from_data must be provided."
-            )
+            raise ValueError("Either from_file or from_data must be provided.")
         paths = [session.path for session in self.sessions]
         if this_data.path in paths:
-            raise ValueError(
-                f"Session {this_data.path} is already registered."
-            )
-        
+            raise ValueError(f"Session {this_data.path} is already registered.")
+
         this_data.id = len(self.sessions)
 
         self.sessions.append(this_data)
@@ -420,7 +438,7 @@ class Tracking:
                 f"[model update] Session {this_data.id} ({this_data.path}) did not pass quality criteria, skipping."
             )
             return
-        
+
         if this_data.status["registered_to_model"]:
             # print(
             #     f"[model update] Session {this_data.id} ({this_data.path}) already registered to model, skipping."
@@ -436,7 +454,6 @@ class Tracking:
         this_data.status["registered_to_model"] = True
         # self.alignment_template = copy.deepcopy(this_data.background)
         self.reference_data = copy.deepcopy(this_data)
-
 
     def update_model_counts(self, this_data: SessionData, mode="to_reference"):
         """
@@ -556,14 +573,13 @@ class Tracking:
     ### ============================================ ###
     ### =========== ASSIGNMENT FUNCTIONS =========== ###
     ### ============================================ ###
-    
+
     def session_assigned(self, session_id):
         if self.assignments is None:
             return False
         if session_id >= len(self.assignments.matched_status):
             return False
         return self.assignments.matched_status[session_id]
-    
 
     def assign_neurons(
         self,
@@ -577,15 +593,19 @@ class Tracking:
     ):
         if self.assignments is None:
             ## or just directly initialize "local"?
-            raise ValueError("No assignments structure defined. Please add an assignments structure before registering neurons.")
-        
+            raise ValueError(
+                "No assignments structure defined. Please add an assignments structure before registering neurons."
+            )
+
         this_data = self.get_session(
             from_file=from_file,
             from_data=from_data,
             from_session_index=from_session_index,
             align_to_reference=align_to_reference,
         )
-        assert this_data.idx_eval is not None, "Session data must have idx_eval defined before registering neurons - run session.get_idx_eval_from_footprints() or session.get_idx_eval_from_quality() first."
+        assert (
+            this_data.idx_eval is not None
+        ), "Session data must have idx_eval defined before registering neurons - run session.get_idx_eval_from_footprints() or session.get_idx_eval_from_quality() first."
 
         if force_registration:
             self.unassign_neurons(this_data.id)
@@ -607,11 +627,16 @@ class Tracking:
                 this_data.clean_data("traces")
             return
 
-        if self.assignments.union is None or not self.assignments.union.status["spatial_loaded"]:
+        if (
+            self.assignments.union is None
+            or not self.assignments.union.status["spatial_loaded"]
+        ):
             ## first session to be registered, just add all neurons to union and assignments
 
             footprints = this_data.footprints[:, this_data.idx_eval]
-            self.assignments.union.register_spatial(footprints=footprints, dims=this_data.dims)
+            self.assignments.union.register_spatial(
+                footprints=footprints, dims=this_data.dims
+            )
 
             actually_good = np.where(this_data.idx_eval)[0]
             N_add = len(actually_good)
@@ -631,9 +656,10 @@ class Tracking:
             return
 
         if self.model is None or not self.model.fitted:
-            raise ValueError("No model is defined. Please add a model before registering neurons.")
+            raise ValueError(
+                "No model is defined. Please add a model before registering neurons."
+            )
 
-        
         ### obtain matching probability from cross session statistics and model
         footprint_shifts, footprint_distances, footprint_correlations, _, _ = (
             calculate_statistics(
@@ -654,7 +680,7 @@ class Tracking:
         ### ======================================== ###
         ### ==== Hungarian Algorithm (matching) ==== ###
         ### ======================================== ###
-        ### run hungarian algorithm (HA) 
+        ### run hungarian algorithm (HA)
         ### with (1-p_same) as score
         ### ======================================== ###
 
@@ -674,7 +700,9 @@ class Tracking:
             matched = np.array([], "int")
 
         ## find neurons which were not matched in current and reference session
-        non_matched_ref = np.setdiff1d(list(range(self.assignments.union.n_neurons)), matched_ref)
+        non_matched_ref = np.setdiff1d(
+            list(range(self.assignments.union.n_neurons)), matched_ref
+        )
         non_matched = np.setdiff1d(
             list(np.where(this_data.idx_eval)[0]), matches[1][idx_TP]
         )
@@ -696,9 +724,9 @@ class Tracking:
         # ### =================================================== ###
         # ### ========= update reference data structure ========= ###
         # ### =================================================== ###
-        # ### update footprint shapes of matched neurons with 
+        # ### update footprint shapes of matched neurons with
         # ### A_ref = (1-p/2)*A_ref + p/2*A
-        # ### to maintain part or all of original shape, 
+        # ### to maintain part or all of original shape,
         # ### depending on p_matched
         # ### =================================================== ###
 
@@ -759,18 +787,20 @@ class Tracking:
             # print(f"adding {N_add} new neurons to union for session {this_data.id}")
             self.assignments.pad_empty(n_neurons=N_add, n_sessions=0)
 
-
         # ... matched neurons are added
         self.assignments.ids[matched_ref, this_data.id] = matched
 
-        self.assignments.stats["p_matched"][matched_ref, this_data.id, 0] = \
-            p_matched[idx_TP]
-        self.assignments.stats["shifts"][matched_ref, this_data.id, :] = \
+        self.assignments.stats["p_matched"][matched_ref, this_data.id, 0] = p_matched[
+            idx_TP
+        ]
+        self.assignments.stats["shifts"][matched_ref, this_data.id, :] = (
             footprint_shifts[matched_ref, matched]
-        self.assignments.stats["fp_corr"][matched_ref, this_data.id] = \
+        )
+        self.assignments.stats["fp_corr"][matched_ref, this_data.id] = (
             footprint_correlations[matched_ref, matched]
+        )
 
-        if N_add>0:
+        if N_add > 0:
             ## ... and non-matched (new) neurons are appended
             self.assignments.ids[-N_add:, this_data.id] = non_matched
             # self.assignments.stats["p_matched"][-N_add:, this_data.id, 0] = 1.0
@@ -782,7 +812,8 @@ class Tracking:
                 p_all[
                     c,
                     np.where(
-                        p_all[c, :] != self.assignments.stats["p_matched"][c, this_data.id, 0]
+                        p_all[c, :]
+                        != self.assignments.stats["p_matched"][c, this_data.id, 0]
                     )[0],
                 ]
             )
@@ -791,11 +822,10 @@ class Tracking:
 
         self.update_union_footprints(
             this_data.footprints,
-            self.assignments.ids[:, this_data.id], 
-            weights=self.assignments.stats["fp_corr"][:,this_data.id],
-            shifts=self.assignments.stats["shifts"][:,this_data.id,:],
+            self.assignments.ids[:, this_data.id],
+            weights=self.assignments.stats["fp_corr"][:, this_data.id],
+            shifts=self.assignments.stats["shifts"][:, this_data.id, :],
         )
-
 
         ## ... and finalize!
         self.assignments.matched_status[this_data.id] = True
@@ -807,24 +837,24 @@ class Tracking:
         #     return
 
     def update_union_footprints(
-            self, 
-            footprints_new,
-            assignments_new,
-            weights: Optional[np.ndarray] = None,
-            shifts: Optional[np.ndarray] = None,
+        self,
+        footprints_new,
+        assignments_new,
+        weights: Optional[np.ndarray] = None,
+        shifts: Optional[np.ndarray] = None,
     ):
         if self.assignments is None:
             return
 
         if self.assignments.union is None:
             self.assignments.union = SessionData()
-        
+
         ### =================================================== ###
         ### ========= update reference data structure ========= ###
         ### =================================================== ###
-        ### update footprint shapes of matched neurons with 
+        ### update footprint shapes of matched neurons with
         ### A_ref = (1-p/2)*A_ref + p/2*A
-        ### to maintain part or all of original shape, 
+        ### to maintain part or all of original shape,
         ### depending on p_matched
         ### =================================================== ###
 
@@ -839,12 +869,15 @@ class Tracking:
         distances = np.sqrt(np.square(shifts).sum(axis=-1))
 
         if weights is None:
-            weights = np.full(nA_post, 1.)
+            weights = np.full(nA_post, 1.0)
 
         fp_updated: List[sparse.csc_matrix] = []
         for n_idx, fp_idx in enumerate(assignments_new):
 
-            footprint_existed = n_idx < nA_prev and self.assignments.union.footprints[:, n_idx].sum() > 0
+            footprint_existed = (
+                n_idx < nA_prev
+                and self.assignments.union.footprints[:, n_idx].sum() > 0
+            )
 
             if fp_idx < 0 and footprint_existed:
                 # print(f"Neuron {n_idx} not present in session, retaining existing footprint.")
@@ -883,21 +916,18 @@ class Tracking:
                 ## assign current footprint
                 fp_updated.append(footprints_new[:, fp_idx])
 
-
         # ## update union data
         self.assignments.union.register_spatial(
-            footprints=sparse.hstack(
-                fp_updated,format="csc"
-            )
+            footprints=sparse.hstack(fp_updated, format="csc")
         )
-    
+
     def rebuild_union(self):
-        
+
         if self.assignments is None:
             return
 
         self.assignments.matched_status = []
-        
+
         self.assignments.union = SessionData(name="union")
         for session_id, assignment_ids in enumerate(self.assignments.ids.T):
             weights = self.assignments.stats.get("fp_corr")
@@ -916,8 +946,6 @@ class Tracking:
             )
             self.assignments.matched_status.append(True)
         # print("union footprint size", self.assignments.union.footprints.shape)
-
-
 
     def check_assignments_compatibility(self, assignments):
 
@@ -942,12 +970,11 @@ class Tracking:
                     f"Session {session_id} has more neurons in assignments ({n_neurons_assignments}) than in the session data ({n_neurons_session})."
                 )
                 return False
-        
+
         ## check session vs union centroids
         # warnings.warn("to be implemented: check if union centroids match session centroids (after alignment)")
 
         return True
-    
 
     def move_session(self, session_id: int, new_session_id: int):
         """
@@ -999,7 +1026,6 @@ class Tracking:
             self.assignments.reset()
             return
         self.assignments.unassign_neurons(session_id)
-    
 
     def reindex_sessions_after_order_change(self):
         # print("Reindexing sessions after order change...")
@@ -1076,7 +1102,9 @@ class Tracking:
             * have a center of mass within the borders of the imaging window, leaving some margin of 'border_margin'
         """
         # clusters = getattr(self, self.cluster_field)
-        assert self.assignments is not None, "No assignments structure defined. Please add an assignments structure before classifying components."
+        assert (
+            self.assignments is not None
+        ), "No assignments structure defined. Please add an assignments structure before classifying components."
 
         n_cluster, n_session = self.assignments.ids.shape
         status = np.ones(n_cluster, bool)
@@ -1166,7 +1194,6 @@ class Tracking:
         arrays["correlation"] = arrays["correlation_bounds"][:-1] + correlation_step / 2
 
         self.params["arrays"] = arrays
-
 
     ### ===================================================== ###
     ### ============= refitting from tracking =============== ###
@@ -1344,7 +1371,7 @@ class Tracking:
     ### ======================================================== ###
     ### ============== saving and loading methods ============== ###
     ### ======================================================== ###
-    
+
     def load_session_data(
         self,
         path: str | Path,
@@ -1360,9 +1387,9 @@ class Tracking:
         with backend.open_read(path) as ref:
             object_type = backend.get_attribute(ref, "/", "object_type")
             if object_type == test_object_type:
-            #     raise ValueError(
-            #         f"Invalid object type: expected 'SessionData', got '{object_type}'"
-            #     )
+                #     raise ValueError(
+                #         f"Invalid object type: expected 'SessionData', got '{object_type}'"
+                #     )
 
                 fields_to_load = LoadConfig.fields_from_resource(
                     NATIVE_SESSION_CONFIG,
@@ -1371,7 +1398,9 @@ class Tracking:
                 # n_sessions = backend.get_attribute(ref, "/", "n_sessions")
                 n_sessions = 9
                 for s in range(n_sessions):
-                    data.append(backend.load(ref, fields_to_load, root=f"/session_{s:03d}"))
+                    data.append(
+                        backend.load(ref, fields_to_load, root=f"/session_{s:03d}")
+                    )
 
             else:
                 if fields_to_load is None:
@@ -1385,7 +1414,7 @@ class Tracking:
                 if data_out["metadata"].get("path") is None:
                     data_out["metadata"]["path"] = str(path)
                 data.append(data_out)
-        
+
         return data
 
     def save_sessions(
@@ -1401,7 +1430,7 @@ class Tracking:
         structure is used. A single SessionData object is still stored below
         ``session_000`` so the native container layout remains uniform.
         """
-        
+
         fields_to_save = LoadConfig.fields_from_resource(
             NATIVE_SESSION_CONFIG,
             enabled_only=False,
@@ -1413,8 +1442,10 @@ class Tracking:
             backend.set_attribute(ref, "/", "format_version", 1)
 
             for session in self.sessions:
-                backend.write(ref, session, fields_to_save, root=f"/session_{session.id:03d}")
-    
+                backend.write(
+                    ref, session, fields_to_save, root=f"/session_{session.id:03d}"
+                )
+
     # def save_sessions(
     #     self,
     #     output_fname: Optional[str | Path] = None,
@@ -1437,7 +1468,6 @@ class Tracking:
     #         raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
     #     print(f"Saved session data to {output_fname}")
 
-
     # def save_sessions_to_hdf5(self, h5ref: h5py.Group | h5py.File) -> None:
     #     print("Saving session data to HDF5...")
     #     h5ref.attrs["object_type"] = "SessionData"
@@ -1449,7 +1479,7 @@ class Tracking:
     #     for session in self.sessions:
     #         session_group = h5ref.create_group(f"session_{session.id:03d}")
     #         session.to_hdf5(session_group)
-        
+
     # def load_session_data(self, fname: str | Path, fields_to_load: Optional[dict] = None) -> List[SessionData]:
     #     """
     #     Triggers loading data from a file. Depending on the provided file, it either loads a single session or multiple sessions (informed by hdf5 attributes).
@@ -1457,7 +1487,7 @@ class Tracking:
     #     ext = Path(fname).suffix
     #     if ext in [".h5", ".hdf5"]:
     #         with h5py.File(fname, "r") as h5ref:
-                
+
     #             if h5ref.attrs.get("object_type") == "SessionData":
     #                 return self.load_sessions_from_hdf5(h5ref)
     #             else:
@@ -1473,7 +1503,7 @@ class Tracking:
     #         return [this_data]
     #     else:
     #         raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
-        
+
     # def load_sessions_from_hdf5(
     #     self, h5ref: h5py.Group | h5py.File
     # ) -> List[SessionData]:
@@ -1510,7 +1540,7 @@ class Tracking:
     #         # print("\n\t data keys: ", data.keys())
     #         session.register_data(self.alignment_template,**data)
     #         sessions.append(session)
-        
+
     #     return sessions
 
     ### ================================================= ###
@@ -1526,9 +1556,11 @@ class Tracking:
 
         if self.model is None:
             raise ValueError("No model to save. Please fit a model before saving.")
-        
+
         if output_fname is None:
-            output_fname = self.get_result_directory() / f"catan_model{fix_suffix(suffix)}{ext}"
+            output_fname = (
+                self.get_result_directory() / f"catan_model{fix_suffix(suffix)}{ext}"
+            )
         else:
             self.get_result_directory(Path(output_fname).parent)
         # output_directory = self.get_result_directory(Path(output_fname).parent)
@@ -1543,14 +1575,18 @@ class Tracking:
         ext: str = ".hdf5",
     ):
         if self.assignments is None:
-            raise ValueError("No assignments to save. Please run the registration before saving.")
+            raise ValueError(
+                "No assignments to save. Please run the registration before saving."
+            )
 
         if output_fname is None:
-            output_fname = self.get_result_directory() / f"catan_registration{fix_suffix(suffix)}{ext}"
+            output_fname = (
+                self.get_result_directory()
+                / f"catan_registration{fix_suffix(suffix)}{ext}"
+            )
         else:
             self.get_result_directory(Path(output_fname).parent)
         self.assignments.save(str(output_fname))
-
 
     def get_result_directory(
         self,
@@ -1582,4 +1618,3 @@ class Tracking:
         ]
         common_path = os.path.commonpath([str(path) for path in candidate_paths])
         return Path(common_path) / "tracking"
-

@@ -21,35 +21,36 @@ NATIVE_MODEL_CONFIG = "catan_model.json"
 
 class Model:
 
-    loaded = False          # tag, whether model was loaded from file
+    loaded = False  # tag, whether model was loaded from file
     HDF5_VERSION = "1.0"
 
     source_type: str = "model"
     source_config: LoadConfig | None = None
 
-    def __init__(self, params = None):
+    def __init__(self, params=None):
 
         ## clean this up!
-        self.params = params if params else {
-            "neighbor_distance": 25.0,
-            "bins": 64,
-            "n_threads": 1,
-            "use_kde": False,
-            "pxtomu": 1.0,
-            "L": 512,
-        }
+        self.params = (
+            params
+            if params
+            else {
+                "neighbor_distance": 25.0,
+                "bins": 64,
+                "n_threads": 1,
+                "use_kde": False,
+                "pxtomu": 1.0,
+                "L": 512,
+            }
+        )
         self.reset()
 
     def reset(self):
-        
+
         self.parameters = {}
-        self.distributions = {
-            "pdf": {},
-            "cdf": {}
-        }
+        self.distributions = {"pdf": {}, "cdf": {}}
         self.p_same = {}
         self.f_same = None
-        self.distance_cutoff = 0.
+        self.distance_cutoff = 0.0
 
         self.fitted: bool = False
         self.build_arrays()
@@ -66,9 +67,12 @@ class Model:
         distance_step = self.params["neighbor_distance"] / nbins
         correlation_step = 1.0 / nbins
 
-        self.arrays["distance"] = self.arrays["distance_bounds"][:-1] + distance_step / 2
-        self.arrays["correlation"] = self.arrays["correlation_bounds"][:-1] + correlation_step / 2
-
+        self.arrays["distance"] = (
+            self.arrays["distance_bounds"][:-1] + distance_step / 2
+        )
+        self.arrays["correlation"] = (
+            self.arrays["correlation_bounds"][:-1] + correlation_step / 2
+        )
 
     def scale_counts(self, counts, times=0):
 
@@ -86,7 +90,7 @@ class Model:
             print("Model was loaded from file - fitting to counts not allowed.")
             return
         bin_counts = counts[..., 0].sum()
-        if bin_counts < 100:
+        if bin_counts < 20:
             raise Exception(
                 f"Not enough data to fit model - at least 100 counts in cross histogram required (currently: {bin_counts})."
             )
@@ -108,8 +112,7 @@ class Model:
         )
 
         opts = dict(
-            counts=counts[..., 0]
-            / counts[..., 0].sum(),  # empirical counts
+            counts=counts[..., 0] / counts[..., 0].sum(),  # empirical counts
             theta0=list(p_init.values()),  # initial parameter guesses
             model_bin_probs=match_function,  # model function to compute probabilities
             bounds=list(bounds.values()),  # parameter bounds
@@ -119,7 +122,7 @@ class Model:
         try:
             res = fit_histogram_params(
                 **opts,
-                method="poisson",  #
+                method="poisson",
             )
             if not res.success:
                 # print(res)
@@ -129,11 +132,11 @@ class Model:
             print("Using initial parameters as fallback.")
             res = type("Result", (object,), {"theta_hat": list(p_init.values())})()
 
-        for (key, val) in zip(p_init.keys(),res.theta_hat):
+        for key, val in zip(p_init.keys(), res.theta_hat):
             self.parameters[key] = val
             # print(f"Updated {key}: {val} -> {p_out[key]}")
-        
-        self.build_from_parameters( use_cdf=use_cdf)
+
+        self.build_from_parameters(use_cdf=use_cdf)
 
     def get_parameter_estimates(self, counts):
         """
@@ -188,9 +191,7 @@ class Model:
             c_centers, counts[mid_row:, :, 2]
         )
 
-        low_dist_bin = np.where(self.arrays["distance_bounds"] > p_init["h"])[
-            0
-        ][0]
+        low_dist_bin = np.where(self.arrays["distance_bounds"] > p_init["h"])[0][0]
         p_init["c_same_mean"], p_init["c_same_sd"] = weighted_stats(
             c_centers, counts[:low_dist_bin, :, 1].sum(axis=0)
         )
@@ -200,7 +201,9 @@ class Model:
 
     def build_from_parameters(self, use_cdf=True):
         if not self.parameters:
-            raise ValueError("Model parameters must be calculated before building the model.")
+            raise ValueError(
+                "Model parameters must be calculated before building the model."
+            )
 
         p_fit = self.parameters
 
@@ -210,9 +213,9 @@ class Model:
             R_cut=self.params["neighbor_distance"],
             nbins=self.params["nbins"],
             L=self.params["L"],
-            return_1D=True
+            return_1D=True,
         )
-    
+
         # convert to cumulative for better numerical stability
         def get_cdf(pdf, reverse=False):
             if reverse:
@@ -223,7 +226,9 @@ class Model:
         self.distributions["cdf"] = {}
         for key in self.distributions["pdf"].keys():
             reverse = key in ["distance_same", "correlation_diff"]
-            self.distributions["cdf"][key] = get_cdf(self.distributions["pdf"][key], reverse=reverse)
+            self.distributions["cdf"][key] = get_cdf(
+                self.distributions["pdf"][key], reverse=reverse
+            )
 
         key_model = "cdf" if use_cdf else "pdf"
         self.p_same = {}
@@ -234,7 +239,9 @@ class Model:
         )
 
         pdf_NN = self.distributions[key_model]["correlation_same"] * p_fit["p_same"]
-        pdf_nNN = self.distributions[key_model]["correlation_diff"] * (1 - p_fit["p_same"])
+        pdf_nNN = self.distributions[key_model]["correlation_diff"] * (
+            1 - p_fit["p_same"]
+        )
         self.p_same["correlation"] = nangauss_filter(
             pdf_NN / (pdf_NN + pdf_nNN), sigma=0.5
         )
@@ -250,16 +257,14 @@ class Model:
             * self.distributions[key_model]["correlation_diff"][None, :]
         ) * (1 - p_fit["p_same"])
 
-        self.p_same["joint"] = nangauss_filter(
-            pdf_NN / (pdf_NN + pdf_nNN), sigma=0.5
-        )
+        self.p_same["joint"] = nangauss_filter(pdf_NN / (pdf_NN + pdf_nNN), sigma=0.5)
 
         self.set_f_same("joint")
 
         p_same = self.f_same(self.arrays["distance_bounds"], 1.0)
 
         p_thr = 0.05
-        found = False 
+        found = False
         while not found:
             idx_low_prob = np.where(p_same < p_thr)[0]
             if len(idx_low_prob) > 0:
@@ -267,13 +272,13 @@ class Model:
                 found = True
 
             p_thr += 0.05
-        
+
         self.distance_cutoff = max(
             10, self.arrays["distance_bounds"][idx_cutoff] * 1.5
         )  ## make sure, also half-detected ones have a chance!
         self.fitted = True
 
-    def set_f_same(self, model: str="joint"):
+    def set_f_same(self, model: str = "joint"):
 
         if model == "joint":
             self.f_same = lambda distance, correlation: interpolate.interpn(
@@ -302,7 +307,9 @@ class Model:
         fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
         params: dict | None = None,
     ) -> "Model":
-        data = load_file(path, fields_to_load, config_name=NATIVE_MODEL_CONFIG, root="/")
+        data = load_file(
+            path, fields_to_load, config_name=NATIVE_MODEL_CONFIG, root="/"
+        )
         return Model._from_dict(data, params=params)
 
     @staticmethod
@@ -322,7 +329,6 @@ class Model:
         self.loaded = True
         self.build_from_parameters(use_cdf=True)
 
-
     def save(
         self,
         path: str | Path,
@@ -335,14 +341,13 @@ class Model:
             enabled_only=False,
         )
         save_file(
-            path, 
-            self, 
-            fields_to_save, 
+            path,
+            self,
+            fields_to_save,
             mat_version=mat_version,
             root_attributes={"object_type": "ModelData", "format_version": 1},
-            root="/"
+            root="/",
         )
-
 
     # def save(self, fname: str):
 
@@ -361,7 +366,6 @@ class Model:
     #     # model_group = h5ref.create_group("model")
     #     h5ref.attrs["parameter_names"] = np.array(list(self.parameters.keys()), dtype="S")
     #     write_optional_array(h5ref, "parameters", np.array(list(self.parameters.values())), compression="gzip")
-
 
     # @staticmethod
     # def load(fname: str, params: dict) -> "Model":
@@ -391,4 +395,3 @@ class Model:
     #             read_optional_attr(h5ref, "parameter_names"), read_optional_array(h5ref, "parameters")
     #         )
     #     }
-

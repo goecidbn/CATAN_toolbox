@@ -54,8 +54,7 @@ class Remapping:
         fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
     ) -> "Remapping":
         fields_to_load = fields_to_load or LoadConfig.fields_from_resource(
-            NATIVE_REMAP_CONFIG, 
-            enabled_only=False
+            NATIVE_REMAP_CONFIG, enabled_only=False
         )
         data = load_file(path, fields_to_load)
         return Remapping._from_dict(data)
@@ -65,8 +64,7 @@ class Remapping:
         remapping = Remapping()
         remapping.register_data(**data)
         return remapping
-    
-    
+
     def __init__(
         self,
         template=None,
@@ -77,11 +75,7 @@ class Remapping:
 
         self.success = False
 
-        if (
-            evaluate
-            and template is not None
-            and template_reference is not None
-        ):
+        if evaluate and template is not None and template_reference is not None:
             self.evaluate(
                 template,
                 template_reference,
@@ -99,7 +93,6 @@ class Remapping:
             self.success = True
             return
 
-        
     def evaluate(
         self,
         template: np.ndarray,
@@ -311,7 +304,6 @@ class Remapping:
             )
         return A
 
-    
     def save(
         self,
         path: str | Path,
@@ -323,78 +315,17 @@ class Remapping:
         If ``fields_to_save`` is omitted, the packaged ``catan_session.json``
         structure is used.
         """
-        
+
         fields_to_save = LoadConfig.fields_from_resource(
             NATIVE_REMAP_CONFIG,
             enabled_only=False,
         )
 
         save_file(
-            path, 
-            self, 
-            fields_to_save, 
+            path,
+            self,
+            fields_to_save,
             mat_version=mat_version,
             root_attributes={"object_type": "Remapping", "format_version": 1},
-            root="/"
+            root="/",
         )
-
-    # def to_hdf5(self, group: h5py.Group) -> None:
-    #     """
-    #     Store this Remapping object in an existing empty HDF5 group.
-    #     """
-    #     group.attrs["object_type"] = "Remapping"
-    #     group.attrs["schema_version"] = self.HDF5_VERSION
-
-    #     write_optional_array(
-    #         group,
-    #         "shift",
-    #         self.shift,
-    #     )
-    #     write_optional_array(
-    #         group,
-    #         "c_max",
-    #         self.c_max,
-    #     )
-
-    #     write_optional_array(
-    #         group,
-    #         "c_zscored",
-    #         self.c_zscored,
-    #     )
-
-    #     write_optional_array(
-    #         group,
-    #         "flow",
-    #         self.flow,
-    #         compression="gzip",
-    #     )
-
-    #     write_optional_attr(
-    #         group,
-    #         "transpose",
-    #         self.transpose,
-    #     )
-
-    # @classmethod
-    # def from_hdf5(cls, h5ref: h5py.Group) -> "Remapping":
-
-    #     object_type = h5ref.attrs.get("object_type", "")
-
-    #     if isinstance(object_type, bytes):
-    #         object_type = object_type.decode("utf-8")
-
-    #     if object_type and object_type != "Remapping":
-    #         raise ValueError(
-    #             f"Expected Remapping group, got {object_type!r}"
-    #         )
-
-    #     version = int(h5ref.attrs.get("schema_version", 1))
-
-    #     if version != 1:
-    #         raise ValueError(
-    #             f"Unsupported Remapping schema version: {version}"
-    #         )
-
-    #     fields_to_load = LoadConfig.fields_from_resource("catan_remap.json")
-    #     data = load_hdf5(h5ref, fields_to_load=fields_to_load)
-    #     return cls(**data["stats"])
