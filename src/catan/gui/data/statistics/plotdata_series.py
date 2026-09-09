@@ -3,15 +3,13 @@ from typing import Literal
 from dataclasses import dataclass
 import numpy as np
 
-from .statistics import STATISTICS
-
 from .dimensions import SESSION_DIMS, NEURON_DIMS
 from .queries import (
     ReductionSpec,
     StatisticQuery,
     allowed_error_methods,
     allowed_reduction_methods,
-    validate_error_reductions,
+    normalize_session_series_reductions,
 )
 from .prepared_data import PickTable
 
@@ -65,156 +63,47 @@ def prepare_query(query: StatisticQuery, registry):
 def make_engine_query_for_session_series(
     query: StatisticQuery,
     registry,
-    *,
-    keep_session_dim: str | None = None,
-    neuron_method: str = "median",
-    neuron_error_method: str = "iqr",
-    other_method: str = "mean",
 ) -> StatisticQuery | None:
+
     if query is None or query.statistic_key == "none":
         return None
 
-    # print(f"Preparing engine query for session series from query: {query}")
-
     stat_def = registry[query.statistic_key]
-    old_reductions = query.reduction_dict()
 
     session_dims = [dim for dim in stat_def.dims if dim in SESSION_DIMS]
-    neuron_dims = [dim for dim in stat_def.dims if dim in NEURON_DIMS]
 
     if not session_dims:
         raise ValueError(
-            f"Statistic {query.statistic_key!r} cannot be used as a "
-            "session series because it has no session dimension."
+            f"Statistic {query.statistic_key!r} cannot be used "
+            "as a session series because it has no session dimension."
         )
 
-    if keep_session_dim is None:
-        if "session" in session_dims:
-            keep_session_dim = "session"
-        elif len(session_dims) == 1:
-            keep_session_dim = session_dims[0]
-        else:
-            keep_session_dim = session_dims[0]
+    reductions = normalize_session_series_reductions(
+        stat_def,
+        query.reduction_dict(),
+        query.filters,
+    )
 
-    reductions: dict[str, ReductionSpec] = {}
-
-    for dim in stat_def.dims:
-        old_spec = old_reductions.get(dim, ReductionSpec("keep"))
-
-        if dim == keep_session_dim:
-            reductions[dim] = ReductionSpec("keep")
-
-        elif dim in SESSION_DIMS:
-            # For session-pair statistics, collapse the non-x session dimension.
-            # Could also be "single" if that is more interpretable for you.
-            reductions[dim] = repair_session_series_nonkept_session_spec(old_spec)
-
-        elif dim in NEURON_DIMS:
-            reductions[dim] = repair_session_series_neuron_spec(
-                old_spec,
-                default_method=neuron_method,
-                default_error_method=neuron_error_method,
-            )
-
-        else:
-            reductions[dim] = repair_session_series_other_spec(old_spec)
+    # Used only for determining reduction order.
+    if "session" in session_dims:
+        keep_session_dim = "session"
+    elif "session_i" in session_dims:
+        keep_session_dim = "session_i"
+    else:
+        keep_session_dim = session_dims[0]
 
     reduction_order = _session_series_reduction_order(
         stat_def.dims,
         reductions,
         keep_session_dim=keep_session_dim,
     )
-    # print(
-    #     f"Prepared engine query for session series: reductions={reductions}, reduction_order={reduction_order}"
-    # )
 
     return StatisticQuery(
         statistic_key=query.statistic_key,
         reductions=tuple(sorted(reductions.items())),
         reduction_order=reduction_order,
         filters=query.filters,
-    )
-
-
-def repair_session_series_other_spec(old_spec: ReductionSpec) -> ReductionSpec:
-    allowed_methods = allowed_reduction_methods(
-        context="session_series",
-        dim_name="default",
-    )
-
-    method = old_spec.method
-    if method not in allowed_methods or method in ("keep", "single"):
-        method = "mean"
-
-    error_methods = allowed_error_methods(
-        context="session_series",
-        dim_name="default",
-        reduction_method=method,
-    )
-
-    error_method = old_spec.error_method
-    if error_method not in error_methods:
-        error_method = "none"
-
-    return ReductionSpec(
-        method=method,
-        index=old_spec.index if method == "single" else None,
-        error_method=error_method,
-    )
-
-
-def repair_session_series_nonkept_session_spec(
-    old_spec: ReductionSpec,
-) -> ReductionSpec:
-    allowed_methods = allowed_reduction_methods(
-        context="session_series",
-        dim_name="session",
-    )
-
-    # For session-series, a non-kept session dimension should usually
-    # be fixed to one session, not averaged blindly.
-    if old_spec.method == "single":
-        return old_spec
-
-    return ReductionSpec("single", index=0)
-
-
-def repair_session_series_neuron_spec(
-    old_spec: ReductionSpec,
-    *,
-    default_method: str = "median",
-    default_error_method: str = "iqr",
-) -> ReductionSpec:
-    allowed_methods = allowed_reduction_methods(
-        "neuron",
-        context="session_series",
-    )
-
-    method = old_spec.method
-    if method not in allowed_methods:
-        method = default_method
-
-    allowed_errors = allowed_error_methods(
-        "neuron",
-        method,
-        context="session_series",
-    )
-
-    error_method = old_spec.error_method
-    if error_method not in allowed_errors:
-        if method == default_method:
-            error_method = default_error_method
-        elif method == "median":
-            error_method = "iqr"
-        elif method == "mean":
-            error_method = "sem"
-        else:
-            error_method = "none"
-
-    return ReductionSpec(
-        method=method,
-        index=old_spec.index,
-        error_method=error_method,
+        context=query.context,
     )
 
 
@@ -229,11 +118,29 @@ def validate_session_series_engine_query(query: StatisticQuery, registry):
         and reductions.get(dim, ReductionSpec("keep")).method == "keep"
     ]
 
-    if len(kept_sessions) != 1:
-        raise ValueError(
-            "Session series needs exactly one kept session dimension, "
-            f"got {kept_sessions}."
-        )
+    session_filter = next(
+        (f for f in query.filters if f.target == "session"),
+        None,
+    )
+
+    relation = session_filter.relation if session_filter is not None else "all"
+
+    if relation in ("same", "with previous"):
+        expected = {"session_i", "session_j"}
+
+        if set(kept_sessions) != expected:
+            raise ValueError(
+                f"Session relation {relation!r} requires both "
+                f"session dimensions to remain until filtering; "
+                f"got {kept_sessions}."
+            )
+
+    else:
+        if len(kept_sessions) != 1:
+            raise ValueError(
+                "Session series needs exactly one kept session dimension, "
+                f"got {kept_sessions}."
+            )
 
     for dim in stat_def.dims:
         spec = reductions.get(dim, ReductionSpec("keep"))
@@ -374,7 +281,7 @@ def build_session_series_from_table(table: PickTable) -> SessionSeries:
     # label = getattr(table.stat, "title", "") or "statistic"
 
     return SessionSeries(
-        title={"first": STATISTICS[table.stat.name].title},
+        title={"first": table.stat.title},
         table=table,
         session_dim=session_dim,
         session_ids=unique_sessions,

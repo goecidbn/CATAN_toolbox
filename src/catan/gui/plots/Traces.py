@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# import importlib
 from catan.gui.plots import BasePlot
 
 from catan.gui.structures.state import NeuronComponent
@@ -28,19 +27,6 @@ from catan.gui.plots.helper.FootprintSlider import (
 from catan.gui.plots.helper.cameras import (
     XOnlyLockedPanZoomCamera,
 )
-
-# @dataclass
-# class TraceMeta:
-#     #     session_id: int
-#     #     cluster_id: int
-#     color: Tuple[float, float, float, float]
-
-
-# @dataclass
-# class TraceVisualRecord:
-#     visual: object  # SurfacePlot / Mesh visual
-#     # pick_points: np.ndarray  # (N, 2) array of (x,y) points for picking
-#     metadata: TraceMeta
 
 
 class Display(BasePlot.BaseCanvas):
@@ -231,7 +217,7 @@ class Display(BasePlot.BaseCanvas):
         time_lim = [np.inf, -np.inf]
 
         compare_mode = self.controls["compare_mode"].currentText()
-        if compare_mode=="between sessions":
+        if compare_mode == "between sessions":
             if self.state.focused_component is None:
                 to_plot_components = None
             else:
@@ -438,12 +424,6 @@ class TraceOptionsController(QWidget):
         offset_layout.addStretch(0)
 
         self.trace_offset.editingFinished.connect(lambda: self.options_changed.emit())
-
-    # def build_trace_checkboxes(self) -> QWidget:
-    #     self.checkbox_traces = QWidget()
-    #     self.checkbox_traces_layout = QVBoxLayout(self.checkbox_traces)
-    #     self.checkbox_traces_options = {}
-    #     return self.checkbox_traces
 
     def build_trace_checkboxes(self):
 

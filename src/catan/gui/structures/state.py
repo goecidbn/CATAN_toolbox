@@ -48,6 +48,8 @@ class AppState(QObject):
     data_changed = Signal(object)
     data_version: int = 0
 
+    statistics_sources_changed = Signal()
+
     def __init__(self):
         super().__init__()
         # self._current_display = 0
@@ -164,16 +166,6 @@ class AppState(QObject):
 
         self._session_active[session_id] = active
         self.session_toggled.emit(input)
-
-    @property
-    def session_added(self):
-        pass
-
-    @session_added.setter
-    def session_added(self, session_id: int):
-        # print(f"[STATE] Adding new session {session_id} to state...")
-        self._session_active.append(True)
-        # self.data_changed.emit(("session", session_id))
 
     # --- current session ---
     @property

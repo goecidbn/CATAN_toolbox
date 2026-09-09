@@ -15,12 +15,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from catan.gui.GUI_elements.fragments.RotatedToolButton import (
-    RotatedToolButton,
-)
-
 from catan.gui.data.statistics import (
     StatisticDefinition,
+    StatisticEngine,
+    CATEGORY_TITLES,
 )
 from catan.gui.data.statistics.dimensions import (
     NEURON_DIMS,
@@ -40,6 +38,8 @@ from catan.gui.data.statistics.queries import (
     PairTarget,
     ReductionSpec,
     StatisticQuery,
+    normalize_session_series_reductions,
+    normalize_generic_session_pair_reductions,
 )
 
 
@@ -217,9 +217,10 @@ class ReductionPopup(QDialog):
         stat_def: StatisticDefinition,
         dim_info: dict[str, DimensionInfo],
         reductions: dict[str, ReductionSpec],
-        parent=None,
+        parent: "StatisticQuerySelector",
     ):
         super().__init__(parent)
+        self.selector = parent
 
         self.query_mode: Contexts = (
             parent.query_mode if parent is not None else "generic"
@@ -240,8 +241,18 @@ class ReductionPopup(QDialog):
         layout.addWidget(title)
 
         for dim in stat_def.dims:
-            methods = self.allowed_reduction_methods(dim)
-            spec = reductions.get(dim, ReductionSpec("keep"))
+
+            methods = self.selector.reduction_methods_for_dim(dim)
+
+            # No user-adjustable reduction for this dimension.
+            if not methods:
+                continue
+
+            spec = reductions.get(
+                dim,
+                ReductionSpec("keep"),
+            )
+
             info = dim_info[dim]
 
             row = ReductionRow(
@@ -249,40 +260,19 @@ class ReductionPopup(QDialog):
                 methods=methods,
                 dim_info=info,
                 spec=spec,
-                error_methods_for_method=lambda method, dim=dim: self.allowed_error_methods(
-                    dim,
-                    method,
+                error_methods_for_method=(
+                    lambda method, dim=dim: self.selector.error_methods_for_dim(
+                        dim,
+                        method,
+                    )
                 ),
                 parent=self,
             )
 
             row.changed.connect(self.reductionChanged.emit)
+
             layout.addWidget(row)
-
             self.rows[dim] = row
-
-    def allowed_reduction_methods(self, dim_name: str) -> tuple[str, ...]:
-        general_allowed_reductions = allowed_reduction_methods(
-            dim_name,
-            context=self.query_mode,
-        )
-
-        stat_allowed_reductions = self.stat_def.get_allowed_reductions(dim_name)
-
-        return tuple(
-            m for m in stat_allowed_reductions if m in general_allowed_reductions
-        )
-
-    def allowed_error_methods(
-        self,
-        dim_name: str,
-        reduction_method: str,
-    ) -> tuple[str, ...]:
-        return allowed_error_methods(
-            dim_name,
-            reduction_method,
-            context=self.query_mode,
-        )
 
     def set_reductions(
         self,
@@ -328,7 +318,13 @@ class PairFilterSelector(QToolButton):
     def _build_menu(self):
         self._filter_menu.clear()
 
-        for relation in ("all", "same", "different", "with previous"):
+        relations = (
+            ("all", "same", "different", "with previous")
+            if self.target == "session"
+            else ("all", "same", "different")
+        )
+
+        for relation in relations:
             action = QAction(relation, self._filter_menu)
             action.setCheckable(True)
             action.setData(relation)
@@ -391,12 +387,10 @@ class PairFilterSelector(QToolButton):
 class StatisticQuerySelector(QWidget):
     queryChanged = Signal(object)  # StatisticQuery | None
 
-    def __init__(self, registry, data, state, axis=None, parent=None):
+    def __init__(self, engine: StatisticEngine, axis=None, parent=None):
         super().__init__(parent)
 
-        self.registry = registry
-        self.data = data
-        self.state = state
+        self.engine = engine
         self.axis = axis
 
         self.query_mode: Contexts = "generic"
@@ -407,7 +401,7 @@ class StatisticQuerySelector(QWidget):
         self.current_reductions: dict[str, ReductionSpec] = {}
         self._popup = None
 
-        self._current_stat_key = next(iter(registry.keys()))
+        self._current_stat_key = next(iter(self.engine.registry.keys()))
 
         if axis == "y":
             layout = QVBoxLayout(self)
@@ -444,6 +438,8 @@ class StatisticQuerySelector(QWidget):
         self.neuron_filter_button.filterChanged.connect(self._on_filter_changed)
         self.session_filter_button.filterChanged.connect(self._on_filter_changed)
 
+        self.engine.registry_changed.connect(self.refresh_statistics)
+
         layout.addWidget(self.stat_button, 1)
         layout.addWidget(self.reduction_button, 1)
         layout.addWidget(self.neuron_filter_button, 1)
@@ -451,6 +447,24 @@ class StatisticQuerySelector(QWidget):
 
         self._on_statistic_changed()
         self._update_filter_visibility()
+
+    def refresh_statistics(self):
+        old_key = self._current_stat_key
+
+        if old_key not in self.engine.registry:
+            self._current_stat_key = "none"
+
+        self._build_stat_menu()
+
+        if self._current_stat_key != old_key:
+            self._on_statistic_changed()
+            return
+
+        # Registry changed, but current statistic still exists.
+        # Its underlying sources/data may nevertheless have changed.
+        if self._current_stat_key != "none":
+            self._update_summary()
+            self._emit_query_changed_once()
 
     def _emit_query_changed_once(self):
         if self._syncing_reductions or self._emitting_query:
@@ -469,20 +483,66 @@ class StatisticQuerySelector(QWidget):
 
     def _build_stat_menu(self):
         self.stat_menu.clear()
+        self._stat_actions = {}
 
-        for key, stat_def in self.registry.items():
-            action = QAction(stat_def.title, self.stat_menu)
-            action.setCheckable(True)
-            action.setData(key)
-            action.setToolTip(stat_def.description)
+        registry = self.engine.registry
 
-            action.triggered.connect(
-                lambda checked=False, key=key: self._set_statistic(key)
+        # "None" stays directly at the top
+        if "none" in registry:
+            self._add_stat_action(
+                self.stat_menu,
+                "none",
+                registry["none"],
             )
+            self.stat_menu.addSeparator()
 
-            self.stat_menu.addAction(action)
+        for category, title in CATEGORY_TITLES.items():
+
+            stats = [
+                (key, stat_def)
+                for key, stat_def in registry.items()
+                if stat_def.category == category
+            ]
+
+            if not stats:
+                continue
+
+            submenu = self.stat_menu.addMenu(title)
+
+            for key, stat_def in sorted(
+                stats,
+                key=lambda item: item[1].title.lower(),
+            ):
+                self._add_stat_action(
+                    submenu,
+                    key,
+                    stat_def,
+                )
 
         self._update_stat_menu_checks()
+
+    def _add_stat_action(
+        self,
+        menu: QMenu,
+        key: str,
+        stat_def: StatisticDefinition,
+    ):
+        action = QAction(
+            stat_def.title,
+            menu,
+        )
+
+        action.setCheckable(True)
+        action.setData(key)
+        action.setToolTip(stat_def.description)
+
+        action.triggered.connect(
+            lambda checked=False, key=key: self._set_statistic(key)
+        )
+
+        menu.addAction(action)
+
+        self._stat_actions[key] = action
 
     def _set_statistic(self, key: str):
         if key == self._current_stat_key:
@@ -513,8 +573,11 @@ class StatisticQuerySelector(QWidget):
         stat_def = self.current_stat_def()
 
         if context == "session_series":
-            self.current_reductions = default_session_series_reductions(stat_def)
-            self._repair_session_series_reductions()
+            self.current_reductions = normalize_session_series_reductions(
+                self.current_stat_def(),
+                default_session_series_reductions(stat_def),
+                self.current_filters(),
+            )
             return
 
         if stat_def.default_reductions is not None:
@@ -523,14 +586,14 @@ class StatisticQuerySelector(QWidget):
             self.current_reductions = stat_def.get_default_reductions()
 
     def _update_stat_menu_checks(self):
-        for action in self.stat_menu.actions():
-            action.setChecked(action.data() == self._current_stat_key)
+        for key, action in self._stat_actions.items():
+            action.setChecked(key == self._current_stat_key)
 
     def current_stat_key(self):
         return self._current_stat_key
 
     def current_stat_def(self):
-        return self.registry[self.current_stat_key()]
+        return self.engine.registry[self.current_stat_key()]
 
     def raw_query(self) -> StatisticQuery | None:
         if self.current_stat_key() == "none":
@@ -552,7 +615,7 @@ class StatisticQuerySelector(QWidget):
         if self.query_preparer is None:
             return query
 
-        return self.query_preparer(query, self.registry)
+        return self.query_preparer(query, self.engine.registry)
 
     def current_query(self) -> StatisticQuery | None:
         # Important:
@@ -568,7 +631,7 @@ class StatisticQuerySelector(QWidget):
         if query is None or self.query_preparer is None:
             return
 
-        effective_query = self.query_preparer(query, self.registry)
+        effective_query = self.query_preparer(query, self.engine.registry)
 
         if effective_query is None:
             return
@@ -604,7 +667,7 @@ class StatisticQuerySelector(QWidget):
         if query is None or self.query_preparer is None:
             return False
 
-        effective_query = self.query_preparer(query, self.registry)
+        effective_query = self.query_preparer(query, self.engine.registry)
 
         if effective_query is None:
             return False
@@ -680,7 +743,7 @@ class StatisticQuerySelector(QWidget):
             self.session_filter_button.set_relation("all", emit=False)
 
     def _get_dimension_info(self, stat_def):
-        return stat_def.get_dimension_info(self.state)
+        return stat_def.get_dimension_info(self.engine.state)
 
     def _open_reduction_popup(self):
         stat_def = self.current_stat_def()
@@ -708,103 +771,53 @@ class StatisticQuerySelector(QWidget):
         self._popup.move(pos)
         self._popup.show()
 
-    def _on_reduction_changed(self, dim_name, spec):
+    def _on_reduction_changed(
+        self,
+        dim_name,
+        spec,
+    ):
         if self._syncing_reductions:
             return
 
         self.current_reductions[dim_name] = spec
 
         if self.query_mode == "session_series":
-            self._repair_session_series_reductions(changed_dim=dim_name)
+            self.current_reductions = normalize_session_series_reductions(
+                self.current_stat_def(),
+                self.current_reductions,
+                self.current_filters(),
+            )
+        else:
+            self.current_reductions = normalize_generic_session_pair_reductions(
+                self.current_stat_def(),
+                self.current_reductions,
+                self.current_filters(),
+            )
 
         self.sync_visible_reductions_from_effective_query()
         self._update_summary()
 
         self._emit_query_changed_once()
 
-    def _repair_session_series_reductions(self, changed_dim: str | None = None):
-        stat_def = self.current_stat_def()
-
-        session_dims = [dim for dim in stat_def.dims if dim in SESSION_DIMS]
-        neuron_dims = [dim for dim in stat_def.dims if dim in NEURON_DIMS]
-
-        # Exactly one session dim must be kept.
-        kept_sessions = [
-            dim
-            for dim in session_dims
-            if self.current_reductions.get(dim, ReductionSpec("mean")).method == "keep"
-        ]
-
-        if len(kept_sessions) == 0:
-            if "session" in session_dims:
-                keep_dim = "session"
-            elif changed_dim in session_dims:
-                keep_dim = changed_dim
-            elif session_dims:
-                keep_dim = session_dims[0]
-            else:
-                return
-
-            self.current_reductions[keep_dim] = ReductionSpec("keep")
-            kept_sessions = [keep_dim]
-
-        elif len(kept_sessions) > 1:
-            if changed_dim in kept_sessions:
-                keep_dim = changed_dim
-            else:
-                keep_dim = kept_sessions[0]
-
-            for dim in kept_sessions:
-                if dim != keep_dim:
-                    self.current_reductions[dim] = ReductionSpec("single", index=0)
-
-        # Non-kept session dims cannot stay keep.
-        kept_sessions = [
-            dim
-            for dim in session_dims
-            if self.current_reductions.get(dim, ReductionSpec("mean")).method == "keep"
-        ]
-        keep_dim = kept_sessions[0] if kept_sessions else None
-
-        for dim in session_dims:
-            if dim != keep_dim:
-                spec = self.current_reductions.get(dim)
-                if spec is None or spec.method == "keep":
-                    self.current_reductions[dim] = ReductionSpec("single", index=0)
-
-        # Neuron dims should use allowed center/error combinations.
-        for dim in neuron_dims:
-            spec = self.current_reductions.get(dim)
-
-            if spec is None:
-                self.current_reductions[dim] = ReductionSpec(
-                    "mean",
-                    error_method="sem",
-                )
-                continue
-
-            if spec.method not in REDUCTION_METHODS["session_series"]["neuron"]:
-                self.current_reductions[dim] = ReductionSpec(
-                    "median",
-                    error_method="iqr",
-                )
-                continue
-
-            allowed_errors = allowed_error_methods(
-                dim, spec.method, context="session_series"
-            )
-
-            if spec.error_method not in allowed_errors:
-                default_error = "iqr" if spec.method == "median" else "sem"
-                self.current_reductions[dim] = ReductionSpec(
-                    spec.method,
-                    index=spec.index,
-                    error_method=default_error,
-                )
-
     def _on_filter_changed(self):
         if self._syncing_reductions:
             return
+
+        if self.query_mode == "session_series":
+            self.current_reductions = normalize_session_series_reductions(
+                self.current_stat_def(),
+                self.current_reductions,
+                self.current_filters(),
+            )
+        else:
+            self.current_reductions = normalize_generic_session_pair_reductions(
+                self.current_stat_def(),
+                self.current_reductions,
+                self.current_filters(),
+            )
+
+        self.sync_visible_reductions_from_effective_query()
+        self._update_summary()
 
         self._emit_query_changed_once()
 
@@ -817,22 +830,135 @@ class StatisticQuerySelector(QWidget):
             return
 
         for dim in stat_def.dims:
-            spec = self.current_reductions.get(dim, ReductionSpec("keep"))
+
+            # Don't display implicit/x-axis dimensions.
+            if not self.reduction_methods_for_dim(dim):
+                continue
+
+            spec = self.current_reductions.get(
+                dim,
+                ReductionSpec("keep"),
+            )
+
             dim_short = dim[0]
 
             if spec.method == "single":
                 parts.append(f"{dim_short}={spec.index}")
 
             elif spec.method == "keep":
-                parts.append(f"{dim_short}")
+                parts.append(dim_short)
 
             else:
                 if spec.error_method != "none":
-                    parts.append(f"{spec.method}±{spec.error_method}({dim_short})")
+                    parts.append(
+                        f"{spec.method}±" f"{spec.error_method}" f"({dim_short})"
+                    )
                 else:
-                    parts.append(f"{spec.method}({dim_short})")
+                    parts.append(f"{spec.method}" f"({dim_short})")
 
         self.reduction_button.setText(", ".join(parts))
+
+    def reduction_methods_for_dim(
+        self,
+        dim: str,
+    ) -> tuple[str, ...]:
+
+        stat_def = self.current_stat_def()
+
+        general = allowed_reduction_methods(
+            dim,
+            context=self.query_mode,
+        )
+
+        specific = stat_def.get_allowed_reductions(dim)
+
+        methods = tuple(m for m in specific if m in general)
+
+        session_dims = [d for d in stat_def.dims if d in SESSION_DIMS]
+
+        if dim not in session_dims:
+            return methods
+
+        # ordinary, non-pair session statistic
+        if session_dims == ["session"]:
+            if self.query_mode == "session_series":
+                return ()
+            return methods
+
+        # only special-case actual session-pair statistics
+        if not ("session_i" in session_dims and "session_j" in session_dims):
+            return methods
+
+        relation = self.session_filter_button.current_relation()
+
+        # ------------------------------------------------
+        # Session-series plot
+        # ------------------------------------------------
+        if self.query_mode == "session_series":
+
+            # session_i is the x-axis
+            if dim == "session_i":
+                return ()
+
+            # session_j is implied by the relation
+            if relation in ("same", "with previous"):
+                return ()
+
+            # all / different:
+            # choose one reference session_j
+            if dim == "session_j":
+                return ("single",)
+
+        # ------------------------------------------------
+        # Generic / histogram / scatter
+        # ------------------------------------------------
+        else:
+
+            # same / previous:
+            # user chooses session_i only;
+            # session_j is derived automatically
+            if relation in ("same", "with previous"):
+                if dim == "session_i":
+                    return ("single",)
+                return ()
+
+            # different:
+            # both sessions must be independently selectable
+            if relation == "different":
+                return ("single",)
+
+            # all:
+            # no relation constraint
+            return methods
+
+        return methods
+
+    def error_methods_for_dim(
+        self,
+        dim: str,
+        method: str,
+    ) -> tuple[str, ...]:
+
+        methods = allowed_error_methods(
+            dim,
+            method,
+            context=self.query_mode,
+        )
+
+        if self.query_mode != "session_series":
+            return methods
+
+        stat_def = self.current_stat_def()
+
+        neuron_dims = [d for d in stat_def.dims if d in NEURON_DIMS]
+
+        # With neuron-pair statistics only the LAST neuron reduction
+        # should generate the error estimate.
+        if dim in neuron_dims and len(neuron_dims) > 1:
+            if dim != neuron_dims[-1]:
+                return ("none",)
+
+        return methods
 
 
 def default_session_series_reductions(stat_def) -> dict[str, ReductionSpec]:
@@ -861,8 +987,7 @@ def default_session_series_reductions(stat_def) -> dict[str, ReductionSpec]:
                 "median",
                 error_method="iqr" if dim == error_neuron_dim else "none",
             )
-
         else:
-            reductions[dim] = ReductionSpec("mean")
+            reductions[dim] = ReductionSpec("single", index=0)
 
     return reductions

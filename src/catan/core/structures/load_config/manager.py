@@ -24,13 +24,13 @@ class LoadConfigManager:
     BUILTIN_RESOURCE_PATH = ("resources", "load_configs")
     HIDDEN_BUILTINS_FILE = ".hidden_builtins.json"
 
-    default_fallback: dict[SourceTypes,str] = {
+    default_fallback: dict[SourceTypes, str] = {
         "session": "catan-caiman-session",
         "assignments": "catan-assignments",
         "model": "catan-model",
         "remapping": "catan-remap",
     }
-    default_configs: dict[Tuple[SourceTypes,FileFormat], str]
+    default_configs: dict[Tuple[SourceTypes, FileFormat], str]
 
     def __init__(self, user_dir: str | Path):
         self.user_dir = Path(user_dir)
@@ -44,14 +44,12 @@ class LoadConfigManager:
 
         self._inspector = None
 
-        self.defaults_file = (
-            self.user_dir / f"load_config_defaults.json"
-        )
-        
+        self.defaults_file = self.user_dir / f"load_config_defaults.json"
+
         self.reload_configs()
         self._load_defaults()
-                
-        self.last_used_configs: dict[Tuple[SourceTypes,FileFormat], LoadConfig] = {}
+
+        self.last_used_configs: dict[Tuple[SourceTypes, FileFormat], LoadConfig] = {}
 
     # ------------------------------------------------------------------
     # Discovery
@@ -84,8 +82,6 @@ class LoadConfigManager:
         self._hidden_builtins = self._load_hidden_builtins()
         self._load_builtin_configs()
         self._load_user_configs()
-
-        print("loaded configs:",self.configs.keys())
 
     def _builtin_dir(self):
         resource = files(self.BUILTIN_PACKAGE)
@@ -148,16 +144,17 @@ class LoadConfigManager:
 
     def builtin_names(self, *, public_only: bool = True) -> list[str]:
         return [
-            name for name in self.names(public_only=public_only)
+            name
+            for name in self.names(public_only=public_only)
             if self.config_sources.get(name) == "builtin"
         ]
 
     def user_names(self, *, public_only: bool = True) -> list[str]:
         return [
-            name for name in self.names(public_only=public_only)
+            name
+            for name in self.names(public_only=public_only)
             if self.config_sources.get(name) == "user"
         ]
-    
 
     def get(self, name: str, *, copy: bool = False) -> LoadConfig:
         config = self.configs[name]
@@ -172,9 +169,7 @@ class LoadConfigManager:
             if config.uid == uid:
                 return config
 
-        raise KeyError(
-            f"No load config with uid {uid!r}"
-        )
+        raise KeyError(f"No load config with uid {uid!r}")
 
     def _validate_unique_uids(self) -> None:
         seen = {}
@@ -192,7 +187,7 @@ class LoadConfigManager:
     def select(self, name: str) -> LoadConfig:
         if name not in self.configs:
             raise KeyError(f"Unknown load config {name!r}")
-        
+
         return self.configs[name].copy_for_session()
 
     def suggest_config_for(
@@ -204,17 +199,13 @@ class LoadConfigManager:
         fmt = detect_file_format(path)
 
         # 1. Previous config for this format
-        previous = self.last_used_configs.get(
-            (source_type,fmt)
-        )
+        previous = self.last_used_configs.get((source_type, fmt))
 
         if previous is not None:
-            return previous.copy(
-                new_identity=True
-            )
+            return previous.copy(new_identity=True)
 
         # 2. Default preset
-        default = self.default_for(fmt,source_type)
+        default = self.default_for(fmt, source_type)
 
         if default is not None:
             return default.copy_for_session()
@@ -229,21 +220,15 @@ class LoadConfigManager:
     #         file_format=file_format,
     #         source_type=source_type,
     #     )
-    
+
     def default_for(
-        self,
-        file_format: FileFormat,
-        source_type: SourceTypes
+        self, file_format: FileFormat, source_type: SourceTypes
     ) -> LoadConfig | None:
 
-        uid = self.default_configs.get(
-            (source_type, file_format)
-        )
-        
+        uid = self.default_configs.get((source_type, file_format))
+
         if uid is None:
-            return self.get_by_uid(
-                self.default_fallback.get(source_type,"session")
-            )
+            return self.get_by_uid(self.default_fallback.get(source_type, "session"))
 
         return self.get_by_uid(uid)
 
@@ -252,7 +237,9 @@ class LoadConfigManager:
         file_format: FileFormat,
         config: LoadConfig,
     ) -> None:
-        self.last_used_configs[(config.source_type, file_format)] = config.copy(new_identity=False)
+        self.last_used_configs[(config.source_type, file_format)] = config.copy(
+            new_identity=False
+        )
 
     def set_default_for_format(
         self,
@@ -276,11 +263,10 @@ class LoadConfigManager:
         self.get_by_uid(uid)
         if not self.is_registered(uid):
             raise ValueError(
-                "Only stored load-config presets can be "
-                "used as persistent defaults."
+                "Only stored load-config presets can be " "used as persistent defaults."
             )
 
-        self.default_configs[(source_type,file_format)] = uid
+        self.default_configs[(source_type, file_format)] = uid
         self._save_defaults()
 
     def clear_default(
@@ -289,7 +275,7 @@ class LoadConfigManager:
         source_type: SourceTypes,
     ) -> None:
 
-        self.default_configs.pop((source_type,file_format),None)
+        self.default_configs.pop((source_type, file_format), None)
 
         self._save_defaults()
 
@@ -302,8 +288,7 @@ class LoadConfigManager:
 
         data = {
             f"{source_type},{file_format.value}": uid
-            for (source_type,file_format), uid
-            in self.default_configs.items()
+            for (source_type, file_format), uid in self.default_configs.items()
         }
         with self.defaults_file.open(
             "w",
@@ -350,7 +335,7 @@ class LoadConfigManager:
             except KeyError:
                 continue
 
-            defaults[(source_type,file_format)] = uid
+            defaults[(source_type, file_format)] = uid
 
         self.default_configs = defaults
 
@@ -359,11 +344,7 @@ class LoadConfigManager:
         config: LoadConfig | str,
     ) -> bool:
 
-        uid = (
-            config.uid
-            if isinstance(config, LoadConfig)
-            else config
-        )
+        uid = config.uid if isinstance(config, LoadConfig) else config
 
         try:
             self.get_by_uid(uid)
@@ -373,7 +354,7 @@ class LoadConfigManager:
 
     def is_default(
         self,
-        path: str,# | Path | FileFormat,
+        path: str,  # | Path | FileFormat,
         config: LoadConfig,
     ) -> bool:
         # if isinstance(path, (str, Path)):
@@ -381,23 +362,20 @@ class LoadConfigManager:
         # else:
         #     file_format = path
 
-        uid = (
-            config.preset_uid
-            if isinstance(config, LoadConfig)
-            else config
-        )
+        uid = config.preset_uid if isinstance(config, LoadConfig) else config
 
-        return (
-            self.default_configs.get((config.source_type,file_format))
-            == uid
-        )
+        return self.default_configs.get((config.source_type, file_format)) == uid
 
     def modified(self, config: LoadConfig) -> bool:
-        original_config = self.get_by_uid(config.preset_uid) if config.preset_uid else None
-        
+        original_config = (
+            self.get_by_uid(config.preset_uid) if config.preset_uid else None
+        )
+
         if original_config is None:
             return True
-        return config.to_dict(for_compare=True) != original_config.to_dict(for_compare=True)
+        return config.to_dict(for_compare=True) != original_config.to_dict(
+            for_compare=True
+        )
 
     def source(self, name: str) -> str | None:
         return self.config_sources.get(name)
@@ -444,13 +422,13 @@ class LoadConfigManager:
         config.name = name
         config.public = True
         config.native = False
-        
+
         # if config.native is None:
 
         # if config.public and not config.native:
         path = self.user_dir / f"{self._safe_filename(name)}.json"
         # else:
-            # path = self._builtin_dir() / f"{self._safe_filename(name)}.json"
+        # path = self._builtin_dir() / f"{self._safe_filename(name)}.json"
 
         # if path.exists() and not overwrite:
         #     raise FileExistsError(f"Config file already exists: {path}")
@@ -511,6 +489,7 @@ class LoadConfigManager:
     def inspector(self):
         if self._inspector is None:
             from catan.core.io.inspection import FileInspector
+
             self._inspector = FileInspector()
         return self._inspector
 
@@ -551,7 +530,6 @@ class LoadConfigManager:
     @staticmethod
     def _safe_filename(name: str) -> str:
         filename = "".join(
-            char if (char.isalnum() or char in "-_") else "_"
-            for char in name.strip()
+            char if (char.isalnum() or char in "-_") else "_" for char in name.strip()
         ).strip("_")
         return filename or "load_config"

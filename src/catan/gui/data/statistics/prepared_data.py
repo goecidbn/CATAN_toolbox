@@ -1,15 +1,11 @@
-from typing import Optional
+from PySide6.QtCore import QObject, Qt, Signal
 
+from typing import Optional
 from dataclasses import dataclass
 import numpy as np
 
 from .dimensions import canonical_dim
-
-# from .plotdata_series import validate_session_series_reductions
-
-from .statistics import StatisticArray
-
-# from .dimensions import NEURON_DIMS, SESSION_DIMS, canonical_dim_name, DIM_CANONICAL
+from .statistics import StatisticArray, build_statistics_registry
 from .queries import ReductionSpec, StatisticQuery, PairFilter
 
 
@@ -129,39 +125,45 @@ class PickTable:
         else:
             raise ValueError(pair_filter.target)
 
-        # If the pair dimensions are not present, this filter is irrelevant.
-        if dim_i not in self.refs or dim_j not in self.refs:
+        ref_i = self._values_for_dim(dim_i)
+        ref_j = self._values_for_dim(dim_j)
+
+        if ref_i is None or ref_j is None:
             return self
 
-        ref_i = self.refs[dim_i]
-        ref_j = self.refs[dim_j]
-
         if pair_filter.relation == "all":
-            mask = np.ones(self.n_rows, dtype=bool)
+            return self
 
         elif pair_filter.relation == "same":
             mask = ref_i == ref_j
 
         elif pair_filter.relation == "different":
             mask = ref_i != ref_j
+
         elif pair_filter.relation == "with previous":
-            # For each row, check if the target dimension matches the previous row's target.
-            # This assumes that the rows are sorted by the target dimension.
-            mask = np.zeros(self.n_rows, dtype=bool)
-            if self.n_rows > 1:
-                mask[1:] = ref_i[1:] == ref_i[:-1]
+            if pair_filter.target != "session":
+                raise ValueError(
+                    "'with previous' is only meaningful for session pairs."
+                )
+
+            # session_i = current session
+            # session_j = previous/reference session
+            mask = ref_j == ref_i - 1
+
         else:
             raise ValueError(pair_filter.relation)
 
         table = self.subset_rows(np.flatnonzero(mask))
 
+        if not pair_filter.collapse_same:
+            return table
+
         if (
             pair_filter.relation == "same"
-            and pair_filter.collapse_same
             and dim_i in table.refs
             and dim_j in table.refs
         ):
-            table = table.collapse_equal_pair_dims(
+            return table.collapse_equal_pair_dims(
                 dim_i=dim_i,
                 dim_j=dim_j,
                 new_dim=collapsed_dim,
@@ -173,10 +175,11 @@ class PickTable:
             and dim_i in table.refs
             and dim_j in table.refs
         ):
-            table = table.collapse_equal_pair_dims(
+            table = table.collapse_pair_dims(
                 dim_i=dim_i,
                 dim_j=dim_j,
                 new_dim=collapsed_dim,
+                coords=table.refs[dim_i],
             )
 
         return table
@@ -196,41 +199,46 @@ class PickTable:
             n=None if self.n is None else self.n[rows],
         )
 
-    def collapse_equal_pair_dims(
+    def collapse_pair_dims(
         self,
         *,
         dim_i: str,
         dim_j: str,
         new_dim: str,
+        coords: np.ndarray,
     ) -> "PickTable":
+
         if dim_i not in self.refs or dim_j not in self.refs:
             raise ValueError(f"Cannot collapse {dim_i!r}/{dim_j!r}; missing refs.")
 
-        if not np.array_equal(self.refs[dim_i], self.refs[dim_j]):
+        coords = np.asarray(coords)
+
+        if coords.shape != (self.n_rows,):
             raise ValueError(
-                f"Cannot collapse {dim_i!r}/{dim_j!r}; refs are not equal."
+                f"Collapsed coordinates must have shape "
+                f"({self.n_rows},), got {coords.shape}."
             )
 
         new_refs = {
-            dim_name: ref_values
-            for dim_name, ref_values in self.refs.items()
-            if dim_name not in (dim_i, dim_j)
+            name: values
+            for name, values in self.refs.items()
+            if name not in (dim_i, dim_j)
         }
 
-        new_refs[new_dim] = self.refs[dim_i]
+        new_refs[new_dim] = coords
 
         new_dims = []
         inserted = False
 
-        for dim_name in self.dims:
-            if dim_name == dim_i:
+        for dim in self.dims:
+            if dim == dim_i:
                 if not inserted:
                     new_dims.append(new_dim)
                     inserted = True
-            elif dim_name == dim_j:
+            elif dim == dim_j:
                 continue
             else:
-                new_dims.append(dim_name)
+                new_dims.append(dim)
 
         return PickTable(
             stat=self.stat,
@@ -240,6 +248,32 @@ class PickTable:
             errors_low=self.errors_low,
             errors_high=self.errors_high,
             n=self.n,
+        )
+
+    def collapse_equal_pair_dims(
+        self,
+        *,
+        dim_i: str,
+        dim_j: str,
+        new_dim: str,
+    ) -> "PickTable":
+
+        if dim_i not in self.refs or dim_j not in self.refs:
+            raise ValueError(f"Cannot collapse {dim_i!r}/{dim_j!r}; missing refs.")
+
+        if not np.array_equal(
+            self.refs[dim_i],
+            self.refs[dim_j],
+        ):
+            raise ValueError(
+                f"Cannot collapse {dim_i!r}/{dim_j!r}; refs are not equal."
+            )
+
+        return self.collapse_pair_dims(
+            dim_i=dim_i,
+            dim_j=dim_j,
+            new_dim=new_dim,
+            coords=self.refs[dim_i],
         )
 
     def refs_for_rows(
@@ -412,17 +446,9 @@ class PickTable:
             sorted({int(c.session_id) for c in components}),
             dtype=int,
         )
-        # print(f"table dims:", self.dims)
-        # print(f"table values:", self.values)
-        # print(
-        #     f"rows_matching_components: selected_neurons={selected_neurons}, selected_sessions={selected_sessions}"
-        # )
 
         neuron_arrays = self._available_neuron_arrays()
         session_arrays = self._available_session_arrays()
-
-        # print(f"neuron_arrays: {neuron_arrays}")
-        # print(f"session_arrays: {session_arrays}")
 
         has_neuron_context = len(neuron_arrays) > 0
         has_session_context = len(session_arrays) > 0
@@ -495,16 +521,36 @@ class PickTable:
         return []
 
 
-class StatisticEngine:
-    def __init__(self, registry, data, state):
-        self.registry = registry  ## contains the dict of possible statistics
+class StatisticEngine(QObject):
+
+    registry_changed = Signal()
+
+    def __init__(self, data, state, parent=None):
+        super().__init__(parent)
+
         self.data = data
         self.state = state
         self._cache = {}
 
+        self.refresh_registry()
+
+        self.state.data_changed.connect(self._on_data_changed)
+        self.state.statistics_sources_changed.connect(self.refresh_registry)
+
+    def refresh_registry(self):
+        self.registry = build_statistics_registry(
+            self.data,
+            self.state,
+        )
+        self.clear_cache()
+
+        self.registry_changed.emit()
+
+    def _on_data_changed(self, input):
+        self.refresh_registry()
+
     def data_version(self):
         # Increase/change this whenever tracking/data/statistics change.
-        # Could be a counter on your global state.
         return getattr(self.state, "data_version", 0)
 
     def clear_cache(self):
@@ -539,6 +585,7 @@ class StatisticEngine:
             data=self.data,
             state=self.state,
             indexers=indexers,
+            filters=query.filters,
         )
 
         reduction_order = query.reduction_order

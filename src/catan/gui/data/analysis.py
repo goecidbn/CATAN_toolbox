@@ -12,31 +12,94 @@ from scipy import sparse, spatial
 from catan.core.image_correlation import calculate_img_correlation
 
 
-def get_stat_from_session(data, state, indexers, get_stat: Callable):
+def apply_indexers(
+    values: np.ndarray,
+    dims: tuple[str, ...],
+    indexers: dict[str, int] | None = None,
+):
+    indexers = indexers or {}
 
-    session_ids = (
-        range(len(data.sessions))
-        if "session" not in indexers
-        else [indexers["session"]]
+    selection = tuple(indexers.get(dim, slice(None)) for dim in dims)
+
+    return values[selection]
+
+
+def requested_indices(
+    size: int,
+    dim: str,
+    indexers: dict[str, int],
+) -> np.ndarray:
+    if dim in indexers:
+        return np.asarray([indexers[dim]], dtype=int)
+
+    return np.arange(size, dtype=int)
+
+
+def drop_indexed_axes(
+    values: np.ndarray,
+    dims: tuple[str, ...],
+    indexers: dict[str, int],
+):
+    """
+    Used when the calculation itself was already restricted to indexed
+    dimensions, so those axes now have length 1.
+    """
+    axes = tuple(axis for axis, dim in enumerate(dims) if dim in indexers)
+
+    if axes:
+        values = np.squeeze(values, axis=axes)
+
+    return values
+
+
+def get_stat_from_session(
+    data: Data,
+    state: AppState,
+    indexers: dict[str, int] | None,
+    get_stat: Callable,
+):
+    indexers = indexers or {}
+
+    N, S = state.assignments.shape
+
+    neuron_ids = requested_indices(N, "neuron", indexers)
+    session_ids = requested_indices(S, "session", indexers)
+
+    values = np.full(
+        (len(neuron_ids), len(session_ids)),
+        np.nan,
     )
-    stat = np.full((state.assignments.shape[0], len(session_ids)), np.nan)
 
-    for i, session_id in enumerate(session_ids):
+    for j, session_id in enumerate(session_ids):
         session = data.sessions[session_id]
+
         stat_session = get_stat(session)
 
-        neuron_ids = np.where(state.assignments[:, session_id] >= 0)[0]
-        fp_ids = state.assignments[neuron_ids, session_id]
+        if stat_session is None:
+            continue
 
-        stat[neuron_ids, i] = stat_session[fp_ids]
+        fp_ids = state.assignments[
+            neuron_ids,
+            session_id,
+        ]
 
-    if "session" in indexers:
-        return np.squeeze(stat)
-    return stat
+        present = fp_ids >= 0
+
+        values[present, j] = stat_session[fp_ids[present]]
+
+    return drop_indexed_axes(
+        values,
+        ("neuron", "session"),
+        indexers,
+    )
 
 
 def get_quality_metric(
-    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None, **kwargs
+    data: Data,
+    state: AppState,
+    indexers: Optional[Dict[str, int]] = None,
+    filters=(),
+    **kwargs,
 ) -> np.ndarray:
     """
     Get a quality metric from the data.
@@ -55,11 +118,27 @@ def get_quality_metric(
     # print(f"Retrieving quality metric '{key}' with indexers: {indexers}")
 
     def get_stat(session):
-        if key not in session.quality:
-            raise KeyError(f"Quality metric '{key}' not found in session.")
-        return session.quality[key]
+        return session.quality.get(key)
 
     return get_stat_from_session(data, state, indexers, get_stat)
+
+
+def get_match_metric(
+    data,
+    state,
+    indexers=None,
+    filters=(),
+    *,
+    key: str,
+    dims: tuple[str, ...],
+):
+    values = np.asarray(data.assignments.stats[key])
+
+    return apply_indexers(
+        values,
+        dims,
+        indexers,
+    )
 
 
 def normalize_csc_columns_to_max(A):
@@ -80,7 +159,11 @@ def normalize_csc_columns_to_max(A):
 
 
 def calculate_footprint_size(
-    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None, thr=0.01
+    data: Data,
+    state: AppState,
+    indexers: Optional[Dict[str, int]] = None,
+    filters=(),
+    thr=0.01,
 ) -> np.ndarray:
     """
     Calculate the size of each footprint.
@@ -91,7 +174,7 @@ def calculate_footprint_size(
     indexers = indexers or {}
 
     def get_size(session):
-        footprints: sparse.csc_matrix = session.A
+        footprints: sparse.csc_matrix = session.footprints
         footprints = normalize_csc_columns_to_max(footprints)
 
         return (footprints > thr).getnnz(axis=0)
@@ -100,100 +183,143 @@ def calculate_footprint_size(
 
 
 def calculate_temporal_correlation(
-    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None, key="C"
-) -> np.ndarray:
-    """
-    Calculate the temporal correlation matrix for given traces.
-
-    Parameters:
-    traces (np.ndarray): 2D array where each row corresponds to a neuron's trace over time.
-
-    Returns:
-    np.ndarray: 2D correlation matrix.
-    """
-
+    data,
+    state,
+    indexers=None,
+    filters=(),
+    key="C",
+):
     indexers = indexers or {}
-
-    session_ids = (
-        range(len(data.sessions))
-        if "session" not in indexers
-        else [indexers["session"]]
-    )
 
     N, S = state.assignments.shape
 
-    correlations = np.full((N, N, len(session_ids)), np.nan)
-    for i, session_id in enumerate(session_ids):
+    neuron_i = requested_indices(N, "neuron_i", indexers)
+    neuron_j = requested_indices(N, "neuron_j", indexers)
+    sessions = requested_indices(S, "session", indexers)
+
+    values = np.full(
+        (
+            len(neuron_i),
+            len(neuron_j),
+            len(sessions),
+        ),
+        np.nan,
+    )
+
+    for k, session_id in enumerate(sessions):
         session = data.sessions[session_id]
 
         if session is None or key not in session.traces:
-            # traces are not necessarily loaded
             continue
-        neuron_ids = np.where(state.assignments[:, session_id] >= 0)[0]
-        fp_ids = state.assignments[neuron_ids, session_id]
 
-        traces_neurons = session.traces[key][fp_ids, :]
+        fp_i = state.assignments[neuron_i, session_id]
+        fp_j = state.assignments[neuron_j, session_id]
 
-        corr = np.corrcoef(traces_neurons)
-        correlations[np.ix_(neuron_ids, neuron_ids) + (i,)] = corr
+        valid_i = fp_i >= 0
+        valid_j = fp_j >= 0
 
-    if "session" in indexers:
-        return np.squeeze(correlations)
-    return correlations
+        traces_i = session.traces[key][fp_i[valid_i]]
+        traces_j = session.traces[key][fp_j[valid_j]]
+
+        if not valid_i.any() or not valid_j.any():
+            continue
+
+        # pair-wise Pearson correlation
+        ti = traces_i - traces_i.mean(axis=1, keepdims=True)
+        tj = traces_j - traces_j.mean(axis=1, keepdims=True)
+
+        numerator = ti @ tj.T
+
+        denominator = np.sqrt(
+            np.sum(ti**2, axis=1)[:, None] * np.sum(tj**2, axis=1)[None, :]
+        )
+
+        corr = numerator / denominator
+
+        values[
+            np.ix_(
+                valid_i,
+                valid_j,
+                [k],
+            )
+        ] = corr[..., None]
+
+    return drop_indexed_axes(
+        values,
+        ("neuron_i", "neuron_j", "session"),
+        indexers,
+    )
 
 
 def calculate_distances(
-    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None
-) -> np.ndarray:
-    """
-    Calculate the pairwise Euclidean distances between centroids.
-
-    Parameters:
-    centroids (np.ndarray): 2D array where each row corresponds to a neuron's centroid (x, y).
-
-    Returns:
-    np.ndarray: 2D distance matrix.
-    """
-    from scipy.spatial.distance import pdist, squareform
-
+    data: Data,
+    state: AppState,
+    indexers: Optional[Dict[str, int]] = None,
+    filters=(),
+):
     indexers = indexers or {}
-
-    session_ids = (
-        range(len(data.sessions))
-        if "session" not in indexers
-        else [indexers["session"]]
-    )
 
     N, S = state.assignments.shape
 
-    distances = np.full((N, N, len(session_ids)), np.nan)
-    for i, session_id in enumerate(session_ids):
+    neuron_i = requested_indices(N, "neuron_i", indexers)
+    neuron_j = requested_indices(N, "neuron_j", indexers)
+    sessions = requested_indices(S, "session", indexers)
+
+    values = np.full(
+        (
+            len(neuron_i),
+            len(neuron_j),
+            len(sessions),
+        ),
+        np.nan,
+    )
+
+    for k, session_id in enumerate(sessions):
         session = data.sessions[session_id]
+
         if session is None or session.centroids is None:
-            # centroids are not necessarily loaded
             continue
-        neuron_ids = np.where(state.assignments[:, session_id] >= 0)[0]
-        fp_ids = state.assignments[neuron_ids, session_id]
 
-        centroids = session.centroids[fp_ids, :]
+        fp_i = state.assignments[neuron_i, session_id]
+        fp_j = state.assignments[neuron_j, session_id]
 
-        dist_matrix = squareform(pdist(centroids, metric="euclidean"))
-        np.fill_diagonal(dist_matrix, np.nan)  # Set self-distance to nan
-        distances[np.ix_(neuron_ids, neuron_ids) + (i,)] = dist_matrix
+        valid_i = fp_i >= 0
+        valid_j = fp_j >= 0
 
-    if "session" in indexers:
-        return np.squeeze(distances)
-    return distances
+        if not valid_i.any() or not valid_j.any():
+            continue
 
-    # if centroids.ndim != 2 or centroids.shape[1] != 2:
-    #     raise ValueError("Centroids should be a 2D array with shape (n_neurons, 2).")
-    # dist_matrix = squareform(pdist(centroids, metric="euclidean"))
-    # np.fill_diagonal(dist_matrix, np.nan)  # Set self-distance to nan
-    # return dist_matrix
+        ctr_i = session.centroids[fp_i[valid_i]]
+        ctr_j = session.centroids[fp_j[valid_j]]
+
+        dist = spatial.distance.cdist(
+            ctr_i,
+            ctr_j,
+        )
+
+        values[
+            np.ix_(
+                valid_i,
+                valid_j,
+                [k],
+            )
+        ] = dist[..., None]
+
+    # self-pairs
+    for ii, n_i in enumerate(neuron_i):
+        matches = np.where(neuron_j == n_i)[0]
+
+        values[ii, matches, :] = np.nan
+
+    return drop_indexed_axes(
+        values,
+        ("neuron_i", "neuron_j", "session"),
+        indexers,
+    )
 
 
 def calculate_border_proximity(
-    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None
+    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None, filters=()
 ) -> np.ndarray:
     """
     Calculate the proximity of each centroid to the borders of the field of view.
@@ -218,123 +344,236 @@ def calculate_border_proximity(
     return get_stat_from_session(data, state, indexers, get_distances)
 
 
-# def calculate_session_presence(assignments: np.ndarray) -> np.ndarray:
-#     """
-#     Calculate the presence of each neuron in each session.
-
-#     Parameters:
-#     assignments (np.ndarray): 2D array where each row corresponds to a neuron and each column corresponds to a session.
-#                               The value is the footprint ID for that neuron in that session, or -1 if not present.
-
-#     Returns:
-#     np.ndarray: 2D boolean array indicating presence (True) or absence (False) of each neuron in each session.
-#     """
-#     # if assignments.ndim != 2:
-#     #     raise ValueError(
-#     #         "Assignments should be a 2D array with shape (n_neurons, n_sessions)."
-#     #     )
-#     # presence = np.sum(assignments >= 0, axis=0)  # Count non-negative footprint IDs
-#     return assignments >= 0
-
-
 def calculate_occurrence(
-    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None
-) -> np.ndarray:
-    """
-    Calculate the occurrence of each neuron across sessions.
-
-    Parameters:
-
-    Returns:
-    np.ndarray: 1D array of occurrence counts for each neuron.
-    """
-    # if assignments.ndim != 2:
-    #     raise ValueError(
-    #         "Assignments should be a 2D array with shape (n_neurons, n_sessions)."
-    #     )
-    # occurrence = np.sum(assignments >= 0, axis=1)  # Count non-negative footprint IDs
-    return state.assignments >= 0
+    data,
+    state,
+    indexers=None,
+    filters=(),
+):
+    return apply_indexers(
+        state.assignments >= 0,
+        ("neuron", "session"),
+        indexers,
+    )
 
 
 def calculate_centroid_shift(
-    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None
-) -> np.ndarray:
-
-    indexers = indexers or {}
-
-    ctrs = np.array(data.neurons["centroids"], copy=True)
-    ctrs_ref = ctrs[..., None, :]
-    ctrs_target = ctrs[:, None, ...]
-
-    if ref_idxed := ("session_j" in indexers):
-        ctrs_ref = ctrs_ref[:, [indexers["session_j"]], ...]
-
-    if target_idxed := ("session_i" in indexers):
-        ctrs_target = ctrs_target[..., [indexers["session_i"]], :]
-
-    shift = ctrs_ref - ctrs_target
-    dshift = np.linalg.norm(shift, axis=-1)
-
-    if ref_idxed:
-        dshift = dshift[:, 0, :]
-    if target_idxed:
-        dshift = dshift[..., 0]
-
-    return dshift
-
-
-def calculate_footprint_similarity(
     data: Data,
     state: AppState,
     indexers: Optional[Dict[str, int]] = None,
-    neighborhood_thr=10,
+    filters=(),
 ) -> np.ndarray:
-    """
-    Calculate the similarity between footprints across sessions.
 
-    Parameters:
-
-    Returns:
-    np.ndarray: 2D array of similarity scores between footprints.
-    """
     indexers = indexers or {}
 
-    if "session_j" not in indexers or "session_i" not in indexers:
-        raise ValueError(
-            "Both 'session_j' and 'session_i' must be specified in indexers."
-        )
-    session_ref = data.sessions[indexers["session_j"]]
-    session_target = data.sessions[indexers["session_i"]]
+    N, S = state.assignments.shape
 
-    centroid_distance = spatial.distance.cdist(
-        session_ref.centroids, session_target.centroids
+    neuron_ids = requested_indices(N, "neuron", indexers)
+    session_i_ids = requested_indices(S, "session_i", indexers)
+    session_j_ids = requested_indices(S, "session_j", indexers)
+
+    coords_i = np.full(
+        (len(neuron_ids), len(session_i_ids), 2),
+        np.nan,
     )
 
-    fp_similarity = np.full(centroid_distance.shape, np.nan)
-    for j, i in zip(*np.where(centroid_distance < neighborhood_thr)):
-        # print(
-        #     f"Neuron {i} in session {indexers['session_j']} is close to neuron {j} in session {indexers['session_i']}. Distance: {centroid_distance[j,i]}"
-        # )
-        fp_similarity[j, i], _, shift = calculate_img_correlation(
-            session_ref.A[:, j],
-            session_target.A[:, i],
-            crop=True,
-            shift=True,
-            mode="cosine_union",
-            gamma=0.1,
-            shift_optimized=True,
-        )
-
-    neuron_ids_ref = np.where(state.assignments[:, indexers["session_j"]] >= 0)[0]
-    fp_ids_ref = state.assignments[neuron_ids_ref, indexers["session_j"]]
-
-    neuron_ids_target = np.where(state.assignments[:, indexers["session_i"]] >= 0)[0]
-    fp_ids_target = state.assignments[neuron_ids_target, indexers["session_i"]]
-
-    fp_similarity_full = np.full(
-        (state.assignments.shape[0], state.assignments.shape[0]), np.nan
+    coords_j = np.full(
+        (len(neuron_ids), len(session_j_ids), 2),
+        np.nan,
     )
-    fp_similarity_full[np.ix_(neuron_ids_ref, neuron_ids_target)] = fp_similarity[
-        np.ix_(fp_ids_ref, fp_ids_target)
-    ]
-    return fp_similarity_full
+
+    def fill_coords(
+        target: np.ndarray,
+        session_ids: np.ndarray,
+    ):
+        for k, session_id in enumerate(session_ids):
+            session = data.sessions[session_id]
+
+            if session is None or session.centroids is None:
+                continue
+
+            # global neuron ID -> local footprint ID
+            fp_ids = state.assignments[
+                neuron_ids,
+                session_id,
+            ]
+
+            present = fp_ids >= 0
+
+            target[present, k, :] = session.centroids[fp_ids[present], :]
+
+    fill_coords(
+        coords_i,
+        session_i_ids,
+    )
+
+    fill_coords(
+        coords_j,
+        session_j_ids,
+    )
+
+    # neuron × session_i × session_j
+    values = np.linalg.norm(
+        coords_i[:, :, None, :] - coords_j[:, None, :, :],
+        axis=-1,
+    )
+
+    return drop_indexed_axes(
+        values,
+        (
+            "neuron",
+            "session_i",
+            "session_j",
+        ),
+        indexers,
+    )
+
+
+def calculate_footprint_similarity(
+    data,
+    state,
+    indexers=None,
+    filters=(),
+    neighborhood_thr=10,
+):
+    indexers = indexers or {}
+
+    N, S = state.assignments.shape
+
+    neuron_i_ids = requested_indices(N, "neuron_i", indexers)
+    neuron_j_ids = requested_indices(N, "neuron_j", indexers)
+
+    session_i_ids = requested_indices(S, "session_i", indexers)
+    session_j_ids = requested_indices(S, "session_j", indexers)
+
+    values = np.full(
+        (
+            len(neuron_i_ids),
+            len(neuron_j_ids),
+            len(session_i_ids),
+            len(session_j_ids),
+        ),
+        np.nan,
+    )
+
+    session_relation = get_pair_relation(
+        filters,
+        "session",
+    )
+
+    for si, session_i_id in enumerate(session_i_ids):
+        session_i = data.sessions[session_i_id]
+
+        if (
+            session_i is None
+            or session_i.centroids is None
+            or session_i.footprints is None
+        ):
+            continue
+
+        fp_i = state.assignments[
+            neuron_i_ids,
+            session_i_id,
+        ]
+
+        valid_i = fp_i >= 0
+        pos_i = np.flatnonzero(valid_i)
+
+        if not valid_i.any():
+            continue
+
+        for sj, session_j_id in enumerate(session_j_ids):
+            session_j = data.sessions[session_j_id]
+
+            if (
+                session_j is None
+                or session_j.centroids is None
+                or session_j.footprints is None
+            ):
+                continue
+
+            if session_relation == "same" and session_i_id != session_j_id:
+                continue
+
+            if session_relation == "different" and session_i_id == session_j_id:
+                continue
+
+            if session_relation == "with previous" and session_j_id != session_i_id - 1:
+                continue
+
+            fp_j = state.assignments[
+                neuron_j_ids,
+                session_j_id,
+            ]
+
+            valid_j = fp_j >= 0
+            pos_j = np.flatnonzero(valid_j)
+
+            if not valid_j.any():
+                continue
+
+            ctr_i = session_i.centroids[fp_i[valid_i]]
+
+            ctr_j = session_j.centroids[fp_j[valid_j]]
+
+            distances = spatial.distance.cdist(
+                ctr_i,
+                ctr_j,
+            )
+
+            # Do not calculate similarity of a neuron with itself
+            # within the same session.
+            if session_i_id == session_j_id:
+                valid_neuron_i = neuron_i_ids[valid_i]
+                valid_neuron_j = neuron_j_ids[valid_j]
+
+                self_pairs = valid_neuron_i[:, None] == valid_neuron_j[None, :]
+
+                distances[self_pairs] = np.inf
+
+            similarity = np.full(
+                distances.shape,
+                np.nan,
+            )
+
+            for ii, jj in zip(*np.where(distances < neighborhood_thr)):
+                similarity[ii, jj], _, _ = calculate_img_correlation(
+                    session_i.footprints[:, fp_i[valid_i][ii]],
+                    session_j.footprints[:, fp_j[valid_j][jj]],
+                    crop=True,
+                    shift=True,
+                    mode="cosine_union",
+                    gamma=0.1,
+                    shift_optimized=True,
+                )
+
+            values[
+                np.ix_(
+                    pos_i,
+                    pos_j,
+                    [si],
+                    [sj],
+                )
+            ] = similarity[:, :, None, None]
+
+    return drop_indexed_axes(
+        values,
+        (
+            "neuron_i",
+            "neuron_j",
+            "session_i",
+            "session_j",
+        ),
+        indexers,
+    )
+
+
+def get_pair_relation(
+    filters,
+    target: str,
+) -> str:
+    for f in filters:
+        if f.target == target:
+            return f.relation
+
+    return "all"

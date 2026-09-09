@@ -42,7 +42,7 @@ class Assignments:
             "fp_corr": np.zeros((0, 0), float),
         }
         self.stats_default_value = {
-            "p_matched": 1.0,  # (1.,0),
+            "p_matched": (1.0, np.nan),
             "shifts": 0.0,
             "fp_corr": 1.0,
         }
@@ -78,15 +78,6 @@ class Assignments:
             )
 
         self.matched_status.extend([False] * n_sessions)
-        # self.stats["p_matched"] = pad_axis(
-        #     self.stats["p_matched"], (n_neurons, n_sessions, 0), np.nan
-        # )
-        # self.stats["shifts"] = pad_axis(
-        #     self.stats["shifts"], (n_neurons, n_sessions, 0), np.nan
-        # )
-        # self.stats["fp_corr"] = pad_axis(
-        #     self.stats["fp_corr"], (n_neurons, n_sessions), np.nan
-        # )
 
         if self.union is None:
             return

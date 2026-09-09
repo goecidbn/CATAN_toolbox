@@ -92,19 +92,54 @@ def crop_to_common_bbox(A1, A2, m=0) -> tuple[np.ndarray, np.ndarray]:
     return A1, A2
 
 
+# def pad_axis(
+#     a: np.ndarray,
+#     dim_pads: Optional[List[int] | Tuple[int, ...]] = None,
+#     value: float = np.nan,
+# ) -> np.ndarray:
+
+#     if dim_pads is None:
+#         dim_pads = [1] * len(a.shape)
+#     assert len(a.shape) == len(dim_pads)
+
+#     pads = [(0, pad) for pad in dim_pads]
+
+#     # if inplace:
+#     #     a = np.pad(a, pads, mode="constant", constant_values=value)
+#     # else:
+#     return np.pad(a, pads, mode="constant", constant_values=value)
+
+
 def pad_axis(
     a: np.ndarray,
-    dim_pads: Optional[List[int] | Tuple[int, ...]] = None,
-    value: float = np.nan,
+    dim_pads: list[int] | tuple[int, ...] | None = None,
+    value=np.nan,
 ) -> np.ndarray:
 
     if dim_pads is None:
-        dim_pads = [1] * len(a.shape)
-    assert len(a.shape) == len(dim_pads)
+        dim_pads = [1] * a.ndim
 
-    pads = [(0, pad) for pad in dim_pads]
+    if len(dim_pads) != a.ndim:
+        raise ValueError(f"Expected {a.ndim} padding values, got {len(dim_pads)}.")
 
-    # if inplace:
-    #     a = np.pad(a, pads, mode="constant", constant_values=value)
-    # else:
-    return np.pad(a, pads, mode="constant", constant_values=value)
+    new_shape = tuple(size + pad for size, pad in zip(a.shape, dim_pads))
+
+    # Allow dtype promotion if necessary, e.g. int + NaN -> float.
+    dtype = np.result_type(
+        a.dtype,
+        np.asarray(value).dtype,
+    )
+
+    result = np.empty(
+        new_shape,
+        dtype=dtype,
+    )
+
+    # Scalar or array/tuple: numpy broadcasting handles both.
+    result[...] = value
+
+    old_region = tuple(slice(0, size) for size in a.shape)
+
+    result[old_region] = a
+
+    return result

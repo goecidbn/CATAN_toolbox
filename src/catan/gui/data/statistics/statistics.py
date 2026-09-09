@@ -1,4 +1,4 @@
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Literal
 
 from dataclasses import dataclass
 import numpy as np
@@ -7,16 +7,37 @@ from .dimensions import (
     Dimension,
     DimensionInfo,
     get_default_coords,
+    get_match_stat_dims,
+    make_match_coord_getter,
 )
 from .queries import ReductionSpec, DEFAULT_REDUCTIONS
 from catan.gui.data import analysis
+
+StatisticCategory = Literal[
+    "session_loaded",
+    "match_loaded",
+    "neuron",
+    "pair",
+]
+
+
+## these should mirror the Literal types defined for StatisticCategory
+CATEGORY_TITLES = {
+    "session_loaded": "Loaded session statistics",
+    "match_loaded": "Loaded match statistics",
+    "neuron": "Neuron-wise statistics",
+    "pair": "Pair statistics",
+}
 
 
 @dataclass
 class StatisticArray:
     name: str
+    title: str
     values: np.ndarray
     dimensions: dict[str, Dimension]
+
+    category: StatisticCategory | None = None
 
     errors_low: np.ndarray | None = None
     errors_high: np.ndarray | None = None
@@ -325,6 +346,7 @@ class StatisticArray:
     def copy(self) -> "StatisticArray":
         return StatisticArray(
             name=self.name,
+            title=self.title,
             values=np.array(self.values, copy=True),
             dimensions={
                 name: Dimension(
@@ -335,6 +357,7 @@ class StatisticArray:
                 )
                 for name, dim in self.dimensions.items()
             },
+            category=self.category,
             errors_low=(
                 None
                 if self.errors_low is None
@@ -354,6 +377,7 @@ class StatisticDefinition:
     key: str
     title: str
     description: str
+    category: StatisticCategory | None
 
     # Conceptual full dimensions before indexing/reduction
     dims: tuple[str, ...]
@@ -374,7 +398,8 @@ class StatisticDefinition:
         self,
         data,
         state,
-        indexers: dict[str, int] | None = None,
+        indexers: dict[str, int] = {},
+        filters=(),
     ) -> StatisticArray:
         """
         Compute statistic values and construct a consistent StatisticArray.
@@ -396,6 +421,7 @@ class StatisticDefinition:
             data,
             state,
             indexers=indexers,
+            filters=filters,
         )
 
         coords = self.coord_getter(state)
@@ -414,8 +440,10 @@ class StatisticDefinition:
 
         stat = StatisticArray(
             name=self.key,
+            title=self.title,
             values=np.asarray(values),
             dimensions=dimensions,
+            category=self.category,
         )
 
         # Mark dimensions already consumed by the getter.
@@ -494,48 +522,23 @@ class StatisticDefinition:
         return False
 
 
-STATISTICS = {
+STATIC_STATISTICS = {
     "none": StatisticDefinition(
         key="none",
         title="None",
         description="No statistic selected.",
         dims=(),
-        getter=lambda data, state, indexers: None,  # lambda data: StatisticArray(np.array([]), dims=()),
-    ),
-    "snr": StatisticDefinition(
-        key="snr",
-        title="SNR",
-        description="Signal-to-noise ratio of inferred activity traces.",
-        dims=("neuron", "session"),
-        getter=lambda data, state, indexers: analysis.get_quality_metric(
-            data, state, indexers=indexers, key="SNR_comp"
-        ),
-    ),
-    "rval": StatisticDefinition(
-        key="rval",
-        title="R-value",
-        description="Correlation coefficients from the quality metrics.",
-        dims=("neuron", "session"),
-        getter=lambda data, state, indexers: analysis.get_quality_metric(
-            data, state, indexers=indexers, key="r_values"
-        ),
-    ),
-    "cnn": StatisticDefinition(
-        key="cnn",
-        title="CNN score",
-        description="Predictions from the convolutional neural network.",
-        dims=("neuron", "session"),
-        getter=lambda data, state, indexers: analysis.get_quality_metric(
-            data, state, indexers=indexers, key="cnn_preds"
-        ),
+        category=None,
+        getter=lambda data, state, indexers, filters: None,  # lambda data: StatisticArray(np.array([]), dims=()),
     ),
     "footprint_size": StatisticDefinition(
         key="footprint_size",
         title="Footprint size",
         description="Size of the neuron footprint in pixels.",
         dims=("neuron", "session"),
-        getter=lambda data, state, indexers: analysis.calculate_footprint_size(
-            data, state, indexers
+        category="neuron",
+        getter=lambda data, state, indexers, filters: analysis.calculate_footprint_size(
+            data, state, indexers, filters
         ),
     ),
     "border_proximity": StatisticDefinition(
@@ -543,8 +546,9 @@ STATISTICS = {
         title="Border proximity",
         description="Proximity of neuron centroids to the borders of the field of view.",
         dims=("neuron", "session"),
-        getter=lambda data, state, indexers: analysis.calculate_border_proximity(
-            data, state, indexers
+        category="neuron",
+        getter=lambda data, state, indexers, filters: analysis.calculate_border_proximity(
+            data, state, indexers, filters
         ),
     ),
     "occurence": StatisticDefinition(
@@ -552,8 +556,9 @@ STATISTICS = {
         title="Occurrence",
         description="Number of sessions in which each neuron is present.",
         dims=("neuron", "session"),
-        getter=lambda data, state, indexers: analysis.calculate_occurrence(
-            data, state, indexers
+        category="neuron",
+        getter=lambda data, state, indexers, filters: analysis.calculate_occurrence(
+            data, state, indexers, filters
         ),
         allowed_reductions={
             "neuron": ("keep", "single", "mean", "sum"),
@@ -569,8 +574,9 @@ STATISTICS = {
         title="Centroid shift",
         description="Centroid distance between sessions.",
         dims=("neuron", "session_i", "session_j"),
-        getter=lambda data, state, indexers: analysis.calculate_centroid_shift(
-            data, state, indexers
+        category="neuron",
+        getter=lambda data, state, indexers, filters: analysis.calculate_centroid_shift(
+            data, state, indexers, filters
         ),
         default_reductions={
             "neuron": ReductionSpec("keep"),
@@ -583,8 +589,9 @@ STATISTICS = {
         title="Temporal correlation",
         description="Pairwise temporal trace correlation within sessions.",
         dims=("neuron_i", "neuron_j", "session"),
-        getter=lambda data, state, indexers: analysis.calculate_temporal_correlation(
-            data, state, indexers
+        category="pair",
+        getter=lambda data, state, indexers, filters: analysis.calculate_temporal_correlation(
+            data, state, indexers, filters
         ),
         default_reductions={
             "neuron_i": ReductionSpec("keep"),
@@ -597,8 +604,9 @@ STATISTICS = {
         title="Centroid distances",
         description="Pairwise Euclidean distances between neuron centroids.",
         dims=("neuron_i", "neuron_j", "session"),
-        getter=lambda data, state, indexers: analysis.calculate_distances(
-            data, state, indexers
+        category="pair",
+        getter=lambda data, state, indexers, filters: analysis.calculate_distances(
+            data, state, indexers, filters
         ),
         default_reductions={
             "neuron_i": ReductionSpec("keep"),
@@ -611,8 +619,9 @@ STATISTICS = {
         title="Footprint similarity",
         description="Pairwise similarity between neuron footprints.",
         dims=("neuron_i", "neuron_j", "session_i", "session_j"),
-        getter=lambda data, state, indexers: analysis.calculate_footprint_similarity(
-            data, state, indexers
+        category="pair",
+        getter=lambda data, state, indexers, filters: analysis.calculate_footprint_similarity(
+            data, state, indexers, filters
         ),
         allowed_reductions={
             "neuron_i": ("keep", "mean"),
@@ -628,3 +637,100 @@ STATISTICS = {
         },
     ),
 }
+
+
+def get_loaded_session_stat_names(data) -> list[str]:
+    names = set()
+
+    for session in data.sessions:
+        if session is None:
+            continue
+
+        names.update(session.quality.keys())
+
+    return sorted(names)
+
+
+def make_session_stat_definition(
+    name: str,
+) -> StatisticDefinition:
+
+    return StatisticDefinition(
+        key=f"session:{name}",
+        title=name,
+        description=f"Loaded session statistic: {name}",
+        category="session_loaded",
+        dims=("neuron", "session"),
+        getter=lambda data, state, indexers, filters, name=name: analysis.get_quality_metric(
+            data,
+            state,
+            indexers=indexers,
+            key=name,
+        ),
+    )
+
+
+def make_match_stat_definition(
+    name: str,
+    values: np.ndarray,
+) -> StatisticDefinition:
+
+    values = np.asarray(values)
+    dims = get_match_stat_dims(
+        name,
+        values,
+    )
+
+    return StatisticDefinition(
+        key=f"match:{name}",
+        title=name,
+        description=f"Loaded match statistic: {name}",
+        category="match_loaded",
+        dims=dims,
+        getter=lambda data, state, indexers, filters, name=name, dims=dims: analysis.get_match_metric(
+            data,
+            state,
+            indexers=indexers,
+            key=name,
+            dims=dims,
+        ),
+        coord_getter=make_match_coord_getter(
+            dims,
+            values.shape,
+        ),
+    )
+
+
+def get_loaded_match_stat_names(data) -> list[str]:
+    assignments = getattr(data, "assignments", None)
+
+    if assignments is None:
+        return []
+
+    return sorted(assignments.stats.keys())
+
+
+def build_statistics_registry(
+    data,
+    state,
+) -> dict[str, StatisticDefinition]:
+
+    registry = dict(STATIC_STATISTICS)
+
+    # Loaded session statistics
+    for name in get_loaded_session_stat_names(data):
+        definition = make_session_stat_definition(name)
+        registry[definition.key] = definition
+
+    # Loaded match statistics
+    assignments = getattr(data, "assignments", None)
+
+    if assignments is not None:
+        for name, values in assignments.stats.items():
+            definition = make_match_stat_definition(
+                name,
+                values,
+            )
+            registry[definition.key] = definition
+
+    return registry

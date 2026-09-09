@@ -12,11 +12,11 @@ from PySide6.QtWidgets import (
     QToolButton,
     QGridLayout,
     QCheckBox,
-    QHBoxLayout
+    QHBoxLayout,
 )
 
 from catan.core.io.inspection import check_file_compatibility
-from catan.core.structures.load_config import FieldGroupSpec, FieldSpec, LoadConfig
+from catan.core.structures.load_config import FieldGroupSpec, FieldSpec
 from catan.tracking.structures import Assignments
 from catan.gui.structures import SessionData, data, state
 from catan.gui.GUI_elements.utils.FlowLayout import FlowLayout, QSizePolicy
@@ -24,11 +24,10 @@ from catan.gui.GUI_elements.utils.FlowLayout import FlowLayout, QSizePolicy
 from .field_chip import FieldChip
 from .dialog_load_field import FieldSelectDialog
 
-
 COMPAT_COLORS = {
-    "available": "#4F7F5A",        # muted green
-    "optional_missing": "#8A7040", # muted amber
-    "required_missing": "#8A4F52", # muted red
+    "available": "#4F7F5A",  # muted green
+    "optional_missing": "#8A7040",  # muted amber
+    "required_missing": "#8A4F52",  # muted red
 }
 # green  = "#3F6548"
 # amber  = "#6F5B35"
@@ -44,7 +43,7 @@ TEXT_COLOR = "#E8E8E8"
 class FieldEditor(QLineEdit):
     name: str
     _field_path: str
-    
+
     def __init__(
         self,
         name: str,
@@ -56,7 +55,7 @@ class FieldEditor(QLineEdit):
         self.set(path=spec.path)
 
         # self.setText(self.field_path)
-    
+
     @property
     def field_path(self) -> str:
         return self.text()
@@ -66,18 +65,16 @@ class FieldEditor(QLineEdit):
         self._field_path = value
         self.setText(value)
         self.setToolTip(f"{self.name}: {value}")
-        
+
     def set(self, *, name: Optional[str] = None, path: Optional[str] = None):
-        
+
         if name is not None:
             self.name = name
         if path is not None:
             self.field_path = path
-    
 
 
 class OptionList(QWidget):
-
     """
     Widget to display a list of options for a given field group. The options can be either static or dynamic, depending on the group specification.
     """
@@ -98,10 +95,7 @@ class OptionList(QWidget):
         self.list_type = group_spec.type
         self.group_spec = group_spec
 
-        self.setSizePolicy(
-            QSizePolicy.Policy.Expanding, 
-            QSizePolicy.Policy.Expanding
-        )
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.callback = callback
 
@@ -159,7 +153,10 @@ class OptionList(QWidget):
         path_edit.setMinimumWidth(30)
         path_edit.editingFinished.connect(
             lambda field_name=name: self.callback(
-                self.group_name, field_name, method="edit_path", field_path=path_edit.field_path
+                self.group_name,
+                field_name,
+                method="edit_path",
+                field_path=path_edit.field_path,
             )
         )
 
@@ -174,14 +171,20 @@ class OptionList(QWidget):
         )
 
         self.list_layout.addWidget(
-            QLabel(name.capitalize() + ":"),row,0,
+            QLabel(name.capitalize() + ":"),
+            row,
+            0,
         )
         self.list_layout.addWidget(
-            path_edit,row,1,
+            path_edit,
+            row,
+            1,
         )
 
         self.list_layout.addWidget(
-            browse,row,2,
+            browse,
+            row,
+            2,
         )
         path_edit.setEnabled(enabled)
         self.option[name] = path_edit
@@ -195,80 +198,76 @@ class OptionList(QWidget):
 
         for name, spec in group_spec.fields.items():
             self.add_chip(name, spec, enabled)
-            # chip = FieldChip(name, spec)
-            # self.list_layout.addWidget(chip)
-
-            # chip.field_button.clicked.connect(
-            #     lambda _, field_name=chip.name: self.callback(
-            #         self.group_name, field_name, method="rename"
-            #     )
-            # )
-            # chip.remove_requested.connect(
-            #     lambda chip_field_name : self.callback(
-            #         self.group_name, chip_field_name, method="remove"
-            #     )
-            # )
-            # chip.setEnabled(enabled) 
-            # self.option[name] = chip
 
         add_button = QToolButton()
         add_button.setText("+")
         add_button.setToolTip(f"Add {self.group_name} field")
-        add_button.clicked.connect(lambda _, field_name=None: self.callback(self.group_name, field_name, method="add"))
+        add_button.clicked.connect(
+            lambda _, field_name=None: self.callback(
+                self.group_name, field_name, method="add"
+            )
+        )
         self.list_layout.addWidget(add_button)
 
     def add_chip(self, name: str, spec: FieldSpec, enabled: bool = True):
 
-        assert isinstance(self.list_layout, FlowLayout), "Cannot add chip to non-flow layout."
+        assert isinstance(
+            self.list_layout, FlowLayout
+        ), "Cannot add chip to non-flow layout."
         chip = FieldChip(name, spec)
         self.list_layout.insertBeforeLast(chip)
 
-        chip.field_button.clicked.connect(
-            lambda _, field_name=chip.name: self.callback(
+        chip.rename_requested.connect(
+            lambda field_name: self.callback(
                 self.group_name, field_name, method="rename"
             )
         )
         chip.remove_requested.connect(
-            lambda chip_field_name : self.callback(
-                self.group_name, chip_field_name, method="remove"
+            lambda field_name: self.callback(
+                self.group_name, field_name, method="remove"
             )
         )
         chip.change_path_requested.connect(
-            lambda field_name=chip.name : self.callback(self.group_name, field_name, method="edit_path")
+            lambda field_name: self.callback(
+                self.group_name, field_name, method="edit_path"
+            )
         )
         chip.setEnabled(enabled)
         self.option[name] = chip
 
-    def refresh(self, name: str, path: Optional[str]=None):
+    def refresh(self, name: str, path: Optional[str] = None):
 
         if name not in self.group_spec.fields:
             self.option[name].deleteLater()
             del self.option[name]
             return
 
-        self.option[name].set(name=name,path=path)
+        self.option[name].set(name=name, path=path)
 
     def update_style(self, name, status):
 
-        self.option[name].setStyleSheet(f"background-color: {COMPAT_COLORS[status]}; color: {TEXT_COLOR}; border: 1px solid {COMPAT_BORDERS[status]}; border-radius: 3px; padding: 2px;")
+        self.option[name].setStyleSheet(
+            f"background-color: {COMPAT_COLORS[status]}; color: {TEXT_COLOR}; border: 1px solid {COMPAT_BORDERS[status]}; border-radius: 3px; padding: 2px;"
+        )
+
 
 class FieldSelector(QWidget):
     """
     Widget to manage field selection for different groups. Provides an interface to edit, add, rename, and remove fields.
     """
+
     fields_changed = Signal()
     loading_possible = bool
-    
+
     def __init__(self, parent, source: SessionData | Assignments):
         super().__init__(parent)
 
         self.state: state.AppState = parent.state
         self.data: data.Data = parent.data
 
-
         self.field_options: dict[str, OptionList] = {}
         self.opts_layout = QVBoxLayout(self)
-        self.opts_layout.setContentsMargins(6,6,6,6)
+        self.opts_layout.setContentsMargins(6, 6, 6, 6)
         self.opts_layout.setSpacing(3)
 
         self.fields_changed.connect(self._on_fields_changed)
@@ -277,13 +276,12 @@ class FieldSelector(QWidget):
         # self.rebuild()
         # self.state.data_changed.connect(self._on_data_changed)
 
-    def update_source(self, source: SessionData | Assignments):
+    def update_source(self, source: SessionData | Assignments | None):
         self.source = source
         self.rebuild()
 
-
     def rebuild(self):
-        
+
         self.clear()
 
         if self.source is None:
@@ -293,9 +291,9 @@ class FieldSelector(QWidget):
         ## loading options
         for group_name, group_spec in self.source.source_config.groups.items():
             self.field_options[group_name] = OptionList(
-                group_name, 
-                group_spec, 
-                self.manipulate_fields, 
+                group_name,
+                group_spec,
+                self.manipulate_fields,
                 # enabled=not self.source.status.get(f"{group_name}_loaded", False)
             )
 
@@ -303,8 +301,10 @@ class FieldSelector(QWidget):
                 group_spec,
                 self.field_options[group_name],
                 self.source.source_config.groups[group_name].enabled,
-                lambda checked, group_name=group_name: self.source.source_config.set_group_enabled(group_name,checked)
-                )
+                lambda checked, group_name=group_name: self.source.source_config.set_group_enabled(
+                    group_name, checked
+                ),
+            )
             self.opts_layout.addWidget(opts_widget)
 
         self.fields_changed.emit()
@@ -316,10 +316,19 @@ class FieldSelector(QWidget):
 
     def _on_fields_changed(self):
 
-        if not self.source.path or self.source.source_config is None:
+        if (
+            self.source is None
+            or not self.source.path
+            or self.source.source_config is None
+        ):
             return
-        
-        report = check_file_compatibility(self.source.path, self.source.source_config.get_fields_to_load(list(self.source.source_config.groups.keys())))
+
+        report = check_file_compatibility(
+            self.source.path,
+            self.source.source_config.get_fields_to_load(
+                list(self.source.source_config.groups.keys())
+            ),
+        )
 
         loading_possible = True
         for field in report.fields:
@@ -332,13 +341,13 @@ class FieldSelector(QWidget):
                 status = "available"
 
             self.field_options[field.group].update_style(field.label, status)
-        
+
         # also, finally color current session properly!!
         self.loading_possible = loading_possible
 
-
-    
-    def manipulate_fields(self, group_name: str, field_name: str, method="edit", **kwargs):
+    def manipulate_fields(
+        self, group_name: str, field_name: str, method="edit", **kwargs
+    ):
 
         assert self.source.path is not None, "Path is not set."
         assert self.source.source_config is not None, "Load config is not initialized."
@@ -351,7 +360,7 @@ class FieldSelector(QWidget):
                 field_name,
             )
             self.field_options[group_name].refresh(field_name)
-                    
+
             self.fields_changed.emit()
             return
 
@@ -378,14 +387,24 @@ class FieldSelector(QWidget):
                 )
                 return
             if new_name != field_name:
-                self.field_options[group_name].option[new_name] = self.field_options[group_name].option.pop(field_name)
+                self.field_options[group_name].option[new_name] = self.field_options[
+                    group_name
+                ].option.pop(field_name)
+
+                ## set name in data source to new one
+                if (
+                    data_source := getattr(self.source, group_name)
+                ) and field_name in data_source:
+                    data_source[new_name] = data_source.pop(field_name)
+
                 field_name = new_name
-    
-                
+
         if method == "edit_path":
 
             if (field_path := kwargs.get("field_path")) is None:
-                field_path = FieldSelectDialog.get_field(path=self.source.path, key=field_name)
+                field_path = FieldSelectDialog.get_field(
+                    path=self.source.path, key=field_name
+                )
                 if field_path is None:
                     return
             assert isinstance(field_path, str), "Field path must be a string."
@@ -397,13 +416,17 @@ class FieldSelector(QWidget):
             )
 
         if method == "add":
-            field_path = FieldSelectDialog.get_field(path=self.source.path, key=field_name)
+            field_path = FieldSelectDialog.get_field(
+                path=self.source.path, key=field_name
+            )
             if field_path is None:
                 return
 
             ## check, if a field with the same path already exists in the group
             fields_to_load = self.source.source_config.get_fields_to_load([group_name])
-            if field_path in [field.path for field in fields_to_load[group_name].values()]:
+            if field_path in [
+                field.path for field in fields_to_load[group_name].values()
+            ]:
                 self.state.issue(
                     "warning",
                     "Adding field is not possible",
@@ -434,17 +457,22 @@ class FieldSelector(QWidget):
                 )
                 return
             self.field_options[group_name].add_chip(
-                field_name, 
-                self.source.source_config.groups[group_name].fields[field_name], 
+                field_name,
+                self.source.source_config.groups[group_name].fields[field_name],
                 # enabled=not self.source.status.get(f"{group_name}_loaded", False)
             )
 
-        field_path = field_path or self.source.source_config.groups[group_name].fields[field_name].path
-        self.field_options[group_name].refresh(field_name,field_path)
+        field_path = (
+            field_path
+            or self.source.source_config.groups[group_name].fields[field_name].path
+        )
+        self.field_options[group_name].refresh(field_name, field_path)
         self.fields_changed.emit()
 
 
-def checkbox_with_options(group_spec: FieldGroupSpec, opts_ref: QWidget, active: bool, callback: Callable) -> QWidget:
+def checkbox_with_options(
+    group_spec: FieldGroupSpec, opts_ref: QWidget, active: bool, callback: Callable
+) -> QWidget:
     label = group_spec.title
 
     container = QWidget()
@@ -463,15 +491,8 @@ def checkbox_with_options(group_spec: FieldGroupSpec, opts_ref: QWidget, active:
         lambda state: callback(state == Qt.CheckState.Checked.value)
     )
 
-    # toggle_button = QToolButton()
-    # toggle_button.setCheckable(True)
-    # toggle_button.setChecked(False)
-    # toggle_button.setAutoRaise(True)
-    # toggle_button.setFixedWidth(22)
-
     header_layout.addWidget(chk)
     header_layout.addStretch()
-    # header_layout.addWidget(toggle_button)
 
     layout.addWidget(header)
 
@@ -480,19 +501,7 @@ def checkbox_with_options(group_spec: FieldGroupSpec, opts_ref: QWidget, active:
     options_layout = QHBoxLayout(options_container)
     options_layout.setContentsMargins(14, 0, 0, 4)
     options_layout.addWidget(opts_ref)
-    # opts_ref.setVisible(False)
 
     layout.addWidget(options_container)
 
-    # def toggle_options(expanded: bool):
-    #     options_container.setVisible(expanded)
-    #     toggle_button.setArrowType(
-    #         Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
-    #     )
-
-    # toggle_button.toggled.connect(toggle_options)
-    # toggle_options(False)
-
     return container
-
-

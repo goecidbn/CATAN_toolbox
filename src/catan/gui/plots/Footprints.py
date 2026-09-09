@@ -680,7 +680,6 @@ class Display(BasePlot.BaseCanvas):
 
         menu.exec(QCursor.pos())
 
-    
     def toggle_session_data(
         self, session_id: int, which: Optional[sessiondata_type] = None
     ):

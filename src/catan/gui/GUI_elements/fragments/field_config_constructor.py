@@ -1,9 +1,19 @@
 from pathlib import Path
 from PySide6.QtCore import QObject, Qt, Signal
 
-from PySide6.QtWidgets import QInputDialog, QLabel, QMessageBox, QHBoxLayout, QComboBox, QSizePolicy, QVBoxLayout, QWidget
-from catan.gui.GUI_elements.fragments.field_selector import FieldSelector
-from catan.gui.GUI_elements.fragments.toggle_option import ToggleOption
+from PySide6.QtWidgets import (
+    QInputDialog,
+    QLabel,
+    QMessageBox,
+    QHBoxLayout,
+    QComboBox,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+from . import FieldSelector, ToggleOption
+from catan.core.structures import SessionData
+from catan.tracking.structures import Assignments
 
 from .IconButton import make_icon_button
 
@@ -22,7 +32,7 @@ class FieldConfigConstructor(QObject):
         self._parent = parent
         self.state = parent.state
 
-        self.source = None
+        self.source: SessionData | Assignments | None = None
 
         ## build the different GUI elements
         self.build_toggle_config_options()
@@ -39,42 +49,39 @@ class FieldConfigConstructor(QObject):
 
         self.build_config_file_options()
         self.build_config_field_options()
-        
+
         ## connect the container to the toggle
         self.toggle_config_options.set_container(self.config_options)
         self.source_changed.connect(self._on_source_changed)
 
         self.update_source(source)
 
-    def update_source(self, source):
+    def update_source(self, source: SessionData | Assignments | None):
         self.source = source
         self.toggle_config_options.setEnabled(self.source is not None)
 
-        expanded = self.toggle_config_options.container is not None and self.toggle_config_options.container.isVisible() and (self.source is not None)
+        expanded = (
+            self.toggle_config_options.container is not None
+            and self.toggle_config_options.container.isVisible()
+            and (self.source is not None)
+        )
         self.toggle_config_options.set_expanded(expanded)
         self.source_changed.emit()
 
     def _on_source_changed(self):
         self.config_field_options.update_source(self.source)
-        # self.rebuild()
-        
-
-    # def rebuild(self):
-        # self.build_config_file_options()
-        # self.build_config_field_options()
         self.rebuild_config_selector()
-        # self.config_field_options.rebuild()
-    
+
     def build_toggle_config_options(self):
         ## define and set toggle
         self.toggle_config_options = ToggleOption(
             icon_name="cog", tooltip="Select fields to load", expanded=False
         )
+
         def on_toggle_config_fields():
             self.expanded_changed.emit()
 
         self.toggle_config_options.toggled.connect(on_toggle_config_fields)
-
 
     def build_config_file_options(self):
         """
@@ -89,7 +96,6 @@ class FieldConfigConstructor(QObject):
         )
         layout = QHBoxLayout(self.config_file_options)
 
-
         # layout.addWidget(QLabel("Load config:"))
         self.load_config_selector = QComboBox()
         self.load_config_selector.setMaximumWidth(120)
@@ -101,25 +107,29 @@ class FieldConfigConstructor(QObject):
         layout.addStretch()
 
         def load_config_changed(idx):
+            if self.source is None:
+                return
+
             name = self.state.config_manager.names()[idx]
             self.source.source_config = self.state.config_manager.select(name)
 
             self.config_field_options.rebuild()
             self.expanded_changed.emit()
-        
+
         self.load_config_selector.currentIndexChanged.connect(
             lambda idx: load_config_changed(idx)
         )
 
         self.load_config_save_button = make_icon_button(
-            "floppy-disk", tooltip="Save load configuration", 
+            "floppy-disk",
+            tooltip="Save load configuration",
             # size=28, icon_size=22
         )
         self.load_config_save_button.clicked.connect(self.on_save_load_config)
-        
 
         self.load_config_delete_button = make_icon_button(
-            "trash", tooltip="Delete load configuration", 
+            "trash",
+            tooltip="Delete load configuration",
             # size=28, icon_size=22
         )
         self.load_config_delete_button.clicked.connect(self.on_delete_load_config)
@@ -142,7 +152,6 @@ class FieldConfigConstructor(QObject):
             self.load_config_set_default_button, alignment=Qt.AlignmentFlag.AlignRight
         )
         self.config_layout.addWidget(self.config_file_options)
-        
 
     def rebuild_config_selector(self):
         selector = self.load_config_selector
@@ -153,8 +162,7 @@ class FieldConfigConstructor(QObject):
             selector.blockSignals(False)
             return
         names = self.state.config_manager.names(
-            public_only=False, 
-            source_type=self.source.source_type
+            public_only=False, source_type=self.source.source_type
         )
         selector.addItems(names)
         for i, name in enumerate(names):
@@ -167,17 +175,11 @@ class FieldConfigConstructor(QObject):
                 selector.setCurrentIndex(i)
         selector.blockSignals(False)
 
-    
     def build_config_field_options(self):
 
-        self.config_field_options = FieldSelector(
-            self._parent, self.source
-        )
-        self.config_field_options.fields_changed.connect(
-            self._on_fields_changed
-        )
+        self.config_field_options = FieldSelector(self._parent, self.source)
+        self.config_field_options.fields_changed.connect(self._on_fields_changed)
         self.config_layout.addWidget(self.config_field_options)
-    
 
     def on_save_load_config(self):
         if self.source is None:
@@ -198,16 +200,14 @@ class FieldConfigConstructor(QObject):
         )
         if ok and new_name:
             # print("saving source_config:", self.source.source_config.name)
-            self.state.config_manager.save_config(
-                self.source.source_config, new_name
-            )
+            self.state.config_manager.save_config(self.source.source_config, new_name)
 
         self.rebuild_config_selector()
 
     def on_delete_load_config(self):
         if self.source is None:
             return
-        
+
         if self.source.source_config is None:
             self.state.issue(
                 "warning",
@@ -244,14 +244,14 @@ class FieldConfigConstructor(QObject):
     def on_set_default(self):
         if self.source is None:
             return
-        
+
         self.state.config_manager.set_default_for_format(
             self.source.path, self.source.source_config
         )
         self._on_fields_changed()
-    
 
     def _on_fields_changed(self):
+
         if self.source is None:
             return
 
@@ -259,7 +259,7 @@ class FieldConfigConstructor(QObject):
         self.expanded_changed.emit()
         if self.source.source_config is None:
             return
-        
+
         is_default = self.state.config_manager.is_default(
             self.source.path, self.source.source_config
         )
@@ -278,5 +278,7 @@ class FieldConfigConstructor(QObject):
             + getattr(self.source.source_config, "name", "")
             + (" (modified)" if is_modified else "")
         )
+
+        self.state.statistics_sources_changed.emit()
 
         # loading_possible = self.field_selector.loading_possible

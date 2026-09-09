@@ -10,10 +10,12 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from catan.core.structures.load_config import FieldSpec
 
+
 class FieldChip(QWidget):
 
+    rename_requested = Signal(str)
     remove_requested = Signal(str)
-    change_path_requested = Signal()
+    change_path_requested = Signal(str)
 
     name: str
     field_path: str
@@ -26,7 +28,6 @@ class FieldChip(QWidget):
     ):
         super().__init__(parent)
 
-
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -34,6 +35,8 @@ class FieldChip(QWidget):
         self.field_button = QToolButton()
         self.field_button.setText(name)
         self.field_button.setChecked(True)
+
+        self.field_button.clicked.connect(lambda: self.rename_requested.emit(self.name))
 
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._open_context_menu)
@@ -63,13 +66,10 @@ class FieldChip(QWidget):
 
         menu = QMenu(self)
 
-        # menu.addAction(
-        #     "Set current session",
-        #     lambda: self.setCurrentRequested.emit(self.index),
-        # )
-        # menu = self.field_button.createStandardContextMenu()
         menu.addSeparator()
-        menu.addAction("Edit field path...", lambda: self.change_path_requested.emit())
+        menu.addAction(
+            "Edit field path...", lambda: self.change_path_requested.emit(self.name)
+        )
         menu.exec(self.mapToGlobal(pos))
 
     def set(self, *, name: Optional[str] = None, path: Optional[str] = None):
@@ -77,7 +77,7 @@ class FieldChip(QWidget):
             self.name = name
         if path is not None:
             self.field_path = path
-        
+
         self.field_button.setText(self.name)
         if self.name != self.field_path:
             self.field_button.setToolTip(f"{self.name} ({self.field_path})")

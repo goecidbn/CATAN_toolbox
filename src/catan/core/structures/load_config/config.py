@@ -11,7 +11,6 @@ from uuid import uuid4
 from catan.core.io.types import SourceTypes, FieldSource, FieldSpec, FieldGroupSpec
 
 
-
 @dataclass
 class SubConfigSpec:
     path: str
@@ -33,12 +32,11 @@ class SubConfigSpec:
             required=data.get("required", False),
         )
 
+
 @dataclass
 class LoadConfig:
     name: str | None = None
-    uid: str = field(
-        default_factory=lambda: str(uuid4())
-    )
+    uid: str = field(default_factory=lambda: str(uuid4()))
     preset_uid: str | None = None
 
     source_type: SourceTypes = "session"
@@ -48,9 +46,7 @@ class LoadConfig:
 
     groups: dict[str, FieldGroupSpec] = field(default_factory=dict)
 
-    subconfigs: dict[str, SubConfigSpec] = field(
-        default_factory=dict
-    )
+    subconfigs: dict[str, SubConfigSpec] = field(default_factory=dict)
 
     FORMAT_VERSION = 1
 
@@ -109,12 +105,12 @@ class LoadConfig:
     ) -> dict[str, dict[str, FieldSpec]]:
         if groups is None:
             groups = [
-                name for name, group in self.groups.items()
+                name
+                for name, group in self.groups.items()
                 if (group.enabled or not enabled_only)
             ]
         return {
-            group_name: dict(self.groups[group_name].fields)
-            for group_name in groups
+            group_name: dict(self.groups[group_name].fields) for group_name in groups
         }
 
     def get_fields_to_save(
@@ -147,7 +143,7 @@ class LoadConfig:
         config.uid = str(uuid4())
 
         return config
-    
+
     def to_dict(self, for_compare=False) -> dict:
 
         out = {
@@ -155,15 +151,9 @@ class LoadConfig:
             "source_type": self.source_type,
             "public": self.public,
             "native": self.native,
-
-            "groups": {
-                name: group.to_dict()
-                for name, group in self.groups.items()
-            },
-
+            "groups": {name: group.to_dict() for name, group in self.groups.items()},
             "subconfigs": {
-                name: spec.to_dict()
-                for name, spec in self.subconfigs.items()
+                name: spec.to_dict() for name, spec in self.subconfigs.items()
             },
         }
 
@@ -174,8 +164,6 @@ class LoadConfig:
                 "uid": self.uid,
                 "name": self.name,
             }
-        
-
 
     @classmethod
     def from_dict(
@@ -217,13 +205,11 @@ class LoadConfig:
             ),
             groups={
                 name: FieldGroupSpec.from_dict(group)
-                for name, group
-                in data.get("groups", {}).items()
+                for name, group in data.get("groups", {}).items()
             },
             subconfigs={
                 name: SubConfigSpec.from_dict(spec)
-                for name, spec
-                in data.get("subconfigs", {}).items()
+                for name, spec in data.get("subconfigs", {}).items()
             },
         )
 
@@ -283,10 +269,7 @@ class LoadConfig:
         try:
             return self.subconfigs[name]
         except KeyError as exc:
-            raise KeyError(
-                f"Unknown subconfig {name!r}"
-            ) from exc
-
+            raise KeyError(f"Unknown subconfig {name!r}") from exc
 
     def add_subconfig(
         self,
@@ -298,9 +281,7 @@ class LoadConfig:
     ) -> None:
 
         if name in self.subconfigs:
-            raise KeyError(
-                f"Subconfig {name!r} already exists"
-            )
+            raise KeyError(f"Subconfig {name!r} already exists")
 
         self.subconfigs[name] = SubConfigSpec(
             path=path,
@@ -308,18 +289,14 @@ class LoadConfig:
             required=required,
         )
 
-
     def remove_subconfig(
         self,
         name: str,
     ) -> None:
         if name not in self.subconfigs:
-            raise KeyError(
-                f"Unknown subconfig {name!r}"
-            )
+            raise KeyError(f"Unknown subconfig {name!r}")
 
         del self.subconfigs[name]
-
 
     def update_subconfig(
         self,
@@ -338,10 +315,7 @@ class LoadConfig:
         unknown = set(changes) - valid
 
         if unknown:
-            raise ValueError(
-                f"Unknown SubConfigSpec properties: "
-                f"{sorted(unknown)}"
-            )
+            raise ValueError(f"Unknown SubConfigSpec properties: " f"{sorted(unknown)}")
 
         for key, value in changes.items():
             setattr(

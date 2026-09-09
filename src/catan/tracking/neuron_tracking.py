@@ -721,49 +721,6 @@ class Tracking:
                 #    print(f'!! neuron {nm} is removed, as it is nonmatched and has high match probability:',p_all)[p_all>0])
                 non_matched = non_matched[non_matched != nm]
 
-        # ### =================================================== ###
-        # ### ========= update reference data structure ========= ###
-        # ### =================================================== ###
-        # ### update footprint shapes of matched neurons with
-        # ### A_ref = (1-p/2)*A_ref + p/2*A
-        # ### to maintain part or all of original shape,
-        # ### depending on p_matched
-        # ### =================================================== ###
-
-        # ## shift union footprints to "new" location of neuron to ensure proper union construction
-        # shifted = sparse.hstack(
-        #     [
-        #         (
-        #             _shift_sparse_bilinear(
-        #                 self.assignments.union.footprints[:, m_ref],  # .reshape(512, 512),
-        #                 self.assignments.union.dims,
-        #                 -footprint_shifts[m_ref, m, 0],
-        #                 -footprint_shifts[m_ref, m, 1],
-        #                 order="C",
-        #                 # output_format="csc",
-        #             )  # .reshape(-1, 1)
-        #             if footprint_distances[m_ref, m] > 0.5
-        #             else self.assignments.union.footprints[:, m_ref]
-        #         ).multiply(1 - footprint_correlations[m_ref, m] / 2)
-        #         + this_data.footprints[:, m].multiply(footprint_correlations[m_ref, m] / 2)
-        #         for m_ref, m in zip(matched_ref, matched)
-        #     ],
-        #     format="csc",
-        # )
-
-        # # self.assignments.union.footprints[:, matched_ref] = self.assignments.union.footprints[:, matched_ref].multiply(
-        # #     1 - p_matched[idx_TP] / 2
-        # # ) + this_data.footprints[:, matched].multiply(p_matched[idx_TP] / 2)
-
-        # self.assignments.union.footprints.toarray()[:, matched_ref] = shifted.toarray()
-        # ## append new neuron footprints to union
-        # footprints_updated = sparse.hstack(
-        #     [sparse.coo_matrix(self.assignments.union.footprints), this_data.footprints[:, non_matched]],
-        #     format="csc",
-        # )
-        # # ## update union data
-        # self.assignments.union.register_spatial(footprints=footprints_updated)
-
         ### =================================================== ###
         ### ============== store matching results ============= ###
         ### =================================================== ###
@@ -819,6 +776,10 @@ class Tracking:
             )
             for c in matched_ref
         ]
+
+        self.assignments.stats["p_matched"][non_matched, this_data.id, 1] = np.max(
+            p_all[non_matched, :], axis=1
+        )
 
         self.update_union_footprints(
             this_data.footprints,

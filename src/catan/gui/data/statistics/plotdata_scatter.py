@@ -3,8 +3,6 @@ from typing import Literal
 from dataclasses import dataclass
 import numpy as np
 
-
-from .statistics import STATISTICS
 from .dimensions import canonical_dims
 from .prepared_data import PickTable
 
@@ -156,8 +154,8 @@ def build_plot_data(
     row_to_marker[marker_rows] = np.arange(marker_rows.size)
 
     title = {
-        "x": STATISTICS[x_table.stat.name].title,
-        "y": STATISTICS[y_table.stat.name].title,
+        "x": x_table.stat.title,
+        "y": y_table.stat.title,
     }
 
     return PlotData(

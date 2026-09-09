@@ -69,7 +69,7 @@ def print_debug(state, data):
     # print("Footprints:", data.sessions[0].footprints.shape)
     # print("Footprints:", data.sessions[0].footprints)
 
-    if print_remap := True:
+    if print_remap := False:
         print("Remapping:")
         for session in data.sessions:
             print(f"\nSession {session.id} ({session.name})")
@@ -82,6 +82,11 @@ def print_debug(state, data):
 
             session.evaluate_alignment_status()
             print("aligned:", session.status["aligned"])
+
+    q_params = data.sessions[0].quality.keys()
+    print(f"Session quality params: {q_params}")
+    for q in q_params:
+        print(f"Session {data.sessions[0].id}, {q}: {data.sessions[0].quality[q][:10]}")
 
     # print("Assignments:", data.assignments.ids)
     # print("Assignments (state):", state.assignments)
@@ -111,8 +116,8 @@ def print_debug(state, data):
     # print("model reference_data:", data.reference_data.id, data.reference_data.name)
     # # print("counts:", data.counts)
     # print("counts sum:", data.counts["cross"][..., 0].sum())
-    print("model:", data.model)
-    print("evaluate f_same: ", data.model.f_same(1.0, 0.9))
+    # print("model:", data.model)
+    # print("evaluate f_same: ", data.model.f_same(1.0, 0.9))
     # print("ids:",data.session_order)
     # print("Session names:", [s.name for s in data.sessions])
     # print("Session order:", [(s.id,s.name) for s in data.sessions])

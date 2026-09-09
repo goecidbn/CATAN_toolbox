@@ -62,3 +62,41 @@ def get_default_coords(state) -> dict[str, np.ndarray]:
         "neuron_i": np.arange(N),
         "neuron_j": np.arange(N),
     }
+
+
+def get_match_stat_dims(
+    name: str,
+    values: np.ndarray,
+) -> tuple[str, ...]:
+
+    if values.ndim < 2:
+        raise ValueError(
+            f"Assignment statistic {name!r} "
+            "must have at least neuron and session axes."
+        )
+
+    extra_dims = tuple(f"{name}_dim_{i}" for i in range(values.ndim - 2))
+
+    return (
+        "neuron",
+        "session",
+        *extra_dims,
+    )
+
+
+def make_match_coord_getter(
+    dims: tuple[str, ...],
+    shape: tuple[int, ...],
+):
+    def coord_getter(state):
+        coords = get_default_coords(state)
+
+        for dim, size in zip(
+            dims[2:],
+            shape[2:],
+        ):
+            coords[dim] = np.arange(size)
+
+        return coords
+
+    return coord_getter

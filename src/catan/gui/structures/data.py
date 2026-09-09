@@ -13,12 +13,11 @@ from catan.gui.plots.colors import CyclicColorMap
 
 from catan import Tracking
 
+# class Neurons:
 
-class Neurons:
-
-    n: int = 0
-    centroids: np.ndarray
-    union_footprints: Dict[int, sparse.csc_matrix]
+#     n: int = 0
+#     centroids: np.ndarray
+#     union_footprints: Dict[int, sparse.csc_matrix]
 
 
 class Data(Tracking):
@@ -37,7 +36,7 @@ class Data(Tracking):
 
         self.state.current_session_changed.connect(self._on_current_session_changed)
 
-    def _on_data_changed(self, change):
+    def notify_change(self, change):
         self.state.data_version += 1
         self.state.data_changed.emit(change)
 
@@ -79,9 +78,9 @@ class Data(Tracking):
             alignment_template=self.alignment_template,
             ctx=kwargs.get("ctx", None),
         )
-        self._on_data_changed(("session", session_id))
+        self.notify_change(("session", session_id))
         if "traces" in fields_to_load:
-            self._on_data_changed(("traces", session_id))
+            self.notify_change(("traces", session_id))
 
     def queue_load_data(self, session_id: int):
         session = self.sessions[session_id]
@@ -128,7 +127,7 @@ class Data(Tracking):
             from_session_index=session_id,
             align_to_reference=True,
         )
-        self._on_data_changed(("model", session_id))
+        self.notify_change(("model", session_id))
 
     def fit_after_loading(self, key: str = "model update"):
         """
@@ -154,7 +153,7 @@ class Data(Tracking):
         if self.model is None:
             raise ValueError("No model to fit. Please add a model before fitting.")
         self.model.fit_model_to_counts(self.counts["cross"])
-        self._on_data_changed(("assignments", -1))  # Notify that model has changed
+        self.notify_change(("assignments", -1))  # Notify that model has changed
 
     def register_session(
         self,
@@ -202,7 +201,7 @@ class Data(Tracking):
                 self.state.current_session_id = session_id
 
             # Notify that sessions have changed
-            self._on_data_changed(("session_added", session_id))
+            self.notify_change(("session_added", session_id))
 
     def remove_session(self, session_id: int):
 
@@ -216,7 +215,7 @@ class Data(Tracking):
                 self.current_session.id if len(self.sessions) > 0 else None
             )
 
-        self._on_data_changed(
+        self.notify_change(
             ("session_removed", session_id)
         )  # Notify that sessions have changed
 
@@ -248,17 +247,15 @@ class Data(Tracking):
         if self.current_session is not None:
             self.state.current_session_id = self.current_session.id
 
-        self._on_data_changed(
-            ("session_moved", -1)
-        )  # Notify that sessions have changed
+        self.notify_change(("session_moved", -1))  # Notify that sessions have changed
 
     def add_model(self, name: str, model: Optional[str | Model] = None):
         super().add_model(name, model)
-        self._on_data_changed(("model", -1))  # Notify that model has changed
+        self.notify_change(("model", -1))  # Notify that model has changed
 
     def change_model(self, name: str):
         super().change_model(name)
-        self._on_data_changed(("model", -1))  # Notify that model has changed
+        self.notify_change(("model", -1))  # Notify that model has changed
 
     def register_assignments(self, path: str, name: str):
 
@@ -283,7 +280,7 @@ class Data(Tracking):
         self.rebuild_union()
 
         self.state.assignments = self.assignments.ids
-        self._on_data_changed(("assignments", -1))
+        self.notify_change(("assignments", -1))
 
     def add_assignments(
         self, name: str, assignments: Optional[str | Assignments] = None
@@ -312,16 +309,12 @@ class Data(Tracking):
                 "No assignments file was added. Please provide valid assignments."
             )
         self.state.assignments = self.assignments.ids
-        self._on_data_changed(
-            ("assignments", -1)
-        )  # Notify that assignments have changed
+        self.notify_change(("assignments", -1))  # Notify that assignments have changed
 
     def change_assignments(self, name: str):
         super().change_assignments(name)
         self.state.assignments = self.assignments.ids
-        self._on_data_changed(
-            ("assignments", -1)
-        )  # Notify that assignments have changed
+        self.notify_change(("assignments", -1))  # Notify that assignments have changed
 
     def queue_assign_neurons(self, session_id: int, to_present=True, callback=None):
         session = self.sessions[session_id]
@@ -366,7 +359,7 @@ class Data(Tracking):
             p_thr=p_thr,
         )
         self.state.assignments = self.assignments.ids
-        self._on_data_changed(("assignments", -1))  # Notify that neurons have changed
+        self.notify_change(("assignments", -1))  # Notify that neurons have changed
 
     def unassign_neurons(self, session_id: int, **kwargs):
 
@@ -376,7 +369,7 @@ class Data(Tracking):
             self.state.current_session_id = None
 
         self.adjust_selected_components_after_data_change(session_id, -1)
-        self._on_data_changed(("assignments", -1))
+        self.notify_change(("assignments", -1))
 
     def adjust_selected_components_after_data_change(
         self, session_id: int, new_session_id: int

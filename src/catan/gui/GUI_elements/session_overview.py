@@ -208,7 +208,6 @@ class SessionRowWidget(QFrame):
 
         self.refresh(current=current)
 
-
     def _on_data_changed(self, input):
 
         data_type, data_var = input
@@ -332,7 +331,6 @@ class SessionRowWidget(QFrame):
             }}
             """)
 
-
     def _on_active_changed(self, state):
         self.activeChanged.emit(
             self.index,
@@ -416,7 +414,7 @@ class LoadSessionRowWidget(QFrame):
         self.selector_load_mode.currentTextChanged.connect(
             lambda text: self.edit_load_glob.setVisible(text == ".* (glob)")
         )
-        
+
         ## save button for sessions data
         self.button_save_sessions = make_icon_button(
             "floppy-disk", tooltip=f"Save sessions data", size=28, icon_size=22
@@ -720,9 +718,6 @@ class SessionOverview(QWidget):
             return
 
         self.data.sessions[session_id].name = name
-
-        # if hasattr(self.state, "data_changed"):
-        #     self.state.data_changed.emit()
 
     def edit_time_offset(self, session_id: int):
         session = self.data.sessions[session_id]

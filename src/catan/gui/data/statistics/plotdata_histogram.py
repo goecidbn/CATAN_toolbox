@@ -3,7 +3,6 @@ from typing import Literal
 from dataclasses import dataclass
 import numpy as np
 
-from .statistics import STATISTICS
 from .prepared_data import PickTable
 from catan.gui.plots.helper.Threshold import ThresholdSpec
 
@@ -143,7 +142,7 @@ def build_plot_data(
         bin_rows = [np.asarray([], dtype=int) for _ in range(len(counts))]
 
     return PlotData(
-        title={"x": STATISTICS[table.stat.name].title},
+        title={"x": table.stat.title},
         table=table,
         bin_edges=edges,
         bin_counts=counts,

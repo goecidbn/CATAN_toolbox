@@ -359,7 +359,7 @@ class SessionData:
     def register_spatial(self, alignment_template: Optional[np.ndarray] = None, **data):
 
         if "footprints" not in data or data["footprints"] is None:
-            print("No footprints provided, skipping spatial registration.")
+            # print("No footprints provided, skipping spatial registration.")
             return
 
         self.footprints = data.get("footprints", sparse.csc_matrix((0, 0)))
