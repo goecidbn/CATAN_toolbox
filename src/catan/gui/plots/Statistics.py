@@ -20,27 +20,25 @@ from PySide6.QtGui import (
 )
 
 import importlib
-from catan.gui.data.statistics import (
-    StatisticEngine,
-    plotdata_histogram,
-)
 from catan.gui.plots import StatisticsData
 from catan.gui.plots.helper import HistogramMesh, series_with_confidence
 from catan.gui.plots.helper.cameras import (
     FixedPanZoomCamera,
 )
 
-from catan.gui.data import analysis
-
+from catan.gui.data.statistics.engine import StatisticEngine
 from catan.gui.data.statistics import (
+    plotdata_histogram,
     plotdata_scatter,
     plotdata_series,
+    PickTable,
+    calculations,
 )
 from catan.gui.structures.state import NeuronComponent
 from catan.gui.plots import BasePlot
 from catan.gui.plots.helper import Threshold
 
-importlib.reload(analysis)
+importlib.reload(calculations)
 # importlib.reload(stats)
 importlib.reload(series_with_confidence)
 # importlib.reload(plotdata_histogram)
@@ -1012,14 +1010,12 @@ class Controller(BasePlot.CanvasController):
         super().build_controls()
 
         # print("Building controls for PlotController (statistics display)")
-        self.engine = StatisticEngine(
-            data=self.data,
-            state=self.state,
-        )
 
-        self.current_x_query = None
-        self.current_y_query = None
-        self.current_y_query_2nd = None
+        self.current_query: dict[str, Optional[StatisticsData.StatisticQuery]] = {
+            "x": None,
+            "y": None,
+            "y_2nd": None,
+        }
 
         self.current_plot_data = None
 
@@ -1036,7 +1032,7 @@ class Controller(BasePlot.CanvasController):
         self.section.x_options_layout.addWidget(self.controls["bin_selector"])
 
         self.controls["x_selector"] = StatisticsData.StatisticQuerySelector(
-            engine=self.engine, axis="x"
+            engine=self.data.statistic_engine, axis="x"
         )
         self.section.x_options_layout.addWidget(self.controls["x_selector"])
 
@@ -1045,7 +1041,7 @@ class Controller(BasePlot.CanvasController):
         )
 
         self.controls["y_selector"] = StatisticsData.StatisticQuerySelector(
-            engine=self.engine, axis="y"
+            engine=self.data.statistic_engine, axis="y"
         )
         self.section.y_options_layout.addWidget(self.controls["y_selector"])
 
@@ -1054,7 +1050,7 @@ class Controller(BasePlot.CanvasController):
         )
 
         self.controls["y_selector_2nd"] = StatisticsData.StatisticQuerySelector(
-            engine=self.engine, axis="y"
+            engine=self.data.statistic_engine, axis="y"
         )
         self.section.y_options_layout.addWidget(self.controls["y_selector_2nd"])
 
@@ -1068,26 +1064,28 @@ class Controller(BasePlot.CanvasController):
         self.canvas.signals.marker_clicked.connect(self._on_visual_clicked)
         self.canvas.signals.bin_clicked.connect(self._on_visual_clicked)
 
+        self.data.statistic_engine.values_changed.connect(self.recalculate_statistics)
+
         self.canvas._on_threshold_changed = self._on_threshold_changed
 
     def _on_data_changed(self, input: Tuple[str, int]):
-        if input[0] == "assignments":
-            self.rebuild_plot_data()
-            # self.update_canvas()
+        # if input[0] == "assignments":
+        self.recalculate_statistics()
+        # self.update_canvas()
 
     def _on_plot_params_changed(self):
-        self.rebuild_plot_data()
+        self.recalculate_statistics()
         # self.update_canvas()
 
     def _on_query_changed(self, which, query: StatisticsData.StatisticQuery):
 
         if which == "x":
-            self.current_x_query = query
+            self.current_query["x"] = query
         elif which == "y":
-            self.current_y_query = query
+            self.current_query["y"] = query
         elif which == "y_2nd":
             ## should only be possible if plot_type is session_series
-            self.current_y_query_2nd = query
+            self.current_query["y_2nd"] = query
 
         self.identify_plot_type()
 
@@ -1097,8 +1095,10 @@ class Controller(BasePlot.CanvasController):
         # print(f"Plot type identified as: {self.plot_type}")
 
         if self.plot_type == "histogram":
-            self.controls["bin_selector"].setVisible(self.current_x_query is not None)
-            self.controls["bin_label"].setVisible(self.current_x_query is not None)
+            self.controls["bin_selector"].setVisible(
+                self.current_query["x"] is not None
+            )
+            self.controls["bin_label"].setVisible(self.current_query["x"] is not None)
 
             self.controls["y_selector"].set_query_mode("generic")
             self.controls["y_selector"].set_query_preparer(None)
@@ -1107,7 +1107,9 @@ class Controller(BasePlot.CanvasController):
             self.controls["x_selector"].set_query_preparer(None)
         elif self.plot_type == "session_series":
 
-            self.controls["y_selector_2nd"].setVisible(self.current_y_query is not None)
+            self.controls["y_selector_2nd"].setVisible(
+                self.current_query["y"] is not None
+            )
 
             # session-series mode
             self.controls["y_selector"].set_query_mode("session_series")
@@ -1122,15 +1124,17 @@ class Controller(BasePlot.CanvasController):
 
             if query is None:
                 if which == "y":
-                    self.current_y_query_2nd = None
+                    self.current_query["y_2nd"] = None
                     self.controls["y_selector_2nd"].set_query(None)
                 return
 
-            prepared_query = plotdata_series.prepare_query(query, self.engine.registry)
+            prepared_query = plotdata_series.prepare_query(
+                query, self.data.statistic_engine.registry
+            )
             if which == "y":
-                self.current_y_query = prepared_query
+                self.current_query["y"] = prepared_query
             elif which == "y_2nd":
-                self.current_y_query_2nd = prepared_query
+                self.current_query["y_2nd"] = prepared_query
 
         elif self.plot_type == "scatter":
             self.controls["y_selector"].set_query_mode("generic")
@@ -1139,25 +1143,52 @@ class Controller(BasePlot.CanvasController):
             self.controls["x_selector"].set_query_mode("generic")
             self.controls["x_selector"].set_query_preparer(None)
 
-        self.canvas.clear()
-
+        self.recalculate_statistics()
         # ## load quality params if SNR, RVAL, or CNN are selected
         # if (
-        #     self.current_x_query is not None
-        #     and self.current_x_query.statistic_key in ["snr", "rval", "cnn"]
+        #     self.current_query["x"] is not None
+        #     and self.current_query["x"].statistic_key in ["snr", "rval", "cnn"]
         # ) or (
-        #     self.current_y_query is not None
-        #     and self.current_y_query.statistic_key in ["snr", "rval", "cnn"]
+        #     self.current_query["y"] is not None
+        #     and self.current_query["y"].statistic_key in ["snr", "rval", "cnn"]
         # ):
         #     if not self.data.current_session.status["quality_loaded"]:
         #         self.data.change_quality_presence(self.state.current_session_id, True)
 
-        self.rebuild_plot_data()
-        # self.update_canvas()
+        # tables = self.data.evaluate_queries(**self.current_query)
+
+    def recalculate_statistics(self):
+
+        def evaluate_tables(ctx=None):
+            """
+            wrapper to obtain all tables at once
+            """
+            tables = {}
+
+            for key, query in self.current_query.items():
+                if query is not None:
+                    tables[key] = self.data.statistic_engine.evaluate_table(query)
+
+            return tables
+
+        status_str = f"Calculating statistics for "
+        if self.current_query["x"] is not None:
+            status_str += f"{self.current_query["x"].statistic_key}"
+        if self.current_query["x"] is not None and self.current_query["y"] is not None:
+            status_str += " and "
+        if self.current_query["y"] is not None:
+            status_str += f"{self.current_query["y"].statistic_key}"
+
+        self.state.tasks.start(
+            "calculating",
+            status_str,
+            evaluate_tables,
+            on_result=self.rebuild_plot_data,
+        )
 
     def identify_plot_type(self):
-        x_query = self.current_x_query
-        y_query = self.current_y_query
+        x_query = self.current_query["x"]
+        y_query = self.current_query["y"]
 
         if y_query is not None and y_query.statistic_key != "none" and x_query is None:
             plot_type = "session_series"
@@ -1173,56 +1204,49 @@ class Controller(BasePlot.CanvasController):
 
         self.plot_type = self.canvas.plot_type = plot_type
 
-    def rebuild_plot_data(self):
+    def rebuild_plot_data(self, tables: dict[str, PickTable] = None):
 
-        def get_plot_data(ctx=None):
-            x_table = self.engine.evaluate_table(self.current_x_query)
-            y_table = self.engine.evaluate_table(self.current_y_query)
+        self.canvas.clear()
+        if tables is None:
+            return
 
-            if x_table is None and y_table is None:
-                return
-            if self.plot_type == "histogram" and x_table is not None:
-                nbins = int(self.controls["bin_selector"].value())
-                self.current_plot_data = plotdata_histogram.build_plot_data(
-                    x_table,
-                    bins=nbins,
-                )
-            elif self.plot_type == "session_series" and y_table is not None:
+        # def get_plot_data(ctx=None):
+        # x_table = self.data.statistic_engine.evaluate_table(self.current_query["x"])
+        # y_table = self.data.statistic_engine.evaluate_table(self.current_query["y"])
 
-                y_table_2nd = self.engine.evaluate_table(self.current_y_query_2nd)
-                self.current_plot_data = plotdata_series.build_plot_data(
-                    first_table=y_table,
-                    second_table=y_table_2nd,
-                )
-                # print(f"Built session series plot data: {self.current_plot_data}")
-            elif (
-                self.plot_type == "scatter"
-                and x_table is not None
-                and y_table is not None
-            ):
-                self.current_plot_data = plotdata_scatter.build_plot_data(
-                    x_table=x_table,
-                    y_table=y_table,
-                )
-            else:
-                raise ValueError(
-                    f"Invalid combination of x_query and y_query for plot_type '{self.plot_type}': x_query={self.current_x_query}, y_query={self.current_y_query}"
-                )
+        if tables.get("x") is None and tables.get("y") is None:
+            return
 
-        status_str = f"Calculating statistics for "
-        if self.current_x_query is not None:
-            status_str += f"{self.current_x_query.statistic_key}"
-        if self.current_x_query is not None and self.current_y_query is not None:
-            status_str += " and "
-        if self.current_y_query is not None:
-            status_str += f"{self.current_y_query.statistic_key}"
+        if self.plot_type == "histogram" and (x_table := tables.get("x")) is not None:
+            nbins = int(self.controls["bin_selector"].value())
+            self.current_plot_data = plotdata_histogram.build_plot_data(
+                x_table,
+                bins=nbins,
+            )
+        elif (
+            self.plot_type == "session_series"
+            and (y_table := tables.get("y")) is not None
+        ):
+            self.current_plot_data = plotdata_series.build_plot_data(
+                first_table=y_table,
+                second_table=tables.get("y_2nd"),
+            )
+            # print(f"Built session series plot data: {self.current_plot_data}")
+        elif (
+            self.plot_type == "scatter"
+            and (x_table := tables.get("x")) is not None
+            and (y_table := tables.get("y")) is not None
+        ):
+            self.current_plot_data = plotdata_scatter.build_plot_data(
+                x_table=x_table,
+                y_table=y_table,
+            )
+        else:
+            raise ValueError(
+                f"Invalid combination of x_query and y_query for plot_type '{self.plot_type}': x_query={self.current_query['x']}, y_query={self.current_query['y']}"
+            )
 
-        self.state.tasks.start(
-            "calculating",
-            status_str,
-            get_plot_data,
-            finished=self.update_canvas,
-        )
+        self.update_canvas()
 
     def _on_selection_changed(self):
         if self.current_plot_data is None:
@@ -1382,7 +1406,6 @@ class Controller(BasePlot.CanvasController):
         super().deactivate()
 
     def _on_session_changed(self):
-        self.rebuild_plot_data()
         super()._on_session_changed()
 
     def update_neuron_selection(self):

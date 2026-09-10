@@ -11,7 +11,7 @@ from .queries import (
     allowed_reduction_methods,
     normalize_session_series_reductions,
 )
-from .prepared_data import PickTable
+from .table import PickTable
 
 ErrorMode = Literal["none", "std", "sem", "iqr"]
 

@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple, List, Callable
+from typing import Dict, Optional, Tuple, List
 import importlib
 
 from PySide6.QtWidgets import (
@@ -87,7 +87,7 @@ class MainMenu(QFrame):
         layout.addWidget(session_list, stretch=1)
 
         layout.addWidget(self.build_app_mode_menu())
-        
+
         layout.addStretch()
 
         self.task_overview = TaskOverviewDisplay(
@@ -181,7 +181,7 @@ class MainMenu(QFrame):
         # File paths & fields
         paths_menu = QWidget()
         self.paths_layout = QVBoxLayout(paths_menu)
-        
+
         formFrame = QFrame()
         formFrame.setFrameShape(QFrame.Shape.StyledPanel)
 
@@ -204,9 +204,7 @@ class MainMenu(QFrame):
         )
 
         ### assignment data loading options
-        self.config_constructor = FieldConfigConstructor(
-            self, self.data.assignments
-        )
+        self.config_constructor = FieldConfigConstructor(self, self.data.assignments)
         form.addRow(
             QLabel("Assignments"),
             self.build_load_options(
@@ -248,6 +246,8 @@ class MainMenu(QFrame):
 
         self.button_save = QPushButton("Save results")
         self.paths_layout.addWidget(self.button_save)
+
+        self.update_buttons()
 
         return paths_menu
 
@@ -352,20 +352,22 @@ class MainMenu(QFrame):
                     self.data.queue_update_model(session.id)
 
         if key == "assignments":
-            # set_button_icon(
-            #     self.loader["assignments"]["button_execute"],
-            #     "play",
-            #     tooltip=f"Run neuron registration",
-            # )
 
             def on_button_click():
                 if self.data.assignments is None:
                     return
-                if self.data.assignments.loaded:
+
+                if (
+                    self.data.assignments
+                    and self.data.assignments.path
+                    and not self.data.assignments.loaded
+                ):
+                    self.data.load_assignments()
+                else:
+                    # if self.data.assignments.loaded:
                     for session in self.data.sessions:
                         self.data.queue_assign_neurons(session.id)
-                else:
-                    self.data.load_assignments()
+                # else:
 
         self.loader[key]["button_execute"].clicked.connect(on_button_click)
         self.loader[key]["button_execute"].setEnabled(False)
@@ -454,7 +456,7 @@ class MainMenu(QFrame):
                 )
                 # print("load path obtainned: ", load_path)
                 if ok and isinstance(name, str):
-                    self.data.register_assignments(load_path,name)
+                    self.data.register_assignments(load_path, name)
                     # self.data.add_assignments(name, load_path)
 
                     self.rebuild_selector(
@@ -477,28 +479,33 @@ class MainMenu(QFrame):
                 self.data.change_assignments(opt)
 
             self.update_buttons()
-            
 
     def update_buttons(self):
 
         ## update of assignments button
-        if self.data.assignments and self.data.assignments.loaded:
+        loading = False
+        if (
+            self.data.assignments
+            and self.data.assignments.path
+            and not self.data.assignments.loaded
+        ):
+            loading = True
+            set_button_icon(
+                self.loader["assignments"]["button_execute"],
+                "folder-open",
+                tooltip=f"Load assignments",
+            )
+        elif self.data.assignments:
             set_button_icon(
                 self.loader["assignments"]["button_execute"],
                 "play",
                 tooltip=f"Run neuron registration",
             )
-        elif self.data.assignments:
-            set_button_icon(
-                self.loader["assignments"]["button_execute"], 
-                "folder-open",
-                tooltip=f"Load assignments",
-            )
 
         if self.data.assignments is None:
-            enable_button = True
+            enable_button = False
         else:
-            enable_button = not self.data.assignments.loaded
+            enable_button = loading
             enable_button |= not all(
                 [
                     not self.data.session_assigned(s.id) and s.status["spatial_loaded"]
@@ -506,7 +513,6 @@ class MainMenu(QFrame):
                 ]
             )
         self.loader["assignments"]["button_execute"].setEnabled(enable_button)
-
 
     def rebuild_selector(
         self, key: str, options: list[str], add_options: Optional[list[str]] = None

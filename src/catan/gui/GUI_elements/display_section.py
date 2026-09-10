@@ -24,7 +24,7 @@ display_modes = {
     "overview": {
         "title": "Overview",
         "options": {
-            "single_overview": "Session footprints",
+            "session_overview": "Session footprints",
             "tracked_overview": "Tracked footprints",
             "selection_display": "Selection display",
         },
@@ -52,7 +52,7 @@ display_modes = {
 }
 
 DISPLAY_CONTROLLERS = {
-    "single_overview": Overview,
+    "session_overview": Overview,
     "tracked_overview": Overview,
     "single_footprint": Footprints,
     "multi_footprint": Footprints,

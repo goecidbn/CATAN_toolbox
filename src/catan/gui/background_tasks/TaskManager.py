@@ -17,21 +17,22 @@ class QueuedTask:
     group: str
     worker: Worker
     finished: Callable | None = None
+    on_result: Callable | None = None
     ready: Callable[[], bool] | None = None
 
 
 class TaskManager(QObject):
 
-    task_added = Signal(str, str)              # group, task_id
-    task_started = Signal(str, str)            # group, task_id
+    task_added = Signal(str, str)  # group, task_id
+    task_started = Signal(str, str)  # group, task_id
 
-    task_finished = Signal(str, str)           # group, task_id
-    task_cancelled = Signal(str, str)          # group, task_id
-    task_failed = Signal(str, str)             # group, task_id
+    task_finished = Signal(str, str)  # group, task_id
+    task_cancelled = Signal(str, str)  # group, task_id
+    task_failed = Signal(str, str)  # group, task_id
 
-    task_progress = Signal(str, str, int)      # group, task_id, progress
-    task_message = Signal(str, str, str)       # group, task_id, message
-    task_error = Signal(str, str, str)         # group, task_id, traceback
+    task_progress = Signal(str, str, int)  # group, task_id, progress
+    task_message = Signal(str, str, str)  # group, task_id, message
+    task_error = Signal(str, str, str)  # group, task_id, traceback
 
     queue_changed = Signal(str)
 
@@ -47,13 +48,11 @@ class TaskManager(QObject):
         self.pool = QThreadPool.globalInstance()
 
         self.queues: dict[str, deque[QueuedTask]] = {
-            group: deque()
-            for group in self.GROUPS
+            group: deque() for group in self.GROUPS
         }
 
         self.current: dict[str, QueuedTask | None] = {
-            group: None
-            for group in self.GROUPS
+            group: None for group in self.GROUPS
         }
 
         self.tasks: dict[str, QueuedTask] = {}
@@ -63,9 +62,7 @@ class TaskManager(QObject):
         # Periodically re-evaluate ready conditions.
         self._queue_timer = QTimer(self)
         self._queue_timer.setInterval(1000)
-        self._queue_timer.timeout.connect(
-            self.process_queues
-        )
+        self._queue_timer.timeout.connect(self.process_queues)
 
     # ------------------------------------------------------------------
     # Timer
@@ -92,14 +89,14 @@ class TaskManager(QObject):
         fn,
         *args,
         finished=None,
+        on_result=None,
         ready=None,
         **kwargs,
     ) -> str:
 
         if group not in self.queues:
             raise ValueError(
-                f"Unknown task group {group!r}. "
-                f"Expected one of {self.GROUPS}."
+                f"Unknown task group {group!r}. " f"Expected one of {self.GROUPS}."
             )
 
         worker = Worker(
@@ -114,6 +111,7 @@ class TaskManager(QObject):
             group=group,
             worker=worker,
             finished=finished,
+            on_result=on_result,
             ready=ready,
         )
 
@@ -209,45 +207,34 @@ class TaskManager(QObject):
         # --------------------------------------------------------------
 
         worker.signals.progress.connect(
-            lambda progress,
-            g=group,
-            tid=task.id:
-                self.task_progress.emit(
-                    g,
-                    tid,
-                    progress,
-                )
+            lambda progress, g=group, tid=task.id: self.task_progress.emit(
+                g,
+                tid,
+                progress,
+            )
         )
 
         worker.signals.message.connect(
-            lambda message,
-            g=group,
-            tid=task.id:
-                self.task_message.emit(
-                    g,
-                    tid,
-                    message,
-                )
+            lambda message, g=group, tid=task.id: self.task_message.emit(
+                g,
+                tid,
+                message,
+            )
         )
 
         worker.signals.error.connect(
-            lambda error,
-            g=group,
-            tid=task.id:
-                self._on_worker_error(
-                    g,
-                    tid,
-                    error,
-                )
+            lambda error, g=group, tid=task.id: self._on_worker_error(
+                g,
+                tid,
+                error,
+            )
         )
 
         worker.signals.finished.connect(
-            lambda result,
-            t=task:
-                self._on_worker_finished(
-                    t,
-                    result,
-                )
+            lambda result, t=task: self._on_worker_finished(
+                t,
+                result,
+            )
         )
 
         self.task_started.emit(
@@ -270,10 +257,7 @@ class TaskManager(QObject):
         error: str,
     ) -> None:
 
-        print(
-            f"Task {task_id} in group {group} "
-            f"raised an error:\n{error}"
-        )
+        print(f"Task {task_id} in group {group} " f"raised an error:\n{error}")
 
         self.task_error.emit(
             group,
@@ -320,6 +304,10 @@ class TaskManager(QObject):
                     group,
                     task.id,
                 )
+
+                # Successful task returned a value.
+                if task.on_result is not None:
+                    task.on_result(result)
 
                 # Only successful tasks execute their completion callback.
                 if task.finished is not None:
@@ -384,9 +372,7 @@ class TaskManager(QObject):
     ) -> None:
 
         if group not in self.queues:
-            raise ValueError(
-                f"Unknown task group {group!r}"
-            )
+            raise ValueError(f"Unknown task group {group!r}")
 
         current = self.current[group]
 
@@ -394,16 +380,12 @@ class TaskManager(QObject):
             self.cancel(current.id)
 
         # Copy because cancel() mutates self.tasks.
-        for task in list(
-            self.queued_tasks(group)
-        ):
+        for task in list(self.queued_tasks(group)):
             self.cancel(task.id)
 
         # Remove cancelled stale entries from physical queue.
         self.queues[group] = deque(
-            task
-            for task in self.queues[group]
-            if task.id in self.tasks
+            task for task in self.queues[group] if task.id in self.tasks
         )
 
         self.queue_changed.emit(group)
@@ -421,11 +403,7 @@ class TaskManager(QObject):
         group: str,
     ) -> list[QueuedTask]:
 
-        return [
-            task
-            for task in self.queues[group]
-            if task.id in self.tasks
-        ]
+        return [task for task in self.queues[group] if task.id in self.tasks]
 
     def current_task(
         self,
@@ -459,14 +437,10 @@ class TaskManager(QObject):
 
         tasks = self.queued_tasks(group)
 
-        if not (
-            0 <= old_index < len(tasks)
-        ):
+        if not (0 <= old_index < len(tasks)):
             return
 
-        if not (
-            0 <= new_index < len(tasks)
-        ):
+        if not (0 <= new_index < len(tasks)):
             return
 
         task = tasks.pop(old_index)
@@ -493,20 +467,10 @@ class TaskManager(QObject):
 
         return {
             "running": current is not None,
-            "current_name": (
-                current.name
-                if current is not None
-                else None
-            ),
-            "current_id": (
-                current.id
-                if current is not None
-                else None
-            ),
+            "current_name": (current.name if current is not None else None),
+            "current_id": (current.id if current is not None else None),
             "current_cancelling": (
-                current.worker.is_cancelled()
-                if current is not None
-                else False
+                current.worker.is_cancelled() if current is not None else False
             ),
             "queued_count": len(queued),
         }

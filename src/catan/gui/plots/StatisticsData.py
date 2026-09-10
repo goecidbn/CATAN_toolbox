@@ -26,11 +26,9 @@ from catan.gui.data.statistics.dimensions import (
     DimensionInfo,
 )
 from catan.gui.data.statistics.queries import (
-    REDUCTION_METHODS,
     Contexts,
     ReductionMethod,
     ReductionSpec,
-    DEFAULT_REDUCTIONS,
     allowed_error_methods,
     allowed_reduction_methods,
     PairFilter,
@@ -38,6 +36,8 @@ from catan.gui.data.statistics.queries import (
     PairTarget,
     ReductionSpec,
     StatisticQuery,
+    neuron_bound_dim,
+    normalize_neuron_bound_reductions,
     normalize_session_series_reductions,
     normalize_generic_session_pair_reductions,
 )
@@ -398,6 +398,7 @@ class StatisticQuerySelector(QWidget):
         self._syncing_reductions = False
         self._emitting_query = False
 
+        self.default_reduction_provider = None
         self.current_reductions: dict[str, ReductionSpec] = {}
         self._popup = None
 
@@ -566,7 +567,13 @@ class StatisticQuerySelector(QWidget):
 
         self._emit_query_changed_once()
 
-    def _apply_default_reductions(self, context: Contexts = "generic"):
+    def set_default_reduction_provider(self, provider):
+        self.default_reduction_provider = provider
+
+    def _apply_default_reductions(
+        self,
+        context: Contexts = "generic",
+    ):
         if self.current_stat_key() == "none":
             return
 
@@ -574,16 +581,30 @@ class StatisticQuerySelector(QWidget):
 
         if context == "session_series":
             self.current_reductions = normalize_session_series_reductions(
-                self.current_stat_def(),
+                stat_def,
                 default_session_series_reductions(stat_def),
                 self.current_filters(),
             )
             return
 
         if stat_def.default_reductions is not None:
-            self.current_reductions = dict(stat_def.default_reductions)
+            reductions = dict(stat_def.default_reductions)
         else:
-            self.current_reductions = stat_def.get_default_reductions()
+            reductions = stat_def.get_default_reductions()
+
+        # Consumer-specific defaults, e.g. Overview mode
+        if self.default_reduction_provider is not None:
+            overrides = self.default_reduction_provider(stat_def)
+            if overrides:
+                reductions.update(overrides)
+
+        if context == "neuron_bound":
+            reductions = normalize_neuron_bound_reductions(
+                stat_def,
+                reductions,
+            )
+
+        self.current_reductions = reductions
 
     def _update_stat_menu_checks(self):
         for key, action in self._stat_actions.items():
@@ -874,6 +895,18 @@ class StatisticQuerySelector(QWidget):
 
         methods = tuple(m for m in specific if m in general)
 
+        # ------------------------------------------------
+        # Neuron-bound plot
+        # ------------------------------------------------
+        # neuron-bound policy applies to ALL dimensions
+        if self.query_mode == "neuron_bound":
+            output_dim = neuron_bound_dim(stat_def.dims)
+
+            if dim == output_dim:
+                return ()
+
+            return tuple(m for m in methods if m != "keep")
+
         session_dims = [d for d in stat_def.dims if d in SESSION_DIMS]
 
         if dim not in session_dims:
@@ -938,6 +971,9 @@ class StatisticQuerySelector(QWidget):
         dim: str,
         method: str,
     ) -> tuple[str, ...]:
+
+        if self.query_mode == "neuron_bound":
+            return ("none",)
 
         methods = allowed_error_methods(
             dim,

@@ -1,17 +1,11 @@
-from typing import Any, Callable, Optional, Literal
-
 from dataclasses import dataclass
+from typing import Literal, Any, Optional
+from collections.abc import Callable
+
 import numpy as np
 
-from .dimensions import (
-    Dimension,
-    DimensionInfo,
-    get_default_coords,
-    get_match_stat_dims,
-    make_match_coord_getter,
-)
+from .dimensions import Dimension, DimensionInfo, get_default_coords
 from .queries import ReductionSpec, DEFAULT_REDUCTIONS
-from catan.gui.data import analysis
 
 StatisticCategory = Literal[
     "session_loaded",
@@ -19,7 +13,6 @@ StatisticCategory = Literal[
     "neuron",
     "pair",
 ]
-
 
 ## these should mirror the Literal types defined for StatisticCategory
 CATEGORY_TITLES = {
@@ -398,7 +391,7 @@ class StatisticDefinition:
         self,
         data,
         state,
-        indexers: dict[str, int] = {},
+        indexers: dict[str, int] | None = None,
         filters=(),
     ) -> StatisticArray:
         """
@@ -520,217 +513,3 @@ class StatisticDefinition:
             return "session_i" in self.dims and "session_j" in self.dims
 
         return False
-
-
-STATIC_STATISTICS = {
-    "none": StatisticDefinition(
-        key="none",
-        title="None",
-        description="No statistic selected.",
-        dims=(),
-        category=None,
-        getter=lambda data, state, indexers, filters: None,  # lambda data: StatisticArray(np.array([]), dims=()),
-    ),
-    "footprint_size": StatisticDefinition(
-        key="footprint_size",
-        title="Footprint size",
-        description="Size of the neuron footprint in pixels.",
-        dims=("neuron", "session"),
-        category="neuron",
-        getter=lambda data, state, indexers, filters: analysis.calculate_footprint_size(
-            data, state, indexers, filters
-        ),
-    ),
-    "border_proximity": StatisticDefinition(
-        key="border_proximity",
-        title="Border proximity",
-        description="Proximity of neuron centroids to the borders of the field of view.",
-        dims=("neuron", "session"),
-        category="neuron",
-        getter=lambda data, state, indexers, filters: analysis.calculate_border_proximity(
-            data, state, indexers, filters
-        ),
-    ),
-    "occurence": StatisticDefinition(
-        key="occurence",
-        title="Occurrence",
-        description="Number of sessions in which each neuron is present.",
-        dims=("neuron", "session"),
-        category="neuron",
-        getter=lambda data, state, indexers, filters: analysis.calculate_occurrence(
-            data, state, indexers, filters
-        ),
-        allowed_reductions={
-            "neuron": ("keep", "single", "mean", "sum"),
-            "session": ("keep", "single", "mean", "sum"),
-        },
-        default_reductions={
-            "neuron": ReductionSpec("keep"),
-            "session": ReductionSpec("sum"),
-        },
-    ),
-    "centroid_shift": StatisticDefinition(
-        key="centroid_shift",
-        title="Centroid shift",
-        description="Centroid distance between sessions.",
-        dims=("neuron", "session_i", "session_j"),
-        category="neuron",
-        getter=lambda data, state, indexers, filters: analysis.calculate_centroid_shift(
-            data, state, indexers, filters
-        ),
-        default_reductions={
-            "neuron": ReductionSpec("keep"),
-            "session_ref": ReductionSpec("max"),
-            "session_target": ReductionSpec("max"),
-        },
-    ),
-    "temporal_corr": StatisticDefinition(
-        key="temporal_corr",
-        title="Temporal correlation",
-        description="Pairwise temporal trace correlation within sessions.",
-        dims=("neuron_i", "neuron_j", "session"),
-        category="pair",
-        getter=lambda data, state, indexers, filters: analysis.calculate_temporal_correlation(
-            data, state, indexers, filters
-        ),
-        default_reductions={
-            "neuron_i": ReductionSpec("keep"),
-            "neuron_j": ReductionSpec("keep"),
-            "session": ReductionSpec("mean"),
-        },
-    ),
-    "distances": StatisticDefinition(
-        key="distances",
-        title="Centroid distances",
-        description="Pairwise Euclidean distances between neuron centroids.",
-        dims=("neuron_i", "neuron_j", "session"),
-        category="pair",
-        getter=lambda data, state, indexers, filters: analysis.calculate_distances(
-            data, state, indexers, filters
-        ),
-        default_reductions={
-            "neuron_i": ReductionSpec("keep"),
-            "neuron_j": ReductionSpec("keep"),
-            "session": ReductionSpec("mean"),
-        },
-    ),
-    "footprint_similarity": StatisticDefinition(
-        key="footprint_similarity",
-        title="Footprint similarity",
-        description="Pairwise similarity between neuron footprints.",
-        dims=("neuron_i", "neuron_j", "session_i", "session_j"),
-        category="pair",
-        getter=lambda data, state, indexers, filters: analysis.calculate_footprint_similarity(
-            data, state, indexers, filters
-        ),
-        allowed_reductions={
-            "neuron_i": ("keep", "mean"),
-            "neuron_j": ("keep", "mean"),
-            "session_i": ("single", "mean", "median", "max", "min"),
-            "session_j": ("single", "mean", "median", "max", "min"),
-        },
-        default_reductions={
-            "neuron_i": ReductionSpec("keep"),
-            "neuron_j": ReductionSpec("keep"),
-            "session_i": ReductionSpec("single", 0),
-            "session_j": ReductionSpec("single", 1),
-        },
-    ),
-}
-
-
-def get_loaded_session_stat_names(data) -> list[str]:
-    names = set()
-
-    for session in data.sessions:
-        if session is None:
-            continue
-
-        names.update(session.quality.keys())
-
-    return sorted(names)
-
-
-def make_session_stat_definition(
-    name: str,
-) -> StatisticDefinition:
-
-    return StatisticDefinition(
-        key=f"session:{name}",
-        title=name,
-        description=f"Loaded session statistic: {name}",
-        category="session_loaded",
-        dims=("neuron", "session"),
-        getter=lambda data, state, indexers, filters, name=name: analysis.get_quality_metric(
-            data,
-            state,
-            indexers=indexers,
-            key=name,
-        ),
-    )
-
-
-def make_match_stat_definition(
-    name: str,
-    values: np.ndarray,
-) -> StatisticDefinition:
-
-    values = np.asarray(values)
-    dims = get_match_stat_dims(
-        name,
-        values,
-    )
-
-    return StatisticDefinition(
-        key=f"match:{name}",
-        title=name,
-        description=f"Loaded match statistic: {name}",
-        category="match_loaded",
-        dims=dims,
-        getter=lambda data, state, indexers, filters, name=name, dims=dims: analysis.get_match_metric(
-            data,
-            state,
-            indexers=indexers,
-            key=name,
-            dims=dims,
-        ),
-        coord_getter=make_match_coord_getter(
-            dims,
-            values.shape,
-        ),
-    )
-
-
-def get_loaded_match_stat_names(data) -> list[str]:
-    assignments = getattr(data, "assignments", None)
-
-    if assignments is None:
-        return []
-
-    return sorted(assignments.stats.keys())
-
-
-def build_statistics_registry(
-    data,
-    state,
-) -> dict[str, StatisticDefinition]:
-
-    registry = dict(STATIC_STATISTICS)
-
-    # Loaded session statistics
-    for name in get_loaded_session_stat_names(data):
-        definition = make_session_stat_definition(name)
-        registry[definition.key] = definition
-
-    # Loaded match statistics
-    assignments = getattr(data, "assignments", None)
-
-    if assignments is not None:
-        for name, values in assignments.stats.items():
-            definition = make_match_stat_definition(
-                name,
-                values,
-            )
-            registry[definition.key] = definition
-
-    return registry

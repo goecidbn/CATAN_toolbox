@@ -59,7 +59,6 @@ class AppState(QObject):
         self._busy = False
 
         self._session_colors = []
-        self._session_active = []
 
         self._selected_components: Optional[List[NeuronComponent]] = None
         self._focused_component: Optional[NeuronComponent] = None
@@ -152,21 +151,6 @@ class AppState(QObject):
             )
         self.session_color_changed.emit(session_id, color)
 
-    @property
-    def session_active(self):
-        return self._session_active
-
-    @session_active.setter
-    def session_active(self, input):
-        session_id, active = input
-        # print(f"Setting session {session_id} active state to {active}")
-        current_active = self._session_active[session_id]
-        if current_active == active:
-            return  # No change, do nothing
-
-        self._session_active[session_id] = active
-        self.session_toggled.emit(input)
-
     # --- current session ---
     @property
     def current_session_id(self) -> Optional[int]:
@@ -177,7 +161,6 @@ class AppState(QObject):
         if s != self._current_session_id:
             self._current_session_id = s
             self.current_session_changed.emit(s)
-            # self.session_active = (s, True)
 
     # --- current neuron ---
     """ 

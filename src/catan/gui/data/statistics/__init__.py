@@ -1,6 +1,17 @@
-# import importlib
+from .engine import StatisticEngine
+from .table import PickTable
+from .types import (
+    StatisticArray,
+    StatisticDefinition,
+    StatisticCategory,
+    CATEGORY_TITLES,
+)
 
-from .statistics import StatisticDefinition, CATEGORY_TITLES
-from .prepared_data import StatisticEngine
-
-__all__ = ["StatisticDefinition", "StatisticEngine", "CATEGORY_TITLES"]
+__all__ = [
+    "StatisticEngine",
+    "PickTable",
+    "StatisticArray",
+    "StatisticDefinition",
+    "StatisticCategory",
+    "CATEGORY_TITLES",
+]

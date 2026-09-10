@@ -1,15 +1,45 @@
 from typing import Dict, Optional, Tuple
+import textwrap
+from dataclasses import dataclass
+from catan.gui.data.statistics.queries import ReductionSpec
 import numpy as np
 from scipy import sparse
 from vispy import scene, color
 from vispy.scene import visuals
 
+from PySide6.QtWidgets import (
+    QComboBox,
+    QCheckBox,
+    QLabel,
+)
 
-from dataclasses import dataclass
 
 from catan.gui.structures.state import NeuronComponent
 from catan.gui.plots import BasePlot
 from catan.gui.interaction import click_events
+
+from catan.gui.data.statistics.dimensions import SESSION_DIMS, neuron_bound_dim
+from catan.gui.plots.StatisticsData import StatisticQuerySelector
+
+STATISTIC_CMAPS = {
+    "viridis": "viridis",
+    "coolwarm": "coolwarm",
+    "cubehelix": "cubehelix",
+    "red-green": color.Colormap(
+        [
+            "#b2182b",
+            "#f2f2f2",
+            "#1a9850",
+        ]
+    ),
+    "blue-orange": color.Colormap(
+        [
+            "#2166ac",
+            "#f2f2f2",
+            "#b35806",
+        ]
+    ),
+}
 
 
 @dataclass
@@ -26,6 +56,7 @@ class Display(BasePlot.BaseCanvas):
     def __init__(self, parent, controls, config=None):
         super().__init__(parent, controls, config)
 
+        print("fix mouseover to only detect currently displayed neurons!")
         self.unfreeze()
         self.grid = self.central_widget.add_grid(spacing=0)
         self.view = self.grid.add_view(row=0, col=0)
@@ -38,9 +69,106 @@ class Display(BasePlot.BaseCanvas):
 
         self.changes_on_click = "selected"
 
+        self.neuron_statistic_values = None
+        self.statistic_title = None
+
+        self.statistic_cmap_name = "viridis"
+        self.statistic_cmap_reversed = False
+
+        self.statistic_clim = None
+        self.build_colorbar()
+
+        self.statistic_nan_color = np.asarray(
+            color.Color("#686868").rgba,
+            dtype=np.float32,
+        )
+        self.statistic_nan_color[3] = 0.55
+
         # self.plot_components: Dict[int, OverviewVisualRecord] = {}
 
         self.freeze()
+
+    def build_colorbar(self):
+
+        cbar_size = (120, 10)
+        cbar_center = (90, 20)
+        cbar_hmargin = 15
+        cbar_vmargin = 10
+
+        self.statistic_colorbar_bg = visuals.Rectangle(
+            center=(cbar_center[0], cbar_center[1] + 15),
+            width=cbar_size[0] + 2 * cbar_hmargin,
+            height=cbar_size[1] + 2 * cbar_vmargin + 30,
+            color=(1.0, 1.0, 1.0, 0.78),
+            border_color=None,
+            parent=self.scene,
+        )
+
+        self.statistic_colorbar_bg.set_gl_state(
+            depth_test=False,
+            blend=True,
+            blend_func=("src_alpha", "one_minus_src_alpha"),
+        )
+        self.statistic_colorbar_bg.order = 10000
+        self.statistic_colorbar_bg.visible = False
+
+        self.statistic_colorbar = visuals.ColorBar(
+            cmap=(
+                self.statistic_cmap_name
+                if not self.statistic_cmap_reversed
+                else self.statistic_cmap_name + "_r"
+            ),
+            orientation="bottom",
+            size=cbar_size,
+            pos=cbar_center,
+            # We'll draw these ourselves
+            label="",
+            clim=("", ""),
+            border_width=1,
+            border_color="black",
+            parent=self.scene,
+        )
+
+        self.statistic_colorbar.order = 10001
+        self.statistic_colorbar.visible = False
+
+        self.statistic_colorbar_low = visuals.Text(
+            "",
+            pos=(cbar_center[0] - cbar_size[0] // 2 + 5, cbar_center[1] + 20),
+            anchor_x="center",
+            anchor_y="top",
+            font_size=9,
+            color="black",
+            parent=self.scene,
+        )
+
+        self.statistic_colorbar_high = visuals.Text(
+            "",
+            pos=(cbar_center[0] + cbar_size[0] // 2 - 5, cbar_center[1] + 20),
+            anchor_x="center",
+            anchor_y="top",
+            font_size=9,
+            color="black",
+            parent=self.scene,
+        )
+
+        self.statistic_colorbar_title = visuals.Text(
+            "",
+            pos=(cbar_center[0], cbar_center[1] + 35),
+            anchor_x="center",
+            anchor_y="top",
+            font_size=10,
+            color="black",
+            parent=self.scene,
+        )
+
+        for text in (
+            self.statistic_colorbar_low,
+            self.statistic_colorbar_high,
+            self.statistic_colorbar_title,
+        ):
+            text.order = 10002
+            text.visible = False
 
     def initialize_overlays(self):
 
@@ -100,6 +228,9 @@ class Display(BasePlot.BaseCanvas):
 
     def build_neuron_visuals_union(self):
 
+        if self.data.assignments is None or self.data.assignments.union is None:
+            return
+
         roi_pos, neuron_ids, roi_vals = sparse_A_to_points(
             self.data.assignments.union.footprints, self.data.sessions[0].dims, thr=0.5
         )
@@ -126,13 +257,19 @@ class Display(BasePlot.BaseCanvas):
             return
 
         if self.display_mode == "tracked_overview" and "union" in self.plotting["data"]:
-            neuron_ids = np.where(
+            present_neuron_ids = np.where(
                 self.state.assignments[:, self.state.current_session_id] >= 0
             )[0]
-            mask = np.isin(self.plotting["data"]["union"].ids, neuron_ids)
-            roi_pos = self.plotting["data"]["union"].pos[mask]
-            roi_vals = self.plotting["data"]["union"].vals[mask]
-            n_rois = len(neuron_ids)
+
+            union = self.plotting["data"]["union"]
+
+            mask = np.isin(union.ids, present_neuron_ids)
+
+            roi_pos = union.pos[mask]
+            roi_vals = union.vals[mask]
+            neuron_ids = union.ids[mask]
+
+            n_rois = len(present_neuron_ids)
         else:
             roi_pos, roi_ids, roi_vals = sparse_A_to_points(
                 self.data.sessions[session_id].footprints,
@@ -171,11 +308,15 @@ class Display(BasePlot.BaseCanvas):
                 blend_func=("src_alpha", "one"),  # Make overlaps visible
             )
 
+            record = self.plotting["data"][key]
+
+            colors = self._statistic_colors_for_record(record)
+
             plot_options = self.styles.get_plot_options(
                 style="background" if key == "union" else "default",
                 plot_type="marker",
-                values=self.plotting["data"][key].vals,
-                colors=self.plotting["data"][key].color,
+                values=record.vals,
+                colors=colors,
                 edge_width=0,
             )
 
@@ -209,45 +350,252 @@ class Display(BasePlot.BaseCanvas):
         )
         self.clean_highlight()
 
-    def update_session_styles(self, session_id):
+    ### ==================================================================== ###
+    ### ======================= STATISTICS SECTION ========================= ###
+    ### ==================================================================== ###
 
-        # print(
-        #     f"Updating session {key}, plotting data: {self.plotting['data'][key]}"
-        # )
-        if session_id not in self.plotting["visuals"]:
-            return
-        if session_id == "union" or session_id == self.state.current_session_id:
-            style = "default"
-        else:
-            style = "background"
+    def set_neuron_statistic_values(
+        self,
+        values,
+        *,
+        title=None,
+    ):
+        self.neuron_statistic_values = (
+            None
+            if values is None
+            else np.asarray(
+                values,
+                dtype=float,
+            )
+        )
 
-        if session_id == "union":
-            self.plotting["data"][session_id].color = None
+        self.statistic_title = title
+
+        if self.neuron_statistic_values is None:
+            self.statistic_clim = None
+
         else:
-            self.plotting["data"][session_id].color = self.state.session_colors[
-                session_id
+            finite = self.neuron_statistic_values[
+                np.isfinite(self.neuron_statistic_values)
             ]
 
-        plot_options = self.styles.get_plot_options(
-            style,
-            "marker",
-            self.plotting["data"][session_id].vals,
-            colors=self.plotting["data"][session_id].color,
-            edge_width=0,
-        )
-        # print("updating style for session", session_id, "with style", plot_options)
+            if finite.size == 0:
+                self.statistic_clim = None
+            else:
+                self.statistic_clim = (
+                    float(np.min(finite)),
+                    float(np.max(finite)),
+                )
 
-        self.plotting["visuals"][session_id].set_data(
-            self.plotting["data"][session_id].pos, **plot_options
+        self._update_statistic_colorbar()
+        self._update_statistic_colors()
+
+    def _statistic_colors_for_record(
+        self,
+        record: OverviewRecord,
+    ):
+
+        ids = np.asarray(
+            record.ids,
+            dtype=int,
         )
+
+        point_values = np.full(
+            ids.shape,
+            np.nan,
+            dtype=float,
+        )
+
+        if self.neuron_statistic_values is not None:
+
+            valid_ids = (ids >= 0) & (ids < len(self.neuron_statistic_values))
+
+            point_values[valid_ids] = self.neuron_statistic_values[ids[valid_ids]]
+
+        # Start ALL points as the NaN style.
+        nan_color = np.asarray(
+            color.Color("#707070").rgba,
+            dtype=np.float32,
+        )
+        nan_color[3] = 0.65
+
+        rgba = np.tile(
+            nan_color,
+            (len(ids), 1),
+        )
+
+        if self.statistic_clim is None or self.neuron_statistic_values is None:
+            return rgba
+
+        finite = np.isfinite(point_values)
+
+        if not np.any(finite):
+            return rgba
+
+        lo, hi = self.statistic_clim
+
+        if hi > lo:
+            normalized = (point_values[finite] - lo) / (hi - lo)
+        else:
+            normalized = np.full(
+                np.count_nonzero(finite),
+                0.5,
+            )
+
+        normalized = np.clip(
+            normalized,
+            0.0,
+            1.0,
+        )
+
+        rgba[finite] = self._statistic_colormap().map(normalized).astype(np.float32)
+
+        return rgba
+
+    ### =========================== COLORSTYLES ============================ ###
+    def set_statistic_colormap(
+        self,
+        name: str,
+        *,
+        reverse: bool = False,
+    ):
+        self.statistic_cmap_name = name
+        self.statistic_cmap_reversed = reverse
+
+        self._update_statistic_colorbar()
+        self._update_statistic_colors()
+
+    def _statistic_colormap(self):
+
+        cmap = color.get_colormap(STATISTIC_CMAPS[self.statistic_cmap_name])
+
+        if not self.statistic_cmap_reversed:
+            return cmap
+
+        return color.Colormap(cmap.map(np.linspace(1.0, 0.0, 256)))
+
+    def _update_statistic_colorbar(self):
+
+        visible = (
+            self.neuron_statistic_values is not None and self.statistic_clim is not None
+        )
+
+        self.statistic_colorbar.visible = visible
+        self.statistic_colorbar_bg.visible = visible
+
+        for text in (
+            self.statistic_colorbar_low,
+            self.statistic_colorbar_high,
+            self.statistic_colorbar_title,
+        ):
+            text.visible = visible
+
+        if not visible:
+            return
+
+        lo, hi = self.statistic_clim
+
+        self.statistic_colorbar.cmap = self._statistic_colormap()
+
+        lo_text, hi_text = format_colorbar_limits(
+            lo,
+            hi,
+        )
+
+        self.statistic_colorbar_low.text = lo_text
+        self.statistic_colorbar_high.text = hi_text
+
+        self.statistic_colorbar_title.text = self._format_colorbar_title(
+            self.statistic_title or ""
+        )
+
+    def _update_statistic_colors(self):
+        """
+        Recolor existing neuron visuals from the current statistic.
+
+        Does not rebuild positions/footprints.
+        """
+
+        for key, record in self.plotting["data"].items():
+
+            visual = self.plotting["visuals"].get(key)
+
+            if visual is None:
+                continue
+
+            # -------------------------------------------
+            # No statistic selected:
+            # restore ordinary overview colors
+            # -------------------------------------------
+            if self.neuron_statistic_values is None:
+
+                if key == "union":
+                    colors = None
+                    style = "background"
+                else:
+                    colors = self.state.session_colors[key]
+
+                    style = (
+                        "default"
+                        if key == self.state.current_session_id
+                        else "background"
+                    )
+
+            # -------------------------------------------
+            # Statistic selected
+            # -------------------------------------------
+            else:
+                colors = self._statistic_colors_for_record(record)
+
+                # For now all statistic-colored data use the
+                # ordinary visual style. The colors themselves
+                # encode the statistic.
+                style = "default"
+
+            plot_options = self.styles.get_plot_options(
+                style=style,
+                plot_type="marker",
+                values=record.vals,
+                colors=colors,
+                edge_width=0,
+            )
+
+            visual.set_data(
+                record.pos,
+                **plot_options,
+            )
+
+        self.update()
+
+    def _format_colorbar_title(
+        self,
+        title: str,
+    ) -> str:
+        return "\n".join(
+            textwrap.wrap(
+                title,
+                width=24,
+                break_long_words=False,
+            )
+        )
+
+    ### ==================================================================== ###
+    ### ======================= GENERAL STYLE HELPER ======================= ###
+    ### ==================================================================== ###
+
+    def update_session_styles(self, session_id):
+
+        if session_id not in self.plotting["visuals"]:
+            return
+
         if session_id == "union":
             self.plotting["visuals"][session_id].visible = True
         else:
-            self.plotting["visuals"][session_id].visible = self.state.session_active[
+            self.plotting["visuals"][session_id].visible = self.data.sessions[
                 session_id
-            ]  # [1]
+            ].active
 
-        self.update()
+        self._update_statistic_colors()
 
     def update_style(self, component, style="default"):
 
@@ -259,7 +607,7 @@ class Display(BasePlot.BaseCanvas):
         if not isinstance(component, list):
             component = [component]
 
-        if self.display_mode == "single_overview":
+        if self.display_mode == "session_overview":
             key = self.state.current_session_id
         else:
             key = "union"
@@ -291,8 +639,10 @@ class Display(BasePlot.BaseCanvas):
     def find_closest_component(self, mouse_pos) -> Optional[NeuronComponent]:
         # print("neurons:", self.data.neurons)
         if (
-            self.data.current_session is None
+            self.state.current_session_id is None
             or "background" not in self.plotting
+            or self.data.assignments is None
+            or self.data.assignments.union is None
             or self.data.assignments.union.centroids is None
         ):
             return None
@@ -303,10 +653,15 @@ class Display(BasePlot.BaseCanvas):
 
         # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
         union_centroids = self.data.assignments.union.centroids
+
         # find closest footprint
         distances = (union_centroids[:, 0] - mouse_pos[0]) ** 2 + (
             union_centroids[:, 1] - mouse_pos[1]
         ) ** 2
+        if self.display_mode == "session_overview":
+            mask = self.state.assignments[:, self.state.current_session_id] >= 0
+            distances[~mask] = np.inf
+
         neuron_id = np.argmin(distances).astype(int)
         if np.sqrt(distances[neuron_id]) > 10.0:
             return None
@@ -317,6 +672,145 @@ class Display(BasePlot.BaseCanvas):
 class Controller(BasePlot.CanvasController):
 
     canvas: Display  # type hint for better code completion
+
+    def build_controls(self):
+
+        self.current_statistic_query = None
+        self.statistic_table = None
+
+        self.controls["statistics"] = StatisticQuerySelector(
+            engine=self.data.statistic_engine,
+        )
+        self.section.x_options_layout.addWidget(self.controls["statistics"])
+
+        self.controls["statistics"].set_default_reduction_provider(
+            self._overview_statistic_defaults
+        )
+        self.controls["statistics"].queryChanged.connect(
+            self._on_statistic_query_changed
+        )
+        self.controls["statistics"].set_query_mode("neuron_bound")
+        self.data.statistic_engine.values_changed.connect(self._recalculate_statistic)
+
+        self.controls["stat_cmap_label"] = QLabel("Colormap:")
+
+        self.controls["stat_cmap"] = QComboBox()
+        self.controls["stat_cmap"].addItems(STATISTIC_CMAPS.keys())
+
+        self.controls["stat_reverse"] = QCheckBox("Reverse")
+
+        self.section.x_options_layout.addWidget(self.controls["stat_cmap_label"])
+        self.section.x_options_layout.addWidget(self.controls["stat_cmap"])
+        self.section.x_options_layout.addWidget(self.controls["stat_reverse"])
+
+        self.controls["stat_cmap"].currentTextChanged.connect(
+            self._on_statistic_color_options_changed
+        )
+
+        self.controls["stat_reverse"].toggled.connect(
+            self._on_statistic_color_options_changed
+        )
+
+    def _on_statistic_query_changed(self, query):
+        self.current_statistic_query = query
+        self._recalculate_statistic()
+
+    def _recalculate_statistic(self):
+
+        query = self.current_statistic_query
+
+        if query is None:
+            self.statistic_table = None
+            self.canvas.set_neuron_statistic_values(
+                None,
+                title=None,
+            )
+            return
+
+        def evaluate(ctx=None):
+            return self.data.statistic_engine.evaluate_table(query)
+
+        self.state.tasks.start(
+            "calculating",
+            f"Calculate {query.statistic_key}",
+            evaluate,
+            on_result=lambda table, query=query: self._on_statistic_ready(
+                query,
+                table,
+            ),
+        )
+
+    def _on_statistic_ready(
+        self,
+        query,
+        table,
+    ):
+        # User changed the selector while this calculation
+        # was queued/running.
+        if query != self.current_statistic_query:
+            return
+
+        self.statistic_table = table
+
+        if table is None:
+            self.canvas.set_neuron_statistic_values(
+                None,
+                title=None,
+            )
+            return
+        values = self._dense_neuron_values(table)
+
+        self.canvas.set_neuron_statistic_values(
+            values,
+            title=table.stat.title,
+        )
+
+    def _dense_neuron_values(self, table):
+
+        neuron_dim = neuron_bound_dim(table.dims)
+
+        if neuron_dim is None:
+            raise ValueError(
+                "Neuron-bound query returned no neuron dimension: " f"{table.dims}"
+            )
+
+        return table.indexed_values(
+            neuron_dim,
+            self.state.assignments.shape[0],
+        )
+
+    def _overview_statistic_defaults(
+        self,
+        stat_def,
+    ):
+        reductions = {}
+
+        session_dims = [dim for dim in stat_def.dims if dim in SESSION_DIMS]
+
+        if self.section.display_mode == "session_overview":
+            session_id = self.state.current_session_id
+
+            if session_id is not None:
+                for dim in session_dims:
+                    reductions[dim] = ReductionSpec(
+                        "single",
+                        index=session_id,
+                    )
+
+        elif self.section.display_mode == "tracked_overview":
+            for dim in session_dims:
+                reductions[dim] = ReductionSpec("mean")
+
+        return reductions
+
+    def _on_statistic_color_options_changed(
+        self,
+        *_,
+    ):
+        self.canvas.set_statistic_colormap(
+            self.controls["stat_cmap"].currentText(),
+            reverse=self.controls["stat_reverse"].isChecked(),
+        )
 
     def initialize_display(self):
 
@@ -338,7 +832,11 @@ class Controller(BasePlot.CanvasController):
         self.initialize_display()
 
     def _on_session_changed(self):
-        if self.state.current_session_id is None:
+        if (
+            self.data.assignments is None
+            or self.data.assignments.ids.shape[1] == 0
+            or self.state.current_session_id is None
+        ):
             return
 
         self.canvas.plot_background()
@@ -347,10 +845,8 @@ class Controller(BasePlot.CanvasController):
             # and self.data.neurons is not None
             and "union" not in self.canvas.plotting["data"]
         ):
-            # print("initializing tracked overview display")
             self.canvas.build_neuron_visuals_union()
 
-        # if self.section.display_mode == "session_overview":
         self.canvas.clean(with_union=self.section.display_mode == "session_overview")
 
         self.canvas.build_neuron_visuals_session(
@@ -360,16 +856,6 @@ class Controller(BasePlot.CanvasController):
         # self.canvas.update_session_styles()
 
         super()._on_session_changed()
-
-        # for key in self.canvas.plotting["data"]:
-        #     if isinstance(key, int) and self.section.display_mode == "tracked_overview":
-
-        #         self.state.session_active[key] = (
-        #             key,
-        #             key == self.state.current_session_id,
-        #         )
-
-        # print(f"Session {key} active: {self.state.session_active[key]}")
 
     def _on_session_style_changed(self, session_id):
         self.canvas.update_session_styles(session_id)
@@ -447,35 +933,31 @@ def normalize_sparse_array(
     ).T
 
 
-def colormap(
-    values: np.ndarray,
-    base_color: list | tuple | str = "viridis",
-    alpha_scale: float = 1.0,
-    offset=0.6,
-):
-    """
-    values: array-like, assumed normalized to [0,1]
-    returns: (N,4) RGBA array
-    """
-    # print(f"cmap which: {which}")
-    val_min, val_max = np.percentile(values, [5, 95])
-    v = (values - val_min) / (val_max - val_min + 1e-8)
-    v = np.clip(v, 0.0, 1.0)
+def format_colorbar_limits(
+    lo: float,
+    hi: float,
+    significant_digits: int = 4,
+) -> tuple[str, str]:
 
-    # optional offset (keeps low values visible)
-    if offset > 0:
-        v = offset + (1.0 - offset) * v
+    max_abs = max(abs(lo), abs(hi))
 
-    if isinstance(base_color, str):
-        # map to RGBA using cmap
-        cmap = color.get_colormap(base_color)
-        rgba = cmap.map(v).astype(np.float32)
+    if max_abs == 0:
+        return ("0", "0")
 
-        # control alpha separately (very useful for overlap)
-        rgba[:, 3] *= alpha_scale
+    order = int(np.floor(np.log10(max_abs)))
 
-        return rgba
-    else:
-        rgba = np.tile(base_color, (len(v), 1))
-        rgba[:, 3] = v * alpha_scale
-        return rgba.astype(np.float32)
+    if order >= 5 or order <= -4:
+        return (
+            f"{lo:.{significant_digits - 1}e}",
+            f"{hi:.{significant_digits - 1}e}",
+        )
+
+    decimals = max(
+        0,
+        significant_digits - 1 - order,
+    )
+
+    return (
+        f"{lo:.{decimals}f}",
+        f"{hi:.{decimals}f}",
+    )

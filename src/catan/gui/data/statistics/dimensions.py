@@ -100,3 +100,19 @@ def make_match_coord_getter(
         return coords
 
     return coord_getter
+
+
+def neuron_bound_dim(
+    dims: tuple[str, ...],
+) -> str | None:
+
+    if "neuron" in dims:
+        return "neuron"
+
+    if "neuron_i" in dims:
+        return "neuron_i"
+
+    if "neuron_j" in dims:
+        return "neuron_j"
+
+    return None

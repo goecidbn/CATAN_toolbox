@@ -1,23 +1,17 @@
 from typing import Dict, Optional, Tuple, List, Union
-from catan.core.io.inspection import check_file_compatibility
 from catan.tracking.structures.model import Model
 import numpy as np
-from scipy import sparse
 from pathlib import Path
 
+from catan import Tracking
 from . import AppState, NeuronComponent
 from catan.core.io import inspect_file
 from catan.core.structures import SessionData, sessiondata_type
 from catan.tracking.structures import Assignments
 from catan.gui.plots.colors import CyclicColorMap
 
-from catan import Tracking
-
-# class Neurons:
-
-#     n: int = 0
-#     centroids: np.ndarray
-#     union_footprints: Dict[int, sparse.csc_matrix]
+from catan.gui.data.statistics.engine import StatisticEngine
+from catan.gui.data.statistics.registry import build_statistics_registry
 
 
 class Data(Tracking):
@@ -27,8 +21,13 @@ class Data(Tracking):
     def __init__(self, state: AppState):
 
         self.state = state
-
         super().__init__()
+
+        self.statistic_engine = StatisticEngine(
+            data=self,
+            state=state,
+            registry_factory=build_statistics_registry,
+        )
 
         self.current_session: Optional[SessionData] = None
 
@@ -49,6 +48,12 @@ class Data(Tracking):
             raise ValueError(f"Invalid session_id {session_id}")
 
         self.current_session = self.sessions[session_id]
+
+    def evaluate_queries(self, **kwargs):
+        table = {}
+        for key, query in kwargs.items():
+            table[key] = self.statistic_engine.evaluate_table(query)
+        return table
 
     def toggle_session_data(
         self,

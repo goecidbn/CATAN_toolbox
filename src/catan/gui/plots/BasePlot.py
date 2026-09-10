@@ -157,8 +157,8 @@ class BaseDisplayController(QObject):
     def __init__(self, display_section, config=None):
         super().__init__(display_section)
         self.section = display_section
-        self.state = display_section.state
-        self.data = display_section.data
+        self.state: AppState = display_section.state
+        self.data: Data = display_section.data
 
         self.config = config or {}
         self.controls = {}

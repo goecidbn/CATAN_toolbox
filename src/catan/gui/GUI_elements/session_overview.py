@@ -708,9 +708,7 @@ class SessionOverview(QWidget):
         session = self.data.sessions[session_id]
         session.active = active
 
-        # Recommended: state signal that all displays/statistics should respect.
-        if hasattr(self.state, "data_changed"):
-            self.state.data_changed.emit(("session", session_id))
+        self.state.data_changed.emit(("session", session_id))
 
     def rename_session(self, session_id: int, name: str):
         if not name:

@@ -2,14 +2,20 @@
 Module for calculating statistics from data
 """
 
-import numpy as np
-from typing import Dict, List, Optional, Callable
+from __future__ import annotations
 
-from catan.gui.structures.state import AppState
-from catan.gui.structures.data import Data
+from typing import TYPE_CHECKING
+from collections.abc import Callable
+
+
+import numpy as np
 from scipy import sparse, spatial
 
 from catan.core.image_correlation import calculate_img_correlation
+
+if TYPE_CHECKING:
+    from catan.gui.structures.state import AppState
+    from catan.gui.structures.data import Data
 
 
 def apply_indexers(
@@ -97,7 +103,7 @@ def get_stat_from_session(
 def get_quality_metric(
     data: Data,
     state: AppState,
-    indexers: Optional[Dict[str, int]] = None,
+    indexers: dict[str, int] | None = None,
     filters=(),
     **kwargs,
 ) -> np.ndarray:
@@ -161,7 +167,7 @@ def normalize_csc_columns_to_max(A):
 def calculate_footprint_size(
     data: Data,
     state: AppState,
-    indexers: Optional[Dict[str, int]] = None,
+    indexers: dict[str, int] | None = None,
     filters=(),
     thr=0.01,
 ) -> np.ndarray:
@@ -254,7 +260,7 @@ def calculate_temporal_correlation(
 def calculate_distances(
     data: Data,
     state: AppState,
-    indexers: Optional[Dict[str, int]] = None,
+    indexers: dict[str, int] | None = None,
     filters=(),
 ):
     indexers = indexers or {}
@@ -319,7 +325,7 @@ def calculate_distances(
 
 
 def calculate_border_proximity(
-    data: Data, state: AppState, indexers: Optional[Dict[str, int]] = None, filters=()
+    data: Data, state: AppState, indexers: dict[str, int] | None = None, filters=()
 ) -> np.ndarray:
     """
     Calculate the proximity of each centroid to the borders of the field of view.
@@ -360,7 +366,7 @@ def calculate_occurrence(
 def calculate_centroid_shift(
     data: Data,
     state: AppState,
-    indexers: Optional[Dict[str, int]] = None,
+    indexers: dict[str, int] | None = None,
     filters=(),
 ) -> np.ndarray:
 
@@ -430,8 +436,8 @@ def calculate_centroid_shift(
 
 
 def calculate_footprint_similarity(
-    data,
-    state,
+    data: Data,
+    state: AppState,
     indexers=None,
     filters=(),
     neighborhood_thr=10,

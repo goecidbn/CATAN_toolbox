@@ -1,9 +1,7 @@
-from typing import Literal
-
 from dataclasses import dataclass
 import numpy as np
 
-from .prepared_data import PickTable
+from .table import PickTable
 from catan.gui.plots.helper.Threshold import ThresholdSpec
 
 

@@ -1,10 +1,8 @@
-from typing import Literal
-
 from dataclasses import dataclass
 import numpy as np
 
 from .dimensions import canonical_dims
-from .prepared_data import PickTable
+from .table import PickTable
 
 
 @dataclass

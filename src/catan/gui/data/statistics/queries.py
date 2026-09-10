@@ -1,7 +1,7 @@
 from typing import Literal, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .dimensions import canonical_dim, SESSION_DIMS, NEURON_DIMS
+from .dimensions import canonical_dim, SESSION_DIMS, NEURON_DIMS, neuron_bound_dim
 
 Contexts = Literal["generic", "session_series", "neuron_bound"]
 
@@ -113,6 +113,16 @@ class StatisticQuery:
 
     def reduction_dict(self):
         return dict(self.reductions)
+
+
+def statistic_allowed_in_context(
+    dims: tuple[str, ...],
+    context: Contexts,
+):
+    if context != "neuron_bound":
+        return True
+
+    return neuron_bound_dim(dims) is not None
 
 
 def allowed_reduction_methods(
@@ -354,6 +364,60 @@ def normalize_generic_session_pair_reductions(
             out[dim] = ReductionSpec(
                 "single",
                 index=old.index or 0,
+            )
+
+    return out
+
+
+def normalize_neuron_bound_reductions(
+    stat_def,
+    reductions,
+):
+    out = dict(reductions)
+
+    output_dim = neuron_bound_dim(stat_def.dims)
+
+    if output_dim is None:
+        raise ValueError(f"{stat_def.key!r} cannot produce neuron-bound data.")
+
+    for dim in stat_def.dims:
+
+        if dim == output_dim:
+            out[dim] = ReductionSpec("keep")
+            continue
+
+        spec = out.get(dim)
+
+        allowed = stat_def.get_allowed_reductions(dim)
+        allowed = tuple(method for method in allowed if method != "keep")
+
+        # Preserve an already valid choice
+        if spec is not None and spec.method in allowed:
+            out[dim] = replace(
+                spec,
+                error_method="none",
+            )
+            continue
+
+        # Sensible fallback
+        if dim in NEURON_DIMS and "median" in allowed:
+            out[dim] = ReductionSpec("median")
+
+        elif "single" in allowed:
+            out[dim] = ReductionSpec(
+                "single",
+                index=0,
+            )
+
+        elif "median" in allowed:
+            out[dim] = ReductionSpec("median")
+
+        elif "mean" in allowed:
+            out[dim] = ReductionSpec("mean")
+
+        else:
+            raise ValueError(
+                f"Dimension {dim!r} cannot be reduced " "for neuron-bound output."
             )
 
     return out
