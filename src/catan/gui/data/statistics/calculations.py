@@ -12,6 +12,7 @@ import numpy as np
 from scipy import sparse, spatial
 
 from catan.core.image_correlation import calculate_img_correlation
+from catan.gui.background_tasks.runtime import current_task_context
 
 if TYPE_CHECKING:
     from catan.gui.structures.state import AppState
@@ -444,6 +445,8 @@ def calculate_footprint_similarity(
 ):
     indexers = indexers or {}
 
+    ctx = current_task_context()
+
     N, S = state.assignments.shape
 
     neuron_i_ids = requested_indices(N, "neuron_i", indexers)
@@ -489,6 +492,14 @@ def calculate_footprint_similarity(
             continue
 
         for sj, session_j_id in enumerate(session_j_ids):
+            ctx.progress(
+                int(
+                    (si * len(session_j_ids) + sj)
+                    / (len(session_i_ids) * len(session_j_ids))
+                    * 100
+                )
+            )
+            ctx.check_cancelled()
             session_j = data.sessions[session_j_id]
 
             if (
@@ -519,7 +530,6 @@ def calculate_footprint_similarity(
                 continue
 
             ctr_i = session_i.centroids[fp_i[valid_i]]
-
             ctr_j = session_j.centroids[fp_j[valid_j]]
 
             distances = spatial.distance.cdist(

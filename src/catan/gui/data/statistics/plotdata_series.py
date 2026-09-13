@@ -31,6 +31,33 @@ class SessionSeries:
     def has_errors(self) -> bool:
         return self.errors_low is not None and self.errors_high is not None
 
+    def tooltip_value_for_index(
+        self,
+        index: int,
+    ) -> str:
+
+        value = self.values[index]
+
+        text = f"{self.title}: " f"{value:.4g}"
+
+        if self.has_errors:
+
+            low = self.errors_low[index]
+            high = self.errors_high[index]
+
+            if np.isfinite(low) and np.isfinite(high):
+
+                if np.isclose(low, high):
+                    text += f" ± {low:.4g}"
+
+                else:
+                    text += f" +{high:.4g}" f" / -{low:.4g}"
+
+        if self.n is not None and np.isfinite(self.n[index]):
+            text += f"    n={int(self.n[index])}"
+
+        return text
+
 
 @dataclass
 class PlotData:
@@ -281,7 +308,7 @@ def build_session_series_from_table(table: PickTable) -> SessionSeries:
     # label = getattr(table.stat, "title", "") or "statistic"
 
     return SessionSeries(
-        title={"first": table.stat.title},
+        title=table.stat.title,
         table=table,
         session_dim=session_dim,
         session_ids=unique_sessions,

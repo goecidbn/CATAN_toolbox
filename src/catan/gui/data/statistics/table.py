@@ -183,7 +183,7 @@ class PickTable:
         return table
 
     def subset_rows(self, rows) -> "PickTable":
-        rows = np.asarray(rows, dtype=int)
+        rows = np.atleast_1d(np.asarray(rows, dtype=int))
 
         return PickTable(
             stat=self.stat,
@@ -316,10 +316,10 @@ class PickTable:
             rows [10, 15, 20]
             -> {"neuron": array([3, 5, 9])}
         """
-        rows = np.asarray(rows, dtype=int)
+        rows = np.atleast_1d(np.asarray(rows, dtype=int))
 
         result = {
-            dim_name: np.atleast_1d(ref_values[rows])
+            dim_name: np.asarray(ref_values[rows]).reshape(-1)
             for dim_name, ref_values in self.refs.items()
         }
 

@@ -53,6 +53,15 @@ class PlotData:
         rows = self.rows_for_bin(bin_index)
         return self.table.refs_for_rows(rows)
 
+    def ref_sets_for_rows(
+        self,
+        rows: int | np.ndarray,
+    ) -> tuple[dict[str, np.ndarray], ...]:
+
+        rows = np.atleast_1d(rows).astype(int, copy=False)
+
+        return (self.table.refs_for_rows(rows),)
+
     def rows_matching_components(self, components) -> np.ndarray:
         return self.table.rows_matching_components(components)
 
@@ -140,7 +149,7 @@ def build_plot_data(
         bin_rows = [np.asarray([], dtype=int) for _ in range(len(counts))]
 
     return PlotData(
-        title={"x": table.stat.title},
+        title={"x": table.stat.display_title},
         table=table,
         bin_edges=edges,
         bin_counts=counts,

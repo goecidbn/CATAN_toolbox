@@ -13,6 +13,8 @@ from catan.gui.plots.colors import CyclicColorMap
 from catan.gui.data.statistics.engine import StatisticEngine
 from catan.gui.data.statistics.registry import build_statistics_registry
 
+from catan.gui.background_tasks.runtime import current_task_context
+
 
 class Data(Tracking):
 
@@ -63,6 +65,8 @@ class Data(Tracking):
         **kwargs,
     ):
 
+        ctx = current_task_context()
+
         session = self.sessions[session_id]
         if session.source_config is None:
             raise ValueError("No load configuration selected.")
@@ -81,7 +85,7 @@ class Data(Tracking):
         session.load_data(
             fields_to_load,
             alignment_template=self.alignment_template,
-            ctx=kwargs.get("ctx", None),
+            ctx=ctx,
         )
         self.notify_change(("session", session_id))
         if "traces" in fields_to_load:
@@ -325,11 +329,12 @@ class Data(Tracking):
         session = self.sessions[session_id]
 
         if to_present:
-            fn = lambda ctx: self.assign_neurons(
+            ctx = current_task_context()
+            fn = lambda: self.assign_neurons(
                 from_session_index=session_id, clean_traces=False, ctx=ctx
             )
         else:
-            fn = lambda ctx: self.unassign_neurons(session_id, ctx=ctx)
+            fn = lambda: self.unassign_neurons(session_id)
 
         self.state.tasks.start(
             "calculating",

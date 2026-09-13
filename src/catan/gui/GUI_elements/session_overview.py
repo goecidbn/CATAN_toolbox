@@ -483,7 +483,7 @@ class LoadSessionRowWidget(QFrame):
             self.state.tasks.start(
                 "loading",
                 "Loading session data from file...",
-                lambda ctx: self.data.register_session(from_file=path, ctx=ctx),
+                lambda: self.data.register_session(from_file=path),
             )
 
         elif opt == ".* (glob)":
@@ -708,7 +708,7 @@ class SessionOverview(QWidget):
         session = self.data.sessions[session_id]
         session.active = active
 
-        self.state.data_changed.emit(("session", session_id))
+        self.data.notify_change(("session", session_id))
 
     def rename_session(self, session_id: int, name: str):
         if not name:
@@ -741,7 +741,7 @@ class SessionOverview(QWidget):
         session.time_offset = value
         self.refresh_rows()
 
-        self.state.data_changed.emit(("sessions", session_id))
+        self.data.notify_change(("sessions", session_id))
 
     def toggle_session_data(
         self, session_id: int, which: Optional[sessiondata_type] = None
@@ -750,7 +750,7 @@ class SessionOverview(QWidget):
         self.state.tasks.start(
             "loading",
             f"Loading {which} data for {session.name}",
-            lambda ctx: self.data.toggle_session_data(session_id, which, ctx=ctx),
+            lambda: self.data.toggle_session_data(session_id, which),
             finished=self.refresh_rows,
         )
 

@@ -41,6 +41,7 @@ from catan.gui.data.statistics.queries import (
     normalize_session_series_reductions,
     normalize_generic_session_pair_reductions,
 )
+from catan.gui.utils.popups import constrain_popup
 
 
 class ReductionRow(QWidget):
@@ -785,11 +786,16 @@ class StatisticQuerySelector(QWidget):
 
         self._popup.reductionChanged.connect(self._on_reduction_changed)
 
-        pos = self.reduction_button.mapToGlobal(
-            QPoint(0, self.reduction_button.height())
+        # pos = self.reduction_button.mapToGlobal(
+        #     QPoint(0, self.reduction_button.height())
+        # )
+
+        # self._popup.move(pos)
+        constrain_popup(
+            self._popup,
+            anchor=self.reduction_button,
         )
 
-        self._popup.move(pos)
         self._popup.show()
 
     def _on_reduction_changed(

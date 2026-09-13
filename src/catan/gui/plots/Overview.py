@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCheckBox,
     QLabel,
+    QInputDialog,
+    QToolTip,
 )
 
 
@@ -25,19 +27,15 @@ STATISTIC_CMAPS = {
     "viridis": "viridis",
     "coolwarm": "coolwarm",
     "cubehelix": "cubehelix",
-    "red-green": color.Colormap(
-        [
-            "#b2182b",
-            "#f2f2f2",
-            "#1a9850",
-        ]
+    "red-green": (
+        "#b2182b",
+        "#f2f2f2",
+        "#1a9850",
     ),
-    "blue-orange": color.Colormap(
-        [
-            "#2166ac",
-            "#f2f2f2",
-            "#b35806",
-        ]
+    "blue-orange": (
+        "#2166ac",
+        "#f2f2f2",
+        "#b35806",
     ),
 }
 
@@ -56,7 +54,6 @@ class Display(BasePlot.BaseCanvas):
     def __init__(self, parent, controls, config=None):
         super().__init__(parent, controls, config)
 
-        print("fix mouseover to only detect currently displayed neurons!")
         self.unfreeze()
         self.grid = self.central_widget.add_grid(spacing=0)
         self.view = self.grid.add_view(row=0, col=0)
@@ -75,7 +72,16 @@ class Display(BasePlot.BaseCanvas):
         self.statistic_cmap_name = "viridis"
         self.statistic_cmap_reversed = False
 
-        self.statistic_clim = None
+        self.statistic_cmap = self._make_statistic_colormap(
+            self.statistic_cmap_name,
+            self.statistic_cmap_reversed,
+        )
+
+        self.statistic_data_clim = None
+        self.statistic_manual_clim = {
+            "low": None,
+            "high": None,
+        }
         self.build_colorbar()
 
         self.statistic_nan_color = np.asarray(
@@ -90,8 +96,10 @@ class Display(BasePlot.BaseCanvas):
 
     def build_colorbar(self):
 
-        cbar_size = (120, 10)
-        cbar_center = (90, 20)
+        self._cbar_size = (120, 10)
+        self._cbar_center = (90, 20)
+        cbar_size = self._cbar_size
+        cbar_center = self._cbar_center
         cbar_hmargin = 15
         cbar_vmargin = 10
 
@@ -113,15 +121,10 @@ class Display(BasePlot.BaseCanvas):
         self.statistic_colorbar_bg.visible = False
 
         self.statistic_colorbar = visuals.ColorBar(
-            cmap=(
-                self.statistic_cmap_name
-                if not self.statistic_cmap_reversed
-                else self.statistic_cmap_name + "_r"
-            ),
+            cmap=self.statistic_cmap,
             orientation="bottom",
-            size=cbar_size,
-            pos=cbar_center,
-            # We'll draw these ourselves
+            size=self._cbar_size,
+            pos=self._cbar_center,
             label="",
             clim=("", ""),
             border_width=1,
@@ -132,9 +135,26 @@ class Display(BasePlot.BaseCanvas):
         self.statistic_colorbar.order = 10001
         self.statistic_colorbar.visible = False
 
+        label_y_offset = 25
+        label_y = self._cbar_center[1] + label_y_offset
+
+        left = self._cbar_center[0] - self._cbar_size[0] / 2
+        right = self._cbar_center[0] + self._cbar_size[0] / 2
+
+        self._cbar_low_label_pos = (left + 8, label_y)
+        self._cbar_high_label_pos = (right - 8, label_y)
+
+        # Slightly above the labels:
+        self._cbar_low_reset_pos = (left + 22, label_y - 11)
+        self._cbar_high_reset_pos = (right + 6, label_y - 11)
+
         self.statistic_colorbar_low = visuals.Text(
             "",
-            pos=(cbar_center[0] - cbar_size[0] // 2 + 5, cbar_center[1] + 20),
+            pos=self._cbar_low_label_pos,
+            # pos=(
+            #     cbar_center[0] - cbar_size[0] // 2 + 5,
+            #     cbar_center[1] + label_y_offset,
+            # ),
             anchor_x="center",
             anchor_y="top",
             font_size=9,
@@ -144,7 +164,11 @@ class Display(BasePlot.BaseCanvas):
 
         self.statistic_colorbar_high = visuals.Text(
             "",
-            pos=(cbar_center[0] + cbar_size[0] // 2 - 5, cbar_center[1] + 20),
+            pos=self._cbar_high_label_pos,
+            # pos=(
+            #     cbar_center[0] + cbar_size[0] // 2 - 5,
+            #     cbar_center[1] + label_y_offset,
+            # ),
             anchor_x="center",
             anchor_y="top",
             font_size=9,
@@ -154,13 +178,40 @@ class Display(BasePlot.BaseCanvas):
 
         self.statistic_colorbar_title = visuals.Text(
             "",
-            pos=(cbar_center[0], cbar_center[1] + 35),
+            pos=(cbar_center[0], cbar_center[1] + label_y_offset + 10),
             anchor_x="center",
             anchor_y="top",
             font_size=10,
             color="black",
             parent=self.scene,
         )
+
+        self.statistic_colorbar_low_reset = visuals.Text(
+            "×",
+            pos=self._cbar_low_reset_pos,
+            anchor_x="center",
+            anchor_y="center",
+            font_size=11,
+            color="#707070",
+            parent=self.scene,
+        )
+
+        self.statistic_colorbar_high_reset = visuals.Text(
+            "×",
+            pos=self._cbar_high_reset_pos,
+            anchor_x="center",
+            anchor_y="center",
+            font_size=11,
+            color="#707070",
+            parent=self.scene,
+        )
+
+        for visual in (
+            self.statistic_colorbar_low_reset,
+            self.statistic_colorbar_high_reset,
+        ):
+            visual.order = 10003
+            visual.visible = False
 
         for text in (
             self.statistic_colorbar_low,
@@ -175,6 +226,8 @@ class Display(BasePlot.BaseCanvas):
         for style in self.plotting["overlays"]:
             self.plotting["overlays"][style] = visuals.Markers(
                 parent=self.plot_root,
+                scaling="scene",
+                symbol="square",
             )
             self.plotting["overlays"][style].set_gl_state(
                 depth_test=False,
@@ -296,24 +349,33 @@ class Display(BasePlot.BaseCanvas):
 
     def plot_neurons_visuals(self):
 
-        # print("Plotting neurons")
         for key in self.plotting["data"]:
             if key in self.plotting["visuals"]:
                 continue
 
-            footprints = visuals.Markers(parent=self.plot_root)
+            footprints = visuals.Markers(
+                parent=self.plot_root,
+                scaling="scene",
+                symbol="square",
+            )
             footprints.set_gl_state(
                 depth_test=False,
                 blend=True,
-                blend_func=("src_alpha", "one"),  # Make overlaps visible
+                blend_func=(
+                    "src_alpha",
+                    "one_minus_src_alpha",
+                ),  # Make overlaps visible
             )
 
             record = self.plotting["data"][key]
 
-            colors = self._statistic_colors_for_record(record)
+            colors, style = self._colors_for_record(
+                key,
+                record,
+            )
 
             plot_options = self.styles.get_plot_options(
-                style="background" if key == "union" else "default",
+                style=style,
                 plot_type="marker",
                 values=record.vals,
                 colors=colors,
@@ -361,34 +423,116 @@ class Display(BasePlot.BaseCanvas):
         title=None,
     ):
         self.neuron_statistic_values = (
-            None
-            if values is None
-            else np.asarray(
-                values,
-                dtype=float,
-            )
+            None if values is None else np.asarray(values, dtype=float)
         )
 
         self.statistic_title = title
 
         if self.neuron_statistic_values is None:
-            self.statistic_clim = None
+            self.statistic_data_clim = None
 
         else:
             finite = self.neuron_statistic_values[
                 np.isfinite(self.neuron_statistic_values)
             ]
 
-            if finite.size == 0:
-                self.statistic_clim = None
-            else:
-                self.statistic_clim = (
-                    float(np.min(finite)),
-                    float(np.max(finite)),
-                )
+            self.statistic_data_clim = (
+                None
+                if finite.size == 0
+                else (float(np.min(finite)), float(np.max(finite)))
+            )
 
         self._update_statistic_colorbar()
         self._update_statistic_colors()
+
+    def _effective_statistic_clim(self):
+
+        if self.statistic_data_clim is None:
+            return None
+
+        data_lo, data_hi = self.statistic_data_clim
+
+        manual_lo = self.statistic_manual_clim["low"]
+        manual_hi = self.statistic_manual_clim["high"]
+
+        lo = data_lo if manual_lo is None else manual_lo
+        hi = data_hi if manual_hi is None else manual_hi
+
+        # Possible if one bound is fixed and a newly displayed
+        # dataset lies completely beyond that bound.
+        if lo >= hi:
+
+            if manual_lo is not None and manual_hi is None:
+                hi = np.nextafter(lo, np.inf)
+
+            elif manual_hi is not None and manual_lo is None:
+                lo = np.nextafter(hi, -np.inf)
+
+            # elif manual_lo is not None and manual_hi is not None:
+            else:
+                self.set_statistic_clim_limit("low", None)
+                self.set_statistic_clim_limit("high", None)
+
+            # else:
+            # return None
+
+        return float(lo), float(hi)
+
+    def set_statistic_clim_limit(
+        self,
+        which: str,
+        value: float | None,
+    ):
+
+        if which not in ("low", "high"):
+            raise ValueError(which)
+
+        if value is not None:
+            value = float(value)
+
+            if not np.isfinite(value):
+                return
+
+            other_key = "high" if which == "low" else "low"
+
+            other = self.statistic_manual_clim[other_key]
+
+            if other is not None:
+                if which == "low" and value >= other:
+                    return
+
+                if which == "high" and value <= other:
+                    return
+
+        self.statistic_manual_clim[which] = value
+
+        self._update_statistic_colorbar()
+        self._update_statistic_colors()
+
+    def _colors_for_record(
+        self,
+        key,
+        record,
+    ):
+        # Statistic coloring takes precedence
+        if self.neuron_statistic_values is not None:
+            return (
+                self._statistic_colors_for_record(record),
+                "default",
+            )
+
+        # Tracked overview: union contains everything
+        if key == "union":
+            return (
+                self._tracked_union_colors(record),
+                "default",
+            )
+
+        # Session overview: ordinary session color
+        return (
+            record.color,
+            "default",
+        )
 
     def _statistic_colors_for_record(
         self,
@@ -412,19 +556,21 @@ class Display(BasePlot.BaseCanvas):
 
             point_values[valid_ids] = self.neuron_statistic_values[ids[valid_ids]]
 
-        # Start ALL points as the NaN style.
+        opts = self.styles.overview
+
         nan_color = np.asarray(
-            color.Color("#707070").rgba,
+            color.Color(opts["statistic_nan_color"]).rgba,
             dtype=np.float32,
         )
-        nan_color[3] = 0.65
+
+        nan_color[3] = opts["statistic_nan_alpha"]
 
         rgba = np.tile(
             nan_color,
             (len(ids), 1),
         )
 
-        if self.statistic_clim is None or self.neuron_statistic_values is None:
+        if self.statistic_data_clim is None or self.neuron_statistic_values is None:
             return rgba
 
         finite = np.isfinite(point_values)
@@ -432,7 +578,10 @@ class Display(BasePlot.BaseCanvas):
         if not np.any(finite):
             return rgba
 
-        lo, hi = self.statistic_clim
+        clim = self._effective_statistic_clim()
+
+        lo, hi = clim
+        # lo, hi = self.statistic_data_clim
 
         if hi > lo:
             normalized = (point_values[finite] - lo) / (hi - lo)
@@ -448,11 +597,186 @@ class Display(BasePlot.BaseCanvas):
             1.0,
         )
 
-        rgba[finite] = self._statistic_colormap().map(normalized).astype(np.float32)
+        rgba[finite] = self.statistic_cmap.map(normalized).astype(np.float32)
+
+        if (
+            self.display_mode == "tracked_overview"
+            and record is self.plotting["data"].get("union")
+            and self.state.current_session_id is not None
+        ):
+
+            current = (
+                self.state.assignments[
+                    :,
+                    self.state.current_session_id,
+                ]
+                >= 0
+            )
+
+            ids = np.asarray(
+                record.ids,
+                dtype=int,
+            )
+
+            valid_ids = (ids >= 0) & (ids < len(current))
+
+            point_in_current = np.zeros(
+                len(ids),
+                dtype=bool,
+            )
+
+            point_in_current[valid_ids] = current[ids[valid_ids]]
+
+            # Neurons not present in current session remain visible,
+            # but substantially dimmer.
+            rgba[~point_in_current, 3] *= opts["tracked_stat_other_alpha_scale"]
 
         return rgba
 
+    def _point_near(
+        self,
+        pos,
+        target,
+        *,
+        radius_x=12,
+        radius_y=10,
+    ):
+        return (
+            abs(pos[0] - target[0]) <= radius_x and abs(pos[1] - target[1]) <= radius_y
+        )
+
+    def _colorbar_hit_target(
+        self,
+        pos,
+    ):
+
+        if not self.statistic_colorbar.visible:
+            return None
+
+        # Reset controls have priority.
+        if self.statistic_colorbar_low_reset.visible and self._point_near(
+            pos, self._cbar_low_reset_pos
+        ):
+            return "reset_low"
+
+        if self.statistic_colorbar_high_reset.visible and self._point_near(
+            pos, self._cbar_high_reset_pos
+        ):
+            return "reset_high"
+
+        if self._point_near(
+            pos,
+            self._cbar_low_label_pos,
+            radius_x=25,
+            radius_y=12,
+        ):
+            return "low"
+
+        if self._point_near(
+            pos,
+            self._cbar_high_label_pos,
+            radius_x=25,
+            radius_y=12,
+        ):
+            return "high"
+
+        return None
+
+    # def _colorbar_click_target(
+    #     self,
+    #     pos,
+    # ):
+    #     if not self.statistic_colorbar.visible:
+    #         return None
+
+    #     x, y = pos
+
+    #     label_y = self._cbar_center[1] + 20
+
+    #     low_x = self._cbar_center[0] - self._cbar_size[0] / 2 + 5
+    #     high_x = self._cbar_center[0] + self._cbar_size[0] / 2 - 5
+
+    #     if abs(y - label_y) < 12:
+
+    #         if abs(x - low_x) < 25:
+    #             return "low"
+
+    #         if abs(x - high_x) < 25:
+    #             return "high"
+
+    #     # reset crosses
+    #     if abs(y - label_y) < 12:
+
+    #         if abs(x - (self._cbar_center[0] - self._cbar_size[0] / 2 - 12)) < 10:
+    #             return "reset_low"
+
+    #         if abs(x - (self._cbar_center[0] + self._cbar_size[0] / 2 + 12)) < 10:
+    #             return "reset_high"
+
+    #     return None
+
+    def _update_colorbar_hover(self, target):
+
+        low_hover = target == "reset_low"
+        high_hover = target == "reset_high"
+
+        self.statistic_colorbar_low_reset.color = "#c62828" if low_hover else "#707070"
+
+        self.statistic_colorbar_high_reset.color = (
+            "#c62828" if high_hover else "#707070"
+        )
+
+        self.statistic_colorbar_low_reset.font_size = 13 if low_hover else 11
+        self.statistic_colorbar_high_reset.font_size = 13 if high_hover else 11
+
     ### =========================== COLORSTYLES ============================ ###
+
+    def _make_statistic_colormap(
+        self,
+        name: str,
+        reverse: bool,
+    ):
+        spec = STATISTIC_CMAPS[name]
+
+        if isinstance(spec, str):
+            base = color.get_colormap(spec)
+        else:
+            base = color.Colormap(spec)
+
+        x = np.linspace(0.0, 1.0, 256)
+
+        if reverse:
+            x = x[::-1]
+
+        # Always return a fresh deterministic colormap.
+        return color.Colormap(base.map(x))
+
+    def _rebuild_statistic_colorbar_gradient(self):
+
+        was_visible = (
+            self.statistic_colorbar.visible
+            if self.statistic_colorbar is not None
+            else False
+        )
+
+        if self.statistic_colorbar is not None:
+            self.statistic_colorbar.parent = None
+
+        self.statistic_colorbar = visuals.ColorBar(
+            cmap=self.statistic_cmap,
+            orientation="bottom",
+            size=self._cbar_size,
+            pos=self._cbar_center,
+            label="",
+            clim=("", ""),
+            border_width=1,
+            border_color="black",
+            parent=self.scene,
+        )
+
+        self.statistic_colorbar.order = 10001
+        self.statistic_colorbar.visible = was_visible
+
     def set_statistic_colormap(
         self,
         name: str,
@@ -462,22 +786,20 @@ class Display(BasePlot.BaseCanvas):
         self.statistic_cmap_name = name
         self.statistic_cmap_reversed = reverse
 
+        self.statistic_cmap = self._make_statistic_colormap(
+            name,
+            reverse,
+        )
+
+        self._rebuild_statistic_colorbar_gradient()
         self._update_statistic_colorbar()
         self._update_statistic_colors()
-
-    def _statistic_colormap(self):
-
-        cmap = color.get_colormap(STATISTIC_CMAPS[self.statistic_cmap_name])
-
-        if not self.statistic_cmap_reversed:
-            return cmap
-
-        return color.Colormap(cmap.map(np.linspace(1.0, 0.0, 256)))
 
     def _update_statistic_colorbar(self):
 
         visible = (
-            self.neuron_statistic_values is not None and self.statistic_clim is not None
+            self.neuron_statistic_values is not None
+            and self.statistic_data_clim is not None
         )
 
         self.statistic_colorbar.visible = visible
@@ -493,9 +815,9 @@ class Display(BasePlot.BaseCanvas):
         if not visible:
             return
 
-        lo, hi = self.statistic_clim
+        clim = self._effective_statistic_clim()
 
-        self.statistic_colorbar.cmap = self._statistic_colormap()
+        lo, hi = clim
 
         lo_text, hi_text = format_colorbar_limits(
             lo,
@@ -505,9 +827,41 @@ class Display(BasePlot.BaseCanvas):
         self.statistic_colorbar_low.text = lo_text
         self.statistic_colorbar_high.text = hi_text
 
+        self.statistic_colorbar_low_reset.visible = (
+            visible and self.statistic_manual_clim["low"] is not None
+        )
+
+        self.statistic_colorbar_high_reset.visible = (
+            visible and self.statistic_manual_clim["high"] is not None
+        )
+
         self.statistic_colorbar_title.text = self._format_colorbar_title(
             self.statistic_title or ""
         )
+
+    def _edit_statistic_clim(
+        self,
+        which: str,
+    ):
+        clim = self._effective_statistic_clim()
+
+        current = clim[0] if which == "low" else clim[1]
+
+        value, accepted = QInputDialog.getDouble(
+            self.native,
+            ("Lower color limit" if which == "low" else "Upper color limit"),
+            "Value:",
+            current,
+            -1e100,
+            1e100,
+            decimals=6,
+        )
+
+        if accepted:
+            self.set_statistic_clim_limit(
+                which,
+                value,
+            )
 
     def _update_statistic_colors(self):
         """
@@ -522,6 +876,13 @@ class Display(BasePlot.BaseCanvas):
 
             if visual is None:
                 continue
+            if (
+                self.neuron_statistic_values is not None
+                and self.display_mode == "tracked_overview"
+                and key != "union"
+            ):
+                visual.visible = False
+                continue
 
             # -------------------------------------------
             # No statistic selected:
@@ -530,8 +891,8 @@ class Display(BasePlot.BaseCanvas):
             if self.neuron_statistic_values is None:
 
                 if key == "union":
-                    colors = None
-                    style = "background"
+                    colors = self._tracked_union_colors(record)
+                    style = "default"
                 else:
                     colors = self.state.session_colors[key]
 
@@ -578,6 +939,56 @@ class Display(BasePlot.BaseCanvas):
                 break_long_words=False,
             )
         )
+
+    def _tracked_union_colors(
+        self,
+        record: OverviewRecord,
+    ):
+        ids = np.asarray(
+            record.ids,
+            dtype=int,
+        )
+
+        opts = self.styles.overview
+
+        # Start with faint neutral colour.
+        other = np.asarray(
+            color.Color(opts["tracked_other_color"]).rgba,
+            dtype=np.float32,
+        )
+        other[3] = opts["tracked_other_alpha"]
+
+        rgba = np.tile(
+            other,
+            (len(ids), 1),
+        )
+
+        current_session = self.state.current_session_id or 0
+        # Current-session neurons get the actual session colour.
+        current_color = np.asarray(
+            color.Color(self.state.session_colors[current_session]).rgba,
+            dtype=np.float32,
+        )
+
+        current_color[3] = opts["tracked_current_alpha"]
+
+        if (
+            self.state.assignments is not None
+            and current_session < self.state.assignments.shape[1]
+        ):
+            current_neurons = self.state.assignments[:, current_session] >= 0
+
+            valid = (ids >= 0) & (ids < len(current_neurons))
+
+            in_current = np.zeros(
+                len(ids),
+                dtype=bool,
+            )
+            in_current[valid] = current_neurons[ids[valid]]
+
+            rgba[in_current] = current_color
+
+        return rgba
 
     ### ==================================================================== ###
     ### ======================= GENERAL STYLE HELPER ======================= ###
@@ -668,6 +1079,49 @@ class Display(BasePlot.BaseCanvas):
 
         return NeuronComponent(self.state.current_session_id, neuron_id)
 
+    def on_mouse_move(self, event):
+
+        target = self._colorbar_hit_target(event.pos)
+
+        self._update_colorbar_hover(target)
+
+        if target is not None:
+            # Don't hover a neuron underneath the controls.
+            QToolTip.hideText()
+            event.handled = True
+            self.update()
+            return
+
+        super().on_mouse_move(event)
+
+    def on_mouse_release(self, event):
+
+        if event.button == 1:
+
+            target = self._colorbar_hit_target(event.pos)
+
+            if target == "reset_low":
+                self.set_statistic_clim_limit("low", None)
+                event.handled = True
+                return
+
+            if target == "reset_high":
+                self.set_statistic_clim_limit("high", None)
+                event.handled = True
+                return
+
+            if target == "low":
+                self._edit_statistic_clim("low")
+                event.handled = True
+                return
+
+            if target == "high":
+                self._edit_statistic_clim("high")
+                event.handled = True
+                return
+
+        super().on_mouse_release(event)
+
 
 class Controller(BasePlot.CanvasController):
 
@@ -727,7 +1181,7 @@ class Controller(BasePlot.CanvasController):
             )
             return
 
-        def evaluate(ctx=None):
+        def evaluate():
             return self.data.statistic_engine.evaluate_table(query)
 
         self.state.tasks.start(
@@ -840,20 +1294,20 @@ class Controller(BasePlot.CanvasController):
             return
 
         self.canvas.plot_background()
-        if (
-            self.section.display_mode == "tracked_overview"
-            # and self.data.neurons is not None
-            and "union" not in self.canvas.plotting["data"]
-        ):
-            self.canvas.build_neuron_visuals_union()
+        if self.section.display_mode == "tracked_overview":
+            if "union" not in self.canvas.plotting["data"]:
+                self.canvas.build_neuron_visuals_union()
+            self.canvas.clean(with_union=False)
 
-        self.canvas.clean(with_union=self.section.display_mode == "session_overview")
+        else:
+            self.canvas.clean(with_union=True)
 
-        self.canvas.build_neuron_visuals_session(
-            session_id=self.state.current_session_id, thr=0.2
-        )
+            self.canvas.build_neuron_visuals_session(
+                session_id=self.state.current_session_id,
+                thr=0.2,
+            )
+
         self.canvas.plot_neurons_visuals()
-        # self.canvas.update_session_styles()
 
         super()._on_session_changed()
 

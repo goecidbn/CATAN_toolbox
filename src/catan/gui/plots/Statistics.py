@@ -1,19 +1,22 @@
 from dataclasses import dataclass
 from functools import partial
-from unittest import result
+import traceback
 
 import numpy as np
 import numbers
-from vispy import scene, color
+from vispy import scene
 from vispy.scene import visuals
-from typing import Optional, List, Tuple, Callable
+from typing import Optional, Tuple, Callable
 from catan.gui.interaction import click_events
 
-from PySide6.QtCore import Qt, Signal, QObject
+from PySide6.QtCore import Qt, QEvent, Signal, QObject
 from PySide6.QtWidgets import (
     QLabel,
     QToolTip,
     QDoubleSpinBox,
+    QFrame,
+    QVBoxLayout,
+    QPushButton,
 )
 from PySide6.QtGui import (
     QCursor,
@@ -26,7 +29,8 @@ from catan.gui.plots.helper.cameras import (
     FixedPanZoomCamera,
 )
 
-from catan.gui.data.statistics.engine import StatisticEngine
+from catan.gui.data.statistics.engine import StatisticsTaskResult
+from catan.gui.data.statistics.errors import StatisticsPlotError
 from catan.gui.data.statistics import (
     plotdata_histogram,
     plotdata_scatter,
@@ -37,6 +41,7 @@ from catan.gui.data.statistics import (
 from catan.gui.structures.state import NeuronComponent
 from catan.gui.plots import BasePlot
 from catan.gui.plots.helper import Threshold
+from catan.gui.background_tasks.runtime import TaskCancelled
 
 importlib.reload(calculations)
 # importlib.reload(stats)
@@ -45,6 +50,14 @@ importlib.reload(series_with_confidence)
 importlib.reload(plotdata_series)
 importlib.reload(StatisticsData)
 importlib.reload(Threshold)
+
+STATUS_ROW_HEIGHT = 58
+STATUS_CARD_IDLE_HEIGHT = 30
+STATUS_CARD_BUSY_HEIGHT = 50
+STATUS_PROGRESS_HEIGHT = 6
+
+SeriesPoint = tuple[str, int]
+VisualIndex = int | SeriesPoint
 
 
 @dataclass
@@ -65,26 +78,40 @@ class DisplaySignals(QObject):
 
 class Display(BasePlot.BaseCanvas):
 
-    pick_radius = 0.05  # for scatter
+    pick_radius_scatter = 0.05
+    pick_radius_series = 0.05
 
     def __init__(self, parent, controls, config=None):
         super().__init__(parent, controls, config)
 
         self.unfreeze()
         self.grid = self.central_widget.add_grid(spacing=0)
-        self.view = self.grid.add_view(row=0, col=1)
-        self.view.stretch = (1, 1)  # expand a lot
-        self.view.camera = FixedPanZoomCamera(aspect=None)
 
-        self.right_view = self.grid.add_view(row=0, col=1)
-        self.right_view.camera = FixedPanZoomCamera(aspect=None)
+        self.initialize_status_bar()
+        self._status_progress_left = None
+        self._status_progress_width = None
+        self._status_progress_y = None
+
+        self.view = self.grid.add_view(row=1, col=1)
+        self.view.stretch = (1, 1)  # expand a lot
+        # self.view.camera = FixedPanZoomCamera(aspect=None)
+        self.view.camera = scene.PanZoomCamera(aspect=None)
+
+        self.right_view = self.grid.add_view(row=1, col=1)
+        # self.right_view.camera = FixedPanZoomCamera(aspect=None)
+        self.right_view.camera = scene.PanZoomCamera(aspect=None)
         self.right_view.bgcolor = (0, 0, 0, 0)
         self.plot_root_right = scene.Node(parent=self.right_view.scene)
+
+        self.right_view.interactive = False
+        self.view.camera.link(
+            self.right_view.camera,
+            axis="x",
+        )
 
         self.right_view.visible = False
 
         self.initialize_axis()
-        # self._ensure_twin_y_view()
 
         self.plot_root = scene.Node(parent=self.view.scene)
 
@@ -97,15 +124,40 @@ class Display(BasePlot.BaseCanvas):
             | plotdata_series.PlotData
         ] = None
 
+        self._default_ranges = {
+            "x": None,
+            "y": None,
+            "y_2nd": None,
+        }
+
         self.hist_base_layer = None
         self.hist_selected_layer = None
+
+        self._hovered_series_session_id = None
 
         self.build_overlays()
 
         self._on_threshold_changed: Optional[Callable] = None
         self.thresholds: dict[str, Threshold.ThresholdOverlay] = {}
 
+        ## build overlay for displaying messages
+        self._build_error_overlay()
+
+        self.events.resize.connect(self._on_canvas_resize)
+        self.view.scene.transform.changed.connect(self._on_view_transform_changed)
+
         self.freeze()
+
+    def _on_canvas_resize(self, event):
+        if self.error_overlay.isVisible():
+            self._position_error_overlay()
+
+    def _on_view_transform_changed(self, event=None):
+        if self.thresholds:
+            self.update_threshold_visuals()
+
+        if self._hovered_series_session_id is not None:
+            self._update_series_hover_line()
 
     def initialize_axis(self):
 
@@ -144,18 +196,243 @@ class Display(BasePlot.BaseCanvas):
         self.axes = {}
 
         self.axes["x"] = create_axis("bottom")
-        self.grid.add_widget(self.axes["x"], row=1, col=1)
+        self.grid.add_widget(self.axes["x"], row=2, col=1)
         self.axes["x"].link_view(self.view)
 
         self.axes["y"] = create_axis("left")
-        self.grid.add_widget(self.axes["y"], row=0, col=0)
+        self.grid.add_widget(self.axes["y"], row=1, col=0)
         self.axes["y"].link_view(self.view)
 
-        self.axes["y_right"] = create_axis("right")
-        self.grid.add_widget(self.axes["y_right"], row=0, col=2)
-        self.axes["y_right"].link_view(self.right_view)
+        self.axes["y_2nd"] = create_axis("right")
+        self.grid.add_widget(self.axes["y_2nd"], row=1, col=2)
+        self.axes["y_2nd"].link_view(self.right_view)
 
-        self.axes["y_right"].visible = False
+        self.axes["y_2nd"].visible = False
+
+    def initialize_status_bar(self):
+
+        self.status_widget = scene.Widget()
+
+        self.status_widget.height_min = STATUS_ROW_HEIGHT
+        self.status_widget.height_max = STATUS_ROW_HEIGHT
+
+        self.grid.add_widget(self.status_widget, row=0, col=1)
+
+        # Main card
+        self.status_bg = visuals.Rectangle(
+            center=(5, 5),
+            width=10,
+            height=10,
+            radius=5,
+            color="#f7f8fa",
+            border_color="#aeb4bc",
+            border_width=1,
+            parent=self.status_widget,
+        )
+
+        self.status_text = visuals.Text(
+            "",
+            pos=(0, 0),
+            anchor_x="left",
+            anchor_y="center",
+            font_size=9,
+            color="#31363d",
+            parent=self.status_widget,
+        )
+
+        self.status_pending_text = visuals.Text(
+            "",
+            pos=(0, 0),
+            anchor_x="left",
+            anchor_y="center",
+            font_size=8,
+            color="#606770",
+            parent=self.status_widget,
+        )
+
+        # Progress track
+        self.status_progress_bg = visuals.Rectangle(
+            center=(50, 3),
+            width=100,
+            height=STATUS_PROGRESS_HEIGHT,
+            radius=STATUS_PROGRESS_HEIGHT / 2,
+            color="#dde1e6",
+            parent=self.status_widget,
+        )
+
+        # Keep the fill square-ended to avoid radius/width problems
+        # when progress is close to zero.
+        self.status_progress = visuals.Rectangle(
+            center=(0.5, 3),
+            width=1,
+            height=STATUS_PROGRESS_HEIGHT,
+            radius=0,
+            color="#4f86c6",
+            parent=self.status_widget,
+        )
+
+        for visual in (
+            self.status_bg,
+            self.status_text,
+            self.status_pending_text,
+            self.status_progress_bg,
+            self.status_progress,
+        ):
+            visual.visible = False
+
+        self._status_progress_left = 0.0
+        self._status_progress_width = 1.0
+        self._status_progress_y = 0.0
+
+        # Important: keep horizontal geometry correct when the window resizes.
+        self.status_widget.events.resize.connect(self._on_status_widget_resize)
+
+    def _on_status_widget_resize(self, event):
+        self._update_status_geometry(
+            busy=self.status_pending_text.visible,
+        )
+
+    def _update_status_geometry(
+        self,
+        *,
+        busy: bool,
+    ):
+
+        rect = self.status_widget.rect
+
+        width = rect.width
+        height = rect.height
+
+        margin_x = 6
+        inner_x = 10
+
+        card_left = margin_x
+        card_right = width - margin_x
+        card_width = max(10, card_right - card_left)
+
+        card_height = STATUS_CARD_BUSY_HEIGHT if busy else STATUS_CARD_IDLE_HEIGHT
+
+        card_top = (height - card_height) / 2
+
+        card_bottom = card_top + card_height
+
+        # Card
+        self.status_bg.center = (width / 2, height / 2)
+        self.status_bg.width = card_width
+        self.status_bg.height = card_height
+
+        text_x = card_left + inner_x
+
+        if not busy:
+            self.status_text.pos = (
+                text_x,
+                height / 2,
+            )
+            return
+
+        # Busy card:
+        # shown line
+        # updating line
+        # progress bar
+        self.status_text.pos = (text_x, card_top + 13)
+
+        self.status_pending_text.pos = (text_x, card_top + 29)
+
+        self._status_progress_left = text_x
+
+        self._status_progress_width = max(
+            1,
+            card_right - inner_x - self._status_progress_left,
+        )
+
+        self._status_progress_y = card_bottom - 6
+
+        self.status_progress_bg.center = (
+            self._status_progress_left + self._status_progress_width / 2,
+            self._status_progress_y,
+        )
+
+        self.status_progress_bg.width = self._status_progress_width
+
+    def _set_status_progress(
+        self,
+        progress: int | None,
+        *,
+        visible: bool,
+    ):
+
+        self.status_progress_bg.visible = visible
+
+        if not visible:
+            self.status_progress.visible = False
+            return
+
+        # Pending, but no determinate progress yet:
+        # show the track but not a fake 1-pixel progress value.
+        if progress is None:
+            self.status_progress.visible = False
+            return
+
+        self.status_progress.visible = True
+
+        fraction = np.clip(progress / 100.0, 0.0, 1.0)
+
+        fill_width = max(1.0, self._status_progress_width * fraction)
+
+        self.status_progress.center = (
+            self._status_progress_left + fill_width / 2,
+            self._status_progress_y,
+        )
+
+        self.status_progress.width = fill_width
+
+    def set_statistics_status(
+        self,
+        *,
+        displayed: str | None,
+        pending: str | None,
+        progress: int | None = None,
+    ):
+
+        has_status = bool(displayed or pending)
+
+        busy = pending is not None
+
+        if not has_status:
+
+            for visual in (
+                self.status_bg,
+                self.status_text,
+                self.status_pending_text,
+                self.status_progress_bg,
+                self.status_progress,
+            ):
+                visual.visible = False
+
+            self.update()
+            return
+
+        self.status_bg.visible = True
+        self.status_text.visible = True
+
+        self.status_text.text = f"Shown: {displayed}" if displayed else "Shown: —"
+
+        if busy:
+            self.status_pending_text.text = f"Updating: {pending}"
+            self.status_pending_text.visible = True
+        else:
+            self.status_pending_text.visible = False
+
+        self._update_status_geometry(
+            busy=busy,
+        )
+
+        self._set_status_progress(
+            progress,
+            visible=busy,
+        )
+
+        self.update()
 
     def build_overlays(self):
 
@@ -290,12 +567,11 @@ class Display(BasePlot.BaseCanvas):
         xmin, xmax = bin_edges[[0, -1]]
         ymax = max(1.0, float(np.nanmax(bin_counts)))
 
-        self.view.camera.set_exact_range(
-            x=(min(0.0, xmin) * 1.1, xmax * 1.1),
-            y=(0.0, ymax * 1.1),
+        self._set_camera_ranges(
+            {"x": (min(0.0, xmin) * 1.1, xmax * 1.1), "y": (0.0, ymax * 1.1)}
         )
 
-        self.axes["x"]._view_changed()
+        # self.axes["x"]._view_changed()
 
         self._init_threshold_overlays(kind="histogram")
         self.update()
@@ -321,12 +597,12 @@ class Display(BasePlot.BaseCanvas):
         if is_dual:
             # self._ensure_twin_y_view()
             self.right_view.visible = True
-            self.axes["y_right"].visible = True
+            self.axes["y_2nd"].visible = True
         else:
             # if getattr(self, "right_view", None) is not None:
             self.right_view.visible = False
-            # if "y_right" in self.axes:
-            self.axes["y_right"].visible = False
+            # if "y_2nd" in self.axes:
+            self.axes["y_2nd"].visible = False
 
         self.axes["y"].visible = True
         self.axes["y"].axis.axis_label = first.table.stat.name
@@ -352,7 +628,7 @@ class Display(BasePlot.BaseCanvas):
 
         # ---------- optional right series ----------
         if is_dual:
-            self.axes["y_right"].axis.axis_label = second.table.stat.name
+            self.axes["y_2nd"].axis.axis_label = second.table.stat.name
 
             second_visual = series_with_confidence.SeriesVisual(
                 parent=self.plot_root_right,
@@ -372,43 +648,6 @@ class Display(BasePlot.BaseCanvas):
                 errors_low=second.errors_low,
                 errors_high=second.errors_high,
             )
-        # x_min, x_max = np.inf, -np.inf
-        # y_min, y_max = np.inf, -np.inf
-        # for key, suffix in zip(["first_series", "second_series"], ["", "_2nd"]):
-
-        #     data = getattr(self.plot_data, key)
-        #     if data is None:
-        #         continue
-        #     # print(data)
-        #     print(
-        #         f"Drawing session series for {key}: session_ids={data.session_ids}, values={data.values}, errors_low={data.errors_low}, errors_high={data.errors_high}"
-        #     )
-        #     visual = series_with_confidence.SeriesVisual(
-        #         parent=self.plot_root,
-        #         line_color=self.styles.get_color_array("selected"),
-        #         band_color=self.styles.get_color_array("default"),
-        #         marker_size=7,
-        #         order=0,
-        #     )
-        #     visual.set_data(
-        #         session_ids=data.session_ids,
-        #         values=data.values,
-        #         errors_low=data.errors_low,
-        #         errors_high=data.errors_high,
-        #     )
-        #     self.plotting["visuals"]["base" + suffix] = visual.line
-        #     self.plotting["visuals"]["band" + suffix] = visual.band
-        #     self.plotting["visuals"]["markers" + suffix] = visual.markers
-
-        #     finite = np.isfinite(data.session_ids) & np.isfinite(data.values)
-
-        #     _x_min, _x_max = data.session_ids[[0, -1]]
-        #     _y_min, _y_max = np.min(data.values[finite]), np.max(data.values[finite])
-
-        #     x_min = min(x_min, _x_min)
-        #     x_max = max(x_max, _x_max)
-        #     y_min = min(y_min, _y_min)
-        #     y_max = max(y_max, _y_max)
 
         # ---------- shared x range ----------
         if is_dual:
@@ -424,33 +663,95 @@ class Display(BasePlot.BaseCanvas):
         # ---------- independent y ranges ----------
         left_y_range = _series_y_range(first)
 
-        self.view.camera.set_exact_range(
-            x=x_range,
-            y=left_y_range,
-        )
+        self._set_camera_ranges({"x": x_range, "y": left_y_range})
 
         if is_dual:
             right_y_range = _series_y_range(second)
 
-            self.right_view.camera.set_exact_range(
-                x=x_range,
-                y=right_y_range,
-            )
+            self._set_camera_ranges({"x": x_range, "y_2nd": right_y_range})
 
         # ---------- update axes ----------
-        self.axes["x"]._view_changed()
-        self.axes["y"]._view_changed()
-
-        if is_dual:
-            self.axes["y_right"]._view_changed()
-
-        # self.view.camera.set_exact_range(
-        #     x=(x_min - 0.5, x_max + 0.5),
-        #     y=(min(0.0, y_min) * 0.9, y_max * 1.1),
-        # )
-
         # self.axes["x"]._view_changed()
         # self.axes["y"]._view_changed()
+
+        # if is_dual:
+        #     self.axes["y_2nd"]._view_changed()
+
+        # Vertical session guide
+        session_line = visuals.Line(
+            pos=np.zeros((2, 2), dtype=np.float32),
+            width=1.5,
+            color=(0.25, 0.25, 0.25, 0.65),
+            parent=self.plot_root,
+        )
+
+        session_line.visible = False
+        session_line.order = 100
+
+        self.plotting["visuals"]["session_hover_line"] = session_line
+
+        first_hover = visuals.Markers(
+            parent=self.plot_root,
+        )
+
+        first_hover.set_data(
+            np.zeros((0, 2), dtype=np.float32),
+        )
+
+        first_hover.visible = False
+        first_hover.order = 110
+
+        self.plotting["visuals"]["session_hover_first"] = first_hover
+
+        second_hover = visuals.Markers(
+            parent=self.plot_root_right,
+        )
+
+        second_hover.set_data(
+            np.zeros((0, 2), dtype=np.float32),
+        )
+
+        second_hover.visible = False
+        second_hover.order = 110
+
+        self.plotting["visuals"]["session_hover_second"] = second_hover
+
+        self.update()
+
+    def _set_camera_ranges(self, ranges):
+
+        if "y" in ranges:
+            self.view.camera.set_range(margin=0.0, **ranges)
+            # self.view.camera.set_exact_range(**ranges)
+
+        if "y_2nd" in ranges:
+            ranges_ = ranges.copy()
+            ranges_["y"] = ranges_.pop("y_2nd")
+            self.right_view.camera.set_range(margin=0.0, **ranges_)
+            # self.right_view.camera.set_exact_range(**ranges_)
+
+        for key in ranges:
+            self._default_ranges[key] = ranges[key]
+            self.axes[key]._view_changed()
+
+    def reset_view_range(self):
+
+        x = self._default_ranges["x"]
+        y = self._default_ranges["y"]
+
+        if x is None or y is None:
+            return
+
+        self._set_camera_ranges({"x": x, "y": y})
+
+        if self.right_view.visible and self._default_ranges["y_2nd"] is not None:
+            self._set_camera_ranges({"x": x, "y_2nd": self._default_ranges["y_2nd"]})
+
+        self.axes["x"]._view_changed()
+        self.axes["y"]._view_changed()
+        if self.axes["y_2nd"].visible:
+            self.axes["y_2nd"]._view_changed()
+
         self.update()
 
     def _draw_scatter(self):
@@ -462,32 +763,6 @@ class Display(BasePlot.BaseCanvas):
             raise ValueError(
                 "plot_data must be an instance of ScatterPlotData for scatter plot."
             )
-
-        if "error" in self.plot_data.title:
-            self.axes["x"].visible = False
-            self.axes["y"].visible = False
-
-            # Display error text in center of canvas
-            error_text = self.plot_data.title.get("error", "Error")
-            text_visual = visuals.Text(
-                text=error_text,
-                pos=[0, 0],
-                anchor_x="center",
-                anchor_y="center",
-                font_size=12,
-                color="red",
-                parent=self.plot_root,
-            )
-            self.plotting["visuals"]["error_text"] = text_visual
-
-            self.view.camera.set_range(x=(-1, 1), y=(-1, 1), margin=0.0)
-            self.update()
-            return
-        # data = self.plot_data
-        # x_data = self.plot_data.x
-        # y_data = self.plot_data.y
-
-        # print(x_data.shape, y_data.shape)
 
         self.axes["x"].visible = True
         self.axes["x"].axis.axis_label = self.plot_data.title["x"]
@@ -509,20 +784,32 @@ class Display(BasePlot.BaseCanvas):
             blend_func=("src_alpha", "one_minus_src_alpha"),
         )
 
-        self.view.camera.set_range(
-            x=(
-                min(0, np.nanmin(self.plot_data.x)) * 1.1,
-                np.nanmax(self.plot_data.x) * 1.1,
-            ),
-            y=(
-                min(0, np.nanmin(self.plot_data.y)) * 1.1,
-                np.nanmax(self.plot_data.y) * 1.1,
-            ),
-            margin=0.0,
+        self._set_camera_ranges(
+            {
+                "x": (
+                    min(0, np.nanmin(self.plot_data.x)) * 1.1,
+                    np.nanmax(self.plot_data.x) * 1.1,
+                ),
+                "y": (
+                    min(0, np.nanmin(self.plot_data.y)) * 1.1,
+                    np.nanmax(self.plot_data.y) * 1.1,
+                ),
+            }
         )
+        # self.view.camera.set_range(
+        #     x=(
+        #         min(0, np.nanmin(self.plot_data.x)) * 1.1,
+        #         np.nanmax(self.plot_data.x) * 1.1,
+        #     ),
+        #     y=(
+        #         min(0, np.nanmin(self.plot_data.y)) * 1.1,
+        #         np.nanmax(self.plot_data.y) * 1.1,
+        #     ),
+        #     margin=0.0,
+        # )
 
-        self.axes["x"]._view_changed()
-        self.axes["y"]._view_changed()
+        # self.axes["x"]._view_changed()
+        # self.axes["y"]._view_changed()
 
         self._init_threshold_overlays(kind="scatter")
 
@@ -564,13 +851,16 @@ class Display(BasePlot.BaseCanvas):
     ### ------------------------------------------------------- ###
     ### ------------------------ INPUT ------------------------ ###
     ### ======================================================= ###
+    def _set_camera_interactive(self, interactive: bool):
+        if self.view.camera is not None:
+            self.view.camera.interactive = interactive
 
     def on_mouse_move(self, event):
 
         if (
             event.pos is None
             or not self.plotting["visuals"]
-            or "error_text" in self.plotting["visuals"]
+            # or "error_text" in self.plotting["visuals"]
             or self.plot_data is None
         ):
             return
@@ -581,6 +871,8 @@ class Display(BasePlot.BaseCanvas):
             threshold_consumed |= threshold.handle_mouse_move(event)
 
         if threshold_consumed:
+            self._set_camera_interactive(False)
+            event.handled = True
             return
 
         # 2. Hover thresholds, but only one owns the tooltip
@@ -596,6 +888,7 @@ class Display(BasePlot.BaseCanvas):
                     hovered_distance = dist
 
         if hovered_overlay is not None:
+            self._set_camera_interactive(False)
             hovered_overlay.show_tooltip()
             event.handled = True
             return
@@ -608,6 +901,8 @@ class Display(BasePlot.BaseCanvas):
         idx = self.find_closest_visual(event.pos, requires_transform=True)
         self.update_style(idx, "hovered")
         self.handle_tooltip(idx)
+
+        self._set_camera_interactive(True)
 
         self.update()
 
@@ -622,21 +917,27 @@ class Display(BasePlot.BaseCanvas):
             event.button != 1
             or event.pos is None
             or not self.plotting["visuals"]
-            or "error_text" in self.plotting["visuals"]
+            # or "error_text" in self.plotting["visuals"]
             or self.plot_data is None
         ):
             return
 
+        threshold_consumed = False
         for threshold in self.thresholds.values():
             if threshold.handle_mouse_release(event):
-                return
+                threshold_consumed = True
+
+        if threshold_consumed:
+            self._set_camera_interactive(True)
+            event.handled = True
+            return
 
         idx = self.find_closest_visual(event.pos, requires_transform=True)
 
         if isinstance(self.plot_data, plotdata_histogram.PlotData):
             self.signals.bin_clicked.emit(idx, event.modifiers)
         elif isinstance(self.plot_data, plotdata_scatter.PlotData):
-            self.signals.marker_clicked.emit(idx, [])
+            self.signals.marker_clicked.emit(idx, event.modifiers)
 
     def on_mouse_press(self, event):
 
@@ -644,7 +945,7 @@ class Display(BasePlot.BaseCanvas):
             event.button != 1
             or event.pos is None
             or not self.plotting["visuals"]
-            or "error_text" in self.plotting["visuals"]
+            # or "error_text" in self.plotting["visuals"]
             or self.plot_data is None
         ):
             return
@@ -654,9 +955,11 @@ class Display(BasePlot.BaseCanvas):
         for threshold in self.thresholds.values():
             if threshold.handle_mouse_press(event):
                 threshold_consumed = True
-                return
+                # return
 
         if threshold_consumed:
+            self._set_camera_interactive(False)
+            event.handled = True
             return
 
         # Click was away from all threshold lines.
@@ -665,20 +968,32 @@ class Display(BasePlot.BaseCanvas):
 
         super().on_mouse_press(event)
 
-    def find_closest_visual(self, data_pos, requires_transform=False) -> Optional[int]:
+    def find_closest_visual(
+        self, canvas_pos, requires_transform=False
+    ) -> VisualIndex | None:
 
         if self.plot_data is None:
             return None
 
+        if isinstance(
+            self.plot_data,
+            plotdata_series.PlotData,
+        ):
+            return self.find_series_session_from_canvas(canvas_pos)
+
         if requires_transform:
             data_pos = click_events.canvas_to_visual(
-                self.plotting["visuals"]["base"], data_pos
+                self.plotting["visuals"]["base"], canvas_pos
             )
+        else:
+            data_pos = canvas_pos
 
         if isinstance(self.plot_data, plotdata_histogram.PlotData):
             return self.find_bin_from_data(data_pos)
         elif isinstance(self.plot_data, plotdata_scatter.PlotData):
             return self.find_marker_from_data(data_pos)
+
+        return None
 
     def find_bin_from_data(self, data_pos) -> Optional[int]:
         """
@@ -708,7 +1023,7 @@ class Display(BasePlot.BaseCanvas):
     def find_marker_from_data(self, data_pos) -> Optional[int]:
         """
         Given data coords x_data, y_data, return marker index (int) or None.
-        We require (x,y) to be within pick_radius around marker.
+        We require (x,y) to be within pick_radius_scatter around marker.
         """
         assert isinstance(self.plot_data, plotdata_scatter.PlotData)
         if self.plot_data is None:
@@ -723,10 +1038,114 @@ class Display(BasePlot.BaseCanvas):
 
         dist_px = float(np.sqrt(d2[idx]))
 
-        if dist_px > self.pick_radius:
+        if dist_px > self.pick_radius_scatter:
             return None
 
         return idx
+
+    def find_series_session_from_canvas(
+        self,
+        canvas_pos,
+    ) -> int | None:
+
+        assert isinstance(
+            self.plot_data,
+            plotdata_series.PlotData,
+        )
+
+        candidates = []
+
+        # First / left series
+        first = self.plot_data.first_series
+
+        first_pos = click_events.canvas_to_visual(
+            self.plotting["visuals"]["markers"],
+            canvas_pos,
+        )
+
+        hit = self.find_series_point_from_data(
+            first_pos,
+            first,
+            self.view,
+        )
+
+        if hit is not None:
+            distance, idx = hit
+            candidates.append(
+                (
+                    distance,
+                    int(first.session_ids[idx]),
+                )
+            )
+
+        # Optional second / right series
+        second = self.plot_data.second_series
+
+        if second is not None:
+
+            second_pos = click_events.canvas_to_visual(
+                self.plotting["visuals"]["markers_second"],
+                canvas_pos,
+            )
+
+            hit = self.find_series_point_from_data(
+                second_pos,
+                second,
+                self.right_view,
+            )
+
+            if hit is not None:
+                distance, idx = hit
+                candidates.append(
+                    (
+                        distance,
+                        int(second.session_ids[idx]),
+                    )
+                )
+
+        if not candidates:
+            return None
+
+        _, session_id = min(
+            candidates,
+            key=lambda item: item[0],
+        )
+
+        return session_id
+
+    def find_series_point_from_data(
+        self,
+        data_pos,
+        series,
+        view,
+    ) -> tuple[float, int] | None:
+
+        x = np.asarray(series.session_ids, dtype=float)
+
+        y = np.asarray(series.values, dtype=float)
+
+        finite = np.isfinite(x) & np.isfinite(y)
+
+        if not np.any(finite):
+            return None
+
+        cam_bounds = view.camera.rect
+
+        dx = (x - data_pos[0]) / (cam_bounds.right - cam_bounds.left)
+
+        dy = (y - data_pos[1]) / (cam_bounds.top - cam_bounds.bottom)
+
+        d2 = dx * dx + dy * dy
+        d2[~finite] = np.inf
+
+        idx = int(np.argmin(d2))
+
+        distance = float(np.sqrt(d2[idx]))
+
+        if distance > self.pick_radius_series:
+            return None
+
+        return distance, idx
 
     ### ======================================================= ###
     ### ---------------- INTERACTION FUNCTIONS ---------------- ###
@@ -841,6 +1260,8 @@ class Display(BasePlot.BaseCanvas):
             self.update_bin_style(idx, style)
         elif isinstance(self.plot_data, plotdata_scatter.PlotData):
             self.update_marker_style(idx, style)
+        elif isinstance(self.plot_data, plotdata_series.PlotData):
+            self.update_session_series_hover(idx)
         else:
             return
 
@@ -896,7 +1317,144 @@ class Display(BasePlot.BaseCanvas):
                 **plot_options,
             )
 
-    def handle_tooltip(self, idx: Optional[int] = None):
+    def _update_series_hover_line(self):
+
+        session_id = self._hovered_series_session_id
+
+        if session_id is None or not isinstance(
+            self.plot_data, plotdata_series.PlotData
+        ):
+            return
+
+        line = self.plotting["visuals"].get("session_hover_line")
+
+        if line is None:
+            return
+
+        rect = self.view.camera.rect
+
+        line.set_data(
+            pos=np.asarray(
+                [
+                    [session_id, rect.bottom],
+                    [session_id, rect.top],
+                ],
+                dtype=np.float32,
+            )
+        )
+
+        line.visible = True
+
+    def update_session_series_hover(
+        self,
+        session_id: int | None,
+    ):
+        self._hovered_series_session_id = session_id
+
+        line = self.plotting["visuals"].get("session_hover_line")
+
+        first_hover = self.plotting["visuals"].get("session_hover_first")
+        second_hover = self.plotting["visuals"].get("session_hover_second")
+
+        # Hide everything first.
+        for visual in (line, first_hover, second_hover):
+            if visual is not None:
+                visual.visible = False
+
+        if session_id is None or not isinstance(
+            self.plot_data,
+            plotdata_series.PlotData,
+        ):
+            return
+
+        # --------------------------------------------
+        # Vertical line
+        # --------------------------------------------
+        self._update_series_hover_line()
+
+        # --------------------------------------------
+        # First series
+        # --------------------------------------------
+
+        first = self.plot_data.first_series
+
+        idx = _session_index(first, session_id)
+
+        if idx is not None:
+
+            first_hover.set_data(
+                np.asarray(
+                    [[session_id, first.values[idx]]],
+                    dtype=np.float32,
+                ),
+                size=12,
+                face_color=self.styles.get_color_array("selected"),
+                edge_width=0,
+            )
+
+            first_hover.visible = True
+
+        # --------------------------------------------
+        # Second series
+        # --------------------------------------------
+
+        second = self.plot_data.second_series
+
+        if second is not None and second_hover is not None:
+
+            idx = _session_index(second, session_id)
+
+            if idx is not None:
+
+                second_hover.set_data(
+                    np.asarray(
+                        [[session_id, second.values[idx]]],
+                        dtype=np.float32,
+                    ),
+                    size=12,
+                    face_color=self.styles.get_color_array("highlighted"),
+                    edge_width=0,
+                )
+
+                second_hover.visible = True
+
+    def _session_series_tooltip(
+        self,
+        session_id: int,
+    ) -> str:
+
+        assert isinstance(
+            self.plot_data,
+            plotdata_series.PlotData,
+        )
+
+        lines = [self._session_label(session_id)]
+
+        first = self.plot_data.first_series
+
+        idx = _session_index(
+            first,
+            session_id,
+        )
+
+        if idx is not None:
+            lines.append(first.tooltip_value_for_index(idx))
+
+        second = self.plot_data.second_series
+
+        if second is not None:
+
+            idx = _session_index(
+                second,
+                session_id,
+            )
+
+            if idx is not None:
+                lines.append(second.tooltip_value_for_index(idx))
+
+        return "\n".join(lines)
+
+    def handle_tooltip(self, idx: Optional[VisualIndex] = None):
 
         if idx is None:
             QToolTip.hideText()
@@ -906,55 +1464,27 @@ class Display(BasePlot.BaseCanvas):
             tooltip_text = self.plot_data.tooltip_for_bin(idx)
         elif isinstance(self.plot_data, plotdata_scatter.PlotData):
             tooltip_text = self.plot_data.tooltip_for_marker(idx)
+        elif isinstance(self.plot_data, plotdata_series.PlotData):
+            tooltip_text = self._session_series_tooltip(idx)
         else:
             tooltip_text = "Unknown selection"
 
         QToolTip.showText(QCursor.pos(), tooltip_text)
 
-    # def handle_tooltip(self, component: Optional[NeuronComponent] = None):
+    def _session_label(
+        self,
+        session_id: int,
+    ) -> str:
 
-    #     if isinstance(self.plot_data, plotdata_histogram.PlotData):
-    #         super().handle_tooltip(component)
-    #         return
+        session_id = int(session_id)
 
-    #     point = None if component is None else int(component)
-    #     # if not isinstance(component, list):
-    #     #     return
-    #     if point is None:
-    #         QToolTip.hideText()
-    #         return
+        if 0 <= session_id < len(self.data.sessions):
+            session = self.data.sessions[session_id]
 
-    #     x_key = self.plot_data.title["x"]
-    #     y_key = self.plot_data.title["y"]
+            if session is not None and session.name:
+                return session.name
 
-    #     if len(self.stat_data.shape["x"]) == 1:
-
-    #         fp_id = point
-    #         component = self.state.get_component_from_footprint(fp_id)
-
-    #         x = self.plot_data.x[point]
-    #         y = self.plot_data.y[point]
-
-    #         tooltip_text = f"Neuron ID: {'unassigned' if component is None else component.neuron_id}\nFootprint ID: {fp_id}"
-    #         tooltip_text += f"\n{x_key}: {x:.3f}\n{y_key}: {y:.3f}"
-
-    #     elif len(self.stat_data.shape["x"]) == 2:
-    #         fp_ids = np.unravel_index(point, self.stat_data.shape["x"])
-    #         x = self.plot_data.x[point]
-    #         y = self.plot_data.y[point]
-    #         # idxes = np.unravel_index(component, self.stat_data.shape["x"])
-    #         components = [
-    #             self.state.get_component_from_footprint(fp_id) for fp_id in fp_ids
-    #         ]
-    #         neuron_ids = [
-    #             "unassigned" if c is None else c.neuron_id for c in components
-    #         ]
-    #         tooltip_text = f"Neuron IDs: {','.join(map(str, neuron_ids))}\nFootprint IDs: {','.join(map(str, fp_ids))}"
-    #         tooltip_text += f"\n{x_key}: {x:.3f}\n{y_key}: {y:.3f}"
-    #     else:
-    #         tooltip_text = "Unknown selection"
-
-    #     QToolTip.showText(QCursor.pos(), tooltip_text)
+        return f"Session {session_id}"
 
     def update_selection(self):
         pass
@@ -970,6 +1500,11 @@ class Display(BasePlot.BaseCanvas):
         self.plotting["data"] = {}
 
         self.clear_overlays()
+
+        for axis in self.axes.values():
+            axis.visible = False
+
+        self.right_view.visible = False
 
     def _clear_histogram_mesh_layers(self):
         for attr in ("hist_base_layer", "hist_selected_layer"):
@@ -1001,24 +1536,131 @@ class Display(BasePlot.BaseCanvas):
             visual.visible = False
             visual.parent = None
 
+    def _build_error_overlay(self):
+
+        self.error_overlay = QFrame(self.native)
+        self.error_overlay.setObjectName("statisticsErrorOverlay")
+
+        layout = QVBoxLayout(self.error_overlay)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(8)
+
+        self.error_title = QLabel()
+        self.error_title.setObjectName("statisticsErrorTitle")
+
+        self.error_message = QLabel()
+        self.error_message.setObjectName("statisticsErrorMessage")
+        self.error_message.setWordWrap(True)
+        self.error_message.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        layout.addWidget(self.error_title)
+        layout.addWidget(self.error_message)
+
+        self.error_overlay.setMaximumWidth(500)
+
+        self.error_overlay.setStyleSheet("""
+            QFrame#statisticsErrorOverlay {
+                background-color: rgba(255, 245, 245, 248);
+                border: 1px solid #c94b4b;
+                border-radius: 7px;
+            }
+
+            QLabel#statisticsErrorTitle {
+                color: #9b2c2c;
+                background: transparent;
+                font-weight: 600;
+                font-size: 14px;
+            }
+
+            QLabel#statisticsErrorMessage {
+                color: #30343b;
+                background: transparent;
+                font-size: 12px;
+            }
+        """)
+
+        self.error_overlay.hide()
+
+    def show_plot_error(
+        self,
+        title: str,
+        message: str,
+    ):
+        self.error_title.setText(title)
+        self.error_message.setText(message)
+
+        self.error_overlay.show()
+        self.error_overlay.adjustSize()
+
+        self._position_error_overlay()
+
+        self.error_overlay.raise_()
+
+    def _position_error_overlay(self):
+
+        self.error_overlay.adjustSize()
+
+        parent_size = self.native.size()
+        size = self.error_overlay.size()
+
+        x = (parent_size.width() - size.width()) // 2
+
+        y = (parent_size.height() - size.height()) // 2
+
+        self.error_overlay.move(max(0, x), max(0, y))
+
+    def hide_plot_error(self):
+
+        self.error_overlay.hide()
+
 
 class Controller(BasePlot.CanvasController):
 
     canvas: Display
 
-    def build_controls(self):
-        super().build_controls()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-        # print("Building controls for PlotController (statistics display)")
-
-        self.current_query: dict[str, Optional[StatisticsData.StatisticQuery]] = {
+        # Currently selected queries for each axis
+        self.current_query: dict[str, StatisticsData.StatisticQuery] = {
             "x": None,
             "y": None,
             "y_2nd": None,
         }
 
+        self.current_results: dict[str, StatisticsTaskResult] = {
+            "x": None,
+            "y": None,
+            "y_2nd": None,
+        }
+
+        self.statistic_tasks: dict[str, str | None] = {
+            "x": None,
+            "y": None,
+            "y_2nd": None,
+        }
+
+        self.statistic_progress: dict[str, int | None] = {
+            "x": None,
+            "y": None,
+            "y_2nd": None,
+        }
+
+        self.displayed_results = {}
         self.current_plot_data = None
 
+        self.state.tasks.task_progress.connect(self._on_task_progress)
+
+        self.state.tasks.task_cancelled.connect(self._on_statistics_task_stopped)
+
+        self.state.tasks.task_failed.connect(self._on_statistics_task_stopped)
+
+    def build_controls(self):
+        super().build_controls()
+
+        # print("Building controls for PlotController (statistics display)")
         bin_selector = QDoubleSpinBox()
         initial_nbin = 30
         bin_selector.setDecimals(0)
@@ -1058,6 +1700,10 @@ class Controller(BasePlot.CanvasController):
             lambda query: self._on_query_changed("y_2nd", query)
         )
 
+        self.controls["reset_view"] = QPushButton("Reset view")
+        self.controls["reset_view"].clicked.connect(self.canvas.reset_view_range)
+
+        self.section.y_options_layout.addWidget(self.controls["reset_view"])
         self.section.y_options_layout.addStretch()
 
         self.controls["bin_selector"].valueChanged.connect(self._on_plot_params_changed)
@@ -1070,11 +1716,11 @@ class Controller(BasePlot.CanvasController):
 
     def _on_data_changed(self, input: Tuple[str, int]):
         # if input[0] == "assignments":
-        self.recalculate_statistics()
         # self.update_canvas()
+        pass
 
     def _on_plot_params_changed(self):
-        self.recalculate_statistics()
+        self.rebuild_plot()
         # self.update_canvas()
 
     def _on_query_changed(self, which, query: StatisticsData.StatisticQuery):
@@ -1093,6 +1739,8 @@ class Controller(BasePlot.CanvasController):
             self.controls[key].setVisible(False)
 
         # print(f"Plot type identified as: {self.plot_type}")
+
+        self._hovered_series_session_id = None
 
         if self.plot_type == "histogram":
             self.controls["bin_selector"].setVisible(
@@ -1143,48 +1791,192 @@ class Controller(BasePlot.CanvasController):
             self.controls["x_selector"].set_query_mode("generic")
             self.controls["x_selector"].set_query_preparer(None)
 
-        self.recalculate_statistics()
-        # ## load quality params if SNR, RVAL, or CNN are selected
-        # if (
-        #     self.current_query["x"] is not None
-        #     and self.current_query["x"].statistic_key in ["snr", "rval", "cnn"]
-        # ) or (
-        #     self.current_query["y"] is not None
-        #     and self.current_query["y"].statistic_key in ["snr", "rval", "cnn"]
-        # ):
-        #     if not self.data.current_session.status["quality_loaded"]:
-        #         self.data.change_quality_presence(self.state.current_session_id, True)
+        self.recalculate_statistics(which)
 
-        # tables = self.data.evaluate_queries(**self.current_query)
+    def recalculate_statistics(
+        self,
+        which: str | None = None,
+        *,
+        force: bool = False,
+    ):
+        """
+        wrapper around _recalculate_statistic for multiple slots.
+        """
+        if which is None:
+            slots = tuple(
+                slot for slot, query in self.current_query.items() if query is not None
+            )
+        else:
+            slots = (which,)
 
-    def recalculate_statistics(self):
+        for slot in slots:
+            self._recalculate_statistic(
+                slot,
+                force=force,
+            )
 
-        def evaluate_tables(ctx=None):
-            """
-            wrapper to obtain all tables at once
-            """
-            tables = {}
+    def _recalculate_statistic(
+        self,
+        which: str,
+        *,
+        force: bool = False,
+    ):
+        """
+        Recalculates the statistic for the specified slot
+        and cancels any obsolete tasks.
+        """
 
-            for key, query in self.current_query.items():
-                if query is not None:
-                    tables[key] = self.data.statistic_engine.evaluate_table(query)
+        query = self.current_query[which]
 
-            return tables
+        # Cancel obsolete task for THIS slot.
+        old_task = self.statistic_tasks[which]
 
-        status_str = f"Calculating statistics for "
-        if self.current_query["x"] is not None:
-            status_str += f"{self.current_query["x"].statistic_key}"
-        if self.current_query["x"] is not None and self.current_query["y"] is not None:
-            status_str += " and "
-        if self.current_query["y"] is not None:
-            status_str += f"{self.current_query["y"].statistic_key}"
+        if old_task is not None:
+            self.state.tasks.cancel(old_task)
+            self.statistic_tasks[which] = None
 
-        self.state.tasks.start(
+        if query is None:
+            self.current_results[which] = None
+            self.rebuild_plot()
+            return
+
+        existing = self.current_results[which]
+
+        if (
+            not force
+            and existing is not None
+            and existing.query == query
+            and existing.data_version == self.state.data_version
+        ):
+            self.rebuild_plot()
+            return
+
+        # Important: snapshot the query.
+        requested_query = query
+        requested_data_version = self.state.data_version
+
+        def evaluate():
+
+            try:
+                table = self.data.statistic_engine.evaluate_table(requested_query)
+
+                return StatisticsTaskResult(
+                    slot=which,
+                    query=requested_query,
+                    data_version=requested_data_version,
+                    table=table,
+                )
+
+            except TaskCancelled:
+                # Important: let Worker handle cancellation.
+                raise
+
+            except Exception as exc:
+                return StatisticsTaskResult(
+                    slot=which,
+                    query=requested_query,
+                    data_version=requested_data_version,
+                    error=(f"{type(exc).__name__}: {exc}"),
+                    traceback=traceback.format_exc(),
+                )
+
+        task_id = self.state.tasks.start(
             "calculating",
-            status_str,
-            evaluate_tables,
-            on_result=self.rebuild_plot_data,
+            f"Calculate {which}: {requested_query.statistic_key}",
+            evaluate,
+            on_result=self._on_statistic_ready,
         )
+
+        self.statistic_tasks[which] = task_id
+
+        self.statistic_progress[which] = None
+        self._update_statistics_status()
+
+    def _slot_for_task(
+        self,
+        task_id: str,
+    ) -> str | None:
+
+        for slot, slot_task_id in self.statistic_tasks.items():
+            if slot_task_id == task_id:
+                return slot
+
+        return None
+
+    def _on_statistics_task_stopped(
+        self,
+        group,
+        task_id,
+    ):
+
+        if group != "calculating":
+            return
+
+        slot = self._slot_for_task(task_id)
+
+        if slot is None:
+            return
+
+        self.statistic_tasks[slot] = None
+        self.statistic_progress[slot] = None
+
+        self._update_statistics_status()
+
+    def _on_statistic_ready(
+        self,
+        result: StatisticsTaskResult,
+    ):
+
+        which = result.slot
+
+        # A newer query has replaced this one.
+        if result.query != self.current_query[which]:
+            return
+
+        # Data changed while this calculation was running.
+        if result.data_version != self.state.data_version:
+            return
+
+        self.statistic_tasks[which] = None
+        self.statistic_progress[which] = None
+        self.current_results[which] = result
+
+        self._update_statistics_status()
+        self.rebuild_plot()
+
+    def _result_is_current(
+        self,
+        slot: str,
+    ) -> bool:
+
+        result = self.current_results[slot]
+        query = self.current_query[slot]
+
+        return (
+            result is not None
+            and result.query == query
+            and result.data_version == self.state.data_version
+        )
+
+    def _required_statistic_slots(self):
+
+        self.identify_plot_type()
+
+        if self.plot_type == "histogram":
+            return ("x",)
+
+        if self.plot_type == "scatter":
+            return ("x", "y")
+
+        if self.plot_type == "session_series":
+            slots = ["y"]
+
+            if self.current_query["y_2nd"] is not None:
+                slots.append("y_2nd")
+
+            return tuple(slots)
+
+        return ()
 
     def identify_plot_type(self):
         x_query = self.current_query["x"]
@@ -1204,49 +1996,151 @@ class Controller(BasePlot.CanvasController):
 
         self.plot_type = self.canvas.plot_type = plot_type
 
-    def rebuild_plot_data(self, tables: dict[str, PickTable] = None):
+    def rebuild_plot(self):
+        """
+        Rebuild the plot once all statistics required for the
+        current plot have completed.
+
+        Expected calculation/plot compatibility errors are shown
+        inside the Statistics display. Unexpected programming
+        errors are allowed to propagate normally.
+        """
+
+        slots = self._required_statistic_slots()
+
+        # ---------------------------------------------------------
+        # Nothing requested.
+        # ---------------------------------------------------------
+
+        if not slots:
+
+            self.current_plot_data = None
+            self.displayed_results = {}
+
+            self.canvas.clear()
+            self.canvas.hide_plot_error()
+
+            self._update_statistics_status()
+            return
+
+        # ---------------------------------------------------------
+        # Wait until all required results correspond to the
+        # currently requested queries/data version.
+        # ---------------------------------------------------------
+
+        for slot in slots:
+
+            if self.current_query[slot] is None:
+                return
+
+            if not self._result_is_current(slot):
+                return
+
+        # ---------------------------------------------------------
+        # We now have one completed result for every required slot.
+        # ---------------------------------------------------------
+
+        results = {slot: self.current_results[slot] for slot in slots}
+
+        self.displayed_results = dict(results)
+
+        try:
+
+            # -----------------------------------------------------
+            # Calculation errors.
+            # -----------------------------------------------------
+
+            errors = [
+                result.error for result in results.values() if result.error is not None
+            ]
+
+            if errors:
+                raise StatisticsPlotError("\n".join(errors))
+
+            # -----------------------------------------------------
+            # Internal consistency.
+            # This should never happen for a successful result.
+            # -----------------------------------------------------
+
+            if any(result.table is None for result in results.values()):
+                raise RuntimeError("Successful statistics result contains no table.")
+
+            tables = {slot: result.table for slot, result in results.items()}
+
+            # -----------------------------------------------------
+            # Plot-data construction.
+            # This may itself raise StatisticsPlotError if the
+            # tables cannot sensibly be combined.
+            # -----------------------------------------------------
+
+            new_plot_data = self._build_plot_data(tables)
+
+        except StatisticsPlotError as exc:
+
+            self._show_statistics_error(str(exc))
+            return
+
+        # ---------------------------------------------------------
+        # Success.
+        #
+        # Only replace the currently visible plot AFTER the new
+        # plot data was successfully constructed.
+        # ---------------------------------------------------------
+
+        self.current_plot_data = new_plot_data
 
         self.canvas.clear()
-        if tables is None:
-            return
-
-        # def get_plot_data(ctx=None):
-        # x_table = self.data.statistic_engine.evaluate_table(self.current_query["x"])
-        # y_table = self.data.statistic_engine.evaluate_table(self.current_query["y"])
-
-        if tables.get("x") is None and tables.get("y") is None:
-            return
-
-        if self.plot_type == "histogram" and (x_table := tables.get("x")) is not None:
-            nbins = int(self.controls["bin_selector"].value())
-            self.current_plot_data = plotdata_histogram.build_plot_data(
-                x_table,
-                bins=nbins,
-            )
-        elif (
-            self.plot_type == "session_series"
-            and (y_table := tables.get("y")) is not None
-        ):
-            self.current_plot_data = plotdata_series.build_plot_data(
-                first_table=y_table,
-                second_table=tables.get("y_2nd"),
-            )
-            # print(f"Built session series plot data: {self.current_plot_data}")
-        elif (
-            self.plot_type == "scatter"
-            and (x_table := tables.get("x")) is not None
-            and (y_table := tables.get("y")) is not None
-        ):
-            self.current_plot_data = plotdata_scatter.build_plot_data(
-                x_table=x_table,
-                y_table=y_table,
-            )
-        else:
-            raise ValueError(
-                f"Invalid combination of x_query and y_query for plot_type '{self.plot_type}': x_query={self.current_query['x']}, y_query={self.current_query['y']}"
-            )
+        self.canvas.hide_plot_error()
 
         self.update_canvas()
+        self._update_statistics_status()
+
+    def _build_plot_data(
+        self,
+        tables: dict[str, PickTable],
+    ):
+
+        if self.plot_type == "histogram":
+
+            nbins = int(self.controls["bin_selector"].value())
+
+            return plotdata_histogram.build_plot_data(
+                tables["x"],
+                bins=nbins,
+            )
+
+        if self.plot_type == "session_series":
+
+            return plotdata_series.build_plot_data(
+                first_table=tables["y"],
+                second_table=tables.get("y_2nd"),
+            )
+
+        if self.plot_type == "scatter":
+
+            return plotdata_scatter.build_plot_data(
+                x_table=tables["x"],
+                y_table=tables["y"],
+            )
+
+        # This is an internal bug, NOT a user-facing plotting error.
+        raise RuntimeError(f"Unknown plot type {self.plot_type!r}")
+
+    def _show_statistics_error(
+        self,
+        message: str,
+    ):
+
+        self.current_plot_data = None
+
+        self.canvas.clear()
+
+        self.canvas.show_plot_error(
+            "Cannot display requested statistics",
+            message,
+        )
+
+        self._update_statistics_status()
 
     def _on_selection_changed(self):
         if self.current_plot_data is None:
@@ -1260,26 +2154,27 @@ class Controller(BasePlot.CanvasController):
     def _on_visual_clicked(self, idx: Optional[int], modifiers):
 
         if idx is None:
-            self._handle_picked_refs(None, modifiers)
+            self._handle_picked_ref_sets(None, modifiers)
             return
 
-        if isinstance(self.current_plot_data, plotdata_histogram.PlotData):
+        if isinstance(
+            self.current_plot_data,
+            plotdata_histogram.PlotData,
+        ):
             rows = self.current_plot_data.rows_for_bin(idx)
-        elif isinstance(self.current_plot_data, plotdata_scatter.PlotData):
+
+        elif isinstance(
+            self.current_plot_data,
+            plotdata_scatter.PlotData,
+        ):
             rows = self.current_plot_data.rows_for_markers(idx)
+
         else:
             return
 
-        refs = self.current_plot_data.table.refs_for_rows(rows)
+        ref_sets = self.current_plot_data.ref_sets_for_rows(rows)
 
-        self._handle_picked_refs(refs, modifiers)
-
-    # def _on_bin_hovered(self, bin_index):
-    #     # self.handle_tooltip_for_bin(bin_index)
-    #     pass
-
-    # def _on_marker_hovered(self, marker_index):
-    #     pass
+        self._handle_picked_ref_sets(ref_sets, modifiers)
 
     def _on_threshold_changed(self, spec: Threshold.ThresholdSpec):
         self._select_from_threshold()
@@ -1296,9 +2191,10 @@ class Controller(BasePlot.CanvasController):
             plot_data, plotdata_histogram.PlotData
         ):
             rows = plot_data.rows_for_threshold(thresholds["x"].spec)
-            refs = plot_data.table.refs_for_rows(rows)
 
-            self._handle_picked_refs(refs, [])
+            ref_sets = plot_data.ref_sets_for_rows(rows)
+
+            self._handle_picked_ref_sets(ref_sets, [])
             return
 
         if self.plot_type == "session_series" and isinstance(
@@ -1315,92 +2211,318 @@ class Controller(BasePlot.CanvasController):
             )
 
             rows = plot_data.rows_for_markers(markers)
-            refs = plot_data.table.refs_for_rows(rows)
 
-            self._handle_picked_refs(refs, [])
+            ref_sets = plot_data.ref_sets_for_rows(rows)
+
+            self._handle_picked_ref_sets(ref_sets, [])
             return
 
-    def _handle_picked_refs(self, refs: dict[str, np.ndarray], modifiers):
+    def _handle_picked_ref_sets(
+        self,
+        ref_sets: tuple[dict[str, np.ndarray], ...] | None,
+        modifiers,
+    ):
 
-        if refs is None:
-            self.state.update_selected_components(None, modifiers)
+        if ref_sets is None:
+            self.state.update_selected_components(
+                None,
+                modifiers,
+            )
             return
 
-        components = []
-        # print(f"Picked refs: {refs}")
+        components = set()
 
-        # one value per neuron
-        if "neuron" in refs:
-            for i, neuron_id in enumerate(refs["neuron"]):
-                components.append(
-                    NeuronComponent(
-                        session_id=(
-                            refs["session"][i]
-                            if "session" in refs
-                            else self.state.current_session_id
-                        ),
-                        neuron_id=int(neuron_id),
-                    )
-                )
-
-        # one value per neuron pair
-        if "neuron_i" in refs or "neuron_j" in refs:
-            neuron_ids = []
-
-            if "neuron_i" in refs:
-                neuron_ids.append(refs["neuron_i"])
-
-            if "neuron_j" in refs:
-                neuron_ids.append(refs["neuron_j"])
-
-            neuron_ids = np.unique(np.concatenate(neuron_ids))
-            # print(f"Picked neuron IDs from pairs: {neuron_ids}")
-
-            for i, neuron_id in enumerate(neuron_ids):
-                components.append(
-                    NeuronComponent(
-                        session_id=(
-                            refs["session"][i]
-                            if "session" in refs
-                            else self.state.current_session_id
-                        ),
-                        neuron_id=int(neuron_id),
-                    )
-                )
+        for refs in ref_sets:
+            components.update(self._components_from_refs(refs))
 
         if components:
-            # set() removes duplicates, list() keeps API simple
-            components = list({c for c in components if c is not None})
-            self.state.update_selected_components(components, modifiers)
+            self.state.update_selected_components(
+                list(components),
+                modifiers,
+            )
+
+    def _components_from_refs(
+        self,
+        refs: dict[str, np.ndarray],
+    ) -> list[NeuronComponent]:
+        """
+        Convert one coherent PickTable reference set into concrete
+        NeuronComponents.
+
+        References within this dict are row-aligned. Do not combine refs
+        from different PickTables before calling this method.
+        """
+
+        if not refs:
+            return []
+
+        refs = {key: np.atleast_1d(value) for key, value in refs.items()}
+
+        component_keys: set[tuple[int, int]] = set()
+
+        def add_components(neuron_key: str, session_key: str | None):
+            neurons = np.asarray(refs[neuron_key]).reshape(-1)
+
+            if session_key is None:
+                sessions = np.full(
+                    neurons.shape,
+                    self.state.current_session_id,
+                    dtype=int,
+                )
+
+            else:
+                sessions = np.asarray(refs[session_key]).reshape(-1)
+
+                if sessions.shape != neurons.shape:
+                    raise ValueError(
+                        "Neuron/session reference arrays are not aligned: "
+                        f"{neuron_key} has shape {neurons.shape}, "
+                        f"{session_key} has shape {sessions.shape}."
+                    )
+
+            component_keys.update(
+                (int(session_id), int(neuron_id))
+                for session_id, neuron_id in zip(sessions, neurons)
+            )
+
+        # ---------------------------------------------------------
+        # Ordinary neuron dimension.
+        # ---------------------------------------------------------
+
+        if "neuron" in refs:
+
+            if "session" in refs:
+                # Ordinary neuron/session statistic.
+                add_components("neuron", "session")
+
+            else:
+                # One neuron may be associated with a session pair,
+                # e.g. the same tracked neuron compared across sessions.
+                pair_session_keys = [
+                    key for key in ("session_i", "session_j") if key in refs
+                ]
+
+                if pair_session_keys:
+                    for session_key in pair_session_keys:
+                        add_components("neuron", session_key)
+                else:
+                    add_components("neuron", None)
+
+        # ---------------------------------------------------------
+        # Pairwise neuron dimensions.
+        # ---------------------------------------------------------
+
+        for suffix in ("i", "j"):
+
+            neuron_key = f"neuron_{suffix}"
+
+            if neuron_key not in refs:
+                continue
+
+            session_key = f"session_{suffix}"
+
+            if session_key in refs:
+                # neuron_i -> session_i
+                # neuron_j -> session_j
+                add_components(neuron_key, session_key)
+
+            elif "session" in refs:
+                # Both neurons belong to one collapsed/shared session.
+                add_components(neuron_key, "session")
+
+            else:
+                # No concrete session survives in the statistic.
+                add_components(neuron_key, None)
+
+        return [
+            NeuronComponent(session_id=session_id, neuron_id=neuron_id)
+            for session_id, neuron_id in component_keys
+        ]
+
+    # def _handle_picked_refs(self, refs: dict[str, np.ndarray], modifiers):
+
+    #     if refs is None:
+    #         self.state.update_selected_components(None, modifiers)
+    #         return
+
+    #     components = []
+    #     # one value per neuron
+    #     if "neuron" in refs:
+    #         for i, neuron_id in enumerate(refs["neuron"]):
+    #             components.append(
+    #                 NeuronComponent(
+    #                     session_id=(
+    #                         refs["session"][i]
+    #                         if "session" in refs
+    #                         else self.state.current_session_id
+    #                     ),
+    #                     neuron_id=int(neuron_id),
+    #                 )
+    #             )
+
+    #     # one value per neuron pair
+    #     if "neuron_i" in refs or "neuron_j" in refs:
+    #         neuron_ids = []
+
+    #         if "neuron_i" in refs:
+    #             neuron_ids.append(refs["neuron_i"])
+
+    #         if "neuron_j" in refs:
+    #             neuron_ids.append(refs["neuron_j"])
+
+    #         neuron_ids = np.unique(np.concatenate(neuron_ids))
+    #         # print(f"Picked neuron IDs from pairs: {neuron_ids}")
+
+    #         for i, neuron_id in enumerate(neuron_ids):
+    #             components.append(
+    #                 NeuronComponent(
+    #                     session_id=(
+    #                         refs["session"][i]
+    #                         if "session" in refs
+    #                         else self.state.current_session_id
+    #                     ),
+    #                     neuron_id=int(neuron_id),
+    #                 )
+    #             )
+
+    #     if components:
+    #         # set() removes duplicates, list() keeps API simple
+    #         components = list({c for c in components if c is not None})
+    #         self.state.update_selected_components(components, modifiers)
+    #         return
+
+    ### ================================================================== ###
+    ### ================= CONTROL STATUS & ERROR DISPLAYS ================ ###
+    ### ================================================================== ###
+
+    def _displayed_query_description(self):
+
+        if not self.displayed_results:
+            return None
+
+        return self._describe_results(self.displayed_results)
+
+    def _describe_results(self, results):
+        parts = []
+
+        for slot in ("x", "y", "y_2nd"):
+            result = results.get(slot)
+
+            if result is None:
+                continue
+
+            if result.table is not None:
+                title = result.table.stat.display_title
+            else:
+                # Fallback for failed/incomplete results.
+                stat_def = self.data.statistic_engine.registry[
+                    result.query.statistic_key
+                ]
+                title = stat_def.title
+
+            parts.append(f"{slot}: {title}")
+
+        return " | ".join(parts)
+
+    def _pending_slots(self):
+
+        return [
+            slot
+            for slot, task_id in self.statistic_tasks.items()
+            if task_id is not None
+        ]
+
+    def _update_statistics_status(self):
+
+        displayed = self._displayed_query_description()
+
+        pending_slots = self._pending_slots()
+
+        if pending_slots:
+            pending = ", ".join(
+                self._query_short_name(self.current_query[slot])
+                for slot in pending_slots
+            )
+        else:
+            pending = None
+
+        self.canvas.set_statistics_status(
+            displayed=displayed,
+            pending=pending,
+            progress=self._current_progress(),
+        )
+
+    def _current_progress(self) -> int | None:
+        """
+        Return progress of the currently running statistics task.
+
+        None means:
+        - no statistics task is currently running, or
+        - it has not reported determinate progress yet.
+        """
+
+        current_task = self.state.tasks.current_task("calculating")
+
+        if current_task is None:
+            return None
+
+        task_id = current_task.id
+
+        slot = self._slot_for_task(task_id)
+
+        # Current calculating task belongs to something
+        # other than this Statistics controller.
+        if slot is None:
+            return None
+
+        # Extra guard against superseded tasks.
+        if self.statistic_tasks.get(slot) != task_id:
+            return None
+
+        return self.statistic_progress.get(slot)
+
+    def _query_short_name(
+        self,
+        query: StatisticsData.StatisticQuery | None,
+    ) -> str:
+
+        if query is None:
+            return "—"
+
+        stat_def = self.data.statistic_engine.registry.get(query.statistic_key)
+
+        if stat_def is None:
+            return query.statistic_key
+
+        return stat_def.title
+
+    def _on_task_progress(
+        self,
+        group,
+        task_id,
+        progress,
+    ):
+
+        if group != "calculating":
             return
 
-        # # optional later: session-based selections
-        # if "session" in refs:
-        #     self.state.update_selected_sessions(np.unique(refs["session"]), modifiers)
-        #     return
+        slot = self._slot_for_task(task_id)
 
-        # if "session_i" in refs or "session_j" in refs:
-        #     session_ids = []
+        if slot is None:
+            return
 
-        #     if "session_i" in refs:
-        #         session_ids.append(refs["session_i"])
+        # Ignore progress from a task that has already
+        # been superseded in this slot.
+        if self.statistic_tasks[slot] != task_id:
+            return
 
-        #     if "session_j" in refs:
-        #         session_ids.append(refs["session_j"])
+        self.statistic_progress[slot] = progress
 
-        #     self.state.update_selected_sessions(
-        #         np.unique(np.concatenate(session_ids)), modifiers
-        #     )
+        self._update_statistics_status()
 
-        # if self.changes_on_click == "selected":
-        #     self.state.update_selected_components(component, event.modifiers)
-        # elif self.changes_on_click == "focused":
-        #     self.state.focused_component = component
-        # elif self.changes_on_click == "highlighted":
-        #     self.state.highlighted_component = component
-        # else:
-        #     raise ValueError(f"Invalid changes_on_click value: {self.changes_on_click}")
-
+    ### ================================================================== ###
+    # Deactivation and session handling
+    ### ================================================================== ###
     def deactivate(self):
 
         super().deactivate()
@@ -1445,3 +2567,16 @@ def _series_y_range(series: plotdata_series.SessionSeries, *, include_zero=True)
         pad = 0.1 * (ymax - ymin)
 
     return ymin - pad, ymax + pad
+
+
+def _session_index(
+    series,
+    session_id: int,
+) -> int | None:
+
+    matches = np.flatnonzero(series.session_ids == session_id)
+
+    if matches.size == 0:
+        return None
+
+    return int(matches[0])

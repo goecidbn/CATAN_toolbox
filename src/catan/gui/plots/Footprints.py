@@ -687,7 +687,7 @@ class Display(BasePlot.BaseCanvas):
         self.state.tasks.start(
             "loading",
             f"Loading {which} data for {session.name}",
-            lambda ctx: self.data.toggle_session_data(session_id, which, ctx=ctx),
+            lambda: self.data.toggle_session_data(session_id, which),
             # finished=self.refresh_rows,
         )
 

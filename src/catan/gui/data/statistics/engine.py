@@ -11,6 +11,21 @@ from .types import StatisticArray
 from .queries import ReductionSpec, StatisticQuery
 
 
+@dataclass(frozen=True, slots=True)
+class StatisticsTaskResult:
+    slot: str
+    query: StatisticQuery
+    data_version: int
+
+    table: PickTable | None = None
+    error: str | None = None
+    traceback: str | None = None
+
+    @property
+    def successful(self) -> bool:
+        return self.error is None and self.table is not None
+
+
 class StatisticEngine(QObject):
 
     registry_changed = Signal()
@@ -120,6 +135,7 @@ class StatisticEngine(QObject):
         return stat
 
     def evaluate_table(self, query: Optional[StatisticQuery]) -> Optional[PickTable]:
+
         if query is None:
             return None
 

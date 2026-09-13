@@ -50,6 +50,56 @@ class StatisticArray:
     def has_errors(self) -> bool:
         return self.errors_low is not None and self.errors_high is not None
 
+    @property
+    def display_title(self) -> str:
+
+        title = self.title
+
+        fixed = []
+
+        for dim_name, dim in self.dimensions.items():
+            if dim.mode != "fixed":
+                continue
+
+            short_name = {
+                "session": "s",
+                "session_i": "s_i",
+                "session_j": "s_j",
+                "neuron": "n",
+                "neuron_i": "n_i",
+                "neuron_j": "n_j",
+            }.get(dim_name, dim_name)
+
+            value = dim.parameter
+
+            if isinstance(value, np.generic):
+                value = value.item()
+
+            fixed.append(f"{short_name}={value}")
+
+        if fixed:
+            title = f"{title}(" + ", ".join(fixed) + ")"
+
+        reductions = []
+
+        for dim in self.dimensions.values():
+            if dim.mode != "reduced":
+                continue
+
+            parameter = dim.parameter
+
+            if isinstance(parameter, dict):
+                method = parameter["method"]
+            else:
+                method = str(parameter)
+
+            reductions.append(method)
+
+        for method in reductions:
+            title = f"{method}({title})"
+
+        return title
+
     def axis(self, dim_name: str) -> int:
         if dim_name not in self.dimensions:
             raise KeyError(f"Unknown dimension {dim_name!r}")

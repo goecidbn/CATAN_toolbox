@@ -6,12 +6,12 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QSizePolicy, QToolTip
 from PySide6.QtGui import QCursor
 
-# import importlib
+import importlib
 from catan.gui.plots import styles
 from catan.gui.structures.state import NeuronComponent, AppState
 from catan.gui.structures.data import Data
 
-# importlib.reload(styles)
+importlib.reload(styles)
 # print("reloading BasePlot")
 
 
