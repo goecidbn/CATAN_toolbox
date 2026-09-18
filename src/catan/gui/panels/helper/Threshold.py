@@ -29,7 +29,7 @@ THRESHOLD_STYLE = {
 
 @dataclass
 class ThresholdSpec:
-    axis: ThresholdAxis
+    axis: ThresholdAxis | None = None
     value: float = 0.0
     direction: ThresholdDirection = "greater"
     active: bool = False

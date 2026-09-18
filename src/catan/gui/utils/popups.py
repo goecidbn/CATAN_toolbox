@@ -23,11 +23,16 @@ class PopupBoundsFilter(QObject):
         anchor: QWidget | None = None,
         bounds: QWidget | None = None,
         margin: int = 4,
+        gap: int = 4,
+        placements: tuple[str, ...] = ("below", "above"),
     ):
         super().__init__(popup)
 
         self.popup = popup
         self.anchor = anchor
+
+        self.placements = placements
+        self.gap = gap
 
         if bounds is None:
             if anchor is not None:
@@ -38,22 +43,36 @@ class PopupBoundsFilter(QObject):
         self.bounds = bounds
         self.margin = margin
 
+        self._reposition_pending = False
+
         popup.installEventFilter(self)
 
     def eventFilter(self, watched, event):
-        if watched is self.popup and event.type() == QEvent.Type.Show:
 
-            # Let Qt finish calculating the popup's actual size/position
-            # first, then correct it.
-            QTimer.singleShot(
-                0,
-                self.reposition,
-            )
+        if watched is self.popup and event.type() in (
+            QEvent.Type.Show,
+            QEvent.Type.LayoutRequest,
+        ):
+            self.schedule_reposition()
 
         return super().eventFilter(
             watched,
             event,
         )
+
+    def schedule_reposition(self):
+        if self._reposition_pending:
+            return
+
+        self._reposition_pending = True
+        QTimer.singleShot(
+            0,
+            self._do_scheduled_reposition,
+        )
+
+    def _do_scheduled_reposition(self):
+        self._reposition_pending = False
+        self.reposition()
 
     def reposition(self):
         popup = self.popup
@@ -86,22 +105,60 @@ class PopupBoundsFilter(QObject):
 
             anchor_top_left = self.anchor.mapToGlobal(QPoint(0, 0))
 
-            anchor_bottom_left = self.anchor.mapToGlobal(
-                QPoint(
-                    0,
-                    self.anchor.height(),
-                )
-            )
+            anchor_rect = QRect(anchor_top_left, self.anchor.size())
 
-            x = anchor_bottom_left.x()
-            y = anchor_bottom_left.y()
+            def candidate(placement: str) -> QPoint:
 
-            # Not enough space below -> open above.
-            if y + popup_size.height() > bounds_rect.bottom():
-                y = anchor_top_left.y() - popup_size.height()
+                if placement == "below":
+                    return QPoint(
+                        anchor_rect.left(),
+                        anchor_rect.bottom() + 1 + self.gap,
+                    )
+
+                if placement == "above":
+                    return QPoint(
+                        anchor_rect.left(),
+                        anchor_rect.top() - popup_size.height() - self.gap,
+                    )
+
+                if placement == "right":
+                    return QPoint(
+                        anchor_rect.right() + 1 + self.gap,
+                        anchor_rect.top(),
+                    )
+
+                if placement == "left":
+                    return QPoint(
+                        anchor_rect.left() - popup_size.width() - self.gap,
+                        anchor_rect.top(),
+                    )
+
+                raise ValueError(f"Unknown popup placement: {placement!r}")
+
+            # Use the first preferred placement which fits
+            # completely into the requested bounds.
+            x = y = None
+
+            for placement in self.placements:
+
+                pos = candidate(placement)
+
+                candidate_rect = QRect(pos, popup_size)
+
+                if bounds_rect.contains(candidate_rect):
+                    x = pos.x()
+                    y = pos.y()
+                    break
+
+            # Nothing fits perfectly:
+            # start from the first preference and clamp below.
+            if x is None:
+                pos = candidate(self.placements[0])
+                x = pos.x()
+                y = pos.y()
 
         else:
-            # Preserve Qt's chosen location as far as possible.
+            # Preserve Qt's / caller's chosen location as far as possible.
             current = popup.pos()
             x = current.x()
             y = current.y()
@@ -135,6 +192,8 @@ def constrain_popup(
     anchor: QWidget | None = None,
     bounds: QWidget | None = None,
     margin: int = 4,
+    gap: int = 4,
+    placements: tuple[str, ...] = ("below", "above"),
 ):
     """
     Configure a popup to remain within a window.
@@ -147,4 +206,6 @@ def constrain_popup(
         anchor=anchor,
         bounds=bounds,
         margin=margin,
+        gap=gap,
+        placements=placements,
     )

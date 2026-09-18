@@ -6,6 +6,7 @@ import numpy as np
 import numbers
 from vispy import scene
 from vispy.scene import visuals
+from vispy.scene.visuals import Rectangle, Text, Markers
 from typing import Optional, Tuple, Callable
 from catan.gui.interaction import click_events
 
@@ -17,15 +18,17 @@ from PySide6.QtWidgets import (
     QFrame,
     QVBoxLayout,
     QPushButton,
+    QToolButton,
+    QStyle,
 )
 from PySide6.QtGui import (
     QCursor,
 )
 
 import importlib
-from catan.gui.plots import StatisticsData
-from catan.gui.plots.helper import HistogramMesh, series_with_confidence
-from catan.gui.plots.helper.cameras import (
+from catan.gui.panels import StatisticsData
+from catan.gui.panels.helper import HistogramMesh, series_with_confidence
+from catan.gui.panels.helper.cameras import (
     FixedPanZoomCamera,
 )
 
@@ -39,17 +42,21 @@ from catan.gui.data.statistics import (
     calculations,
 )
 from catan.gui.structures.state import NeuronComponent
-from catan.gui.plots import BasePlot
-from catan.gui.plots.helper import Threshold
+from catan.gui.panels import BasePlot
+from catan.gui.panels.helper import Threshold
 from catan.gui.background_tasks.runtime import TaskCancelled
+import catan.gui.data.curation_filter as curation_filter
+from catan.gui.panels.helper.Threshold import ThresholdSpec
+from catan.gui.GUI_elements.fragments.ResetViewButton import ResetViewButton
 
-importlib.reload(calculations)
-# importlib.reload(stats)
-importlib.reload(series_with_confidence)
-# importlib.reload(plotdata_histogram)
-importlib.reload(plotdata_series)
-importlib.reload(StatisticsData)
-importlib.reload(Threshold)
+# # importlib.reload(curation_filter)
+# importlib.reload(calculations)
+# # importlib.reload(stats)
+# importlib.reload(series_with_confidence)
+# # importlib.reload(plotdata_histogram)
+# importlib.reload(plotdata_series)
+# importlib.reload(StatisticsData)
+# importlib.reload(Threshold)
 
 STATUS_ROW_HEIGHT = 58
 STATUS_CARD_IDLE_HEIGHT = 30
@@ -81,11 +88,22 @@ class Display(BasePlot.BaseCanvas):
     pick_radius_scatter = 0.05
     pick_radius_series = 0.05
 
+    main_visual: Optional[Callable] = None
+    main_visual_name: Optional[str] = None
+    overlays: list[BasePlot.SelectionType] = []
+
     def __init__(self, parent, controls, config=None):
         super().__init__(parent, controls, config)
 
         self.unfreeze()
         self.grid = self.central_widget.add_grid(spacing=0)
+
+        self.reset_view_button = ResetViewButton(
+            native=self.native,
+            pos=(6, STATUS_ROW_HEIGHT),
+            callback=self.reset_view_range,
+        )
+        # self._initialize_reset_view_button()
 
         self.initialize_status_bar()
         self._status_progress_left = None
@@ -135,7 +153,7 @@ class Display(BasePlot.BaseCanvas):
 
         self._hovered_series_session_id = None
 
-        self.build_overlays()
+        # self.build_overlays()
 
         self._on_threshold_changed: Optional[Callable] = None
         self.thresholds: dict[str, Threshold.ThresholdOverlay] = {}
@@ -148,7 +166,40 @@ class Display(BasePlot.BaseCanvas):
 
         self.freeze()
 
+    def change_plot_type(self, plot_type):
+
+        if plot_type != self.plot_type:
+            self.clear_overlays()
+        self.plot_type = plot_type
+
+        if plot_type == "histogram":
+            self.main_visual = Rectangle
+            self.main_visual_name = "bar"
+
+            # Selection remains special because it changes
+            # histogram COUNTS, rather than overlaying bars.
+            self.overlays = ["hovered"]
+
+        elif plot_type == "scatter":
+            self.main_visual = Markers
+            self.main_visual_name = "marker"
+
+            self.overlays = ["selected", "focused", "highlighted", "hovered"]
+        elif plot_type == "series":
+            self.main_visual = None
+            self.main_visual_name = None
+
+            self.overlays = []
+        else:
+            self.main_visual = None
+            self.main_visual_name = None
+
+            self.overlays = []
+
     def _on_canvas_resize(self, event):
+
+        self.reset_view_button._reposition()
+
         if self.error_overlay.isVisible():
             self._position_error_overlay()
 
@@ -219,7 +270,7 @@ class Display(BasePlot.BaseCanvas):
         self.grid.add_widget(self.status_widget, row=0, col=1)
 
         # Main card
-        self.status_bg = visuals.Rectangle(
+        self.status_bg = Rectangle(
             center=(5, 5),
             width=10,
             height=10,
@@ -230,7 +281,7 @@ class Display(BasePlot.BaseCanvas):
             parent=self.status_widget,
         )
 
-        self.status_text = visuals.Text(
+        self.status_text = Text(
             "",
             pos=(0, 0),
             anchor_x="left",
@@ -240,7 +291,7 @@ class Display(BasePlot.BaseCanvas):
             parent=self.status_widget,
         )
 
-        self.status_pending_text = visuals.Text(
+        self.status_pending_text = Text(
             "",
             pos=(0, 0),
             anchor_x="left",
@@ -251,7 +302,7 @@ class Display(BasePlot.BaseCanvas):
         )
 
         # Progress track
-        self.status_progress_bg = visuals.Rectangle(
+        self.status_progress_bg = Rectangle(
             center=(50, 3),
             width=100,
             height=STATUS_PROGRESS_HEIGHT,
@@ -262,7 +313,7 @@ class Display(BasePlot.BaseCanvas):
 
         # Keep the fill square-ended to avoid radius/width problems
         # when progress is close to zero.
-        self.status_progress = visuals.Rectangle(
+        self.status_progress = Rectangle(
             center=(0.5, 3),
             width=1,
             height=STATUS_PROGRESS_HEIGHT,
@@ -434,46 +485,6 @@ class Display(BasePlot.BaseCanvas):
 
         self.update()
 
-    def build_overlays(self):
-
-        self.clear_overlays()
-
-        if isinstance(self.plot_data, plotdata_histogram.PlotData):
-            visual = partial(
-                visuals.Rectangle,
-                center=(0, 0),
-                width=1,
-                height=1,
-                parent=self.plot_root,
-            )
-            plot_options = partial(
-                self.styles.get_plot_options,
-                **{"plot_type": "bar", "values": 0.7, "border_color": "black"},
-            )
-        elif isinstance(self.plot_data, plotdata_scatter.PlotData):
-            visual = partial(visuals.Markers, parent=self.plot_root)
-            plot_options = partial(
-                self.styles.get_plot_options,
-                **{"plot_type": "marker", "values": 0.7},
-            )
-        else:
-            return
-
-        for key in self.plotting["overlays"]:
-
-            self.plotting["overlays"][key] = visual(
-                **plot_options(key),
-            )
-            self.plotting["overlays"][key].visible = False
-            self.plotting["overlays"][key].set_gl_state(
-                blend=True,
-                depth_test=False,
-                blend_func=("src_alpha", "one_minus_src_alpha"),
-            )
-        self.plotting["overlays"]["hovered"].order = 100
-        self.plotting["overlays"]["focused"].order = 90
-        self.plotting["overlays"]["selected"].order = 80
-
     def set_plot_data(self, plot_data):
         self.plot_data = plot_data
 
@@ -492,13 +503,11 @@ class Display(BasePlot.BaseCanvas):
         else:
             return
 
-        self.highlight_visuals_from_selection()
-
     def _draw_histogram(self):
         # print("drawing histogram")
 
         self.clear()
-        self.build_overlays()
+        # self.build_overlays()
 
         if not isinstance(self.plot_data, plotdata_histogram.PlotData):
             raise ValueError(
@@ -579,7 +588,7 @@ class Display(BasePlot.BaseCanvas):
     def _draw_session_series(self):
 
         self.clear()
-        self.build_overlays()
+        # self.build_overlays()
         # print("drawing session series")
         if not isinstance(self.plot_data, plotdata_series.PlotData):
             raise ValueError(
@@ -690,7 +699,7 @@ class Display(BasePlot.BaseCanvas):
 
         self.plotting["visuals"]["session_hover_line"] = session_line
 
-        first_hover = visuals.Markers(
+        first_hover = Markers(
             parent=self.plot_root,
         )
 
@@ -703,7 +712,7 @@ class Display(BasePlot.BaseCanvas):
 
         self.plotting["visuals"]["session_hover_first"] = first_hover
 
-        second_hover = visuals.Markers(
+        second_hover = Markers(
             parent=self.plot_root_right,
         )
 
@@ -757,7 +766,7 @@ class Display(BasePlot.BaseCanvas):
     def _draw_scatter(self):
 
         self.clear()
-        self.build_overlays()
+        # self.build_overlays()
 
         if not isinstance(self.plot_data, plotdata_scatter.PlotData):
             raise ValueError(
@@ -796,20 +805,6 @@ class Display(BasePlot.BaseCanvas):
                 ),
             }
         )
-        # self.view.camera.set_range(
-        #     x=(
-        #         min(0, np.nanmin(self.plot_data.x)) * 1.1,
-        #         np.nanmax(self.plot_data.x) * 1.1,
-        #     ),
-        #     y=(
-        #         min(0, np.nanmin(self.plot_data.y)) * 1.1,
-        #         np.nanmax(self.plot_data.y) * 1.1,
-        #     ),
-        #     margin=0.0,
-        # )
-
-        # self.axes["x"]._view_changed()
-        # self.axes["y"]._view_changed()
 
         self._init_threshold_overlays(kind="scatter")
 
@@ -899,7 +894,16 @@ class Display(BasePlot.BaseCanvas):
         #         return
 
         idx = self.find_closest_visual(event.pos, requires_transform=True)
-        self.update_style(idx, "hovered")
+
+        if isinstance(self.plot_data, plotdata_histogram.PlotData):
+            self.update_style(idx, "hovered")
+
+        elif isinstance(self.plot_data, plotdata_scatter.PlotData):
+            self.signals.marker_hovered.emit(idx)
+
+        elif isinstance(self.plot_data, plotdata_series.PlotData):
+            self.update_session_series_hover(idx)
+
         self.handle_tooltip(idx)
 
         self._set_camera_interactive(True)
@@ -1121,7 +1125,6 @@ class Display(BasePlot.BaseCanvas):
     ) -> tuple[float, int] | None:
 
         x = np.asarray(series.session_ids, dtype=float)
-
         y = np.asarray(series.values, dtype=float)
 
         finite = np.isfinite(x) & np.isfinite(y)
@@ -1132,7 +1135,6 @@ class Display(BasePlot.BaseCanvas):
         cam_bounds = view.camera.rect
 
         dx = (x - data_pos[0]) / (cam_bounds.right - cam_bounds.left)
-
         dy = (y - data_pos[1]) / (cam_bounds.top - cam_bounds.bottom)
 
         d2 = dx * dx + dy * dy
@@ -1152,6 +1154,90 @@ class Display(BasePlot.BaseCanvas):
     ### ------------------------------------------------------- ###
     ### ------------------------ OUTPUT ----------------------- ###
     ### ======================================================= ###
+
+    def style_records(self, selection, style: str):
+
+        if self.plot_data is None or selection is None:
+            return []
+
+        # =========================================================
+        # Scatter:
+        # component selection -> matching marker IDs
+        #
+        # Keep all matching marker IDs together as ONE record,
+        # so BasePlot creates one batched Markers overlay rather
+        # than hundreds of individual Markers visuals.
+        # =========================================================
+
+        if isinstance(self.plot_data, plotdata_scatter.PlotData):
+
+            if not isinstance(selection, list):
+                selection = [selection]
+
+            marker_ids = self.plot_data.markers_matching_components(selection)
+
+            marker_ids = np.asarray(marker_ids, dtype=int)
+
+            if marker_ids.size == 0:
+                return []
+
+            return [marker_ids]
+
+        # =========================================================
+        # Histogram:
+        # local mouse hover supplies a bin index.
+        # =========================================================
+
+        if isinstance(self.plot_data, plotdata_histogram.PlotData):
+
+            if style != "hovered" or not isinstance(selection, numbers.Integral):
+                return []
+
+            bin_id = int(selection)
+
+            if (
+                bin_id not in self.plotting["data"]
+                or self.plot_data.bin_counts[bin_id] <= 0
+            ):
+                return []
+
+            return [self.plotting["data"][bin_id]]
+
+        return []
+
+    def plot_data_from_rec(
+        self,
+        rec,
+        style: str,
+    ) -> dict[str, np.ndarray]:
+
+        if isinstance(self.plot_data, plotdata_histogram.PlotData):
+
+            return {
+                "center": rec.center,
+                "width": rec.width,
+                "height": rec.height,
+            }
+
+        if isinstance(self.plot_data, plotdata_scatter.PlotData):
+
+            marker_ids = np.atleast_1d(np.asarray(rec, dtype=int))
+
+            pos = np.column_stack(
+                (self.plot_data.x[marker_ids], self.plot_data.y[marker_ids])
+            ).astype(np.float32)
+
+            plot_options = self.styles.get_plot_options(
+                style,
+                "marker",
+                0.7,
+                size=8.0,
+                edge_width=0.0,
+            )
+
+            return {"pos": pos, **plot_options}
+
+        return {}
 
     def highlight_visuals_from_selection(self):
         """
@@ -1236,86 +1322,86 @@ class Display(BasePlot.BaseCanvas):
 
         return colors
 
-    def highlight_markers_from_selection(self):
+    # def highlight_markers_from_selection(self):
 
-        if not isinstance(self.plot_data, plotdata_scatter.PlotData):
-            return
+    #     if not isinstance(self.plot_data, plotdata_scatter.PlotData):
+    #         return
 
-        if self.state.selected_components is None:
-            self.update_style(None, "selected")
-            return
+    #     if self.state.selected_components is None:
+    #         self.update_style(None, "selected")
+    #         return
 
-        markers = self.plot_data.markers_matching_components(
-            self.state.selected_components
-        )
-        self.update_style(markers, "selected")
+    #     markers = self.plot_data.markers_matching_components(
+    #         self.state.selected_components
+    #     )
+    #     self.update_style(markers, "selected")
 
-    def update_style(self, idx: Optional[int | np.ndarray] = None, style="default"):
+    # def update_style(self, idx: Optional[int | np.ndarray] = None, style="default"):
 
-        if isinstance(self.plot_data, plotdata_histogram.PlotData):
-            if not isinstance(idx, (numbers.Integral, type(None))):
-                raise ValueError(
-                    f"Expected idx to be an int or None for HistogramPlotData, but got {type(idx)}"
-                )
-            self.update_bin_style(idx, style)
-        elif isinstance(self.plot_data, plotdata_scatter.PlotData):
-            self.update_marker_style(idx, style)
-        elif isinstance(self.plot_data, plotdata_series.PlotData):
-            self.update_session_series_hover(idx)
-        else:
-            return
+    #     if isinstance(self.plot_data, plotdata_histogram.PlotData):
+    #         if not isinstance(idx, (numbers.Integral, type(None))):
+    #             raise ValueError(
+    #                 f"Expected idx to be an int or None for HistogramPlotData, but got {type(idx)}"
+    #             )
+    #         self.update_bin_style(idx, style)
+    #     elif isinstance(self.plot_data, plotdata_scatter.PlotData):
+    #         self.update_marker_style(idx, style)
+    #     elif isinstance(self.plot_data, plotdata_series.PlotData):
+    #         self.update_session_series_hover(idx)
+    #     else:
+    #         return
 
-    def update_bin_style(self, bin: Optional[int], style: str = "default"):
-        """Apply base/hover/selected colors to rectangle visuals."""
+    # def update_bin_style(self, bin: Optional[int], style: str = "default"):
+    #     """Apply base/hover/selected colors to rectangle visuals."""
 
-        assert isinstance(self.plot_data, plotdata_histogram.PlotData)
-        if style == "hovered":
-            rect = self.plotting["overlays"][style]
-            if rect is None:
-                return
+    #     assert isinstance(self.plot_data, plotdata_histogram.PlotData)
+    #     if style == "hovered":
+    #         rect = self.plotting["overlays"][style]
+    #         if rect is None:
+    #             return
 
-            if (
-                bin is None
-                or self.plotting["data"].get(bin, None) is None
-                or self.plot_data.bin_counts[bin] <= 0
-            ):
-                rect.visible = False
-                return
-            data = self.plotting["data"][bin]
+    #         if (
+    #             bin is None
+    #             or self.plotting["data"].get(bin, None) is None
+    #             or self.plot_data.bin_counts[bin] <= 0
+    #         ):
+    #             rect.visible = False
+    #             return
+    #         data = self.plotting["data"][bin]
 
-            rect.visible = True
-            rect.center = data.center
-            rect.width = data.width
-            rect.height = data.height
-            return
+    #         rect.visible = True
+    #         rect.center = data.center
+    #         rect.width = data.width
+    #         rect.height = data.height
+    #         return
 
-    def update_marker_style(
-        self, marker: Optional[int | np.ndarray], style: str = "default", update=True
-    ):
-        """Show highlight marker on points idx (or hide if idx is None)."""
+    # def update_marker_style(
+    #     self, marker: Optional[int | np.ndarray], style: str = "default", update=True
+    # ):
+    #     """Show highlight marker on points idx (or hide if idx is None)."""
 
-        assert isinstance(self.plot_data, plotdata_scatter.PlotData)
+    #     assert isinstance(self.plot_data, plotdata_scatter.PlotData)
 
-        # print(f"updating style '{style}' for marker: {marker}")
+    #     # print(f"updating style '{style}' for marker: {marker}")
 
-        self.plotting["overlays"][style].visible = False
-        if marker is None:
-            self.plotting["overlays"][style].set_data(
-                np.zeros((0, 2), dtype=np.float32)
-            )
-        else:
-            plot_options = self.styles.get_plot_options(
-                style, "marker", 0.7, size=8.0, edge_width=0.0  # , edge_color=None
-            )
+    #     self.plotting["overlays"][style].visible = False
+    #     if marker is None:
+    #         self.plotting["overlays"][style].set_data(
+    #             np.zeros((0, 2), dtype=np.float32)
+    #         )
+    #     else:
+    #         plot_options = self.styles.get_plot_options(
+    #             style, "marker", 0.7, size=8.0, edge_width=0.0  # , edge_color=None
+    #         )
 
-            pos = self.plot_data.pos_for_marker(marker)
-            self.plotting["overlays"][style].visible = True
+    #         pos = self.plot_data.pos_for_marker(marker)
+    #         self.plotting["overlays"][style].visible = True
 
-            data = np.column_stack(tuple(pos))
-            self.plotting["overlays"][style].set_data(
-                data,
-                **plot_options,
-            )
+    #         data = np.column_stack(tuple(pos))
+    #         self.plotting["overlays"][style].set_data(
+    #             data,
+    #             **plot_options,
+    #         )
 
     def _update_series_hover_line(self):
 
@@ -1469,7 +1555,11 @@ class Display(BasePlot.BaseCanvas):
         else:
             tooltip_text = "Unknown selection"
 
-        QToolTip.showText(QCursor.pos(), tooltip_text)
+        QToolTip.showText(
+            QCursor.pos(),
+            tooltip_text,
+            self.native,
+        )
 
     def _session_label(
         self,
@@ -1499,7 +1589,7 @@ class Display(BasePlot.BaseCanvas):
         self.plotting["visuals"] = {}
         self.plotting["data"] = {}
 
-        self.clear_overlays()
+        # self.clear_overlays()
 
         for axis in self.axes.values():
             axis.visible = False
@@ -1514,11 +1604,11 @@ class Display(BasePlot.BaseCanvas):
                 layer.destroy()
                 setattr(self, attr, None)
 
-    def clear_overlays(self):
-        for _, overlay in self.plotting["overlays"].items():
-            if overlay is None:
-                continue
-            overlay.visible = False
+    # def clear_overlays(self):
+    #     for _, overlay in self.plotting["overlays"].items():
+    #         if overlay is None:
+    #             continue
+    #         overlay.visible = False
 
     def _destroy_threshold_overlays(self):
 
@@ -1612,7 +1702,6 @@ class Display(BasePlot.BaseCanvas):
         self.error_overlay.move(max(0, x), max(0, y))
 
     def hide_plot_error(self):
-
         self.error_overlay.hide()
 
 
@@ -1624,13 +1713,13 @@ class Controller(BasePlot.CanvasController):
         super().__init__(*args, **kwargs)
 
         # Currently selected queries for each axis
-        self.current_query: dict[str, StatisticsData.StatisticQuery] = {
+        self.current_query: dict[str, StatisticsData.StatisticQuery | None] = {
             "x": None,
             "y": None,
             "y_2nd": None,
         }
 
-        self.current_results: dict[str, StatisticsTaskResult] = {
+        self.current_results: dict[str, StatisticsTaskResult | None] = {
             "x": None,
             "y": None,
             "y_2nd": None,
@@ -1652,10 +1741,96 @@ class Controller(BasePlot.CanvasController):
         self.current_plot_data = None
 
         self.state.tasks.task_progress.connect(self._on_task_progress)
-
         self.state.tasks.task_cancelled.connect(self._on_statistics_task_stopped)
-
         self.state.tasks.task_failed.connect(self._on_statistics_task_stopped)
+
+    # def _on_test_button_clicked(self):
+
+    #     if self.current_query["x"] is None:
+    #         return
+
+    #     # query = self.current_query["x"]  # Example: using the current x-axis query
+    #     condition_a = curation_filter.CurationFilterCondition(
+    #         query=self.current_query["x"],
+    #         threshold=ThresholdSpec(
+    #             value=2.5,
+    #             direction="less",
+    #             active=True,
+    #         ),
+    #     )
+    #     condition_b = curation_filter.CurationFilterCondition(
+    #         query=self.current_query["x"],
+    #         threshold=ThresholdSpec(
+    #             value=3.0,
+    #             direction="greater",
+    #             active=True,
+    #         ),
+    #     )
+
+    #     root = curation_filter.CurationFilterGroup(
+    #         operator="and",
+    #         match_level="footprint",
+    #         children=[
+    #             condition_a,
+    #             condition_b,
+    #         ],
+    #     )
+    #     evaluator = curation_filter.CurationFilterEvaluator(self.data.statistic_engine)
+
+    #     result_a = evaluator._evaluate_condition(condition_a)
+    #     result_b = evaluator._evaluate_condition(condition_b)
+
+    #     result = evaluator.evaluate(root)
+
+    #     print(
+    #         "footprint:",
+    #         len(result.neurons),
+    #         sorted(result.neurons)[:20],
+    #     )
+
+    #     print("A neurons:", len(result_a.neurons))
+    #     print("B neurons:", len(result_b.neurons))
+
+    #     print("A components:", len(result_a.components))
+    #     print("B components:", len(result_b.components))
+
+    #     print(
+    #         "neuron intersection:",
+    #         len(result_a.neurons & result_b.neurons),
+    #     )
+
+    #     print(
+    #         "component intersection:",
+    #         len(result_a.components & result_b.components),
+    #     )
+
+    #     print(result_a.table.dims)
+    #     print(result_a.table.refs.keys())
+
+    #     root = curation_filter.CurationFilterGroup(
+    #         operator="and",
+    #         match_level="neuron",
+    #         children=[
+    #             condition_a,
+    #             condition_b,
+    #         ],
+    #     )
+
+    #     # root = CurationFilterGroup(
+    #     #     operator="and",
+    #     #     children=[condition],
+    #     # )
+
+    #     evaluator = curation_filter.CurationFilterEvaluator(self.data.statistic_engine)
+
+    #     result = evaluator.evaluate(root)
+
+    #     print(
+    #         "neuron:",
+    #         len(result.neurons),
+    #         sorted(result.neurons)[:20],
+    #     )
+    #     # print(result)
 
     def build_controls(self):
         super().build_controls()
@@ -1672,6 +1847,10 @@ class Controller(BasePlot.CanvasController):
 
         self.section.x_options_layout.addWidget(self.controls["bin_label"])
         self.section.x_options_layout.addWidget(self.controls["bin_selector"])
+
+        # self.controls["test_button"] = QPushButton("Test Filter")
+        # self.section.x_options_layout.addWidget(self.controls["test_button"])
+        # self.controls["test_button"].clicked.connect(self._on_test_button_clicked)
 
         self.controls["x_selector"] = StatisticsData.StatisticQuerySelector(
             engine=self.data.statistic_engine, axis="x"
@@ -1700,13 +1879,10 @@ class Controller(BasePlot.CanvasController):
             lambda query: self._on_query_changed("y_2nd", query)
         )
 
-        self.controls["reset_view"] = QPushButton("Reset view")
-        self.controls["reset_view"].clicked.connect(self.canvas.reset_view_range)
-
-        self.section.y_options_layout.addWidget(self.controls["reset_view"])
         self.section.y_options_layout.addStretch()
 
         self.controls["bin_selector"].valueChanged.connect(self._on_plot_params_changed)
+        self.canvas.signals.marker_hovered.connect(self._on_marker_hovered)
         self.canvas.signals.marker_clicked.connect(self._on_visual_clicked)
         self.canvas.signals.bin_clicked.connect(self._on_visual_clicked)
 
@@ -1721,7 +1897,6 @@ class Controller(BasePlot.CanvasController):
 
     def _on_plot_params_changed(self):
         self.rebuild_plot()
-        # self.update_canvas()
 
     def _on_query_changed(self, which, query: StatisticsData.StatisticQuery):
 
@@ -1994,7 +2169,9 @@ class Controller(BasePlot.CanvasController):
         else:
             plot_type = None
 
-        self.plot_type = self.canvas.plot_type = plot_type
+        self.plot_type = plot_type
+
+        self.canvas.change_plot_type(plot_type)
 
     def rebuild_plot(self):
         """
@@ -2142,14 +2319,18 @@ class Controller(BasePlot.CanvasController):
 
         self._update_statistics_status()
 
-    def _on_selection_changed(self):
-        if self.current_plot_data is None:
-            return
-
-        self.canvas.highlight_visuals_from_selection()
-
     def update_canvas(self):
         self.canvas.set_plot_data(self.current_plot_data)
+
+        self.update_neuron_selection()
+
+    def update_neuron_selection(self):
+
+        if isinstance(self.current_plot_data, plotdata_histogram.PlotData):
+            self.canvas.highlight_bins_from_selection()
+
+        elif isinstance(self.current_plot_data, plotdata_scatter.PlotData):
+            self.update_styles()
 
     def _on_visual_clicked(self, idx: Optional[int], modifiers):
 
@@ -2175,6 +2356,25 @@ class Controller(BasePlot.CanvasController):
         ref_sets = self.current_plot_data.ref_sets_for_rows(rows)
 
         self._handle_picked_ref_sets(ref_sets, modifiers)
+
+    def _on_marker_hovered(self, marker_id):
+
+        plot_data = self.current_plot_data
+
+        if marker_id is None or not isinstance(plot_data, plotdata_scatter.PlotData):
+            self.state.update_hovered_components(None)
+            return
+
+        rows = plot_data.rows_for_markers(marker_id)
+
+        ref_sets = plot_data.ref_sets_for_rows(rows)
+
+        components = set()
+
+        for refs in ref_sets:
+            components.update(self._components_from_refs(refs))
+
+        self.state.update_hovered_components(list(components) if components else None)
 
     def _on_threshold_changed(self, spec: Threshold.ThresholdSpec):
         self._select_from_threshold()
@@ -2339,58 +2539,6 @@ class Controller(BasePlot.CanvasController):
             for session_id, neuron_id in component_keys
         ]
 
-    # def _handle_picked_refs(self, refs: dict[str, np.ndarray], modifiers):
-
-    #     if refs is None:
-    #         self.state.update_selected_components(None, modifiers)
-    #         return
-
-    #     components = []
-    #     # one value per neuron
-    #     if "neuron" in refs:
-    #         for i, neuron_id in enumerate(refs["neuron"]):
-    #             components.append(
-    #                 NeuronComponent(
-    #                     session_id=(
-    #                         refs["session"][i]
-    #                         if "session" in refs
-    #                         else self.state.current_session_id
-    #                     ),
-    #                     neuron_id=int(neuron_id),
-    #                 )
-    #             )
-
-    #     # one value per neuron pair
-    #     if "neuron_i" in refs or "neuron_j" in refs:
-    #         neuron_ids = []
-
-    #         if "neuron_i" in refs:
-    #             neuron_ids.append(refs["neuron_i"])
-
-    #         if "neuron_j" in refs:
-    #             neuron_ids.append(refs["neuron_j"])
-
-    #         neuron_ids = np.unique(np.concatenate(neuron_ids))
-    #         # print(f"Picked neuron IDs from pairs: {neuron_ids}")
-
-    #         for i, neuron_id in enumerate(neuron_ids):
-    #             components.append(
-    #                 NeuronComponent(
-    #                     session_id=(
-    #                         refs["session"][i]
-    #                         if "session" in refs
-    #                         else self.state.current_session_id
-    #                     ),
-    #                     neuron_id=int(neuron_id),
-    #                 )
-    #             )
-
-    #     if components:
-    #         # set() removes duplicates, list() keeps API simple
-    #         components = list({c for c in components if c is not None})
-    #         self.state.update_selected_components(components, modifiers)
-    #         return
-
     ### ================================================================== ###
     ### ================= CONTROL STATUS & ERROR DISPLAYS ================ ###
     ### ================================================================== ###
@@ -2530,11 +2678,10 @@ class Controller(BasePlot.CanvasController):
     def _on_session_changed(self):
         super()._on_session_changed()
 
-    def update_neuron_selection(self):
-        self.canvas.highlight_visuals_from_selection()
-
     def update_styles(self):
-        pass
+
+        if isinstance(self.current_plot_data, plotdata_scatter.PlotData):
+            super().update_styles()
 
 
 def _series_y_range(series: plotdata_series.SessionSeries, *, include_zero=True):

@@ -1,14 +1,14 @@
 import json, uuid
 import importlib
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QSplitter,
 )
 
-from catan.gui.plots import BasePlot
+from catan.gui.panels import BasePlot
 from catan.gui.structures import Data, AppState
 
 from .display_section import DisplaySection
@@ -47,7 +47,6 @@ class DisplayArea(QWidget):
         self.state: AppState = parent.state
         self.data: Data = parent.data
 
-        self.settings = QSettings()
         self.splitter_widgets = {}  # split_id -> QSplitter
         self.section_widgets = {}  # leaf_id -> DisplaySection
 
@@ -62,8 +61,8 @@ class DisplayArea(QWidget):
         self._collect_live_leaf_configs(self.tree)
         self._collect_splitter_sizes(self.tree)
 
-        self.settings.setValue("display/layout_tree", json.dumps(self.tree))
-        self.settings.sync()
+        self.state.settings.setValue("display/layout_tree", json.dumps(self.tree))
+        self.state.settings.sync()
 
     def _collect_live_leaf_configs(self, node):
         if node["type"] == "leaf":
@@ -208,7 +207,7 @@ class DisplayArea(QWidget):
     # ---------- settings ----------
 
     def _load_tree(self):
-        raw = self.settings.value("display/layout_tree", "", type=str)
+        raw = self.state.settings.value("display/layout_tree", "", type=str)
         # raw = None
         # print("loading:", raw)
         if not raw:

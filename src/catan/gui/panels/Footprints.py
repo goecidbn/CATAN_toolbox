@@ -5,24 +5,32 @@ from typing import Optional, Tuple, Dict
 from vispy import scene, color
 from vispy.scene import visuals, cameras
 from vispy.color import Colormap
+from vispy.scene.visuals import Mesh
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCursor, QAction
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QCheckBox,
     QLabel,
     QVBoxLayout,
+    QHBoxLayout,
     QWidget,
     QMenu,
     QPushButton,
+    QButtonGroup,
+    QFrame,
+    QFormLayout,
+    QToolButton,
+    QSlider,
 )
 
 import importlib
 
 from catan.core.structures import sessiondata_type
-from catan.gui.plots import BasePlot
-from catan.gui.plots.helper import FootprintSlider
+from catan.gui.panels import BasePlot
+from catan.gui.panels.helper import FootprintSlider
 from catan.gui.interaction import click_events
 
 from catan.gui.structures.state import NeuronComponent
@@ -30,16 +38,19 @@ from catan.gui.GUI_elements.utils.menu_creation import (
     get_colored_label,
     add_label_to_menu,
 )
+from catan.gui.GUI_elements.fragments.ResetViewButton import ResetViewButton
 
 from catan.core.image_correlation import calculate_img_correlation
 
 importlib.reload(FootprintSlider)
 
+CAMERA_PADDING_PX = 25.0
+
 
 @dataclass
 class FootprintRecord:
     key: Tuple[int, int]  # e.g. (session_id, footprint_id)
-
+    neuron: int
     vertex_start: int
     vertex_stop: int
     face_start: int
@@ -60,6 +71,11 @@ class NeuronRecord:
 
 class Display(BasePlot.BaseCanvas):
 
+    main_visual = Mesh
+    main_visual_name = "mesh"
+
+    overlays = ["focused", "highlighted", "hovered"]
+
     def __init__(self, display_section, controls, config=None):
         super().__init__(display_section, controls, config)
 
@@ -74,11 +90,91 @@ class Display(BasePlot.BaseCanvas):
 
         self.plot_root = scene.Node(parent=self.view.scene)
 
-        self.build_overlays()
+        self.reset_view_button = ResetViewButton(
+            self.native, (6, 50), lambda: self.reset_camera(full=True)
+        )
+
+        self.parameter_overlay = None
+        # self.session_filter_overlay = None
+
+        self.events.resize.connect(self._on_canvas_resize)
+
         self.clear()
         self.camera_set = False
 
         self.freeze()
+
+    def _on_canvas_resize(
+        self,
+        event=None,
+    ):
+        self._position_overlay_controls()
+
+    def _position_overlay_controls(self):
+
+        if self.parameter_overlay is None:
+            return
+
+        margin = 8
+        spacing = 6
+
+        palette = self.parameter_overlay
+
+        palette.adjustSize()
+
+        x = self.native.width() - palette.width() - margin
+
+        palette.move(max(margin, x), margin)
+
+        palette.raise_()
+
+        # session = self.session_filter_overlay
+
+        # if session is None or not session.isVisible():
+        #     return
+
+        # session.adjustSize()
+
+        # session_x = palette.x() - session.width() - spacing
+        # session_y = palette.y() + palette.toggle_button.height() + spacing
+
+        # session.move(max(margin, session_x), session_y)
+        # session.raise_()
+
+    def attach_parameter_overlay(self):
+        """
+        Attach the Footprints parameter widgets to the canvas after
+        Controller.build_controls() has created them.
+        """
+
+        parameter_overlay = self.controls.get("parameter")
+
+        if parameter_overlay is None:
+            return
+
+        self.parameter_overlay = parameter_overlay
+
+        self.parameter_overlay.setParent(self.native)
+        self.parameter_overlay.show()
+        self.parameter_overlay.raise_()
+
+        self.parameter_overlay.overlay_layout_changed.connect(
+            self._position_overlay_controls
+        )
+
+        if hasattr(self.parameter_overlay, "session_filter_overlay"):
+            self.session_filter_overlay = self.parameter_overlay.session_filter_overlay
+
+            self.session_filter_overlay.setParent(self.native)
+
+            # Respect current filter state.
+            self.session_filter_overlay.setVisible(
+                self.parameter_overlay.checkbox_session_only.isChecked()
+            )
+
+            self.session_filter_overlay.raise_()
+
+        self._position_overlay_controls()
 
     def clear(self):
 
@@ -99,31 +195,15 @@ class Display(BasePlot.BaseCanvas):
 
     def clear_highlights(self):
 
-        # for key in ["hovered", "focused", "highlighted"]:
-        #     self.plotting["overlays"][key].visible = False
-
-        for key, overlay in self.plotting["overlays"].items():
-            if overlay is None:
+        for style, visuals in self.plotting["overlays"].items():
+            if visuals is None:
                 continue
-            overlay.visible = False
-            # self.plotting["overlays"][key].visible = False
+            for visual in visuals:
+                if visual is None:
+                    continue
+                visual.visible = False
 
-    def build_overlays(self):
-
-        # for key in ["hovered", "focused", "highlighted"]:
-        for key in ["hovered", "focused", "highlighted"]:
-            self.plotting["overlays"][key] = visuals.Mesh(parent=self.plot_root)
-            self.plotting["overlays"][key].visible = False
-            self.plotting["overlays"][key].set_gl_state(
-                blend=True,
-                depth_test=False,
-                blend_func=("src_alpha", "one_minus_src_alpha"),
-            )
-        self.plotting["overlays"]["hovered"].order = 100
-        self.plotting["overlays"]["focused"].order = 80
-        self.plotting["overlays"]["highlighted"].order = 90
-
-    def plot_neurons(self, single=False, reset=False):
+    def plot_neurons(self, reset=False):
 
         # self.state.logger.debug(
         #     f"Plotting footprints for neurons: {self.state.selected_components}"
@@ -139,30 +219,32 @@ class Display(BasePlot.BaseCanvas):
         if self.data is None or self.state.selected_components is None:
             return
 
-        z_stretch = self.controls["parameter"].z_stretch_spin.value()
         self.state.timeit("Initial setup")
 
         ## identify the neurons thata should be plotted
         this_neuron = self.state.focused_component.neuron_id
-        if single:
-            session_only = self.controls["parameter"].checkbox_session_only.isChecked()
+
+        display_scope = self.controls["parameter"].display_scope
+        if display_scope == "adjacent":
+
+            adjacent_radius = self.controls["parameter"].adj_radius_spin.value()
 
             ## find closeby neurons
-            adjacent_radius = self.controls["parameter"].adj_radius_spin.value()
-            to_plot_neurons = []
-            if adjacent_radius > 1e-2:
-                # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
-                union_centroids = self.data.assignments.union.centroids
-                distances = np.linalg.norm(
-                    union_centroids - union_centroids[this_neuron],
-                    axis=1,
-                )
+            union_centroids = self.data.assignments.union.centroids
+            distances = np.linalg.norm(
+                union_centroids - union_centroids[this_neuron], axis=1
+            )
+            to_plot_neurons = np.where(distances <= adjacent_radius)[0]
 
-                adjacent_neurons = np.where(distances <= adjacent_radius)[0]
-                to_plot_neurons.extend(adjacent_neurons)
-        else:
-            session_only = False
+        elif display_scope == "selection":
             to_plot_neurons = [c.neuron_id for c in self.state.selected_components]
+        else:
+            raise ValueError(f"Unknown footprint display scope: " f"{display_scope!r}")
+
+        session_filter = self.controls["parameter"].checkbox_session_only.isChecked()
+        filter_focused = self.controls["parameter"].checkbox_filter_focused.isChecked()
+
+        z_stretch = self.controls["parameter"].z_stretch_spin.value()
 
         self.state.timeit("Found neurons to plot and calculated centroid ranges")
 
@@ -180,10 +262,10 @@ class Display(BasePlot.BaseCanvas):
                     z_stretch=z_stretch,
                 )
 
-            if neuron != this_neuron and session_only:
+            if session_filter and (neuron != this_neuron or filter_focused):
                 ## select subset of data for session-only display ...
 
-                session_id = self.controls["parameter"].session_index_spin.value()
+                session_id = int(self.controls["session_filter"].slider.value())
                 component = NeuronComponent(session_id, neuron)
 
                 rec = self.plotting["data"].get(component.id, None)
@@ -216,7 +298,7 @@ class Display(BasePlot.BaseCanvas):
             )
 
             ## plot the actual data
-            mesh = visuals.Mesh(
+            mesh = Mesh(
                 vertices=verts,
                 faces=faces,
                 **plot_options,
@@ -252,18 +334,16 @@ class Display(BasePlot.BaseCanvas):
         centroid_min = np.nanmin(union_centroids, axis=0)
         centroid_max = np.nanmax(union_centroids, axis=0)
 
-        distance_threshold = self.controls["parameter"].distance_spin.value()
-
         ## calculate ranges
         x_range = np.clip(
             np.array([centroid_min[0], centroid_max[0]])
-            + np.array([-distance_threshold, distance_threshold]),
+            + np.array([-CAMERA_PADDING_PX, CAMERA_PADDING_PX]),
             0,
             self.data.current_session.dims[1],
         )
         y_range = np.clip(
             np.array([centroid_min[1], centroid_max[1]])
-            + np.array([-distance_threshold, distance_threshold]),
+            + np.array([-CAMERA_PADDING_PX, CAMERA_PADDING_PX]),
             0,
             self.data.current_session.dims[0],
         )
@@ -346,6 +426,7 @@ class Display(BasePlot.BaseCanvas):
 
             self.plotting["data"][component.id] = FootprintRecord(
                 key=component.id,
+                neuron=neuron,
                 vertex_start=v0,
                 vertex_stop=v1,
                 face_start=f0,
@@ -370,8 +451,6 @@ class Display(BasePlot.BaseCanvas):
         )
 
         self.state.timeit("Added surfaces")
-
-        # return mesh
 
     def find_closest_component(self, mouse_pos) -> Optional[NeuronComponent]:
 
@@ -445,41 +524,13 @@ class Display(BasePlot.BaseCanvas):
 
         return np.array(neuron_ids), np.array(d[neuron_ids])
 
-    def update_style(self, component, style="default"):
+    def plot_data_from_rec(self, rec, style: str) -> dict[str, np.ndarray]:
 
-        if style == "selected":
-            return
-
-        if component is None:
-            self.plotting["overlays"][style].visible = False
-            self.update()
-            return
-
-        rec = self.plotting["data"].get(component.id, None)
-        if rec is None:
-            self.plotting["overlays"][style].visible = False
-            self.update()
-            return
-
-        verts = self.plotting["data"][component.neuron_id].mesh_vertices[
-            rec.vertex_start : rec.vertex_stop
-        ]
-        faces = (
-            self.plotting["data"][component.neuron_id].mesh_faces[
-                rec.face_start : rec.face_stop
-            ]
-            - rec.vertex_start
-        )
-
+        neuron_rec = self.plotting["data"][rec.neuron]
+        verts = neuron_rec.mesh_vertices[rec.vertex_start : rec.vertex_stop]
+        faces = neuron_rec.mesh_faces[rec.face_start : rec.face_stop] - rec.vertex_start
         cols = self.styles.get_color_array(style, verts[:, 2], alpha=0.6)
-        self.plotting["overlays"][style].set_data(
-            vertices=verts,
-            faces=faces,  # .astype(np.uint32),
-            vertex_colors=cols,
-        )
-        self.plotting["overlays"][style].visible = True
-
-        self.update()
+        return {"vertices": verts, "faces": faces, "vertex_colors": cols}
 
     def on_mouse_release(self, event):
 
@@ -770,8 +821,7 @@ class Display(BasePlot.BaseCanvas):
                 f"CAREFUL!! all references are f**cked up now, need to update all neurons"
             )
 
-        #### for now hardcoded true single mode, asa it can only be done in single mode
-        self.plot_neurons(single=True, reset=True)
+        self.plot_neurons(reset=True)
 
     def set_focused_footprint(self, component: NeuronComponent):
         self.state.focused_component = component
@@ -791,12 +841,10 @@ class Controller(BasePlot.CanvasController):
             self.section
         )
         self.section.x_options_layout.addWidget(self.controls["slider"])
-        # print("Added footprint slider to controls")
 
-        self.controls["parameter"] = FootprintParametersController(
-            self.section, single_mode=self.single_mode
-        )
-        self.section.y_options_layout.addWidget(self.controls["parameter"])
+        self.controls["parameter"] = FootprintParametersController(self.section)
+
+        self.canvas.attach_parameter_overlay()
 
         self.controls["parameter"].data_parameter_changed.connect(
             lambda: self.replot_neurons()
@@ -804,30 +852,62 @@ class Controller(BasePlot.CanvasController):
         self.controls["parameter"].display_parameter_changed.connect(
             lambda: self.update_neuron_selection()
         )
-        self.controls["parameter"].reset_camera_requested.connect(
-            lambda: self.canvas.reset_camera(full=True)
+
+        self.controls["session_filter"] = SessionFilterControl(self.section)
+
+        self.controls["session_filter"].hide()
+
+        self.section.y_options_layout.addWidget(
+            self.controls["session_filter"],
+            stretch=1,
+            alignment=Qt.AlignmentFlag.AlignHCenter,
         )
-        # self.controls["parameter"].session_only_changed.connect(
-        #     lambda: self._on_session_only_changed()
-        # )
+
+        self.controls["parameter"].session_only_changed.connect(
+            self._on_session_filter_toggled
+        )
+
+        self.controls["session_filter"].valueChanged.connect(
+            lambda _: self.update_neuron_selection()
+        )
 
     def _on_data_changed(self, input: Tuple[str, int]):
         if input[0] in ["sessions", "assignments"]:
             self.replot_neurons()
 
     def initialize_display(self):
-        if self.single_mode:
-            self.controls["parameter"].session_only_setup()
+        self._setup_session_filter()
 
         super().initialize_display()
 
     def _on_session_changed(self):
-        if self.single_mode:
-            self.controls["parameter"].session_only_setup()
+        self._setup_session_filter()
+
+        super()._on_session_changed()
 
     def _on_session_only_changed(self):
         # self.controls["parameter"]._on_session_only_changed()
         self.update_neuron_selection()
+
+    def _on_session_filter_toggled(self, active: bool):
+
+        self.controls["session_filter"].setVisible(active)
+        self.controls["session_filter"]._on_value_changed(self.state.current_session_id)
+
+        self.update_neuron_selection()
+
+    def _setup_session_filter(self):
+
+        if (
+            not hasattr(self.state, "assignments")
+            or self.state.current_session_id is None
+        ):
+            return
+
+        self.controls["session_filter"].set_sessions(
+            n_sessions=self.state.assignments.shape[1],
+            current_session=self.state.current_session_id,
+        )
 
     def _on_selection_changed(self):
         self.controls["slider"].update_setup()
@@ -838,28 +918,159 @@ class Controller(BasePlot.CanvasController):
         super()._on_focus_changed()
 
     def update_neuron_selection(self):
-        self.canvas.plot_neurons(single=self.single_mode)
+        self.canvas.plot_neurons()
         self.update_styles()
 
     def replot_neurons(self):
-        self.canvas.plot_neurons(single=self.single_mode, reset=True)
+        self.canvas.plot_neurons(reset=True)
         self.update_styles()
+
+
+class SessionFilterControl(QWidget):
+
+    valueChanged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.data = parent.data
+
+        self.setFixedWidth(50)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 4, 2, 4)
+        layout.setSpacing(4)
+
+        self.title = QLabel("Session")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.title)
+
+        self.value_label = QLabel("")
+        self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.slider = QSlider(Qt.Orientation.Vertical)
+
+        self.slider.setRange(0, 0)
+        self.slider.setSingleStep(1)
+        self.slider.setPageStep(1)
+
+        # Important:
+        # session 0 at the BOTTOM,
+        # increasing session IDs upward.
+        self.slider.setInvertedAppearance(False)
+        self.slider.setInvertedControls(False)
+
+        self.zero_label = QLabel("0")
+        self.zero_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        layout.addWidget(self.value_label)
+        layout.addWidget(
+            self.slider,
+            stretch=1,
+        )
+        layout.addWidget(self.zero_label)
+
+        self.slider.valueChanged.connect(self._on_value_changed)
+
+    def _on_value_changed(self, value: int):
+        self.value_label.setText(f"{value:d} / {len(self.data.sessions)}")
+        self.value_label.setToolTip(f"{self.data.sessions[value].name}")
+        self.valueChanged.emit(value)
+
+    def set_sessions(
+        self,
+        n_sessions: int,
+        current_session: int | None = None,
+    ):
+        if n_sessions <= 0:
+            self.slider.setRange(0, 0)
+            return
+
+        self.slider.setRange(0, n_sessions - 1)
+
+        if current_session is not None:
+            self.slider.setValue(int(current_session))
 
 
 class FootprintParametersController(QWidget):
 
     data_parameter_changed = Signal()
     display_parameter_changed = Signal()
-    session_only_changed = Signal()
+
+    overlay_layout_changed = Signal()
+
+    session_only_changed = Signal(bool)
     reset_camera_requested = Signal()
 
-    def __init__(self, parent, single_mode=False):
+    def __init__(self, parent):
         super().__init__(parent)
 
         self.state = parent.state
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Parameters"))
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(4, 4, 4, 4)
+        root_layout.setSpacing(3)
+
+        self.toggle_button = QToolButton()
+        self.toggle_button.setText("⚙")
+        self.toggle_button.setToolTip("Footprint display settings")
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(False)
+
+        root_layout.addWidget(
+            self.toggle_button,
+            alignment=Qt.AlignmentFlag.AlignRight,
+        )
+
+        self.parameter_body = QWidget()
+
+        form = QFormLayout(self.parameter_body)
+        form.setContentsMargins(8, 5, 8, 8)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(5)
+
+        root_layout.addWidget(self.parameter_body)
+
+        self.display_scope_group = QButtonGroup(self)
+        self.display_scope_group.setExclusive(True)
+
+        scope_widget = QWidget()
+        scope_layout = QHBoxLayout(scope_widget)
+        scope_layout.setContentsMargins(0, 0, 0, 0)
+        scope_layout.setSpacing(0)
+
+        self.scope_adjacent_button = QToolButton()
+        self.scope_adjacent_button.setText("Nearby")
+        self.scope_adjacent_button.setCheckable(True)
+        self.scope_adjacent_button.setProperty("footprintScope", "adjacent")
+        self.scope_adjacent_button.setObjectName("scopeLeft")
+        self.scope_adjacent_button.setMinimumWidth(70)
+
+        self.scope_selection_button = QToolButton()
+        self.scope_selection_button.setText("Selected")
+        self.scope_selection_button.setCheckable(True)
+        self.scope_selection_button.setProperty("footprintScope", "selection")
+        self.scope_selection_button.setObjectName("scopeRight")
+        self.scope_selection_button.setMinimumWidth(70)
+
+        self.display_scope_group.addButton(self.scope_adjacent_button)
+        self.display_scope_group.addButton(self.scope_selection_button)
+
+        scope_layout.addWidget(self.scope_adjacent_button)
+        scope_layout.addWidget(self.scope_selection_button)
+
+        self.scope_adjacent_button.setChecked(True)
+
+        form.addRow("Show", scope_widget)
+
+        ## add adjacency radius control
+        initial_adj_radius = 15
+        self.adj_radius_spin = QDoubleSpinBox()
+        self.adj_radius_spin.setDecimals(1)
+        self.adj_radius_spin.setRange(0.0, 50.0)
+        self.adj_radius_spin.setSingleStep(1.0)
+        self.adj_radius_spin.setValue(initial_adj_radius)
+        form.addRow("Adjacency", self.adj_radius_spin)
 
         ## add footprint threshold control
         initial_threshold = 0.1
@@ -868,20 +1079,7 @@ class FootprintParametersController(QWidget):
         self.threshold_spin.setRange(0.0, 1.0)
         self.threshold_spin.setSingleStep(0.01)
         self.threshold_spin.setValue(initial_threshold)
-
-        layout.addWidget(QLabel("Threshold"))
-        layout.addWidget(self.threshold_spin)
-
-        ## add distance threshold control
-        initial_distance = 25
-        self.distance_spin = QDoubleSpinBox()
-        self.distance_spin.setDecimals(0)
-        self.distance_spin.setRange(0.0, 100.0)
-        self.distance_spin.setSingleStep(5.0)
-        self.distance_spin.setValue(initial_distance)
-
-        layout.addWidget(QLabel("Distance (px)"))
-        layout.addWidget(self.distance_spin)
+        form.addRow("Threshold", self.threshold_spin)
 
         ## z_stretch control (for 3D visualization)
         initial_z_stretch = 5.0
@@ -890,116 +1088,176 @@ class FootprintParametersController(QWidget):
         self.z_stretch_spin.setRange(1.0, 10.0)
         self.z_stretch_spin.setSingleStep(0.5)
         self.z_stretch_spin.setValue(initial_z_stretch)
+        form.addRow("Z stretch", self.z_stretch_spin)
 
-        layout.addWidget(QLabel("Z Stretch"))
-        layout.addWidget(self.z_stretch_spin)
+        for spin in (
+            self.adj_radius_spin,
+            self.threshold_spin,
+            self.z_stretch_spin,
+        ):
+            spin.setFixedWidth(72)
 
-        ## add reset camera button
-        self.reset_camera_button = QPushButton("Reset Camera")
-        self.reset_camera_button.clicked.connect(
-            lambda: self.reset_camera_requested.emit()
-        )
-        layout.addWidget(self.reset_camera_button)
+        # layout.addWidget(QLabel("Adjacency (px)"))
+        # layout.addWidget(self.adj_radius_spin)
 
-        ## add adjacency radius control
-        if single_mode:
-            initial_adj_radius = 15
-            self.adj_radius_spin = QDoubleSpinBox()
-            self.adj_radius_spin.setDecimals(1)
-            self.adj_radius_spin.setRange(0.0, 50.0)
-            self.adj_radius_spin.setSingleStep(1.0)
-            self.adj_radius_spin.setValue(initial_adj_radius)
+        ## checkbox for toggling single session display
+        self.checkbox_session_only = QCheckBox("Session filter")
+        self.checkbox_session_only.setChecked(False)
+        form.addRow(self.checkbox_session_only)
 
-            layout.addWidget(QLabel("Adjacency radius (px)"))
-            layout.addWidget(self.adj_radius_spin)
+        self.checkbox_filter_focused = QCheckBox("Filter focused neuron")
+        self.checkbox_filter_focused.setChecked(False)
+        self.checkbox_filter_focused.setEnabled(False)
+        form.addRow(self.checkbox_filter_focused)
 
-            ## checkbox for toggling single session display
-            self.checkbox_session_only = QCheckBox("Show single session only")
-            self.checkbox_session_only.setCheckable(True)
-            self.checkbox_session_only.setChecked(False)
-
-            layout.addWidget(self.checkbox_session_only)
-
-            ## spinbox for selecting session index
-            self.session_index_spin = QDoubleSpinBox()
-            self.session_index_spin.setDecimals(0)
-            self.session_index_spin.setRange(0, 1)
-            self.session_index_spin.setSingleStep(1)
-            self.session_index_spin.setValue(0)
-
-            self.session_only_label = QLabel("Session index")
-            layout.addWidget(self.session_only_label)
-            layout.addWidget(self.session_index_spin)
-
-            self._on_session_only_changed()  # initial visibility
-
-        layout.addStretch()
+        self.display_scope_group.buttonClicked.connect(self._on_display_scope_changed)
 
         self.threshold_spin.valueChanged.connect(
             lambda: self.data_parameter_changed.emit()
         )
-        self.distance_spin.valueChanged.connect(
-            lambda: self.display_parameter_changed.emit()
-        )
         self.z_stretch_spin.valueChanged.connect(
             lambda: self.data_parameter_changed.emit()
         )
-        if single_mode:
-            self.adj_radius_spin.valueChanged.connect(
-                lambda: self.display_parameter_changed.emit()
-            )
-            self.checkbox_session_only.toggled.connect(
-                lambda: self._on_session_only_changed()
-            )
-            self.session_index_spin.valueChanged.connect(
-                lambda: self._on_session_only_changed()
-            )
+        self.adj_radius_spin.valueChanged.connect(
+            lambda: self.display_parameter_changed.emit()
+        )
+        self.checkbox_session_only.toggled.connect(self._on_session_only_changed)
+
+        self.checkbox_filter_focused.toggled.connect(
+            lambda: self.display_parameter_changed.emit()
+        )
+
+        self.parameter_body.setVisible(False)
+
+        self.toggle_button.toggled.connect(self._set_expanded)
+
+        self.setObjectName("footprintParameterOverlay")
+
+        self.setStyleSheet("""
+            QWidget#footprintParameterOverlay {
+                background: rgba(35, 39, 45, 235);
+                border: 1px solid #59616c;
+                border-radius: 6px;
+            }
+
+            QWidget#footprintParameterOverlay QLabel,
+            QWidget#footprintParameterOverlay QCheckBox {
+                color: #e8eaed;
+                border: none;
+            }
+
+            QWidget#footprintParameterOverlay QToolButton {
+                color: #e8eaed;
+                background: #343941;
+                border: 1px solid #59616c;
+                border-radius: 4px;
+                padding: 3px 6px;
+            }
+
+            QWidget#footprintParameterOverlay QToolButton:hover {
+                background: #414751;
+            }
+
+            QToolButton:checked {
+                background: #59616c;
+                border: 1px solid #8a96a6;
+            }
+
+            QWidget#footprintParameterOverlay QToolButton#scopeLeft,
+            QWidget#footprintParameterOverlay QToolButton#scopeRight {
+                color: #e8eaed;
+                background: #444a53;
+
+                border: 1px solid #69727f;
+
+                padding: 5px 8px;
+                min-height: 22px;
+            }
+
+            /* Only the outside edges are rounded */
+            QWidget#footprintParameterOverlay QToolButton#scopeLeft {
+                border-top-left-radius: 15px;
+                border-bottom-left-radius: 15px;
+
+                border-top-right-radius: 0px;
+                border-bottom-right-radius: 0px;
+
+                /* avoid doubled border in the middle */
+                border-right-width: 0px;
+            }
+
+            QWidget#footprintParameterOverlay QToolButton#scopeRight {
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
+
+                border-top-right-radius: 15px;
+                border-bottom-right-radius: 15px;
+            }
+
+            /* "popped out" */
+            QWidget#footprintParameterOverlay QToolButton#scopeLeft:!checked,
+            QWidget#footprintParameterOverlay QToolButton#scopeRight:!checked {
+                background: #4a515b;
+                border-style: outset;
+            }
+
+            /* "pushed in" */
+            QWidget#footprintParameterOverlay QToolButton#scopeLeft:checked,
+            QWidget#footprintParameterOverlay QToolButton#scopeRight:checked {
+                background: #2d3239;
+
+                border-color: #363b42;
+                border-style: inset;
+
+                color: #ffffff;
+
+                /* subtle physical displacement */
+                padding-top: 6px;
+                padding-bottom: 4px;
+            }
+
+            /* Optional hover only for the unselected half */
+            QWidget#footprintParameterOverlay QToolButton#scopeLeft:!checked:hover,
+            QWidget#footprintParameterOverlay QToolButton#scopeRight:!checked:hover {
+                background: #555d68;
+            }
+        """)
 
         # self.controller_layout = layout
 
+    @property
+    def display_scope(self) -> str:
+
+        button = self.display_scope_group.checkedButton()
+
+        if button is None:
+            return "adjacent"
+
+        return button.property("footprintScope")
+
+    def _on_display_scope_changed(
+        self,
+        button,
+    ):
+
+        adjacent = self.display_scope == "adjacent"
+        self.adj_radius_spin.setEnabled(adjacent)
+        self.display_parameter_changed.emit()
+
+    def _set_expanded(self, expanded: bool):
+        self.parameter_body.setVisible(expanded)
+
+        self.adjustSize()
+
+        self.overlay_layout_changed.emit()
+
     def _on_session_only_changed(self):
 
-        self.session_index_spin.setVisible(self.checkbox_session_only.isChecked())
-        self.session_index_spin.setEnabled(self.checkbox_session_only.isChecked())
+        active = self.checkbox_session_only.isChecked()
 
-        self.session_only_label.setVisible(self.checkbox_session_only.isChecked())
-
-    def session_only_setup(self):
-
-        if (
-            not hasattr(self.state, "assignments")
-            or self.state.current_session_id is None
-        ):
-            return
-        self.session_index_spin.setRange(0, self.state.assignments.shape[1] - 1)
-        self.session_index_spin.setValue(self.state.current_session_id)
-
-        # if self.checkbox_session_only.isChecked():
-        #     if hasattr(self, "session_index_spin"):
-        #         return  # already exists
-
-        #     ## spinbox for selecting session index
-        #     self.session_index_spin = QDoubleSpinBox()
-        #     self.session_index_spin.setDecimals(0)
-        #     self.session_index_spin.setRange(0, self.state.assignments.shape[1])
-        #     self.session_index_spin.setSingleStep(1)
-        #     self.session_index_spin.setValue(self.state.current_session_id or 0)
-
-        #     self.session_only_label = QLabel("Session index")
-        #     self.controller_layout.addWidget(self.session_only_label)
-        #     self.controller_layout.addWidget(self.session_index_spin)
-
-        #     self.session_index_spin.valueChanged.connect(
-        #         lambda: self.session_only_changed.emit()
-        #     )
-        # else:
-        #     if hasattr(self, "session_index_spin"):
-        #         self.controller_layout.removeWidget(self.session_only_label)
-        #         self.session_only_label.deleteLater()
-        #         del self.session_only_label
-        #         self.controller_layout.removeWidget(self.session_index_spin)
-        #         self.session_index_spin.deleteLater()
-        #         del self.session_index_spin
+        self.checkbox_filter_focused.setEnabled(active)
+        self.session_only_changed.emit(active)
+        self.display_parameter_changed.emit()
 
 
 def add_surface_to_mesh(vertices_all, faces_all, colors_all, X, Y, Z, rgba):

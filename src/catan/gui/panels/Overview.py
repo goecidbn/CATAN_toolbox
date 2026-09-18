@@ -6,6 +6,7 @@ import numpy as np
 from scipy import sparse
 from vispy import scene, color
 from vispy.scene import visuals
+from vispy.scene.visuals import Markers, Image, Rectangle, Text
 
 from PySide6.QtWidgets import (
     QComboBox,
@@ -17,11 +18,11 @@ from PySide6.QtWidgets import (
 
 
 from catan.gui.structures.state import NeuronComponent
-from catan.gui.plots import BasePlot
+from catan.gui.panels import BasePlot
 from catan.gui.interaction import click_events
 
 from catan.gui.data.statistics.dimensions import SESSION_DIMS, neuron_bound_dim
-from catan.gui.plots.StatisticsData import StatisticQuerySelector
+from catan.gui.panels.StatisticsData import StatisticQuerySelector
 
 STATISTIC_CMAPS = {
     "viridis": "viridis",
@@ -51,6 +52,12 @@ class OverviewRecord:
 
 
 class Display(BasePlot.BaseCanvas):
+
+    main_visual = Markers
+    main_visual_name = "marker"
+
+    overlays = ["selected", "focused", "highlighted", "hovered"]
+
     def __init__(self, parent, controls, config=None):
         super().__init__(parent, controls, config)
 
@@ -103,7 +110,7 @@ class Display(BasePlot.BaseCanvas):
         cbar_hmargin = 15
         cbar_vmargin = 10
 
-        self.statistic_colorbar_bg = visuals.Rectangle(
+        self.statistic_colorbar_bg = Rectangle(
             center=(cbar_center[0], cbar_center[1] + 15),
             width=cbar_size[0] + 2 * cbar_hmargin,
             height=cbar_size[1] + 2 * cbar_vmargin + 30,
@@ -148,7 +155,7 @@ class Display(BasePlot.BaseCanvas):
         self._cbar_low_reset_pos = (left + 22, label_y - 11)
         self._cbar_high_reset_pos = (right + 6, label_y - 11)
 
-        self.statistic_colorbar_low = visuals.Text(
+        self.statistic_colorbar_low = Text(
             "",
             pos=self._cbar_low_label_pos,
             # pos=(
@@ -162,7 +169,7 @@ class Display(BasePlot.BaseCanvas):
             parent=self.scene,
         )
 
-        self.statistic_colorbar_high = visuals.Text(
+        self.statistic_colorbar_high = Text(
             "",
             pos=self._cbar_high_label_pos,
             # pos=(
@@ -176,7 +183,7 @@ class Display(BasePlot.BaseCanvas):
             parent=self.scene,
         )
 
-        self.statistic_colorbar_title = visuals.Text(
+        self.statistic_colorbar_title = Text(
             "",
             pos=(cbar_center[0], cbar_center[1] + label_y_offset + 10),
             anchor_x="center",
@@ -186,7 +193,7 @@ class Display(BasePlot.BaseCanvas):
             parent=self.scene,
         )
 
-        self.statistic_colorbar_low_reset = visuals.Text(
+        self.statistic_colorbar_low_reset = Text(
             "×",
             pos=self._cbar_low_reset_pos,
             anchor_x="center",
@@ -196,7 +203,7 @@ class Display(BasePlot.BaseCanvas):
             parent=self.scene,
         )
 
-        self.statistic_colorbar_high_reset = visuals.Text(
+        self.statistic_colorbar_high_reset = Text(
             "×",
             pos=self._cbar_high_reset_pos,
             anchor_x="center",
@@ -223,23 +230,26 @@ class Display(BasePlot.BaseCanvas):
 
     def initialize_overlays(self):
 
-        for style in self.plotting["overlays"]:
-            self.plotting["overlays"][style] = visuals.Markers(
-                parent=self.plot_root,
-                scaling="scene",
-                symbol="square",
-            )
-            self.plotting["overlays"][style].set_gl_state(
-                depth_test=False,
-                blend=True,
-                blend_func=("src_alpha", "one_minus_src_alpha"),
-            )
-            self.plotting["overlays"][style].visible = False
+        for style in ["selected", "focused", "highlighted", "hovered"]:
+            self.add_overlay(style)
 
-        self.plotting["overlays"]["hovered"].order = 100
-        self.plotting["overlays"]["highlighted"].order = 90
-        self.plotting["overlays"]["focused"].order = 80
-        self.plotting["overlays"]["selected"].order = 70
+        #     self.plotting["overlays"][style] = Markers(
+        #         parent=self.plot_root,
+        #         scaling="scene",
+        #         symbol="square",
+        #     )
+        #     self.plotting["overlays"][style].set_gl_state(
+        #         blend=True,
+        #         depth_test=False,
+        #         blend_func=("src_alpha", "one_minus_src_alpha"),
+        #     )
+        #     self.plotting["overlays"][style].visible = False
+
+        # print(f"current overlays: {self.plotting['overlays']}")
+        # self.plotting["overlays"]["hovered"].order = 100
+        # self.plotting["overlays"]["highlighted"].order = 90
+        # self.plotting["overlays"]["focused"].order = 80
+        # self.plotting["overlays"]["selected"].order = 70
 
     def plot_background(self):
 
@@ -256,9 +266,9 @@ class Display(BasePlot.BaseCanvas):
             return
 
         background /= np.percentile(background, 90)
-        self.plotting["background"] = visuals.Image(
+        self.plotting["background"] = Image(
             background.astype(np.float32),  # .T,
-            cmap="viridis",
+            cmap="grays",
             method="subdivide",
             parent=self.plot_root,
         )
@@ -353,7 +363,7 @@ class Display(BasePlot.BaseCanvas):
             if key in self.plotting["visuals"]:
                 continue
 
-            footprints = visuals.Markers(
+            footprints = Markers(
                 parent=self.plot_root,
                 scaling="scene",
                 symbol="square",
@@ -410,7 +420,11 @@ class Display(BasePlot.BaseCanvas):
             if with_union
             else {k: v for k, v in self.plotting["data"].items() if k == "union"}
         )
-        self.clean_highlight()
+        # self.clear_overlays()
+
+    # def clear_overlays(self):
+    #     super().clear_overlays()
+    #     self.initialize_overlays()
 
     ### ==================================================================== ###
     ### ======================= STATISTICS SECTION ========================= ###
@@ -1010,8 +1024,10 @@ class Display(BasePlot.BaseCanvas):
 
     def update_style(self, component, style="default"):
 
+        visuals = self.plotting["overlays"].get(style, [])
         if component is None:
-            self.plotting["overlays"][style].visible = False
+            for vis in visuals:
+                vis.visible = False
             self.update()
             return
 
@@ -1025,14 +1041,14 @@ class Display(BasePlot.BaseCanvas):
 
         if key is None:
             ## can happen on session unregistration
-            self.plotting["overlays"][style].visible = False
+            self.plotting["overlays"][style][0].visible = False
             self.update()
             return
 
         neuron_ids = [c.neuron_id for c in component]
         mask = np.isin(self.plotting["data"][key].ids, neuron_ids)
         if not np.any(mask):
-            self.plotting["overlays"][style].visible = False
+            self.plotting["overlays"][style][0].visible = False
             self.update()
             return
         vals = self.plotting["data"][key].vals[mask]
@@ -1040,11 +1056,11 @@ class Display(BasePlot.BaseCanvas):
 
         plot_options = self.styles.get_plot_options(style, "marker", vals, edge_width=0)
 
-        self.plotting["overlays"][style].set_data(
+        self.plotting["overlays"][style][0].set_data(
             self.plotting["data"][key].pos[mask].astype(np.float32),
             **plot_options,
         )
-        self.plotting["overlays"][style].visible = True
+        self.plotting["overlays"][style][0].visible = True
         self.update()
 
     def find_closest_component(self, mouse_pos) -> Optional[NeuronComponent]:

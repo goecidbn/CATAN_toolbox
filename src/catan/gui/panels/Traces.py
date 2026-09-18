@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from vispy import scene, color
 from vispy.scene import visuals
+from vispy.scene.visuals import Line, Text
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -16,20 +17,32 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from catan.gui.plots import BasePlot
+from catan.gui.panels import BasePlot
 
 from catan.gui.structures.state import NeuronComponent
 from catan.gui.interaction import click_events
 
-from catan.gui.plots.helper.FootprintSlider import (
+from catan.gui.panels.helper.FootprintSlider import (
     FootprintSliderController,
 )
-from catan.gui.plots.helper.cameras import (
+from catan.gui.panels.helper.cameras import (
     XOnlyLockedPanZoomCamera,
 )
 
 
+@dataclass
+class TraceRecord:
+    key: Tuple[int | None, int | None]
+    pos: np.ndarray
+
+
 class Display(BasePlot.BaseCanvas):
+
+    main_visual = Line
+    main_visual_name: str = "line"
+
+    overlays = ["focused", "highlighted", "hovered"]
+
     def __init__(self, parent, controls, config=None):
         super().__init__(parent, controls, config)
 
@@ -45,7 +58,6 @@ class Display(BasePlot.BaseCanvas):
 
         self.changes_on_click = "highlighted"  # or "highlighted" or "selected"
 
-        self.build_overlays()
         self.clear()
         self.freeze()
 
@@ -93,7 +105,7 @@ class Display(BasePlot.BaseCanvas):
         for key, opt in trace_options.items():
             if not opt.isChecked():
                 continue
-            self.labels[key] = visuals.Text(
+            self.labels[key] = Text(
                 key,
                 pos=[0, -offset + 0.5 * self.trace_distance],
                 anchor_x="left",
@@ -104,29 +116,34 @@ class Display(BasePlot.BaseCanvas):
             offset += self.trace_distance
             # self.labels[key].set_visible(False)
 
-    def build_overlays(self):
+    # def build_overlays(self):
 
-        for style in ["hovered", "focused", "highlighted"]:
+    #     for style in ["hovered", "focused", "highlighted"]:
 
-            plot_options = self.styles.get_plot_options(style, "line", values=0.7)
-            # cmap = color.get_colormap(display_style[style]["cmap"])
-            # color_array = cmap.map(np.array([0.7], dtype=np.float32))
+    #         plot_options = self.styles.get_plot_options(style, "line", values=0.7)
 
-            self.plotting["overlays"][style] = visuals.Line(
-                **plot_options,
-                # color=color_array,
-                # width=display_style[style]["width"],
-                parent=self.plot_root,
-            )
-            self.plotting["overlays"][style].visible = False
-            self.plotting["overlays"][style].set_gl_state(
-                blend=True,
-                depth_test=False,
-                blend_func=("src_alpha", "one_minus_src_alpha"),
-            )
-        self.plotting["overlays"]["hovered"].order = 100
-        self.plotting["overlays"]["focused"].order = 80
-        self.plotting["overlays"]["highlighted"].order = 90
+    #         n_overlays = 2 if style == "highlighted" else 1
+    #         self.plotting["overlays"][style] = [None] * n_overlays
+
+    #         for n in range(n_overlays):
+    #             vis = visuals.Line(
+    #                 **plot_options,
+    #                 parent=self.plot_root,
+    #             )
+    #             vis.visible = False
+    #             vis.set_gl_state(
+    #                 blend=True,
+    #                 depth_test=False,
+    #                 blend_func=("src_alpha", "one_minus_src_alpha"),
+    #             )
+    #             if style == "focused":
+    #                 vis.order = 80
+    #             elif style == "highlighted":
+    #                 vis.order = 90
+    #             elif style == "hovered":
+    #                 vis.order = 100
+
+    #             self.plotting["overlays"][style][n] = vis
 
     def plot_single_trace(self, component: NeuronComponent, offset, height=1.0, f=15.0):
 
@@ -185,7 +202,7 @@ class Display(BasePlot.BaseCanvas):
             colors=self.state.session_colors[session_id],
         )
 
-        line = visuals.Line(
+        line = Line(
             parts,
             **plot_options,
             parent=self.plot_root,
@@ -196,6 +213,7 @@ class Display(BasePlot.BaseCanvas):
             blend_func=("src_alpha", "one_minus_src_alpha"),
         )
 
+        self.plotting["data"][component.id] = TraceRecord(component.id, line.pos)
         self.plotting["visuals"][component.id] = line
 
     def plot_neurons(self, max_components=10):
@@ -241,6 +259,9 @@ class Display(BasePlot.BaseCanvas):
 
         height = 1.0 / len(to_plot_components)
         for n, component in enumerate(to_plot_components):
+
+            if component.session_id is None:
+                continue
 
             if not self.data.sessions[component.session_id].traces:
                 continue
@@ -293,48 +314,29 @@ class Display(BasePlot.BaseCanvas):
 
         return None
 
-    def update_style(self, component, style="default"):
-
-        if style == "selected":
-            return
-
-        if component is None:
-            self.plotting["overlays"][style].visible = False
-            self.update()
-            return
-
-        if (trace := self.plotting["visuals"].get(component.id)) is None:
-            return
-
-        self.plotting["overlays"][style].set_data(pos=trace.pos)
-        self.plotting["overlays"][style].visible = True
-
-        self.update()
+    def plot_data_from_rec(self, rec, style: str) -> dict[str, np.ndarray]:
+        plot_options = self.styles.get_plot_options(style, "line", values=0.7)
+        return {"pos": rec.pos, **plot_options}
 
     def clear_labels(self):
 
         for child in list(self.plot_root.children):
-            if isinstance(child, visuals.Text):
+            if isinstance(child, Text):
                 child.parent = None
         self.labels = {}
 
     def clear_traces(self):
         for visual in self.plotting["visuals"].values():
             visual.parent = None
-        for visual in self.plotting["overlays"].values():
-            if visual is not None:
-                visual.visible = False
-
         self.plotting["visuals"] = {}
-
-        self._selected = None
-        self._hovered = None
+        self.plotting["data"] = {}
 
     def clear(self):
         # for child in list(self.plot_root.children):
         # child.parent = None
         self.clear_labels()
         self.clear_traces()
+        self.clear_overlays()
 
 
 class Controller(BasePlot.CanvasController):

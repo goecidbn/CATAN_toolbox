@@ -432,80 +432,174 @@ class PickTable:
         include_self_pairs: bool = True,
     ) -> np.ndarray:
         """
-        Find PickTable rows corresponding to a list of NeuronComponent objects.
+        Find PickTable rows corresponding to NeuronComponents.
 
-        A row matches a component if:
-        - a neuron dimension is present/fixed and matches component.neuron_id
-        - and, if a session dimension is present/fixed, it matches component.session_id
+        session_id=None means that the component represents the tracked
+        neuron independent of session and therefore acts as a wildcard
+        for session matching.
 
-        If the session dimension was reduced, the session is not used as a filter.
+        Pair semantics:
+        - one selected neuron:
+            match pairs involving that neuron
+        - multiple selected neurons:
+            match only pairs whose members are both represented in the
+            selection
         """
 
         if not components:
             return np.asarray([], dtype=int)
 
-        selected_neurons = np.asarray(
-            sorted({int(c.neuron_id) for c in components}),
-            dtype=int,
-        )
+        components = list(components)
 
-        selected_sessions = np.asarray(
-            sorted({int(c.session_id) for c in components}),
-            dtype=int,
-        )
+        selected_neurons = {
+            int(component.neuron_id)
+            for component in components
+        }
 
         neuron_arrays = self._available_neuron_arrays()
-        session_arrays = self._available_session_arrays()
 
-        has_neuron_context = len(neuron_arrays) > 0
-        has_session_context = len(session_arrays) > 0
-
-        if not has_neuron_context and not has_session_context:
+        if not neuron_arrays:
             return np.asarray([], dtype=int)
 
-        mask = np.zeros(self.n_rows, dtype=bool)
+        def component_mask(
+            neuron_values,
+            session_arrays,
+        ):
+            """
+            Rows on one semantic neuron axis matching at least one
+            selected component.
+            """
 
-        is_pairwise = len(neuron_arrays) >= 2
+            neuron_values = np.asarray(neuron_values)
 
-        if not is_pairwise:
-            # Ordinary neuron-wise statistic
-            mask = np.isin(neuron_arrays[0], selected_neurons)
+            mask = np.zeros(
+                self.n_rows,
+                dtype=bool,
+            )
 
-        else:
-            if len(selected_neurons) == 1:
-                # One selected neuron:
-                # highlight all pairs involving this neuron.
-                mask = np.zeros(self.n_rows, dtype=bool)
+            for component in components:
 
-                for arr in neuron_arrays:
-                    mask |= arr == selected_neurons[0]
+                component_mask = (
+                    neuron_values
+                    == int(component.neuron_id)
+                )
 
-            else:
-                # Two or more selected neurons:
-                # highlight only interactions among selected neurons.
-                mask = np.ones(self.n_rows, dtype=bool)
+                # None = tracked-neuron identity,
+                # independent of session.
+                if (
+                    use_session_filter
+                    and component.session_id is not None
+                    and session_arrays
+                ):
 
-                for arr in neuron_arrays:
-                    mask &= np.isin(arr, selected_neurons)
+                    session_mask = np.zeros(
+                        self.n_rows,
+                        dtype=bool,
+                    )
 
-                if not include_self_pairs and len(neuron_arrays) == 2:
-                    mask &= neuron_arrays[0] != neuron_arrays[1]
+                    for session_values in session_arrays:
+                        session_mask |= (
+                            np.asarray(session_values)
+                            == int(component.session_id)
+                        )
 
-        if use_session_filter:
+                    component_mask &= session_mask
+
+                mask |= component_mask
+
+            return mask
+
+        # ============================================================
+        # Ordinary neuron-wise statistic
+        # ============================================================
+
+        if len(neuron_arrays) == 1:
+
             session_arrays = []
 
-            for dim_name in ("session", "session_i", "session_j"):
-                arr = self._values_for_dim(dim_name)
-                if arr is not None:
-                    session_arrays.append(arr)
+            if use_session_filter:
 
-            if session_arrays:
-                session_mask = np.zeros(self.n_rows, dtype=bool)
+                # An ordinary neuron may occur with either one session
+                # dimension or a session pair.
+                for dim_name in (
+                    "session",
+                    "session_i",
+                    "session_j",
+                ):
+                    values = self._values_for_dim(
+                        dim_name
+                    )
 
-                for arr in session_arrays:
-                    session_mask |= np.isin(arr, selected_sessions)
+                    if values is not None:
+                        session_arrays.append(
+                            values
+                        )
 
-                mask &= session_mask
+            mask = component_mask(
+                neuron_arrays[0],
+                session_arrays,
+            )
+
+            return np.flatnonzero(mask)
+
+        # ============================================================
+        # Pairwise neuron statistic
+        # ============================================================
+
+        neuron_i, neuron_j = neuron_arrays[:2]
+
+        if use_session_filter:
+
+            session_i = self._values_for_dim(
+                "session_i"
+            )
+            session_j = self._values_for_dim(
+                "session_j"
+            )
+
+            # _values_for_dim() also resolves collapsed/shared
+            # session dimensions where applicable.
+            sessions_i = (
+                [session_i]
+                if session_i is not None
+                else []
+            )
+
+            sessions_j = (
+                [session_j]
+                if session_j is not None
+                else []
+            )
+
+        else:
+            sessions_i = []
+            sessions_j = []
+
+        mask_i = component_mask(
+            neuron_i,
+            sessions_i,
+        )
+
+        mask_j = component_mask(
+            neuron_j,
+            sessions_j,
+        )
+
+        if len(selected_neurons) == 1:
+
+            # A single selected neuron highlights all interactions
+            # involving that neuron.
+            mask = mask_i | mask_j
+
+        else:
+
+            # Multiple selected neurons:
+            # both sides of the interaction must belong to the
+            # selected component set.
+            mask = mask_i & mask_j
+
+            if not include_self_pairs:
+                mask &= neuron_i != neuron_j
 
         return np.flatnonzero(mask)
 

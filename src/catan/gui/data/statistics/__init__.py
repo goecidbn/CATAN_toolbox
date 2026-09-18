@@ -1,5 +1,6 @@
 from .engine import StatisticEngine
 from .table import PickTable
+from .queries import StatisticQuery
 from .types import (
     StatisticArray,
     StatisticDefinition,
@@ -10,6 +11,7 @@ from .types import (
 __all__ = [
     "StatisticEngine",
     "PickTable",
+    "StatisticQuery",
     "StatisticArray",
     "StatisticDefinition",
     "StatisticCategory",

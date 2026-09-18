@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "name": "CATAN default",
+  "root": {
+    "type": "group",
+    "id": "741d3e09c1de439e8d639c1b0384073d",
+    "operator": "and",
+    "match_level": "footprint",
+    "children": [
+      {
+        "type": "condition",
+        "id": "a5ef6457436b4567aeb42934ed45c3aa",
+        "query": {
+          "statistic_key": "border_proximity",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic"
+        },
+        "threshold": {
+          "value": 5.0,
+          "direction": "less",
+          "active": true
+        }
+      }
+    ]
+  }
+}

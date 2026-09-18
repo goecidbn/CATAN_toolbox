@@ -17,12 +17,10 @@ class IOBackend(ABC):
     file_format: FileFormat
 
     @abstractmethod
-    def open_read(self, path: str | Path) -> AbstractContextManager[Any]:
-        ...
+    def open_read(self, path: str | Path) -> AbstractContextManager[Any]: ...
 
     @abstractmethod
-    def open_write(self, path: str | Path) -> AbstractContextManager[Any]:
-        ...
+    def open_write(self, path: str | Path) -> AbstractContextManager[Any]: ...
 
     def load(
         self,
@@ -61,20 +59,16 @@ class IOBackend(ABC):
         *,
         key: str | None,
         root: str,
-    ) -> dict[str, Any]:
-        ...
+    ) -> dict[str, Any]: ...
 
     @abstractmethod
-    def write_entry(self, ref: Any, entry: SaveEntry, *, root: str) -> None:
-        ...
+    def write_entry(self, ref: Any, entry: SaveEntry, *, root: str) -> None: ...
 
     @abstractmethod
-    def load_all(self, ref: Any, *, root: str = "/") -> dict[str, Any]:
-        ...
+    def load_all(self, ref: Any, *, root: str = "/") -> dict[str, Any]: ...
 
     @abstractmethod
-    def inspect(self, ref: Any, *, root: str = "/") -> FileStructure:
-        ...
+    def inspect(self, ref: Any, *, root: str = "/") -> FileStructure: ...
 
     def inspect_file(
         self,
@@ -98,8 +92,7 @@ class IOBackend(ABC):
         *,
         root: str = "/",
         default: Any = None,
-    ) -> Any:
-        ...
+    ) -> Any: ...
 
     @abstractmethod
     def set_attribute(
@@ -110,8 +103,7 @@ class IOBackend(ABC):
         value: Any,
         *,
         root: str = "/",
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @abstractmethod
     def list_groups(

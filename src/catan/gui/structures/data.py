@@ -4,11 +4,11 @@ import numpy as np
 from pathlib import Path
 
 from catan import Tracking
-from . import AppState, NeuronComponent
+from . import AppState, NeuronComponent, StatisticDisplayConfig
 from catan.core.io import inspect_file
 from catan.core.structures import SessionData, sessiondata_type
 from catan.tracking.structures import Assignments
-from catan.gui.plots.colors import CyclicColorMap
+from catan.gui.panels.colors import CyclicColorMap
 
 from catan.gui.data.statistics.engine import StatisticEngine
 from catan.gui.data.statistics.registry import build_statistics_registry
@@ -29,6 +29,9 @@ class Data(Tracking):
             data=self,
             state=state,
             registry_factory=build_statistics_registry,
+        )
+        self.statistic_display_config = StatisticDisplayConfig(
+            settings=state.settings, engine=self.statistic_engine
         )
 
         self.current_session: Optional[SessionData] = None

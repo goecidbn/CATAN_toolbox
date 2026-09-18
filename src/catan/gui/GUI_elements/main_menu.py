@@ -23,7 +23,7 @@ from shiboken6 import isValid
 
 from pathlib import Path
 
-from catan.gui.structures import data, state, config
+from catan.gui.structures import data, state
 
 from .resource_monitor import ResourceMonitor
 from .fragments import (
@@ -54,8 +54,8 @@ class MainMenu(QFrame):
     def __init__(self, parent):
         super().__init__(parent)
 
-        self.settings = QSettings()
-        self.config: config.ConfigData = parent.config
+        # self.settings = QSettings()
+        self.settings = parent.settings
         self.state: state.AppState = parent.state
         self.data: data.Data = parent.data
 
@@ -270,6 +270,7 @@ class MainMenu(QFrame):
 
         def on_root_path_changed():
             self.data.root = self.edit_root_path.text().strip()
+            self.settings.setValue(f"paths/root_folder", str(self.data.root))
 
         self.button_root_path.clicked.connect(
             lambda: (
@@ -533,47 +534,4 @@ class MainMenu(QFrame):
     ###    Logic for saving/restoring settings    ###
     ### ------------------------------------------###
     def _restore_settings(self):
-        # print("Restoring settings...")
-        self.defaults = {
-            f"{name}_{info['type']}": self.settings.value(
-                f"paths/{name}_{info['type']}", "", type=str
-            )
-            for name, info in self.config.paths.items()
-        }
-        self.data.root = str(self.defaults["root_folder"])
-
-    def _save_settings(self):
-        """
-        this is currently just in a quick patch state - should be fixed!
-        """
-        key = "root_folder"
-        self.settings.setValue(f"paths/{key}", str(self.data.root))
-
-        # for name, info in self.config.paths.items():
-        #     key = f"{name}_{info['type']}"
-        #     # try:
-        #     ## only relative structure is stored
-        #     # relative = paths[info["root"]]
-        #     path_key = getattr(self, key, None)
-        #     print(f"Saving setting for key: {key}, path: {path_key}")
-        #     if path_key:
-        #         if info["root"]:
-        #             relative_path = Path(path_key).relative_to(
-        #                 getattr(self, info["root"] + "_folder")
-        #             )
-        #         else:
-        #             relative_path = path_key
-        #         self.settings.setValue(f"paths/{key}", str(relative_path))
-        #     # except:
-        #     #     # if mode was not selected, variables wont be set, so just skip
-        #     #     pass
-
-        self.settings.sync()  # flush to disk
-
-
-# def toggle_enable(widgets: List[QWidget], enabled: bool):
-#     for w in widgets:
-#         w.setEnabled(enabled)
-
-#         if not enabled and isinstance(w, (QLineEdit, QLabel)):
-#             w.setText("")
+        self.data.root = self.settings.value(f"paths/root_folder", "", type=str)

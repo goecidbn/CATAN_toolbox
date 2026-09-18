@@ -1,6 +1,7 @@
 import importlib
+import threading
 
-from PySide6.QtCore import QCoreApplication, QSettings
+from PySide6.QtCore import QCoreApplication, QSettings, QThreadPool
 from PySide6.QtGui import QAction, QFont, Qt
 from PySide6.QtWidgets import (
     QApplication,
@@ -15,7 +16,7 @@ from catan.gui.resources import (
     load_stylesheet,
 )
 
-from catan.gui.structures import AppState, Data, ConfigData
+from catan.gui.structures import AppState, Data
 from catan.gui.interaction import click_events
 
 from .display_area import DisplayArea
@@ -25,12 +26,11 @@ from .main_menu import MainMenu
 class MainWindow(QMainWindow):
 
     settings = QSettings()
-    state = AppState()
 
     def __init__(self):
         super().__init__()
 
-        self.config: ConfigData = ConfigData(self)
+        self.state = AppState(settings=self.settings)
         self.data: Data = Data(self.state)
         self.state.tasks.start_queue_timer()
 
@@ -68,6 +68,8 @@ class MainWindow(QMainWindow):
         self.style_sheet = app.styleSheet()
 
         self.reset_stylesheet()
+        app.aboutToQuit.connect(self.debug_shutdown)
+
 
     def _restore_settings(self):
 
@@ -108,12 +110,31 @@ class MainWindow(QMainWindow):
         click_events.print_debug(self.state, self.data)
 
     def closeEvent(self, event):
+        print("MainWindow closeEvent")
         self._save_settings()
         for gui in self.gui_elements.values():
             if hasattr(gui, "_save_settings"):
                 gui._save_settings()
         # self.gui_elements._save_settings()
         super().closeEvent(event)
+        print("MainWindow closeEvent finished")
+
+        app = QApplication.instance()
+        print("quitOnLastWindowClosed:", app.quitOnLastWindowClosed())
+
+        print("top-level widgets:")
+        for widget in app.topLevelWidgets():
+            print(
+                " ",
+                type(widget).__name__,
+                repr(widget.objectName()),
+                "visible=",
+                widget.isVisible(),
+                "window=",
+                widget.isWindow(),
+                "parent=",
+                type(widget.parent()).__name__ if widget.parent() is not None else None,
+            )
 
     ### ------------------------------------------###
     ###            UI initialization              ###
@@ -149,3 +170,38 @@ class MainWindow(QMainWindow):
             "main_menu": main_menu,
             "display_area": display_area,
         }
+
+    def debug_shutdown(self):
+        print("\n=== SHUTDOWN DEBUG ===")
+
+        pool = QThreadPool.globalInstance()
+
+        print(
+            "QThreadPool active:",
+            pool.activeThreadCount(),
+            "/ max:",
+            pool.maxThreadCount(),
+        )
+
+        print("Python threads:")
+        for thread in threading.enumerate():
+            print(
+                " ",
+                repr(thread.name),
+                "alive=",
+                thread.is_alive(),
+                "daemon=",
+                thread.daemon,
+                "ident=",
+                thread.ident,
+            )
+
+        print("TaskManager:")
+        for group in self.state.tasks.GROUPS:
+            print(
+                " ",
+                group,
+                self.state.tasks.group_summary(group),
+            )
+
+        print("======================\n")

@@ -18,7 +18,14 @@ from PySide6.QtWidgets import (
 )
 
 from catan.gui.structures import AppState, Data
-from catan.gui.plots import Footprints, Overview, Statistics, SelectionDisplay, Traces
+from catan.gui.panels import (
+    Footprints,
+    Overview,
+    Statistics,
+    SelectionDisplay,
+    Traces,
+    CurationFilter,
+)
 
 display_modes = {
     "overview": {
@@ -32,8 +39,8 @@ display_modes = {
     "footprints": {
         "title": "Neuron footprints",
         "options": {
-            "single_footprint": "Neuron footprints (single)",
-            "multi_footprint": "Neuron footprints (multi)",
+            "footprints": "Neuron footprints",
+            # "multi_footprint": "Neuron footprints (multi)",
         },
     },
     "traces": {
@@ -49,16 +56,23 @@ display_modes = {
             "raster": "Raster plot",
         },
     },
+    "controls": {
+        "title": "Controls",
+        "options": {
+            "curator": "Curator",
+        },
+    },
 }
 
 DISPLAY_CONTROLLERS = {
     "session_overview": Overview,
     "tracked_overview": Overview,
-    "single_footprint": Footprints,
-    "multi_footprint": Footprints,
+    "footprints": Footprints,
+    # "multi_footprint": Footprints,
     "traces": Traces,
     "statistics": Statistics,
     "selection_display": SelectionDisplay,
+    "curator": CurationFilter,
 }
 
 

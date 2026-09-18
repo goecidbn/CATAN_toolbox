@@ -1,23 +1,24 @@
 from dataclasses import dataclass
 from time import time
 import numpy as np
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, QSettings
 from typing import Literal, Tuple, Optional, List
 import logging
 
 from catan.gui.background_tasks import TaskManager
 from catan.core.structures.load_config import LoadConfig, LoadConfigManager
+
 from platformdirs import user_config_dir
 from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
 class NeuronComponent:
-    session_id: int
+    session_id: int | None
     neuron_id: int
 
     @property
-    def id(self) -> Tuple[int, int]:
+    def id(self) -> Tuple[int | None, int]:
         return self.session_id, self.neuron_id
 
     def __iter__(self):
@@ -28,17 +29,16 @@ class NeuronComponent:
 class AppState(QObject):
 
     assignments: np.ndarray  # shape (n_clusters, n_sessions)
-    tracking_loaded: bool = False
 
     # Signals for things that can change
-
     session_color_changed = Signal(int, object)  # session_id, color_value
 
     current_session_changed = Signal(int)
 
+    hovered_components_changed = Signal()
     selected_components_changed = Signal()
     focused_component_changed = Signal()
-    highlighted_component_changed = Signal()
+    highlighted_components_changed = Signal()
 
     # compare_mode_changed = Signal(str)
     busy_changed = Signal(bool)
@@ -50,21 +50,23 @@ class AppState(QObject):
 
     statistics_sources_changed = Signal()
 
-    def __init__(self):
+    def __init__(self, settings: QSettings):
         super().__init__()
-        # self._current_display = 0
+
+        self.settings = settings
+
         self._current_session_id = None
 
-        self._model_fitted = False
         self._busy = False
 
         self._session_colors = []
 
+        self._hovered_components: Optional[NeuronComponent] = None
         self._selected_components: Optional[List[NeuronComponent]] = None
         self._focused_component: Optional[NeuronComponent] = None
-        self._highlighted_component: Optional[NeuronComponent] = None
-        self.current_job = None
+        self._highlighted_components: Optional[List[NeuronComponent]] = None
 
+        self.current_job = None
         self.tasks = TaskManager()
 
         self.config_manager = LoadConfigManager(
@@ -103,19 +105,6 @@ class AppState(QObject):
             self.logger.debug("--- Timer reset ---")
 
         self.time_ref = time()
-
-    @property
-    def load_config(self) -> LoadConfig:
-        return self.config_manager.current
-
-    @property
-    def model_fitted(self) -> bool:
-        return self._model_fitted
-
-    @model_fitted.setter
-    def model_fitted(self, val: bool):
-        self._model_fitted = val
-        self.data_changed.emit(("model_fitted", -1))
 
     @property
     def busy(self):
@@ -168,6 +157,29 @@ class AppState(QObject):
     """
 
     @property
+    def hovered_components(self):
+        return self._hovered_components
+
+    def update_hovered_components(
+        self,
+        components,
+    ):
+
+        if components is None:
+            new_components = None
+        elif isinstance(components, NeuronComponent):
+            new_components = [components]
+        else:
+            new_components = list(components)
+
+        if new_components == self._hovered_components:
+            return
+
+        self._hovered_components = new_components
+
+        self.hovered_components_changed.emit()
+
+    @property
     def selected_components(self) -> Optional[List[NeuronComponent]]:
         if self._selected_components is None:
             return None
@@ -177,7 +189,7 @@ class AppState(QObject):
     def update_selected_components(
         self,
         components: Optional[NeuronComponent | List[NeuronComponent]],
-        modifiers=[],
+        modifiers=(),
     ):
         if isinstance(components, NeuronComponent):
             # print(f"Casting input component to list: {components}")
@@ -210,20 +222,28 @@ class AppState(QObject):
         if isinstance(selected_components, list) and len(selected_components) == 0:
             selected_components = None
 
-        if (
-            selected_components is not None
-            and self.focused_component not in selected_components
+        old_focused_component = self._focused_component
+
+        if selected_components is not None and not self._component_in_components(
+            self.focused_component,
+            selected_components,
         ):
-            self._focused_component = selected_components[-1]
+            new_focused_component = selected_components[-1]
         elif selected_components is None:
-            self._focused_component = None
+            new_focused_component = None
+        else:
+            new_focused_component = self.focused_component
 
         self._selected_components = (
             sorted(selected_components, key=lambda c: c.neuron_id)
             if selected_components is not None
             else None
         )
+        self._focused_component = new_focused_component
+
         self.selected_components_changed.emit()
+        if new_focused_component != old_focused_component:
+            self.focused_component_changed.emit()
 
     @property
     def focused_component(self) -> Optional[NeuronComponent]:
@@ -232,6 +252,9 @@ class AppState(QObject):
     @focused_component.setter
     def focused_component(self, component: Optional[NeuronComponent]):
 
+        if component == self._focused_component:
+            return
+
         self.logger.debug(f"Setting focused component to {component}")
         self._focused_component = component
 
@@ -239,9 +262,9 @@ class AppState(QObject):
             self.focused_component_changed.emit()
             return
 
-        if (
-            self.selected_components is not None
-            and component in self.selected_components
+        if self._component_in_components(
+            component,
+            self.selected_components,
         ):
             self.focused_component_changed.emit()
             return
@@ -249,13 +272,135 @@ class AppState(QObject):
         self.update_selected_components(component)
 
     @property
-    def highlighted_component(self) -> Optional[NeuronComponent]:
-        return self._highlighted_component
+    def highlighted_components(
+        self,
+    ) -> Optional[List[NeuronComponent]]:
 
-    @highlighted_component.setter
-    def highlighted_component(self, component: Optional[NeuronComponent]):
-        self._highlighted_component = component
-        self.highlighted_component_changed.emit()
+        if self._highlighted_components is None:
+            return None
+
+        return self._highlighted_components
+
+    def update_highlighted_components(
+        self,
+        components: Optional[NeuronComponent | List[NeuronComponent]],
+        modifiers=(),
+        *,
+        max_components: int | None = None,
+    ):
+
+        if isinstance(components, NeuronComponent):
+            components = [components]
+
+        if "Control" in modifiers:
+
+            # Ctrl-clicking empty space does nothing.
+            if components is None:
+                return
+
+            if self._highlighted_components is None:
+                highlighted_components = list(components)
+
+            else:
+                highlighted_components = self._highlighted_components.copy()
+
+                for component in components:
+
+                    try:
+                        idx = highlighted_components.index(component)
+
+                        highlighted_components.pop(idx)
+
+                    except ValueError:
+                        highlighted_components.append(component)
+
+        else:
+            # Ordinary click replaces the highlight.
+            highlighted_components = components
+
+        if (
+            isinstance(highlighted_components, list)
+            and len(highlighted_components) == 0
+        ):
+            highlighted_components = None
+
+        if highlighted_components is not None:
+
+            # Avoid accidental duplicates while preserving
+            # click/insertion order.
+            highlighted_components = list(dict.fromkeys(highlighted_components))
+
+        if highlighted_components == self._highlighted_components:
+            return
+
+        if (
+            highlighted_components is not None
+            and max_components is not None
+            and len(highlighted_components) > max_components
+        ):
+            highlighted_components = highlighted_components[-max_components:]
+
+        self._highlighted_components = highlighted_components
+
+        self.highlighted_components_changed.emit()
+
+    @staticmethod
+    def _components_match_selection(
+        a: NeuronComponent | None,
+        b: NeuronComponent | None,
+    ) -> bool:
+        """
+        Whether two components refer to compatible selected identities.
+
+        A session-independent neuron acts as a wildcard for session.
+        """
+
+        if a is None or b is None:
+            return False
+
+        if int(a.neuron_id) != int(b.neuron_id):
+            return False
+
+        return (
+            a.session_id is None
+            or b.session_id is None
+            or int(a.session_id) == int(b.session_id)
+        )
+
+    @classmethod
+    def _component_in_components(
+        cls,
+        component: NeuronComponent | None,
+        components,
+    ) -> bool:
+
+        if component is None or not components:
+            return False
+
+        return any(
+            cls._components_match_selection(
+                component,
+                selected,
+            )
+            for selected in components
+        )
+
+    def selected_component_index(
+        self,
+        component: NeuronComponent | None,
+    ) -> int | None:
+
+        if component is None or not self.selected_components:
+            return None
+
+        for index, selected in enumerate(self.selected_components):
+            if self._components_match_selection(
+                component,
+                selected,
+            ):
+                return index
+
+        return None
 
     def get_footprint_from_component(self, component: NeuronComponent) -> Optional[int]:
 

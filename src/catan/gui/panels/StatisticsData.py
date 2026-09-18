@@ -31,12 +31,16 @@ from catan.gui.data.statistics.queries import (
     ReductionSpec,
     allowed_error_methods,
     allowed_reduction_methods,
+    statistic_allowed_in_context,
     PairFilter,
     PairRelation,
     PairTarget,
     ReductionSpec,
     StatisticQuery,
     neuron_bound_dim,
+    component_bound_dims,
+    neuron_pair_bound_dims,
+    component_pair_bound_dims,
     normalize_neuron_bound_reductions,
     normalize_session_series_reductions,
     normalize_generic_session_pair_reductions,
@@ -385,6 +389,131 @@ class PairFilterSelector(QToolButton):
             self.filterChanged.emit()
 
 
+_DIM_DISPLAY = {
+    "neuron": "n",
+    "neuron_i": "nᵢ",
+    "neuron_j": "nⱼ",
+    "session": "s",
+    "session_i": "sᵢ",
+    "session_j": "sⱼ",
+}
+
+_DIM_SUBSCRIPT = {
+    "neuron": "ₙ",
+    "neuron_i": "ₙᵢ",
+    "neuron_j": "ₙⱼ",
+    "session": "ₛ",
+    "session_i": "ₛᵢ",
+    "session_j": "ₛⱼ",
+}
+
+
+def format_dimension_short(dim: str) -> str:
+    return _DIM_DISPLAY.get(dim, dim)
+
+
+def format_reduction_short(
+    dim: str,
+    spec: ReductionSpec,
+) -> str:
+
+    dim_short = format_dimension_short(dim)
+
+    if spec.method == "keep":
+        return dim_short
+
+    if spec.method == "single":
+        return f"{dim_short}={spec.index}"
+
+    subscript = _DIM_SUBSCRIPT.get(dim)
+
+    if subscript is None:
+        text = f"{spec.method}({dim_short})"
+    else:
+        text = f"{spec.method}{subscript}"
+
+    if spec.error_method != "none":
+        text += f"±{spec.error_method}"
+
+    return text
+
+
+def format_query_expression(
+    query: StatisticQuery,
+    stat_def: StatisticDefinition,
+) -> str:
+
+    reductions = query.reduction_dict()
+
+    # -----------------------------------------
+    # Dimensions that remain arguments
+    # -----------------------------------------
+
+    arguments = []
+
+    for dim in stat_def.dims:
+
+        spec = reductions.get(
+            dim,
+            ReductionSpec("keep"),
+        )
+
+        if spec.method == "keep":
+            arguments.append(_DIM_DISPLAY.get(dim, dim))
+
+        elif spec.method == "single":
+            arguments.append(f"{_DIM_DISPLAY.get(dim, dim)}={spec.index}")
+
+    # Use the short/internal statistic name here,
+    # not the verbose menu title.
+    base_name = stat_def.title
+
+    if arguments:
+        expression = f"{base_name}(" f"{', '.join(arguments)}" f")"
+    else:
+        expression = base_name
+
+    # -----------------------------------------
+    # Wrap actual reductions
+    # -----------------------------------------
+
+    reduction_dims = [
+        dim
+        for dim in query.reduction_order
+        if reductions.get(
+            dim,
+            ReductionSpec("keep"),
+        ).method
+        not in ("keep", "single")
+    ]
+
+    # Generic queries currently often have no explicit
+    # reduction_order. Fall back to statistic dimension order.
+    if not reduction_dims:
+        reduction_dims = [
+            dim
+            for dim in stat_def.dims
+            if reductions.get(
+                dim,
+                ReductionSpec("keep"),
+            ).method
+            not in ("keep", "single")
+        ]
+
+    for dim in reduction_dims:
+
+        spec = reductions[dim]
+
+        subscript = _DIM_SUBSCRIPT.get(
+            dim,
+            f"_{dim}",
+        )
+
+        expression = f"{spec.method}{subscript}" f"({expression})"
+
+    return expression
+
+
 class StatisticQuerySelector(QWidget):
     queryChanged = Signal(object)  # StatisticQuery | None
 
@@ -393,6 +522,8 @@ class StatisticQuerySelector(QWidget):
 
         self.engine = engine
         self.axis = axis
+
+        self._popup_bounds = None
 
         self.query_mode: Contexts = "generic"
         self.query_preparer = None
@@ -413,11 +544,6 @@ class StatisticQuerySelector(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addStretch()
 
-        # Statistic selector button instead of QComboBox
-        # if axis == "y":
-        #     self.stat_button = RotatedToolButton(angle=-90)
-        #     self.stat_button.setMaximumWidth(34)
-        # else:
         self.stat_button = QToolButton()
         self.stat_button.setMaximumWidth(120)
 
@@ -426,11 +552,16 @@ class StatisticQuerySelector(QWidget):
 
         self.stat_menu = QMenu(self.stat_button)
         self.stat_button.setMenu(self.stat_menu)
+        constrain_popup(
+            self.stat_menu,
+            anchor=self.stat_button,
+            bounds=self._popup_bounds,
+        )
 
         self._build_stat_menu()
 
         self.reduction_button = QToolButton()
-        self.reduction_button.setMaximumWidth(120)
+        self.reduction_button.setMaximumWidth(160)
         self.reduction_button.setText("Reductions")
         self.reduction_button.clicked.connect(self._open_reduction_popup)
 
@@ -449,6 +580,55 @@ class StatisticQuerySelector(QWidget):
 
         self._on_statistic_changed()
         self._update_filter_visibility()
+
+    def set_popup_bounds(
+        self,
+        bounds: QWidget,
+    ):
+        self._popup_bounds = bounds
+
+    def set_query(
+        self,
+        query: StatisticQuery,
+        *,
+        emit: bool = True,
+    ):
+
+        if query.statistic_key not in self.engine.registry:
+            raise KeyError(query.statistic_key)
+
+        self._current_stat_key = query.statistic_key
+        self.current_reductions = dict(query.reductions)
+
+        neuron_relation = "all"
+        session_relation = "all"
+
+        for filter_ in query.filters:
+            if filter_.target == "neuron":
+                neuron_relation = filter_.relation
+            elif filter_.target == "session":
+                session_relation = filter_.relation
+
+        self.neuron_filter_button.set_relation(
+            neuron_relation,
+            emit=False,
+        )
+        self.session_filter_button.set_relation(
+            session_relation,
+            emit=False,
+        )
+
+        self._update_stat_menu_checks()
+        self._update_stat_button()
+        self._update_filter_visibility()
+
+        # Reconcile the stored raw query with the current table context.
+        self.sync_visible_reductions_from_effective_query()
+
+        self._update_summary()
+
+        if emit:
+            self._emit_query_changed_once()
 
     def refresh_statistics(self):
         old_key = self._current_stat_key
@@ -503,7 +683,13 @@ class StatisticQuerySelector(QWidget):
             stats = [
                 (key, stat_def)
                 for key, stat_def in registry.items()
-                if stat_def.category == category
+                if (
+                    stat_def.category == category
+                    and statistic_allowed_in_context(
+                        stat_def.dims,
+                        self.query_mode,
+                    )
+                )
             ]
 
             if not stats:
@@ -559,6 +745,15 @@ class StatisticQuerySelector(QWidget):
             return
 
         self.query_mode = mode
+
+        if self._current_stat_key != "none" and not statistic_allowed_in_context(
+            self.current_stat_def().dims,
+            self.query_mode,
+        ):
+            self._current_stat_key = "none"
+
+        self._build_stat_menu()
+        self._update_stat_button()
 
         self._apply_default_reductions(context=self.query_mode)
         self.sync_visible_reductions_from_effective_query()
@@ -786,14 +981,11 @@ class StatisticQuerySelector(QWidget):
 
         self._popup.reductionChanged.connect(self._on_reduction_changed)
 
-        # pos = self.reduction_button.mapToGlobal(
-        #     QPoint(0, self.reduction_button.height())
-        # )
-
-        # self._popup.move(pos)
         constrain_popup(
             self._popup,
             anchor=self.reduction_button,
+            bounds=self._popup_bounds,
+            placements=("right", "left", "above", "below"),
         )
 
         self._popup.show()
@@ -849,6 +1041,7 @@ class StatisticQuerySelector(QWidget):
         self._emit_query_changed_once()
 
     def _update_summary(self):
+
         parts = []
         stat_def = self.current_stat_def()
 
@@ -858,30 +1051,12 @@ class StatisticQuerySelector(QWidget):
 
         for dim in stat_def.dims:
 
-            # Don't display implicit/x-axis dimensions.
             if not self.reduction_methods_for_dim(dim):
                 continue
 
-            spec = self.current_reductions.get(
-                dim,
-                ReductionSpec("keep"),
-            )
+            spec = self.current_reductions.get(dim, ReductionSpec("keep"))
 
-            dim_short = dim[0]
-
-            if spec.method == "single":
-                parts.append(f"{dim_short}={spec.index}")
-
-            elif spec.method == "keep":
-                parts.append(dim_short)
-
-            else:
-                if spec.error_method != "none":
-                    parts.append(
-                        f"{spec.method}±" f"{spec.error_method}" f"({dim_short})"
-                    )
-                else:
-                    parts.append(f"{spec.method}" f"({dim_short})")
+            parts.append(format_reduction_short(dim, spec))
 
         self.reduction_button.setText(", ".join(parts))
 
@@ -902,16 +1077,67 @@ class StatisticQuerySelector(QWidget):
         methods = tuple(m for m in specific if m in general)
 
         # ------------------------------------------------
-        # Neuron-bound plot
+        # Bound entity contexts
         # ------------------------------------------------
-        # neuron-bound policy applies to ALL dimensions
-        if self.query_mode == "neuron_bound":
-            output_dim = neuron_bound_dim(stat_def.dims)
 
+        if self.query_mode == "neuron_bound":
+
+            output_dim = neuron_bound_dim(stat_def.dims)
             if dim == output_dim:
+                # Implicitly kept by the bound context.
                 return ()
 
-            return tuple(m for m in methods if m != "keep")
+            # Every other dimension must disappear.
+            return tuple(method for method in methods if method != "keep")
+
+        if self.query_mode == "component_bound":
+
+            bound = component_bound_dims(stat_def.dims)
+
+            if bound is None:
+                return ()
+
+            neuron_dim, session_dim = bound
+
+            # Neuron identity is fixed by the table row.
+            if dim == neuron_dim:
+                return ()
+
+            # Session may remain component-specific OR be reduced.
+            if dim == session_dim:
+                return methods
+
+            # All other dimensions must disappear.
+            return tuple(method for method in methods if method != "keep")
+
+        if self.query_mode == "neuron_pair_bound":
+
+            neuron_dims = neuron_pair_bound_dims(stat_def.dims)
+
+            if neuron_dims is None:
+                return ()
+
+            if dim in neuron_dims:
+                return ()
+
+            return tuple(method for method in methods if method != "keep")
+
+        if self.query_mode == "component_pair_bound":
+
+            bound = component_pair_bound_dims(stat_def.dims)
+
+            if bound is None:
+                return ()
+
+            neuron_dims, session_dims = bound
+
+            if dim in neuron_dims:
+                return ()
+
+            if dim in session_dims:
+                return methods
+
+            return tuple(method for method in methods if method != "keep")
 
         session_dims = [d for d in stat_def.dims if d in SESSION_DIMS]
 
@@ -978,7 +1204,12 @@ class StatisticQuerySelector(QWidget):
         method: str,
     ) -> tuple[str, ...]:
 
-        if self.query_mode == "neuron_bound":
+        if self.query_mode in (
+            "neuron_bound",
+            "component_bound",
+            "neuron_pair_bound",
+            "component_pair_bound",
+        ):
             return ("none",)
 
         methods = allowed_error_methods(

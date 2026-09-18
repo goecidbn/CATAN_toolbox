@@ -37,6 +37,12 @@ def main() -> int:
     font = QFont("Noto Sans", 10)
     app.setFont(font)
 
+    app.aboutToQuit.connect(lambda: print("QApplication aboutToQuit"))
+    app.lastWindowClosed.connect(lambda: print("lastWindowClosed"))
+
+    app.aboutToQuit.connect(lambda: print("aboutToQuit"))
+
+
     window = MainWindow(*sys.argv[1:])
     window.show()
 
@@ -44,6 +50,11 @@ def main() -> int:
         return app.exec()
 
     return 0
+
+
+import threading
+
+from PySide6.QtCore import QThreadPool
 
 
 if __name__ == "__main__":

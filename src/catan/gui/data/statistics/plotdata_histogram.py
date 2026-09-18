@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .table import PickTable
-from catan.gui.plots.helper.Threshold import ThresholdSpec
+from catan.gui.panels.helper.Threshold import ThresholdSpec
 
 
 @dataclass

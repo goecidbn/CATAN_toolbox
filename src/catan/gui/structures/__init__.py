@@ -1,3 +1,5 @@
 from .state import AppState, NeuronComponent
-from .config import ConfigData
+from .display_config import StatisticDisplayConfig
+
+# from .config import ConfigData
 from .data import Data, SessionData

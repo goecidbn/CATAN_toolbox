@@ -116,3 +116,73 @@ def neuron_bound_dim(
         return "neuron_j"
 
     return None
+
+
+def component_bound_dims(
+    dims: tuple[str, ...],
+) -> tuple[str, str | None] | None:
+    """
+    Return the dimensions identifying one session-specific neuron/component.
+
+    Preference:
+        ("neuron", "session")
+        ("neuron_i", "session_i")
+        ("neuron_j", "session_j")
+
+    The session dimension may be None if the statistic has a neuron
+    dimension but no session dimension.
+    """
+
+    if "neuron" in dims:
+        session_dim = "session" if "session" in dims else None
+
+        return "neuron", session_dim
+
+    if "neuron_i" in dims:
+        session_dim = "session_i" if "session_i" in dims else None
+
+        return "neuron_i", session_dim
+
+    if "neuron_j" in dims:
+        session_dim = "session_j" if "session_j" in dims else None
+
+        return "neuron_j", session_dim
+
+    return None
+
+
+def neuron_pair_bound_dims(
+    dims: tuple[str, ...],
+) -> tuple[str, str] | None:
+    """
+    Return the two neuron dimensions identifying a neuron pair.
+
+    Pair-bound output requires explicit neuron_i / neuron_j dimensions.
+    """
+    if "neuron_i" in dims and "neuron_j" in dims:
+        return "neuron_i", "neuron_j"
+
+    return None
+
+
+def component_pair_bound_dims(
+    dims: tuple[str, ...],
+) -> tuple[tuple[str, str], tuple[str, ...]] | None:
+    """
+    Return neuron-pair dimensions plus any session dimensions
+    describing the concrete component pair.
+
+    Session dimensions are optional: a neuron-pair statistic without
+    session dimensions is still usable in footprint-pair mode and will
+    simply have the same value for all component pairs of those neurons.
+    """
+    neuron_dims = neuron_pair_bound_dims(dims)
+
+    if neuron_dims is None:
+        return None
+
+    session_dims = tuple(
+        dim for dim in ("session", "session_i", "session_j") if dim in dims
+    )
+
+    return neuron_dims, session_dims

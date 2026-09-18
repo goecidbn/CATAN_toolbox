@@ -46,12 +46,28 @@ class ResourceMonitor(QWidget):
         self.timer.start(2000)  # every 2 seconds
 
     def update_display(self):
-        text = self.collect_resource_text()
-        self.label.setText(text)
+        import time
+
+        # print("resource monitor update")
+
+        t0 = time.perf_counter()
+
+        try:
+            # existing method contents
+
+            text = self.collect_resource_text()
+            self.label.setText(text)
+
+        finally:
+            dt = time.perf_counter() - t0
+
+            if dt > 0.05:
+                print(f"ResourceMonitor.update_display: " f"{dt * 1000:.1f} ms")
 
     def collect_resource_text(self):
         items = {
             "sessions": self.data.sessions,
+            "assignments": self.data.assignments,
             # "neurons": self.data.neurons,
             # "matching": self.data.matching,
             # "statistics": self.data.statistics,
@@ -116,6 +132,7 @@ def format_bytes(n):
 
 
 process = psutil.Process(os.getpid())
+
 
 def process_memory():
     return process.memory_info().rss

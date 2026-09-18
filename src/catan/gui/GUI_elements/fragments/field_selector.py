@@ -170,22 +170,10 @@ class OptionList(QWidget):
             )
         )
 
-        self.list_layout.addWidget(
-            QLabel(name.capitalize() + ":"),
-            row,
-            0,
-        )
-        self.list_layout.addWidget(
-            path_edit,
-            row,
-            1,
-        )
+        self.list_layout.addWidget(QLabel(name.capitalize() + ":"), row, 0)
+        self.list_layout.addWidget(path_edit, row, 1)
 
-        self.list_layout.addWidget(
-            browse,
-            row,
-            2,
-        )
+        self.list_layout.addWidget(browse, row, 2)
         path_edit.setEnabled(enabled)
         self.option[name] = path_edit
 
@@ -343,7 +331,7 @@ class FieldSelector(QWidget):
             self.field_options[field.group].update_style(field.label, status)
 
         # also, finally color current session properly!!
-        self.loading_possible = loading_possible
+        self.source.loading_possible = loading_possible
 
     def manipulate_fields(
         self, group_name: str, field_name: str, method="edit", **kwargs

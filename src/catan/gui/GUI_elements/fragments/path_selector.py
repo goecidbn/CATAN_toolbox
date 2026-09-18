@@ -16,7 +16,6 @@ def choose_path(
     only_existing: bool = True,
 ) -> Optional[str]:
     if pick_dir:
-        print(f"Choosing directory with initial path: {init_path}")
         path = QFileDialog.getExistingDirectory(
             parent=parent,
             caption=display_text,

@@ -1,9 +1,24 @@
 from typing import Literal, Optional
 from dataclasses import dataclass, replace
 
-from .dimensions import canonical_dim, SESSION_DIMS, NEURON_DIMS, neuron_bound_dim
+from .dimensions import (
+    canonical_dim,
+    SESSION_DIMS,
+    NEURON_DIMS,
+    neuron_bound_dim,
+    component_bound_dims,
+    neuron_pair_bound_dims,
+    component_pair_bound_dims,
+)
 
-Contexts = Literal["generic", "session_series", "neuron_bound"]
+Contexts = Literal[
+    "generic",
+    "session_series",
+    "neuron_bound",
+    "component_bound",
+    "neuron_pair_bound",
+    "component_pair_bound",
+]
 
 ReductionMethod = Literal[
     "keep",
@@ -36,6 +51,25 @@ REDUCTION_METHODS = {
         "session": ("keep", "single"),
         "neuron": ("mean", "median"),
         "default": ("single", "mean", "median", "max", "min"),
+    },
+    "neuron_bound": {
+        "neuron": DEFAULT_REDUCTIONS,
+        "default": DEFAULT_REDUCTIONS,
+    },
+    "component_bound": {
+        "neuron": DEFAULT_REDUCTIONS,
+        "session": DEFAULT_REDUCTIONS,
+        "default": DEFAULT_REDUCTIONS,
+    },
+    "neuron_pair_bound": {
+        "neuron": DEFAULT_REDUCTIONS,
+        "session": DEFAULT_REDUCTIONS,
+        "default": DEFAULT_REDUCTIONS,
+    },
+    "component_pair_bound": {
+        "neuron": DEFAULT_REDUCTIONS,
+        "session": DEFAULT_REDUCTIONS,
+        "default": DEFAULT_REDUCTIONS,
     },
 }
 
@@ -82,6 +116,11 @@ ERROR_METHODS = {
         },
     },
 }
+# lazy adding
+ERROR_METHODS["neuron_bound"] = ERROR_METHODS["generic"]
+ERROR_METHODS["component_bound"] = ERROR_METHODS["generic"]
+ERROR_METHODS["neuron_pair_bound"] = ERROR_METHODS["generic"]
+ERROR_METHODS["component_pair_bound"] = ERROR_METHODS["generic"]
 
 
 PairRelation = Literal["all", "same", "different", "with previous"]
@@ -114,15 +153,83 @@ class StatisticQuery:
     def reduction_dict(self):
         return dict(self.reductions)
 
+    def to_dict(self) -> dict:
+        return {
+            "statistic_key": self.statistic_key,
+            "reductions": {
+                dim: {
+                    "method": spec.method,
+                    "index": spec.index,
+                    "error_method": spec.error_method,
+                }
+                for dim, spec in self.reductions
+            },
+            "reduction_order": list(self.reduction_order),
+            "filters": [
+                {
+                    "target": f.target,
+                    "relation": f.relation,
+                    "collapse_same": f.collapse_same,
+                }
+                for f in self.filters
+            ],
+            "context": self.context,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict,
+    ) -> "StatisticQuery":
+
+        return cls(
+            statistic_key=data["statistic_key"],
+            reductions=tuple(
+                sorted(
+                    (
+                        dim,
+                        ReductionSpec(
+                            method=spec["method"],
+                            index=spec.get("index"),
+                            error_method=spec.get("error_method", "none"),
+                        ),
+                    )
+                    for dim, spec in data.get(
+                        "reductions",
+                        {},
+                    ).items()
+                )
+            ),
+            reduction_order=tuple(data.get("reduction_order", ())),
+            filters=tuple(
+                PairFilter(
+                    target=f["target"],
+                    relation=f["relation"],
+                    collapse_same=f.get("collapse_same", True),
+                )
+                for f in data.get("filters", ())
+            ),
+            context=data.get("context", "generic"),
+        )
+
 
 def statistic_allowed_in_context(
     dims: tuple[str, ...],
     context: Contexts,
 ):
-    if context != "neuron_bound":
-        return True
+    if context == "neuron_bound":
+        return neuron_bound_dim(dims) is not None
 
-    return neuron_bound_dim(dims) is not None
+    if context == "component_bound":
+        return component_bound_dims(dims) is not None
+
+    if context == "neuron_pair_bound":
+        return neuron_pair_bound_dims(dims) is not None
+
+    if context == "component_pair_bound":
+        return component_pair_bound_dims(dims) is not None
+
+    return True
 
 
 def allowed_reduction_methods(
@@ -418,6 +525,220 @@ def normalize_neuron_bound_reductions(
         else:
             raise ValueError(
                 f"Dimension {dim!r} cannot be reduced " "for neuron-bound output."
+            )
+
+    return out
+
+
+def normalize_component_bound_reductions(
+    stat_def,
+    reductions,
+):
+    """
+    Normalize a query so its output remains bound to one component.
+
+    Ordinary statistic:
+        neuron + session remain
+
+    Pair statistic:
+        prefer neuron_i + session_i
+        neuron_j / session_j and all other dimensions disappear
+    """
+
+    out = dict(reductions)
+
+    bound = component_bound_dims(stat_def.dims)
+
+    if bound is None:
+        raise ValueError(f"{stat_def.key!r} cannot produce component-bound data.")
+
+    neuron_dim, session_dim = bound
+
+    keep_dims = {neuron_dim}
+
+    if session_dim is not None:
+        keep_dims.add(session_dim)
+
+    for dim in stat_def.dims:
+
+        allowed = stat_def.get_allowed_reductions(dim)
+        spec = out.get(dim)
+
+        # -----------------------------------------
+        # The neuron identity MUST survive.
+        # -----------------------------------------
+        if dim == neuron_dim:
+            out[dim] = ReductionSpec("keep")
+            continue
+
+        # -----------------------------------------
+        # The associated session dimension MAY
+        # survive.
+        #
+        # Default = keep, because footprint mode
+        # normally wants component-specific values.
+        # But the user may deliberately reduce it.
+        # -----------------------------------------
+        if dim == session_dim:
+
+            if spec is not None and spec.method in allowed:
+                out[dim] = replace(spec, error_method="none")
+            else:
+                out[dim] = ReductionSpec("keep")
+
+            continue
+
+        # -----------------------------------------
+        # Every other dimension MUST disappear.
+        # -----------------------------------------
+        allowed = tuple(method for method in allowed if method != "keep")
+
+        if spec is not None and spec.method in allowed:
+            out[dim] = replace(spec, error_method="none")
+            continue
+
+        if dim in NEURON_DIMS and "median" in allowed:
+            out[dim] = ReductionSpec("median")
+
+        elif dim in SESSION_DIMS and "single" in allowed:
+            out[dim] = ReductionSpec("single", index=0)
+
+        elif "single" in allowed:
+            out[dim] = ReductionSpec("single", index=0)
+
+        elif "median" in allowed:
+            out[dim] = ReductionSpec("median")
+
+        elif "mean" in allowed:
+            out[dim] = ReductionSpec("mean")
+
+        else:
+            raise ValueError(
+                f"Dimension {dim!r} cannot be reduced " "for component-bound output."
+            )
+
+    return out
+
+
+def normalize_neuron_pair_bound_reductions(
+    stat_def,
+    reductions,
+):
+    out = dict(reductions)
+
+    neuron_dims = neuron_pair_bound_dims(stat_def.dims)
+
+    if neuron_dims is None:
+        raise ValueError(f"{stat_def.key!r} cannot produce neuron-pair-bound data.")
+
+    keep_dims = set(neuron_dims)
+
+    for dim in stat_def.dims:
+
+        allowed = stat_def.get_allowed_reductions(dim)
+        spec = out.get(dim)
+
+        # Both neuron identities define the table row.
+        if dim in keep_dims:
+            out[dim] = ReductionSpec("keep")
+            continue
+
+        # Everything else must disappear.
+        allowed = tuple(method for method in allowed if method != "keep")
+
+        if spec is not None and spec.method in allowed:
+            out[dim] = replace(spec, error_method="none")
+            continue
+
+        if dim in SESSION_DIMS and "single" in allowed:
+            out[dim] = ReductionSpec("single", index=0)
+
+        elif dim in NEURON_DIMS and "median" in allowed:
+            out[dim] = ReductionSpec("median")
+
+        elif "single" in allowed:
+            out[dim] = ReductionSpec("single", index=0)
+
+        elif "median" in allowed:
+            out[dim] = ReductionSpec("median")
+
+        elif "mean" in allowed:
+            out[dim] = ReductionSpec("mean")
+
+        else:
+            raise ValueError(
+                f"Dimension {dim!r} cannot be reduced " "for neuron-pair-bound output."
+            )
+
+    return out
+
+
+def normalize_component_pair_bound_reductions(
+    stat_def,
+    reductions,
+):
+    out = dict(reductions)
+
+    bound = component_pair_bound_dims(stat_def.dims)
+
+    if bound is None:
+        raise ValueError(
+            f"{stat_def.key!r} cannot produce " "component-pair-bound data."
+        )
+
+    neuron_dims, session_dims = bound
+
+    neuron_dims = set(neuron_dims)
+    session_dims = set(session_dims)
+
+    for dim in stat_def.dims:
+
+        allowed = stat_def.get_allowed_reductions(dim)
+        spec = out.get(dim)
+
+        # Pair identity MUST survive.
+        if dim in neuron_dims:
+            out[dim] = ReductionSpec("keep")
+            continue
+
+        # Session identity MAY survive.
+        if dim in session_dims:
+
+            if spec is not None and spec.method in allowed:
+                out[dim] = replace(spec, error_method="none")
+            else:
+                # Footprint-pair default:
+                # stay specific to the concrete components.
+                out[dim] = ReductionSpec("keep")
+
+            continue
+
+        # Everything unrelated to the pair must disappear.
+        allowed = tuple(method for method in allowed if method != "keep")
+
+        if spec is not None and spec.method in allowed:
+            out[dim] = replace(spec, error_method="none")
+            continue
+
+        if dim in NEURON_DIMS and "median" in allowed:
+            out[dim] = ReductionSpec("median")
+
+        elif dim in SESSION_DIMS and "single" in allowed:
+            out[dim] = ReductionSpec("single", index=0)
+
+        elif "single" in allowed:
+            out[dim] = ReductionSpec("single", index=0)
+
+        elif "median" in allowed:
+            out[dim] = ReductionSpec("median")
+
+        elif "mean" in allowed:
+            out[dim] = ReductionSpec("mean")
+
+        else:
+            raise ValueError(
+                f"Dimension {dim!r} cannot be reduced "
+                "for component-pair-bound output."
             )
 
     return out
