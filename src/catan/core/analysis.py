@@ -12,8 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def calculate_statistics(
-    this_data: SessionData,
-    reference_data: SessionData,
+    this_session: SessionData,
+    reference_session: SessionData,
     distance_threshold: float = 25.0,
     **kwargs,
     # mode: str = "cross",
@@ -31,36 +31,43 @@ def calculate_statistics(
 
     """
 
-    if this_data.footprints is None or reference_data.footprints is None:
-        raise ValueError("Both this_data and reference_data must have A attribute set.")
+    if this_session.footprints is None or reference_session.footprints is None:
+        raise ValueError(
+            "Both this_session and reference_session must have A attribute set."
+        )
 
     if (
-        this_data.footprints.shape == reference_data.footprints.shape
-        and len(this_data.footprints.indices) == len(reference_data.footprints.indices)
-        and np.all(this_data.footprints.indices == reference_data.footprints.indices)
-        and np.all(this_data.footprints.indptr == reference_data.footprints.indptr)
-        and np.allclose(this_data.footprints.data, reference_data.footprints.data)
+        this_session.footprints.shape == reference_session.footprints.shape
+        and len(this_session.footprints.indices)
+        == len(reference_session.footprints.indices)
+        and np.all(
+            this_session.footprints.indices == reference_session.footprints.indices
+        )
+        and np.all(
+            this_session.footprints.indptr == reference_session.footprints.indptr
+        )
+        and np.allclose(this_session.footprints.data, reference_session.footprints.data)
     ):
         mode = "same"
     else:
         mode = "cross"
     # print(
-    #     f"Calculating statistics for {mode}-matching of {this_data.n_neurons} vs {reference_data.n_neurons} neurons"
+    #     f"Calculating statistics for {mode}-matching of {this_session.n_neurons} vs {reference_session.n_neurons} neurons"
     # )
     # calculate distance between footprints and identify NN
     centroid_distance = spatial.distance.cdist(
-        reference_data.centroids, this_data.centroids
+        reference_session.centroids, this_session.centroids
     )
 
     def process_neuron(i):
-        """Process a single reference neuron against all nearby neurons in this_data"""
+        """Process a single reference neuron against all nearby neurons in this_session"""
         local_removals = []
         local_remove_info = []
         local_distances = centroid_distance[i, :].copy()
-        local_correlations = np.full(this_data.n_neurons, np.nan)
-        local_shifts = np.full((this_data.n_neurons, 2), np.nan)
+        local_correlations = np.full(this_session.n_neurons, np.nan)
+        local_shifts = np.full((this_session.n_neurons, 2), np.nan)
 
-        if not reference_data.idx_eval[i] or i in idx_remove:
+        if not reference_session.included[i] or i in idx_remove:
             return (
                 i,
                 local_shifts,
@@ -71,14 +78,14 @@ def calculate_statistics(
             )
 
         for j in np.where(local_distances < distance_threshold)[0]:
-            if not this_data.idx_eval[j] or j in idx_remove:
+            if not this_session.included[j] or j in idx_remove:
                 continue
 
-            A_ref = reference_data.footprints[:, i]  # .toarray()
+            A_ref = reference_session.footprints[:, i]  # .toarray()
 
             ## calculate pairwise correlation between reference and current set of neuron footprints
             local_correlations[j], _, local_shifts[j, :] = calculate_img_correlation(
-                this_data.footprints[:, j],  # .toarray(),
+                this_session.footprints[:, j],  # .toarray(),
                 A_ref,
                 crop=True,
                 shift=True,  # (key == "shifted"),
@@ -93,17 +100,17 @@ def calculate_statistics(
             if (
                 (mode != "same")
                 or (i == j)
-                or (this_data.trace is None)
-                or (not isinstance(this_data.quality, dict))
-                or (this_data.quality.get("SNR_comp", None) is None)
+                or (this_session.trace is None)
+                or (not isinstance(this_session.quality, dict))
+                or (this_session.quality.get("SNR_comp", None) is None)
             ):
                 continue
 
             remove_id, remove_info = check_removal(
                 # footprint_correlation["shifted"][(i, j)],
                 local_correlations[j],
-                this_data.trace,
-                this_data.quality["SNR_comp"],
+                this_session.trace,
+                this_session.quality["SNR_comp"],
                 i,
                 j,
             )
@@ -121,9 +128,11 @@ def calculate_statistics(
         )
 
     ## prepare arrays to hold statistics
-    centroid_shift = np.full((reference_data.n_neurons, this_data.n_neurons, 2), np.nan)
+    centroid_shift = np.full(
+        (reference_session.n_neurons, this_session.n_neurons, 2), np.nan
+    )
     footprint_correlation = np.full(
-        (reference_data.n_neurons, this_data.n_neurons), np.nan
+        (reference_session.n_neurons, this_session.n_neurons), np.nan
     )
     idx_remove = []  # only gets populated, when 'same' is True
     remove_info = {}  # only gets populated, when 'same' is True
@@ -135,14 +144,14 @@ def calculate_statistics(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(process_neuron, i): i
-                for i in range(reference_data.n_neurons)
+                for i in range(reference_session.n_neurons)
             }
 
             for future in tqdm(
                 as_completed(futures),
-                total=reference_data.n_neurons,
+                total=reference_session.n_neurons,
                 desc="calculating footprint correlation of %d neurons"
-                % reference_data.idx_eval.sum(),
+                % reference_session.included.sum(),
                 leave=False,
             ):
                 (
@@ -164,9 +173,9 @@ def calculate_statistics(
                     remove_info[id] = local_remove_info[j]
     else:
         for i in tqdm(
-            range(reference_data.n_neurons),
+            range(reference_session.n_neurons),
             desc="calculating footprint correlation of %d neurons"
-            % reference_data.idx_eval.sum(),
+            % reference_session.included.sum(),
             leave=False,
         ):
             (

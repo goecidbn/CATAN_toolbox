@@ -14,9 +14,10 @@ from scipy.optimize import linear_sum_assignment
 from pathlib import Path
 
 from catan.core.io import NATIVE_SESSION_CONFIG, get_backend
+from catan.core.data import center_of_mass
 from catan.core.structures.load_config.config import LoadConfig, FieldSpec
 
-from catan.core.structures import SessionData
+from catan.core.structures import SessionData, NeuronComponent
 from catan.core.analysis import calculate_statistics, calculate_p
 from catan.core.alignment import _shift_sparse_bilinear
 
@@ -224,50 +225,50 @@ class Tracking:
         if self.assignments is None:
             return
 
-        for session in self.sessions:
-            if session.id >= (n_status := len(self.assignments.matched_status)):
-                self.assignments.matched_status.extend(
-                    [False] * (session.id - n_status + 1)
-                )
-                # print(
-                #     "Warning: trying to update matched_status with invalid session_id:", session.id
-                # )
-                # continue
-            self.assignments.matched_status[session.id] = False
+        # for session in self.sessions:
+        # if session.id >= (n_status := len(self.assignments.matched_status)):
+        #     self.assignments.matched_status.extend(
+        #         [False] * (session.id - n_status + 1)
+        #     )
+        # print(
+        #     "Warning: trying to update matched_status with invalid session_id:", session.id
+        # )
+        # continue
+        # self.assignments.matched_status[session.id] = False
 
         for session, assignment_ids in zip(self.sessions, self.assignments.ids.T):
 
-            if np.any(assignment_ids >= 0):
-                # mark session as matched, if it has assignments
-                self.assignments.matched_status[session.id] = True
+            # if np.any(assignment_ids >= 0):
+            #     # mark session as matched, if it has assignments
+            #     self.assignments.matched_status[session.id] = True
 
-            update_idx_eval = False
-            if session.idx_eval is not None:
-                idx_assigned_from_session = np.where(session.idx_eval)[0]
+            update_included = False
+            if session.included is not None:
+                idx_assigned_from_session = np.where(session.included)[0]
                 idx_assigned_from_assignments = assignment_ids[assignment_ids >= 0]
 
                 assignment_in_session = np.isin(
                     idx_assigned_from_assignments, idx_assigned_from_session
                 )
                 if not assignment_in_session.all():
-                    # warnings.warn(f"Session {session_id} has neurons in 'assignments' that are not marked as valid in the session data (idx_eval).")
-                    # warnings.warn(f"Neurons in assignments but not in session idx_eval: {idx_assigned_from_assignments[~assignment_in_session]}")
-                    update_idx_eval = True
+                    # warnings.warn(f"Session {session_id} has neurons in 'assignments' that are not marked as valid in the session data (included).")
+                    # warnings.warn(f"Neurons in assignments but not in session included: {idx_assigned_from_assignments[~assignment_in_session]}")
+                    update_included = True
 
                 session_in_assignment = np.isin(
                     idx_assigned_from_session, idx_assigned_from_assignments
                 )
                 if not session_in_assignment.all():
-                    # warnings.warn(f"Session {session_id} has neurons marked as valid in the session data (idx_eval) that are not present in 'assignments'.")
-                    # warnings.warn(f"Neurons in session idx_eval but not in assignments: {idx_assigned_from_session[~session_in_assignment]}")
-                    update_idx_eval = True
+                    # warnings.warn(f"Session {session_id} has neurons marked as valid in the session data (included) that are not present in 'assignments'.")
+                    # warnings.warn(f"Neurons in session included but not in assignments: {idx_assigned_from_session[~session_in_assignment]}")
+                    update_included = True
             else:
-                # warnings.warn(f"Session {session_id} does not have 'idx_eval' defined. It will be updated based on 'assignments'.")
-                update_idx_eval = True
+                # warnings.warn(f"Session {session_id} does not have 'included' defined. It will be updated based on 'assignments'.")
+                update_included = True
 
-            if update_idx_eval:
-                session.idx_eval = np.zeros(session.n_neurons, dtype=bool)
-                session.idx_eval[assignment_ids[assignment_ids >= 0]] = True
+            if update_included:
+                session.included = np.zeros(session.n_neurons, dtype=bool)
+                session.included[assignment_ids[assignment_ids >= 0]] = True
 
     ### ============================================= ###
     ### ============= DEFINE DATA LOADING =========== ###
@@ -496,10 +497,10 @@ class Tracking:
         )
 
         if mode == "same" and len(idx_remove) > 0:
-            this_data.idx_eval[idx_remove] = False
+            this_data.included[idx_remove] = False
 
-        idx_this = this_data.idx_eval
-        idx_ref = ref_data.idx_eval
+        idx_this = this_data.included
+        idx_ref = ref_data.included
 
         ### ======================================== ###
         ### =========== define neighbours ========== ###
@@ -532,7 +533,8 @@ class Tracking:
             ],
         }
         if mode == "same":
-            idxes = neighbors & ~is_NN & ref_data.idx_kde[:, None]
+            # idxes = neighbors & ~is_NN & ref_data.idx_kde[:, None]
+            idxes = neighbors & ~is_NN
             # print(idxes.sum(), "counts to add")
 
             self.counts["same"] += np.histogram2d(
@@ -543,7 +545,8 @@ class Tracking:
             )[0].astype(int)
 
         else:
-            idxes = neighbors & ref_data.idx_kde[:, None]
+            # idxes = neighbors & ref_data.idx_kde[:, None]
+            idxes = neighbors
             self.counts["cross"][..., 0] += np.histogram2d(
                 footprint_distances[idxes],
                 # footprint_correlations["shifted"][idxes],
@@ -551,7 +554,8 @@ class Tracking:
                 **histo_options,
             )[0].astype(int)
 
-            idxes = neighbors & is_NN & ref_data.idx_kde[:, None]
+            # idxes = neighbors & is_NN & ref_data.idx_kde[:, None]
+            idxes = neighbors & is_NN
             self.counts["cross"][..., 1] += np.histogram2d(
                 footprint_distances[idxes],
                 # footprint_correlations["shifted"][idxes],
@@ -559,7 +563,8 @@ class Tracking:
                 **histo_options,
             )[0].astype(int)
 
-            idxes = neighbors & ~is_NN & ref_data.idx_kde[:, None]
+            # idxes = neighbors & ~is_NN & ref_data.idx_kde[:, None]
+            idxes = neighbors & ~is_NN
             self.counts["cross"][..., 2] += np.histogram2d(
                 footprint_distances[idxes],
                 # footprint_correlations["shifted"][idxes],
@@ -577,7 +582,7 @@ class Tracking:
     def session_assigned(self, session_id):
         if self.assignments is None:
             return False
-        if session_id >= len(self.assignments.matched_status):
+        if session_id >= self.assignments.matched_status.shape[0]:
             return False
         return self.assignments.matched_status[session_id]
 
@@ -604,8 +609,8 @@ class Tracking:
             align_to_reference=align_to_reference,
         )
         assert (
-            this_data.idx_eval is not None
-        ), "Session data must have idx_eval defined before registering neurons - run session.get_idx_eval_from_footprints() or session.get_idx_eval_from_quality() first."
+            this_data.included is not None
+        ), "Session data must have included defined before registering neurons - run session.get_included_from_footprints() or session.get_included_from_quality() first."
 
         if force_registration:
             self.unassign_neurons(this_data.id)
@@ -627,18 +632,18 @@ class Tracking:
                 this_data.clean_data("traces")
             return
 
-        if (
-            self.assignments.union is None
-            or not self.assignments.union.status["spatial_loaded"]
-        ):
+        if self.assignments.union is None or self.assignments.union.n_neurons == 0:
             ## first session to be registered, just add all neurons to union and assignments
-
-            footprints = this_data.footprints[:, this_data.idx_eval]
-            self.assignments.union.register_spatial(
-                footprints=footprints, dims=this_data.dims
+            self.rebuild_union()
+            footprints = this_data.footprints[:, this_data.included]
+            self.assignments.union.update_footprints(
+                footprints=footprints,
+                mode="replace",
+                included_values=True,
+                synthetic_values=False,
             )
 
-            actually_good = np.where(this_data.idx_eval)[0]
+            actually_good = np.where(this_data.included)[0]
             N_add = len(actually_good)
 
             self.assignments.pad_empty(n_neurons=N_add, n_sessions=1)
@@ -704,9 +709,9 @@ class Tracking:
             list(range(self.assignments.union.n_neurons)), matched_ref
         )
         non_matched = np.setdiff1d(
-            list(np.where(this_data.idx_eval)[0]), matches[1][idx_TP]
+            list(np.where(this_data.included)[0]), matches[1][idx_TP]
         )
-        non_matched = non_matched[this_data.idx_eval[non_matched]]
+        non_matched = non_matched[this_data.included[non_matched]]
 
         ## calculate number of matches found
         # TP = np.sum(p_matched > p_thr[0]).astype("float32")
@@ -797,6 +802,59 @@ class Tracking:
         #     print("double match!")
         #     return
 
+    def exclude_component(self, component: NeuronComponent) -> NeuronComponent:
+
+        if self.assignments is None:
+            raise ValueError("No assignments available.")
+
+        if component.session_id is None:
+            raise ValueError("A concrete session component " "is required.")
+
+        session_id = int(component.session_id)
+        neuron_id = int(component.neuron_id)
+
+        footprint_id = int(self.assignments.ids[neuron_id, session_id])
+
+        if footprint_id < 0:
+            raise ValueError(f"{component} has no footprint.")
+
+        session = self.sessions[session_id]
+
+        # ----------------------------------------------
+        # Retire actual detected component.
+        # ----------------------------------------------
+        session.included[footprint_id] = False
+
+        # ----------------------------------------------
+        # Add singleton bookkeeping neuron.
+        # ----------------------------------------------
+
+        self.assignments.pad_empty(n_neurons=1, n_sessions=0)
+        retired_neuron_id = self.assignments.ids.shape[0] - 1
+
+        # Remove from original tracked neuron.
+        self.assignments.ids[neuron_id, session_id] = -1
+
+        # And retain it under its own identity.
+        self.assignments.ids[retired_neuron_id, session_id] = footprint_id
+
+        # ----------------------------------------------
+        # Only these two union neurons changed.
+        # ----------------------------------------------
+
+        self.rebuild_union_neurons([neuron_id, retired_neuron_id])
+
+        # This is deliberately stored rather than inferred.
+        self.assignments.union.included[retired_neuron_id] = False
+        self.assignments.union.synthetic[retired_neuron_id] = False
+
+        # GUI mirror.
+        self.state.assignments = self.assignments.ids
+
+        self.notify_change(("assignments", -1))
+
+        return NeuronComponent(neuron_id=retired_neuron_id, session_id=session_id)
+
     def update_union_footprints(
         self,
         footprints_new,
@@ -878,16 +936,161 @@ class Tracking:
                 fp_updated.append(footprints_new[:, fp_idx])
 
         # ## update union data
-        self.assignments.union.register_spatial(
-            footprints=sparse.hstack(fp_updated, format="csc")
+        self.assignments.union.update_footprints(
+            footprints=sparse.hstack(fp_updated, format="csc"),
+            mode="replace",
+            included_values=True,
+            synthetic_values=False,
+        )
+
+    def _build_union_footprint_for_neuron(self, neuron_id: int) -> sparse.csc_matrix:
+        """
+        Rebuild one union footprint from the currently assigned
+        session footprints.
+
+        Uses the same sequential shift/weighted-update logic as
+        update_union_footprints().
+        """
+
+        if self.assignments is None:
+            raise ValueError("No assignments available.")
+
+        union = self.assignments.union
+
+        if union is None:
+            raise ValueError("No union data available.")
+
+        if not (0 <= neuron_id < self.assignments.ids.shape[0]):
+            raise IndexError(f"Invalid neuron ID {neuron_id}.")
+
+        footprint = None
+
+        shifts = self.assignments.stats.get("shifts")
+        weights = self.assignments.stats.get("fp_corr")
+
+        for session_id in range(self.assignments.ids.shape[1]):
+
+            fp_id = int(self.assignments.ids[neuron_id, session_id])
+
+            if fp_id < 0:
+                continue
+
+            session = self.sessions[session_id]
+
+            current = session.footprints[:, fp_id]
+
+            # First occurrence defines the initial
+            # union footprint.
+            if footprint is None:
+                footprint = current.copy()
+                continue
+
+            shift = shifts[neuron_id, session_id] if shifts is not None else np.zeros(2)
+            weight = weights[neuron_id, session_id] if weights is not None else 1.0
+
+            if any(np.isnan(shift)):
+                shift = np.zeros_like(shift)
+            if np.isnan(weight):
+                weight = 1.0
+
+            distance = np.sqrt(np.square(shift).sum())
+            if distance > 0.5:
+                footprint = _shift_sparse_bilinear(
+                    footprint, union.dims, -shift[0], -shift[1], order="C"
+                )
+
+            footprint = footprint.multiply(1 - weight / 2) + current.multiply(
+                weight / 2
+            )
+
+        if footprint is None:
+
+            n_pixels = (
+                union.footprints.shape[0]
+                if union.footprints.shape[0] > 0
+                else self.sessions[0].footprints.shape[0]
+            )
+            footprint = sparse.csc_matrix((n_pixels, 1))
+
+        return footprint.tocsc()
+
+    @staticmethod
+    def _replace_csc_columns(
+        matrix: sparse.csc_matrix,
+        replacements: dict[
+            int,
+            sparse.csc_matrix,
+        ],
+    ) -> sparse.csc_matrix:
+
+        matrix = matrix.tocsc()
+
+        n_rows, n_cols = matrix.shape
+
+        data_parts = []
+        index_parts = []
+
+        indptr = np.zeros(n_cols + 1, dtype=matrix.indptr.dtype)
+
+        nnz = 0
+
+        for column in range(n_cols):
+
+            replacement = replacements.get(column)
+
+            if replacement is None:
+
+                start = matrix.indptr[column]
+                stop = matrix.indptr[column + 1]
+
+                data = matrix.data[start:stop]
+
+                indices = matrix.indices[start:stop]
+
+            else:
+
+                replacement = replacement.tocsc()
+
+                if replacement.shape != (
+                    n_rows,
+                    1,
+                ):
+                    raise ValueError(
+                        "Replacement column has "
+                        f"shape {replacement.shape}, "
+                        f"expected {(n_rows, 1)}."
+                    )
+
+                data = replacement.data
+                indices = replacement.indices
+
+            data_parts.append(data)
+            index_parts.append(indices)
+
+            nnz += len(data)
+            indptr[column + 1] = nnz
+
+        data = (
+            np.concatenate(data_parts)
+            if data_parts
+            else np.asarray([], dtype=matrix.dtype)
+        )
+
+        indices = (
+            np.concatenate(index_parts)
+            if index_parts
+            else np.asarray([], dtype=matrix.indices.dtype)
+        )
+
+        return sparse.csc_matrix(
+            (data, indices, indptr),
+            shape=matrix.shape,
         )
 
     def rebuild_union(self):
 
         if self.assignments is None:
             return
-
-        self.assignments.matched_status = []
 
         self.assignments.union = SessionData(name="union")
         for session_id, assignment_ids in enumerate(self.assignments.ids.T):
@@ -905,8 +1108,138 @@ class Tracking:
                 weights,
                 shifts,
             )
-            self.assignments.matched_status.append(True)
-        # print("union footprint size", self.assignments.union.footprints.shape)
+
+        self.rebuild_union_included()
+
+    def rebuild_union_included(self):
+        """
+        checks if at least one footprint per neuron is included
+        (should only be either all or none)
+        """
+
+        if self.assignments is None or self.assignments.union is None:
+            return
+
+        included = np.zeros(self.assignments.ids.shape, dtype=bool)
+        for session_id, ids in enumerate(self.assignments.ids.T):
+            neuron_ids = np.where(ids >= 0)[0]
+            included[neuron_ids, session_id] = self.sessions[session_id].included[
+                ids[neuron_ids]
+            ]
+
+        self.assignments.union.included = np.any(included, axis=1)
+
+    def rebuild_union_neurons(self, neuron_ids):
+        """
+        Rebuild only selected neuron columns of the union.
+
+        All other union footprints and centroids remain unchanged.
+        """
+
+        if self.assignments is None:
+            raise ValueError("No assignments available.")
+
+        union = self.assignments.union
+
+        if union is None:
+            raise ValueError("No union data available.")
+
+        neuron_ids = np.unique(np.atleast_1d(neuron_ids).astype(int))
+
+        n_neurons = self.assignments.ids.shape[0]
+
+        if np.any((neuron_ids < 0) | (neuron_ids >= n_neurons)):
+            raise IndexError("Invalid neuron ID in " f"{neuron_ids}.")
+
+        # ==================================================
+        # Make sure union storage has a column for every
+        # assignment row.
+        #
+        # This matters when exclude_component() has just
+        # appended a singleton neuron.
+        # ==================================================
+
+        n_union = union.footprints.shape[1]
+
+        if n_union > n_neurons:
+            raise ValueError("Union has more neurons than assignments.")
+
+        if n_union < n_neurons:
+
+            n_add = n_neurons - n_union
+
+            empty = sparse.csc_matrix((union.footprints.shape[0], n_add))
+
+            union.footprints = sparse.hstack([union.footprints, empty], format="csc")
+
+            if union.centroids is None:
+                union.centroids = np.full((n_neurons, 2), np.nan)
+            else:
+                union.centroids = np.pad(
+                    union.centroids,
+                    ((0, n_add), (0, 0)),
+                    constant_values=np.nan,
+                )
+
+            # pad these only if pad_empty() hasn't
+            # already done so
+            # if len(union.idx_kde) < n_neurons:
+            #     union.idx_kde = np.pad(
+            #         union.idx_kde,
+            #         (0, n_neurons - len(union.idx_kde)),
+            #         constant_values=False,
+            #     )
+
+            if len(union.included) < n_neurons:
+                union.included = np.pad(
+                    union.included,
+                    (0, n_neurons - len(union.included)),
+                    constant_values=True,
+                )
+
+            if len(union.synthetic) < n_neurons:
+                union.synthetic = np.pad(
+                    union.synthetic,
+                    (0, n_neurons - len(union.synthetic)),
+                    constant_values=False,
+                )
+
+        # ==================================================
+        # Rebuild requested footprints only.
+        # ==================================================
+
+        replacements = {
+            neuron_id: self._build_union_footprint_for_neuron(int(neuron_id))
+            for neuron_id in neuron_ids
+        }
+
+        new_block = sparse.hstack(
+            [replacements[int(neuron_id)] for neuron_id in neuron_ids],
+            format="csc",
+        )
+
+        old_block = union.footprints[:, neuron_ids]
+
+        union.footprints = self._replace_csc_columns(union.footprints, replacements)
+
+        # ==================================================
+        # Update derived spatial information only for those
+        # neuron rows.
+        # ==================================================
+
+        union.centroids[neuron_ids, :] = center_of_mass(
+            new_block,
+            *union.dims,
+            convert=union.params.get("pxtomu", 1.0),
+        )
+
+        union.n_neurons = n_neurons
+
+        # Keep the automatically generated union background
+        # consistent without recomputing the whole projection.
+        if union.background is not None:
+            delta = new_block.sum(axis=1) - old_block.sum(axis=1)
+            union.background += np.asarray(delta).reshape(union.dims)
 
     def check_assignments_compatibility(self, assignments):
 
@@ -1519,13 +1852,9 @@ class Tracking:
             raise ValueError("No model to save. Please fit a model before saving.")
 
         if output_fname is None:
-            output_fname = (
-                self.get_result_directory() / f"catan_model{fix_suffix(suffix)}{ext}"
-            )
+            output_fname = self.get_result_directory() / f"catan_model{suffix}{ext}"
         else:
             self.get_result_directory(Path(output_fname).parent)
-        # output_directory = self.get_result_directory(Path(output_fname).parent)
-        # fname = output_directory / f"catan_model{fix_suffix(suffix)}{ext}"
 
         self.model.save(str(output_fname))
 
@@ -1542,8 +1871,7 @@ class Tracking:
 
         if output_fname is None:
             output_fname = (
-                self.get_result_directory()
-                / f"catan_registration{fix_suffix(suffix)}{ext}"
+                self.get_result_directory() / f"catan_registration{suffix}{ext}"
             )
         else:
             self.get_result_directory(Path(output_fname).parent)

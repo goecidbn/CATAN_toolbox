@@ -1,6 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Literal
 
 from vispy import scene, color
 from vispy.scene import visuals, cameras
@@ -8,8 +8,12 @@ from vispy.color import Colormap
 from vispy.scene.visuals import Mesh
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCursor, QAction
-from PySide6.QtCore import QTimer
+
+from PySide6.QtGui import (
+    QCursor,
+    QAction,
+)
+
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QCheckBox,
@@ -19,30 +23,29 @@ from PySide6.QtWidgets import (
     QWidget,
     QMenu,
     QPushButton,
-    QButtonGroup,
     QFrame,
-    QFormLayout,
-    QToolButton,
     QSlider,
 )
 
 import importlib
 
-from catan.core.structures import sessiondata_type
+from catan.core.structures import NeuronComponent, sessiondata_type
 from catan.gui.panels import BasePlot
-from catan.gui.panels.helper import FootprintSlider
+from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
+
 from catan.gui.interaction import click_events
 
-from catan.gui.structures.state import NeuronComponent
+from catan.gui.structures import request_handler
 from catan.gui.GUI_elements.utils.menu_creation import (
     get_colored_label,
     add_label_to_menu,
 )
 from catan.gui.GUI_elements.fragments.ResetViewButton import ResetViewButton
-
+from catan.tracking.structures import ReviewStatus
 from catan.core.image_correlation import calculate_img_correlation
 
-importlib.reload(FootprintSlider)
+# importlib.reload(FootprintSlider)
+importlib.reload(request_handler)
 
 CAMERA_PADDING_PX = 25.0
 
@@ -94,13 +97,20 @@ class Display(BasePlot.BaseCanvas):
             self.native, (6, 50), lambda: self.reset_camera(full=True)
         )
 
+        self._build_review_status_tag()
+
         self.parameter_overlay = None
-        # self.session_filter_overlay = None
+        self.request_display = RequestDisplay(self.native)
+        self.state.current_request = None
 
         self.events.resize.connect(self._on_canvas_resize)
 
         self.clear()
         self.camera_set = False
+
+        self.register_actions: dict[str, QAction] = {}
+
+        # self._setup_review_shortcuts()
 
         self.freeze()
 
@@ -109,6 +119,84 @@ class Display(BasePlot.BaseCanvas):
         event=None,
     ):
         self._position_overlay_controls()
+        self._position_request_display()
+        self._position_review_status_tag()
+
+    def _build_review_status_tag(self):
+        self.review_status_label = QLabel(self.native)
+        self.review_status_label.setObjectName("reviewStatusTag")
+        self.review_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.review_status_label.setStyleSheet("""
+            QLabel#reviewStatusTag {
+                color: white;
+                background-color: #666666;
+                border: 1px solid #808080;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }
+        """)
+
+        self.review_status_label.hide()
+
+    def _position_review_status_tag(self):
+
+        if not self.review_status_label.isVisible():
+            return
+
+        margin = 8
+
+        self.review_status_label.move(margin, margin)
+
+        self.review_status_label.raise_()
+
+    def update_review_status_tag(self):
+
+        component = self.state.focused_component
+
+        if component is None or self.data is None or self.data.assignments is None:
+            self.review_status_label.hide()
+            return
+
+        neuron_id = int(component.neuron_id)
+
+        if neuron_id >= len(self.data.assignments.review_status):
+            self.review_status_label.hide()
+            return
+
+        status = ReviewStatus(self.data.assignments.review_status[neuron_id])
+
+        if status == ReviewStatus.REVIEWED:
+            background = "#357a4f"
+            border = "#58a873"
+
+        elif status == ReviewStatus.UNCERTAIN:
+            background = "#9a672c"
+            border = "#c98a3e"
+
+        else:  # PENDING
+            background = "#555b63"
+            border = "#747b85"
+
+        self.review_status_label.setText(status.label)
+
+        self.review_status_label.setStyleSheet(f"""
+            QLabel#reviewStatusTag {{
+                color: #ffffff;
+                background-color: {background};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-weight: 600;
+            }}
+            """)
+
+        self.review_status_label.adjustSize()
+        self.review_status_label.show()
+        self.review_status_label.raise_()
+
+        self._position_review_status_tag()
 
     def _position_overlay_controls(self):
 
@@ -128,18 +216,22 @@ class Display(BasePlot.BaseCanvas):
 
         palette.raise_()
 
-        # session = self.session_filter_overlay
+    def _position_request_display(self):
 
-        # if session is None or not session.isVisible():
-        #     return
+        if self.request_display is None:
+            return
 
-        # session.adjustSize()
+        margin = 8
 
-        # session_x = palette.x() - session.width() - spacing
-        # session_y = palette.y() + palette.toggle_button.height() + spacing
+        display = self.request_display
+        display.adjustSize()
 
-        # session.move(max(margin, session_x), session_y)
-        # session.raise_()
+        x = margin
+        y = self.native.height() - display.height() - margin
+
+        display.move(x, max(margin, y))
+
+        display.raise_()
 
     def attach_parameter_overlay(self):
         """
@@ -162,17 +254,17 @@ class Display(BasePlot.BaseCanvas):
             self._position_overlay_controls
         )
 
-        if hasattr(self.parameter_overlay, "session_filter_overlay"):
-            self.session_filter_overlay = self.parameter_overlay.session_filter_overlay
+        # if hasattr(self.parameter_overlay, "session_filter_overlay"):
+        #     self.session_filter_overlay = self.parameter_overlay.session_filter_overlay
 
-            self.session_filter_overlay.setParent(self.native)
+        #     self.session_filter_overlay.setParent(self.native)
 
-            # Respect current filter state.
-            self.session_filter_overlay.setVisible(
-                self.parameter_overlay.checkbox_session_only.isChecked()
-            )
+        #     # Respect current filter state.
+        #     self.session_filter_overlay.setVisible(
+        #         self.parameter_overlay.checkbox_session_only.isChecked()
+        #     )
 
-            self.session_filter_overlay.raise_()
+        #     self.session_filter_overlay.raise_()
 
         self._position_overlay_controls()
 
@@ -227,19 +319,35 @@ class Display(BasePlot.BaseCanvas):
         display_scope = self.controls["parameter"].display_scope
         if display_scope == "adjacent":
 
-            adjacent_radius = self.controls["parameter"].adj_radius_spin.value()
-
             ## find closeby neurons
             union_centroids = self.data.assignments.union.centroids
             distances = np.linalg.norm(
                 union_centroids - union_centroids[this_neuron], axis=1
             )
-            to_plot_neurons = np.where(distances <= adjacent_radius)[0]
+            to_plot_neurons = np.where(distances <= self.state.adjacency_radius)[0]
 
         elif display_scope == "selection":
             to_plot_neurons = [c.neuron_id for c in self.state.selected_components]
         else:
             raise ValueError(f"Unknown footprint display scope: " f"{display_scope!r}")
+
+        show_excluded = self.controls["parameter"].checkbox_show_excluded.isChecked()
+
+        if not show_excluded:
+            included = self.data.assignments.union.included
+            to_plot_neurons = [neuron for neuron in to_plot_neurons if included[neuron]]
+
+        to_plot_neurons = np.asarray(to_plot_neurons, dtype=int)
+
+        review_mask = ReviewStatusFilter.neuron_mask(
+            to_plot_neurons,
+            self.data.assignments.review_status,
+            (self.controls["parameter"].review_filter.visible_statuses),
+            focused_neuron_id=this_neuron,
+            keep_focused=True,
+        )
+
+        to_plot_neurons = to_plot_neurons[review_mask]
 
         session_filter = self.controls["parameter"].checkbox_session_only.isChecked()
         filter_focused = self.controls["parameter"].checkbox_filter_focused.isChecked()
@@ -250,9 +358,28 @@ class Display(BasePlot.BaseCanvas):
 
         ## iterate through each neuron that should be plotted
         for neuron in to_plot_neurons:
-            key = "focused" if neuron == this_neuron else "default"
-            alpha = 0.8 if key == "focused" else self.styles.opts[key]["alpha"]
-            # alpha = self.styles.opts[key]["alpha"]
+            included = bool(self.data.assignments.union.included[neuron])
+
+            selected_neurons = {
+                component.neuron_id
+                for component in (self.state.selected_components or [])
+            }
+
+            if not included:
+                key = "default"
+                alpha = 0.1
+
+            elif neuron == this_neuron:
+                key = "focused"
+                alpha = self.styles.opts[key]["alpha"]
+
+            elif neuron in selected_neurons:
+                key = "selected"
+                alpha = self.styles.opts[key]["alpha"]
+
+            else:
+                key = "default"
+                alpha = self.styles.opts[key]["alpha"]
 
             ## create new data if not yet present
             if neuron not in self.plotting["data"]:
@@ -266,7 +393,7 @@ class Display(BasePlot.BaseCanvas):
                 ## select subset of data for session-only display ...
 
                 session_id = int(self.controls["session_filter"].slider.value())
-                component = NeuronComponent(session_id, neuron)
+                component = NeuronComponent(neuron, session_id)
 
                 rec = self.plotting["data"].get(component.id, None)
                 if rec is None:
@@ -383,6 +510,7 @@ class Display(BasePlot.BaseCanvas):
         self.state.logger.debug(
             f"Plotting neuron {neuron} with threshold {thr} and alpha {alpha}"
         )
+        # print(f"Adding footprint data for neuron {neuron}")
 
         vertex_offset = 0
         face_offset = 0
@@ -396,15 +524,20 @@ class Display(BasePlot.BaseCanvas):
             if not self.data.session_assigned(session.id):
                 continue
 
-            component = NeuronComponent(session.id, neuron)
+            component = NeuronComponent(neuron, session.id)
 
             fp_id = self.state.get_footprint_from_component(component)
 
             if fp_id is None or fp_id < 0:
                 continue
 
-            rgba = self.state.session_colors[session.id]
-            rgba[3] = alpha
+            rgba = np.array(
+                self.state.session_colors[session.id],
+                dtype=np.float32,
+                copy=True,
+            )
+
+            rgba[3] = 1.0
 
             z_offset = float(session.id) * z_stretch
 
@@ -463,7 +596,7 @@ class Display(BasePlot.BaseCanvas):
         keys = [
             key
             for key in self.plotting["data"].keys()
-            if isinstance(key, tuple) and key[1] in self.plotting["visuals"]
+            if isinstance(key, tuple) and key[0] in self.plotting["visuals"]
         ]
         centers = np.asarray(
             [self.plotting["data"][key].center_xyz for key in keys],
@@ -471,7 +604,7 @@ class Display(BasePlot.BaseCanvas):
         )
 
         screen_centers = click_events.visual_to_canvas(
-            self.plotting["visuals"][keys[0][1]], centers
+            self.plotting["visuals"][keys[0][0]], centers
         )
 
         dx = screen_centers[:, 0] - mouse_pos[0]
@@ -490,7 +623,7 @@ class Display(BasePlot.BaseCanvas):
             rec = self.plotting["data"][key]
 
             screen = click_events.visual_to_canvas(
-                self.plotting["visuals"][keys[int(i)][1]], rec.pick_points
+                self.plotting["visuals"][keys[int(i)][0]], rec.pick_points
             )
 
             ddx = screen[:, 0] - mouse_pos[0]
@@ -511,15 +644,12 @@ class Display(BasePlot.BaseCanvas):
         union_centroids = self.data.assignments.union.centroids
         neuron_id = component.neuron_id
         d = np.linalg.norm(union_centroids - union_centroids[neuron_id], axis=1)
-        try:
-            adj_radius = self.controls["parameter"].adj_radius_spin.value()
-        except Exception:
-            adj_radius = 15.0
-        neuron_ids = np.where(d <= adj_radius)[0]
+
+        neuron_ids = np.where(d <= self.state.adjacency_radius)[0]
         neuron_ids = [n for n in neuron_ids if n != neuron_id]
 
         self.state.logger.debug(
-            f"Neuron {neuron_id} has {len(neuron_ids)} adjacent neurons within radius {adj_radius}: {neuron_ids}"
+            f"Neuron {neuron_id} has {len(neuron_ids)} adjacent neurons within radius {self.state.adjacency_radius}: {neuron_ids}"
         )
 
         return np.array(neuron_ids), np.array(d[neuron_ids])
@@ -533,6 +663,14 @@ class Display(BasePlot.BaseCanvas):
         return {"vertices": verts, "faces": faces, "vertex_colors": cols}
 
     def on_mouse_release(self, event):
+
+        if self.state.current_request is not None:
+
+            if event.button == 1 and event.pos is not None:
+                self._on_request_interaction(event)
+
+            event.handled = True
+            return
 
         if event.button == 2:  # right click in VisPy
             key = self.find_closest_component(event.pos)
@@ -588,23 +726,30 @@ class Display(BasePlot.BaseCanvas):
             raise ValueError(f"Invalid with_session value: {with_session}")
 
         ## decided on the reference component to compare with
-        ref_component = NeuronComponent(ref_session_id, ref_neuron)
+        ref_component = NeuronComponent(ref_neuron, ref_session_id)
         ref_fp_id = self.state.get_footprint_from_component(ref_component)
 
         ## calculate the statistics
-        similarity, _, shift = calculate_img_correlation(
-            A1=self.data.sessions[this_component.session_id].footprints[:, this_fp_id],
-            A2=self.data.sessions[ref_component.session_id].footprints[:, ref_fp_id],
-            dims=self.data.sessions[this_component.session_id].dims,
-            crop=True,
-            binary=False,
-            shift=True,
-            mode="cosine_union",
-            gamma=0.1,
-            shift_optimized=True,
-        )
-        d_shift = np.sqrt(np.sum([s**2 for s in shift]))
-        p_same = self.data.model.f_same(d_shift, similarity)[0]
+        if self.data.model is not None and self.data.model.fitted:
+            similarity, _, shift = calculate_img_correlation(
+                A1=self.data.sessions[this_component.session_id].footprints[
+                    :, this_fp_id
+                ],
+                A2=self.data.sessions[ref_component.session_id].footprints[
+                    :, ref_fp_id
+                ],
+                dims=self.data.sessions[this_component.session_id].dims,
+                crop=True,
+                binary=False,
+                shift=True,
+                mode="cosine_union",
+                gamma=0.1,
+                shift_optimized=True,
+            )
+            d_shift = np.sqrt(np.sum([s**2 for s in shift]))
+            p_same = self.data.model.f_same(d_shift, similarity)[0]
+        else:
+            similarity, d_shift, p_same = None, None, None
         return similarity, d_shift, p_same, ref_session_id
 
     def add_info_str(
@@ -615,10 +760,12 @@ class Display(BasePlot.BaseCanvas):
         which: str = "previous",
         cmap=Colormap(["green", "black", "red"]),
     ):
+
         similarity, shift, p_same, session_id = self.calculate_tracking_statistics(
             this_component, candidate, with_session=which
         )
-        if similarity is None or shift is None or p_same is None or session_id is None:
+        if session_id is None:
+            # similarity is None or shift is None or p_same is None or
             add_label_to_menu(
                 menu,
                 f"no {which} session found",
@@ -628,16 +775,28 @@ class Display(BasePlot.BaseCanvas):
         ds = abs(this_component.session_id - session_id)
 
         arrow = "\u25bc" if which == "previous" else "\u25b2"
-        html_probability = get_colored_label(f"p={p_same:.2f}", 1 - p_same, cmap, ["b"])
         html_session = (
             f"\u0394s="
             + get_colored_label(f"{ds}", ds / 10.0, cmap)
             + f"({session_id})"
         )
-        html_similarity = "c=" + get_colored_label(
-            f"{similarity:.2f}", (1 - similarity) / 2.0, cmap
-        )
-        html_shift = "shift=" + get_colored_label(f"{shift:.2f}px", shift / 10.0, cmap)
+        html_probability = ""
+        html_similarity = ""
+        html_shift = ""
+        if p_same is not None:
+            html_probability = get_colored_label(
+                f"p={p_same:.2f}", 1 - p_same, cmap, ["b"]
+            )
+
+        if similarity is not None:
+            html_similarity = "c=" + get_colored_label(
+                f"{similarity:.2f}", (1 - similarity) / 2.0, cmap
+            )
+
+        if shift is not None:
+            html_shift = "shift=" + get_colored_label(
+                f"{shift:.2f}px", shift / 10.0, cmap
+            )
 
         add_label_to_menu(
             menu,
@@ -646,6 +805,9 @@ class Display(BasePlot.BaseCanvas):
         )
 
     def open_footprint_context_menu(self, this_component: NeuronComponent):
+
+        if this_component.session_id is None:
+            return
 
         ## find adjacent neurons
         neuron_candidates, distances = self.find_nearby_neurons(this_component)
@@ -675,11 +837,6 @@ class Display(BasePlot.BaseCanvas):
                 f"<b>Current assignment (neuron {this_neuron}, session {this_component.session_id})</b>",
                 enabled=False,
             )
-            # act_candidate = QAction(
-            #     f"Current assignment (neuron {this_neuron}, session {this_component.session_id})",
-            #     submenu_change,
-            # )
-            # submenu_change.addAction(act_candidate)
 
             self.add_info_str(submenu_change, this_component, this_neuron, "next")
             self.add_info_str(submenu_change, this_component, this_neuron, "previous")
@@ -709,16 +866,14 @@ class Display(BasePlot.BaseCanvas):
             menu.addMenu(submenu_change)
             menu.addSeparator()
 
-        ## === flag options ===
-        submenu_flag = QMenu("Flag neuron ...", menu)
+        ## === flag submenus ===
+        submenu_neuron = self.build_neuron_tag_menu(this_component.neuron_id, menu)
+        menu.addMenu(submenu_neuron)
 
-        submenu_flag.addAction(QAction("... as uncertain", submenu_flag))
-        submenu_flag.addAction(QAction("... as certain", submenu_flag))
-        submenu_flag.addSeparator()
-        submenu_flag.addAction(QAction("... for merge", submenu_flag))
-        submenu_flag.addAction(QAction("... for split", submenu_flag))
-        submenu_flag.addAction(QAction("... for removal", submenu_flag))
-        menu.addMenu(submenu_flag)
+        submenu_footprint = self.build_footprint_tag_menu(this_component, menu)
+        menu.addMenu(submenu_footprint)
+
+        menu.addSeparator()
 
         if not self.data.sessions[this_component.session_id].status["traces_loaded"]:
 
@@ -730,6 +885,189 @@ class Display(BasePlot.BaseCanvas):
             )
 
         menu.exec(QCursor.pos())
+
+    def build_neuron_tag_menu(self, neuron_id: int, menu: QMenu) -> QMenu:
+        submenu = QMenu("Tag neuron ...", menu)
+
+        for status in ReviewStatus:
+            key = status.name.lower()
+
+            self.register_actions[key] = QAction(f"... as {status.menu_label}", submenu)
+            submenu.addAction(self.register_actions[key])
+
+            self.register_actions[key].triggered.connect(
+                lambda checked, status=status: self.change_review_status(
+                    neuron_id, status
+                )
+            )
+
+        submenu.addSeparator()
+
+        self.register_actions["toggle_included_neuron"] = QAction(
+            f"... as {"excluded" if self.data.is_included(neuron_id) else "included"}",
+            submenu,
+        )
+        submenu.addAction(self.register_actions["toggle_included_neuron"])
+        self.register_actions["toggle_included_neuron"].triggered.connect(
+            lambda: self.toggle_included(neuron_id)
+        )
+
+        self.register_actions["remove_neuron"] = QAction("... as removed", submenu)
+        submenu.addAction(self.register_actions["remove_neuron"])
+        self.register_actions["remove_neuron"].triggered.connect(
+            lambda: self.remove_component(neuron_id)
+        )
+
+        menu.addMenu(submenu)
+
+        return submenu
+
+    def build_footprint_tag_menu(
+        self, component: NeuronComponent, menu: QMenu
+    ) -> QMenu:
+
+        submenu = QMenu("Tag footprint ...", menu)
+
+        self.register_actions["merge"] = QAction("... for merge", submenu)
+        submenu.addAction(self.register_actions["merge"])
+        self.register_actions["merge"].triggered.connect(
+            lambda: self.start_merge(component)
+        )
+
+        self.register_actions["split"] = QAction("... for split", submenu)
+        submenu.addAction(self.register_actions["split"])
+        self.register_actions["split"].triggered.connect(
+            lambda: self.start_split(component)
+        )
+
+        fp_id = self.state.get_footprint_from_component(component)
+        self.register_actions["toggle_included"] = QAction(
+            f"... as {"excluded" if self.data.is_included(component) else "included"}",
+            submenu,
+        )
+        submenu.addAction(self.register_actions["toggle_included"])
+        self.register_actions["toggle_included"].triggered.connect(
+            lambda: self.toggle_included(component)
+        )
+
+        self.register_actions["remove"] = QAction("... as removed", submenu)
+        submenu.addAction(self.register_actions["remove"])
+        self.register_actions["remove"].triggered.connect(
+            lambda: self.remove_component(component)
+        )
+
+        return submenu
+
+    def _on_request_status_changed(self):
+
+        self.request_display.set_request(self.state.current_request)
+        self._position_request_display()
+
+    def sync_request_display(self):
+
+        request = self.state.current_request
+
+        self.request_display.set_request(request)
+
+        if request is not None:
+            self.state.update_highlighted_components(request.components)
+
+        self._position_request_display()
+
+    def start_merge(self, component: NeuronComponent):
+        self.state.current_request = request_handler.RequestHandler("merge", component)
+        self.state.update_highlighted_components(self.state.current_request.components)
+
+    def start_split(self, component: NeuronComponent):
+        self.state.current_request = request_handler.RequestHandler("split", component)
+        self.state.update_highlighted_components(self.state.current_request.components)
+
+    def cancel_request(self):
+        self.state.current_request = None
+        self.state.update_highlighted_components(None)
+
+    def advance_or_confirm_request(self):
+
+        request = self.state.current_request
+
+        if request is None:
+            return
+
+        # ---------------------------------------------
+        # Origin -> destination
+        # ---------------------------------------------
+        if request.stage == "origin":
+
+            try:
+                request.advance_stage()
+
+            except ValueError as exc:
+                self.request_display.set_error(str(exc))
+                return
+
+            self.state.notify_request_changed()
+            return
+
+        # ---------------------------------------------
+        # Final confirmation
+        # ---------------------------------------------
+        if not request.is_complete:
+            self.request_display.set_error("The request is not complete yet.")
+            return
+
+        try:
+            self.data.process_component_request(request)
+        except Exception as exc:
+            self.request_display.set_error(str(exc))
+            return
+
+        self.state.current_request = None
+        self.state.update_highlighted_components(None)
+
+    def _on_request_interaction(self, event):
+
+        request = self.state.current_request
+
+        if request is None:
+            return
+
+        component = self.find_closest_component(event.pos)
+
+        if component is None:
+            return
+
+        current_components = (
+            request.origin if request.stage == "origin" else request.destination
+        )
+
+        if component in current_components:
+
+            request.remove_component(component)
+
+            self.state.update_highlighted_components(request.components)
+            self.state.notify_request_changed()
+            return
+
+        error = request.validation_error(component)
+
+        if error is not None:
+            self.request_display.set_error(error)
+            return
+
+        request.add_component(component)
+
+        self.state.update_highlighted_components(request.components)
+        self.state.notify_request_changed()
+
+    def toggle_included(self, component: NeuronComponent | int):
+        # Implement the logic for handling the removal action
+        if self.data.is_included(component):
+            self.data.exclude_component(component)
+        else:
+            self.data.reinclude_component(component)
+
+    def remove_component(self, component: NeuronComponent | int):
+        self.data.remove_component(component)
 
     def toggle_session_data(
         self, session_id: int, which: Optional[sessiondata_type] = None
@@ -745,41 +1083,7 @@ class Display(BasePlot.BaseCanvas):
     def change_neuron_assignment_dialog(
         self, component: NeuronComponent, new_neuron: Optional[int] = None
     ):
-        # Implement a dialog to change the neuron assignment for the given footprint
-        # This is a placeholder for the actual implementation
-        # print(
-        #     f"Change neuron assignment for footprint: {old_component} to {new_component}"
-        # )
-        """
-        [1h] find all adjacent neurons (within distance threshold) and show a dialog to select one
-            * [x] calculate and display distance + similarity + probability
-            * [x] sort neurons according to calculated probability
 
-        [2h] on selection, update the previous neuron and the new neuron
-            * [x] update assignments (in state)
-            * [x] remove & insert footprint data in old & new data.neurons
-            * [x] recalculate neuron statistics and union A & centroid for both neurons
-            * remove old neuron if empty
-
-        [2h] update plots:
-            * overview: union shape of both neurons, display table?
-            * [x] footprints: update plotting data for both neurons, update selection/focus if needed
-
-        further things:
-            * [10h] calculate general neuron/tracking statistics & session-to-session data:
-                * [x] distance, similarity, probability
-                * [x] shift
-                * # components / neuron
-                * overall matching goodness (high prob everywhere? few shifts?, few size differences?)
-                    * and highlight / allow filter
-            * [x] implement "display session x only" for footprints
-            * [1h] implement moving up/down sessions with arrow keys for highlighted footprint
-            * [x] properly check alpha options for footprints
-            * [x] change alpha on already registered components (when selecting others, etc)
-            * [30min] enable zooming out when changing display distaance (without full camera reset)
-            * [x] implement "unassign footprint" (create new neuron for this footprint)
-
-        """
         session_id = component.session_id
         fp_id = self.state.get_footprint_from_component(component)
 
@@ -789,31 +1093,13 @@ class Display(BasePlot.BaseCanvas):
             self.state.logger.debug(
                 f"Creating new neuron {new_neuron} for footprint {fp_id} in session {session_id}"
             )
-            self.state.assignments = np.pad(
-                self.state.assignments,
-                ((0, 1), (0, 0)),
-                mode="constant",
-                constant_values=-1,
-            )
-
-            # self.data.neurons.centroids = np.pad(
-            #     self.data.neurons.centroids,
-            #     ((0, 1), (0, 0), (0, 0)),
-            #     mode="constant",
-            #     constant_values=np.nan,
-            # )
-            ## union footprints is dict - no need to pad
+            self.data.assignments.pad_empty(n_neurons=1, n_sessions=0)
 
         ## change assignments array
         self.state.assignments[new_neuron, session_id] = fp_id
         self.state.assignments[component.neuron_id, session_id] = -1
 
-        ## update neuron data for both neurons
-        # self.data.rebuild_neuron(new_neuron, self.state.assignments)
-        # self.data.rebuild_neuron(component.neuron_id, self.state.assignments)
-
-        # self.data.rebuild_neuron(new_neuron, self.state.assignments)
-        # self.data.rebuild_neuron(component.neuron_id, self.state.assignments)
+        self.data.rebuild_union_neurons([new_neuron, component.neuron_id])
 
         if np.all(self.state.assignments[component.neuron_id, :] < 0):
             print(f"Neuron {component.neuron_id} is now empty and will be removed.")
@@ -826,24 +1112,25 @@ class Display(BasePlot.BaseCanvas):
     def set_focused_footprint(self, component: NeuronComponent):
         self.state.focused_component = component
 
+    def change_review_status(self, neuron_id: int, status: ReviewStatus):
+        self.data.change_review_status(neuron_id, status)
+
 
 class Controller(BasePlot.CanvasController):
+
+    request_status_changed = Signal()
 
     def disconnect_signals(self):
         super().disconnect_signals()
         self.controls["parameter"].data_parameter_changed.disconnect()
         self.controls["parameter"].display_parameter_changed.disconnect()
+        self.state.request_status_changed.disconnect(self._on_request_status_changed)
 
     def build_controls(self):
         super().build_controls()
 
-        self.controls["slider"] = FootprintSlider.FootprintSliderController(
-            self.section
-        )
-        self.section.x_options_layout.addWidget(self.controls["slider"])
-
+        self.state.adjacency_radius_changed.connect(self.replot_neurons)
         self.controls["parameter"] = FootprintParametersController(self.section)
-
         self.canvas.attach_parameter_overlay()
 
         self.controls["parameter"].data_parameter_changed.connect(
@@ -871,14 +1158,30 @@ class Controller(BasePlot.CanvasController):
             lambda _: self.update_neuron_selection()
         )
 
+        self.state.request_status_changed.connect(self._on_request_status_changed)
+
+        self.canvas.request_display.cancel_requested.connect(self.canvas.cancel_request)
+
+        self.canvas.request_display.confirm_requested.connect(
+            self.canvas.advance_or_confirm_request
+        )
+
+        # Important for hot reload:
+        # there may already be a pending request.
+        self._on_request_status_changed()
+
     def _on_data_changed(self, input: Tuple[str, int]):
+
         if input[0] in ["sessions", "assignments"]:
             self.replot_neurons()
 
+        elif input[0] == "review_status":
+            self.canvas.update_review_status_tag()
+
     def initialize_display(self):
         self._setup_session_filter()
-
         super().initialize_display()
+        self.canvas.update_review_status_tag()
 
     def _on_session_changed(self):
         self._setup_session_filter()
@@ -910,11 +1213,12 @@ class Controller(BasePlot.CanvasController):
         )
 
     def _on_selection_changed(self):
-        self.controls["slider"].update_setup()
+        # self.controls["slider"].update_setup()
         super()._on_selection_changed()
 
     def _on_focus_changed(self):
-        self.controls["slider"].adjust_id()
+        # self.controls["slider"].adjust_id()
+        self.canvas.update_review_status_tag()
         super()._on_focus_changed()
 
     def update_neuron_selection(self):
@@ -924,6 +1228,9 @@ class Controller(BasePlot.CanvasController):
     def replot_neurons(self):
         self.canvas.plot_neurons(reset=True)
         self.update_styles()
+
+    def _on_request_status_changed(self):
+        self.canvas.sync_request_display()
 
 
 class SessionFilterControl(QWidget):
@@ -992,12 +1299,184 @@ class SessionFilterControl(QWidget):
             self.slider.setValue(int(current_session))
 
 
-class FootprintParametersController(QWidget):
+class RequestDisplay(QFrame):
+
+    cancel_requested = Signal()
+    confirm_requested = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        self.setMaximumWidth(parent.width() / 2)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(10, 8, 10, 8)
+        root_layout.setSpacing(5)
+
+        self.title = QLabel("")
+        self.title.setObjectName("requestTitle")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root_layout.addWidget(self.title)
+
+        self.origin_label = QLabel("")
+        self.origin_label.setObjectName("requestStatus")
+        self.origin_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        root_layout.addWidget(self.origin_label)
+
+        self.destination_label = QLabel("")
+        self.destination_label.setObjectName("requestStatus")
+        self.destination_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        root_layout.addWidget(self.destination_label)
+
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("requestError")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        root_layout.addWidget(self.error_label)
+
+        button_layout = QHBoxLayout()
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setObjectName("requestCancelButton")
+
+        self.confirm_button = QPushButton("Confirm")
+        self.confirm_button.setObjectName("requestConfirmButton")
+
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addWidget(self.confirm_button)
+
+        root_layout.addLayout(button_layout)
+
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+
+        self.confirm_button.clicked.connect(self.confirm_requested.emit)
+
+        # self.root_layout = root_layout
+        self.setObjectName("RequestDisplayOverlay")
+
+        self.setStyleSheet("""
+            QFrame#RequestDisplayOverlay {
+                background-color: rgba(30, 34, 40, 245);
+                border: 1px solid #6b7480;
+                border-radius: 7px;
+            }
+
+            QFrame#RequestDisplayOverlay QLabel {
+                background: transparent;
+                border: none;
+                color: #e8eaed;
+            }
+
+            QLabel#requestTitle {
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: 600;
+                padding-bottom: 3px;
+            }
+
+            QLabel#requestStatus {
+                color: #d5d9df;
+                font-size: 11px;
+                padding: 1px 2px;
+            }
+
+            QLabel#requestError {
+                color: #ff8a8a;
+                font-size: 11px;
+                font-weight: 500;
+                padding: 3px 2px;
+            }
+
+            QFrame#RequestDisplayOverlay QPushButton {
+                color: #e8eaed;
+                background-color: #3b414a;
+                border: 1px solid #66707c;
+                border-radius: 4px;
+                padding: 5px 12px;
+                min-width: 32px;
+            }
+
+            QFrame#RequestDisplayOverlay QPushButton:hover {
+                background-color: #4a525d;
+                border-color: #8793a1;
+            }
+
+            QPushButton#requestCancelButton:pressed {
+                background-color: #30353c;
+            }
+
+            QPushButton#requestConfirmButton {
+                background-color: #355f4b;
+                border-color: #57906f;
+                color: #ffffff;
+                font-weight: 600;
+            }
+
+            QPushButton#requestConfirmButton:hover {
+                background-color: #40735a;
+            }
+
+            QPushButton#requestConfirmButton:disabled {
+                background-color: #2b3036;
+                border-color: #474e57;
+                color: #777f89;
+                font-weight: normal;
+            }
+        """)
+
+        self.setVisible(False)
+
+    def set_request(
+        self,
+        request_handler: request_handler.RequestHandler | None,
+    ):
+
+        if request_handler is None:
+            self.clear_request()
+            return
+
+        self.setVisible(True)
+
+        self.title.setText(f"{request_handler.type.capitalize()} request")
+        self.origin_label.setText(request_handler.origin_status_text())
+        self.destination_label.setText(request_handler.destination_status_text())
+
+        if request_handler.stage == "origin":
+            self.confirm_button.setText("Continue to destination")
+
+        else:
+            self.confirm_button.setText(f"Confirm {request_handler.type}")
+
+        self.confirm_button.setEnabled(request_handler.stage_complete)
+
+        self.clear_error()
+
+    def set_error(self, message: str):
+        self.error_label.setText(message)
+        self.error_label.show()
+        self.adjustSize()
+
+    def clear_error(self):
+        self.error_label.clear()
+        self.error_label.hide()
+
+    def clear_request(self):
+
+        self.setVisible(False)
+
+        self.title.clear()
+        self.origin_label.clear()
+        self.destination_label.clear()
+
+        self.confirm_button.setEnabled(False)
+
+        self.clear_error()
+
+
+class FootprintParametersController(ControlPanel.ControlPanel):
 
     data_parameter_changed = Signal()
-    display_parameter_changed = Signal()
-
-    overlay_layout_changed = Signal()
 
     session_only_changed = Signal(bool)
     reset_camera_requested = Signal()
@@ -1005,72 +1484,22 @@ class FootprintParametersController(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
 
-        self.state = parent.state
-
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(4, 4, 4, 4)
-        root_layout.setSpacing(3)
-
-        self.toggle_button = QToolButton()
-        self.toggle_button.setText("⚙")
-        self.toggle_button.setToolTip("Footprint display settings")
-        self.toggle_button.setCheckable(True)
-        self.toggle_button.setChecked(False)
-
-        root_layout.addWidget(
-            self.toggle_button,
-            alignment=Qt.AlignmentFlag.AlignRight,
+        scope_selector = self._build_display_scope_selection(
+            {
+                "adjacent": {
+                    "label": "Nearby",
+                    "position": "left",
+                },
+                "selection": {
+                    "label": "Selected",
+                    "position": "right",
+                },
+            }
         )
+        self.form.addRow("Show", scope_selector)
 
-        self.parameter_body = QWidget()
-
-        form = QFormLayout(self.parameter_body)
-        form.setContentsMargins(8, 5, 8, 8)
-        form.setHorizontalSpacing(8)
-        form.setVerticalSpacing(5)
-
-        root_layout.addWidget(self.parameter_body)
-
-        self.display_scope_group = QButtonGroup(self)
-        self.display_scope_group.setExclusive(True)
-
-        scope_widget = QWidget()
-        scope_layout = QHBoxLayout(scope_widget)
-        scope_layout.setContentsMargins(0, 0, 0, 0)
-        scope_layout.setSpacing(0)
-
-        self.scope_adjacent_button = QToolButton()
-        self.scope_adjacent_button.setText("Nearby")
-        self.scope_adjacent_button.setCheckable(True)
-        self.scope_adjacent_button.setProperty("footprintScope", "adjacent")
-        self.scope_adjacent_button.setObjectName("scopeLeft")
-        self.scope_adjacent_button.setMinimumWidth(70)
-
-        self.scope_selection_button = QToolButton()
-        self.scope_selection_button.setText("Selected")
-        self.scope_selection_button.setCheckable(True)
-        self.scope_selection_button.setProperty("footprintScope", "selection")
-        self.scope_selection_button.setObjectName("scopeRight")
-        self.scope_selection_button.setMinimumWidth(70)
-
-        self.display_scope_group.addButton(self.scope_adjacent_button)
-        self.display_scope_group.addButton(self.scope_selection_button)
-
-        scope_layout.addWidget(self.scope_adjacent_button)
-        scope_layout.addWidget(self.scope_selection_button)
-
-        self.scope_adjacent_button.setChecked(True)
-
-        form.addRow("Show", scope_widget)
-
-        ## add adjacency radius control
-        initial_adj_radius = 15
-        self.adj_radius_spin = QDoubleSpinBox()
-        self.adj_radius_spin.setDecimals(1)
-        self.adj_radius_spin.setRange(0.0, 50.0)
-        self.adj_radius_spin.setSingleStep(1.0)
-        self.adj_radius_spin.setValue(initial_adj_radius)
-        form.addRow("Adjacency", self.adj_radius_spin)
+        review_selector = self._build_review_selector()
+        self.form.addRow("Review status", review_selector)
 
         ## add footprint threshold control
         initial_threshold = 0.1
@@ -1079,7 +1508,10 @@ class FootprintParametersController(QWidget):
         self.threshold_spin.setRange(0.0, 1.0)
         self.threshold_spin.setSingleStep(0.01)
         self.threshold_spin.setValue(initial_threshold)
-        form.addRow("Threshold", self.threshold_spin)
+        self.threshold_spin.valueChanged.connect(
+            lambda: self.data_parameter_changed.emit()
+        )
+        self.form.addRow("Threshold", self.threshold_spin)
 
         ## z_stretch control (for 3D visualization)
         initial_z_stretch = 5.0
@@ -1088,168 +1520,37 @@ class FootprintParametersController(QWidget):
         self.z_stretch_spin.setRange(1.0, 10.0)
         self.z_stretch_spin.setSingleStep(0.5)
         self.z_stretch_spin.setValue(initial_z_stretch)
-        form.addRow("Z stretch", self.z_stretch_spin)
+        self.z_stretch_spin.valueChanged.connect(
+            lambda: self.data_parameter_changed.emit()
+        )
+        self.form.addRow("Z stretch", self.z_stretch_spin)
 
         for spin in (
-            self.adj_radius_spin,
             self.threshold_spin,
             self.z_stretch_spin,
         ):
             spin.setFixedWidth(72)
 
-        # layout.addWidget(QLabel("Adjacency (px)"))
-        # layout.addWidget(self.adj_radius_spin)
-
         ## checkbox for toggling single session display
         self.checkbox_session_only = QCheckBox("Session filter")
         self.checkbox_session_only.setChecked(False)
-        form.addRow(self.checkbox_session_only)
+        self.checkbox_session_only.toggled.connect(self._on_session_only_changed)
+        self.form.addRow(self.checkbox_session_only)
 
         self.checkbox_filter_focused = QCheckBox("Filter focused neuron")
         self.checkbox_filter_focused.setChecked(False)
         self.checkbox_filter_focused.setEnabled(False)
-        form.addRow(self.checkbox_filter_focused)
-
-        self.display_scope_group.buttonClicked.connect(self._on_display_scope_changed)
-
-        self.threshold_spin.valueChanged.connect(
-            lambda: self.data_parameter_changed.emit()
-        )
-        self.z_stretch_spin.valueChanged.connect(
-            lambda: self.data_parameter_changed.emit()
-        )
-        self.adj_radius_spin.valueChanged.connect(
-            lambda: self.display_parameter_changed.emit()
-        )
-        self.checkbox_session_only.toggled.connect(self._on_session_only_changed)
-
         self.checkbox_filter_focused.toggled.connect(
             lambda: self.display_parameter_changed.emit()
         )
+        self.form.addRow(self.checkbox_filter_focused)
 
-        self.parameter_body.setVisible(False)
-
-        self.toggle_button.toggled.connect(self._set_expanded)
-
-        self.setObjectName("footprintParameterOverlay")
-
-        self.setStyleSheet("""
-            QWidget#footprintParameterOverlay {
-                background: rgba(35, 39, 45, 235);
-                border: 1px solid #59616c;
-                border-radius: 6px;
-            }
-
-            QWidget#footprintParameterOverlay QLabel,
-            QWidget#footprintParameterOverlay QCheckBox {
-                color: #e8eaed;
-                border: none;
-            }
-
-            QWidget#footprintParameterOverlay QToolButton {
-                color: #e8eaed;
-                background: #343941;
-                border: 1px solid #59616c;
-                border-radius: 4px;
-                padding: 3px 6px;
-            }
-
-            QWidget#footprintParameterOverlay QToolButton:hover {
-                background: #414751;
-            }
-
-            QToolButton:checked {
-                background: #59616c;
-                border: 1px solid #8a96a6;
-            }
-
-            QWidget#footprintParameterOverlay QToolButton#scopeLeft,
-            QWidget#footprintParameterOverlay QToolButton#scopeRight {
-                color: #e8eaed;
-                background: #444a53;
-
-                border: 1px solid #69727f;
-
-                padding: 5px 8px;
-                min-height: 22px;
-            }
-
-            /* Only the outside edges are rounded */
-            QWidget#footprintParameterOverlay QToolButton#scopeLeft {
-                border-top-left-radius: 15px;
-                border-bottom-left-radius: 15px;
-
-                border-top-right-radius: 0px;
-                border-bottom-right-radius: 0px;
-
-                /* avoid doubled border in the middle */
-                border-right-width: 0px;
-            }
-
-            QWidget#footprintParameterOverlay QToolButton#scopeRight {
-                border-top-left-radius: 0px;
-                border-bottom-left-radius: 0px;
-
-                border-top-right-radius: 15px;
-                border-bottom-right-radius: 15px;
-            }
-
-            /* "popped out" */
-            QWidget#footprintParameterOverlay QToolButton#scopeLeft:!checked,
-            QWidget#footprintParameterOverlay QToolButton#scopeRight:!checked {
-                background: #4a515b;
-                border-style: outset;
-            }
-
-            /* "pushed in" */
-            QWidget#footprintParameterOverlay QToolButton#scopeLeft:checked,
-            QWidget#footprintParameterOverlay QToolButton#scopeRight:checked {
-                background: #2d3239;
-
-                border-color: #363b42;
-                border-style: inset;
-
-                color: #ffffff;
-
-                /* subtle physical displacement */
-                padding-top: 6px;
-                padding-bottom: 4px;
-            }
-
-            /* Optional hover only for the unselected half */
-            QWidget#footprintParameterOverlay QToolButton#scopeLeft:!checked:hover,
-            QWidget#footprintParameterOverlay QToolButton#scopeRight:!checked:hover {
-                background: #555d68;
-            }
-        """)
-
-        # self.controller_layout = layout
-
-    @property
-    def display_scope(self) -> str:
-
-        button = self.display_scope_group.checkedButton()
-
-        if button is None:
-            return "adjacent"
-
-        return button.property("footprintScope")
-
-    def _on_display_scope_changed(
-        self,
-        button,
-    ):
-
-        adjacent = self.display_scope == "adjacent"
-        self.adj_radius_spin.setEnabled(adjacent)
-        self.display_parameter_changed.emit()
-
-    def _set_expanded(self, expanded: bool):
-        self.parameter_body.setVisible(expanded)
-
-        self.adjustSize()
-
-        self.overlay_layout_changed.emit()
+        self.checkbox_show_excluded = QCheckBox("Show excluded")
+        self.checkbox_show_excluded.setChecked(True)
+        self.checkbox_show_excluded.toggled.connect(
+            lambda: self.display_parameter_changed.emit()
+        )
+        self.form.addRow(self.checkbox_show_excluded)
 
     def _on_session_only_changed(self):
 
@@ -1257,7 +1558,8 @@ class FootprintParametersController(QWidget):
 
         self.checkbox_filter_focused.setEnabled(active)
         self.session_only_changed.emit(active)
-        self.display_parameter_changed.emit()
+
+        super()._on_session_only_changed()
 
 
 def add_surface_to_mesh(vertices_all, faces_all, colors_all, X, Y, Z, rgba):

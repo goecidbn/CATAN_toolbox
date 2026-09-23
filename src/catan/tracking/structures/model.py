@@ -319,11 +319,12 @@ class Model:
         return model
 
     def register_data(self, **data):
+        names = data["parameters"]["names"]
+        values = data["parameters"]["values"]
+
         parameters = {
-            name.decode("utf-8"): value
-            for name, value in zip(
-                data["parameters"]["names"], data["parameters"]["values"]
-            )
+            (name.decode("utf-8") if isinstance(name, bytes) else str(name)): value
+            for name, value in zip(names, values)
         }
         self.parameters = parameters
         self.loaded = True
@@ -340,58 +341,23 @@ class Model:
             NATIVE_MODEL_CONFIG,
             enabled_only=False,
         )
+
+        parameter_names = list(self.parameters.keys())
+
+        parameter_values = np.asarray(list(self.parameters.values()))
+
+        save_data = {
+            "parameters": {
+                "names": parameter_names,
+                "values": parameter_values,
+            }
+        }
+
         save_file(
             path,
-            self,
+            save_data,
             fields_to_save,
             mat_version=mat_version,
             root_attributes={"object_type": "ModelData", "format_version": 1},
             root="/",
         )
-
-    # def save(self, fname: str):
-
-    #     if fname.endswith(".h5") or fname.endswith(".hdf5"):
-    #         with h5py.File(fname, "w") as f:
-    #             self._save_to_hdf5(f)
-    #     else:
-    #         raise ValueError(f"Unsupported file extension: {fname}. Use '.h5' or '.hdf5'.")
-
-    #     print(f"Saved model data to {fname}")
-
-    # def _save_to_hdf5(self, h5ref: h5py.File) -> None:
-    #     h5ref.attrs["object_type"] = "TrackingModel"
-    #     h5ref.attrs["schema_version"] = self.HDF5_VERSION
-
-    #     # model_group = h5ref.create_group("model")
-    #     h5ref.attrs["parameter_names"] = np.array(list(self.parameters.keys()), dtype="S")
-    #     write_optional_array(h5ref, "parameters", np.array(list(self.parameters.values())), compression="gzip")
-
-    # @staticmethod
-    # def load(fname: str, params: dict) -> "Model":
-
-    #     model = Model(params)
-    #     if fname.endswith(".h5") or fname.endswith(".hdf5"):
-    #         with h5py.File(fname, "r") as f:
-    #             model._load_from_hdf5(f)
-    #     else:
-    #         raise ValueError(f"Unsupported file extension: {fname}. Use '.h5' or '.hdf5'.")
-
-    #     model.build_from_parameters(use_cdf=True)
-    #     model.loaded = True
-
-    #     return model
-
-    # def _load_from_hdf5(self, h5ref: h5py.File):
-
-    #     if h5ref.attrs.get("schema_version") != self.HDF5_VERSION:
-    #         raise ValueError(
-    #             f"Schema version mismatch: expected {self.HDF5_VERSION}, found {h5ref.attrs.get('schema_version')}"
-    #         )
-
-    #     self.parameters = {
-    #         name.decode("utf-8"): value
-    #         for name, value in zip(
-    #             read_optional_attr(h5ref, "parameter_names"), read_optional_array(h5ref, "parameters")
-    #         )
-    #     }

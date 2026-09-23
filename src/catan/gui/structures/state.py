@@ -5,30 +5,22 @@ from PySide6.QtCore import QObject, Signal, QSettings
 from typing import Literal, Tuple, Optional, List
 import logging
 
+
+from catan.core.structures import NeuronComponent
+from .request_handler import RequestHandler
+
 from catan.gui.background_tasks import TaskManager
-from catan.core.structures.load_config import LoadConfig, LoadConfigManager
+from catan.core.structures.load_config import LoadConfigManager
 
 from platformdirs import user_config_dir
 from pathlib import Path
 
 
-@dataclass(frozen=True, slots=True)
-class NeuronComponent:
-    session_id: int | None
-    neuron_id: int
-
-    @property
-    def id(self) -> Tuple[int | None, int]:
-        return self.session_id, self.neuron_id
-
-    def __iter__(self):
-        yield self.session_id
-        yield self.neuron_id
-
-
 class AppState(QObject):
 
     assignments: np.ndarray  # shape (n_clusters, n_sessions)
+
+    request_status_changed = Signal()
 
     # Signals for things that can change
     session_color_changed = Signal(int, object)  # session_id, color_value
@@ -49,6 +41,8 @@ class AppState(QObject):
     data_version: int = 0
 
     statistics_sources_changed = Signal()
+
+    adjacency_radius_changed = Signal()
 
     def __init__(self, settings: QSettings):
         super().__init__()
@@ -78,6 +72,11 @@ class AppState(QObject):
         # logging.basicConfig(level=getattr(logging, self.logging_level))
 
         self.time_ref = None
+
+        self._current_request: Optional[RequestHandler] = None
+
+        ## global parameters
+        self._adjacency_radius = 15.0
 
     def issue(self, level, title, message):
         from PySide6.QtWidgets import QMessageBox
@@ -114,6 +113,40 @@ class AppState(QObject):
     def busy(self, val: bool):
         self._busy = val
         self.busy_changed.emit(val)
+
+    @property
+    def current_request(
+        self,
+    ) -> Optional[RequestHandler]:
+        return self._current_request
+
+    @current_request.setter
+    def current_request(
+        self,
+        request: Optional[RequestHandler],
+    ):
+        if request is self._current_request:
+            return
+
+        self._current_request = request
+        self.request_status_changed.emit()
+
+    def notify_request_changed(self):
+        self.request_status_changed.emit()
+
+    @property
+    def adjacency_radius(self) -> float:
+        return self._adjacency_radius
+
+    @adjacency_radius.setter
+    def adjacency_radius(self, value: float):
+        value = float(value)
+
+        if value == self._adjacency_radius:
+            return
+
+        self._adjacency_radius = value
+        self.adjacency_radius_changed.emit()
 
     @property
     def session_colors(self):
@@ -222,28 +255,21 @@ class AppState(QObject):
         if isinstance(selected_components, list) and len(selected_components) == 0:
             selected_components = None
 
-        old_focused_component = self._focused_component
-
-        if selected_components is not None and not self._component_in_components(
-            self.focused_component,
-            selected_components,
-        ):
-            new_focused_component = selected_components[-1]
-        elif selected_components is None:
-            new_focused_component = None
-        else:
-            new_focused_component = self.focused_component
-
         self._selected_components = (
             sorted(selected_components, key=lambda c: c.neuron_id)
             if selected_components is not None
             else None
         )
-        self._focused_component = new_focused_component
+        if selected_components is not None and not self._component_in_components(
+            self.focused_component, selected_components
+        ):
+            self.focused_component = selected_components[-1]
+        elif selected_components is None:
+            self.focused_component = None
+        else:
+            self.focused_component = self.focused_component
 
         self.selected_components_changed.emit()
-        if new_focused_component != old_focused_component:
-            self.focused_component_changed.emit()
 
     @property
     def focused_component(self) -> Optional[NeuronComponent]:
@@ -262,14 +288,10 @@ class AppState(QObject):
             self.focused_component_changed.emit()
             return
 
-        if self._component_in_components(
-            component,
-            self.selected_components,
-        ):
-            self.focused_component_changed.emit()
-            return
+        if not self._component_in_components(component, self.selected_components):
+            self.update_selected_components(component)
 
-        self.update_selected_components(component)
+        self.focused_component_changed.emit()
 
     @property
     def highlighted_components(
@@ -448,7 +470,7 @@ class AppState(QObject):
             )
         neuron_id = int(neuron_ids[0])
 
-        return NeuronComponent(session_id, neuron_id)
+        return NeuronComponent(neuron_id, session_id)
 
 
 def equal_neurons(id1: NeuronComponent, id2: NeuronComponent):

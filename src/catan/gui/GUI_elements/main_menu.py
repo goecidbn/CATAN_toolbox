@@ -361,11 +361,10 @@ class MainMenu(QFrame):
                 if (
                     self.data.assignments
                     and self.data.assignments.path
-                    and not self.data.assignments.loaded
+                    and not self.data.assignments.status["loaded"]
                 ):
                     self.data.load_assignments()
                 else:
-                    # if self.data.assignments.loaded:
                     for session in self.data.sessions:
                         self.data.queue_assign_neurons(session.id)
                 # else:
@@ -403,83 +402,67 @@ class MainMenu(QFrame):
         if not opt:
             return
 
-        if key == "model":
-            if opt in selector_options["model"]:
-                load_path = None
-                if opt == "Load ...":
-                    load_path = choose_path(
-                        self,
-                        pick_dir=False,
-                        init_path=self.data.root,
-                        display_text="Select model file",
-                        only_existing=True,
-                    )
-                    if not load_path:
-                        self.loader[key]["selector"].setCurrentIndex(0)
-                        return
-
-                name, ok = QInputDialog.getText(
-                    self, "Model name", "Enter a name for the model:"
+        name = None
+        ok = False
+        if opt in selector_options[key]:
+            load_path = None
+            if opt == "Load ...":
+                load_path = choose_path(
+                    self,
+                    pick_dir=False,
+                    init_path=self.data.root,
+                    display_text=f"Select {key} file",
+                    only_existing=True,
                 )
-                if ok and isinstance(name, str):
-                    self.data.add_model(name, load_path)
+                if not load_path:
+                    self.loader[key]["selector"].setCurrentIndex(0)
+                    return
 
-                    self.rebuild_selector(
-                        key,
-                        self.data.available_models,
-                        add_options=selector_options[key],
-                    )
-                    index = self.data.available_models.index(name)
-                else:
-                    index = 0
-
-                self.loader[key]["selector"].setCurrentIndex(index)
-            else:
+            name, ok = QInputDialog.getText(
+                self,
+                f"{key.capitalize()} name",
+                f"Enter a name for the {key}:",
+                text=Path(load_path).stem if load_path else "",
+            )
+        else:
+            if key == "model":
                 self.data.change_model(opt)
-
-        elif key == "assignments":
-            if opt in selector_options["assignments"]:
-                load_path = None
-                if opt == "Load ...":
-                    load_path = choose_path(
-                        self,
-                        pick_dir=False,
-                        init_path=self.data.root,
-                        display_text="Select assignment file",
-                        only_existing=True,
-                    )
-                    if not load_path:
-                        self.loader[key]["selector"].setCurrentIndex(0)
-                        return
-
-                name, ok = QInputDialog.getText(
-                    self, "Assignment name", "Enter a name for the assignment:"
-                )
-                # print("load path obtainned: ", load_path)
-                if ok and isinstance(name, str):
-                    self.data.register_assignments(load_path, name)
-                    # self.data.add_assignments(name, load_path)
-
-                    self.rebuild_selector(
-                        key,
-                        self.data.available_assignments,
-                        add_options=selector_options[key],
-                    )
-                    self.config_constructor.update_source(self.data.assignments)
-
-                    if name in self.data.available_assignments:
-                        index = self.data.available_assignments.index(name)
-                    else:
-                        ## if adding failed for whatever reason
-                        index = 0
-                else:
-                    index = 0
-
-                self.loader[key]["selector"].setCurrentIndex(index)
-            else:
+            elif key == "assignments":
                 self.data.change_assignments(opt)
 
-            self.update_buttons()
+            return
+
+        if ok:
+            if key == "model":
+                if isinstance(name, str):
+                    self.data.add_model(name, load_path)
+
+                available_names = self.data.available_models
+            elif key == "assignments":
+
+                if isinstance(name, str):
+                    self.data.register_assignments(load_path, name)
+
+                    self.config_constructor.update_source(self.data.assignments)
+                available_names = self.data.available_assignments
+            else:
+                return
+
+            self.rebuild_selector(
+                key,
+                available_names,
+                add_options=selector_options[key],
+            )
+
+            if name in available_names:
+                index = available_names.index(name)
+            else:
+                ## if adding failed for whatever reason
+                index = 0
+
+            self.loader[key]["selector"].setCurrentIndex(index)
+
+        self.update_buttons()
 
     def update_buttons(self):
 
@@ -488,7 +471,7 @@ class MainMenu(QFrame):
         if (
             self.data.assignments
             and self.data.assignments.path
-            and not self.data.assignments.loaded
+            and not self.data.assignments.status["loaded"]
         ):
             loading = True
             set_button_icon(

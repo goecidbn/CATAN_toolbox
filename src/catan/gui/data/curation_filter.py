@@ -471,8 +471,8 @@ class CurationFilterEvaluator:
                 if "session" in refs:
                     row_components.add(
                         NeuronComponent(
-                            session_id=int(refs["session"][local_row]),
                             neuron_id=neuron_id,
+                            session_id=int(refs["session"][local_row]),
                         )
                     )
 
@@ -499,8 +499,8 @@ class CurationFilterEvaluator:
 
                     row_components.add(
                         NeuronComponent(
-                            session_id=session_id,
                             neuron_id=neuron_id,
+                            session_id=session_id,
                         )
                     )
 
@@ -516,8 +516,8 @@ class CurationFilterEvaluator:
 
                     row_components.add(
                         NeuronComponent(
-                            session_id=session_id,
                             neuron_id=neuron_id,
+                            session_id=session_id,
                         )
                     )
 
@@ -669,8 +669,8 @@ def components_for_table_rows(
 
                 components.add(
                     NeuronComponent(
-                        session_id=int(refs["session"][i]),
                         neuron_id=neuron_id,
+                        session_id=int(refs["session"][i]),
                     )
                 )
 
@@ -684,8 +684,8 @@ def components_for_table_rows(
                     if session_key in refs:
                         components.add(
                             NeuronComponent(
-                                session_id=int(refs[session_key][i]),
                                 neuron_id=neuron_id,
+                                session_id=int(refs[session_key][i]),
                             )
                         )
 
@@ -719,8 +719,8 @@ def components_for_table_rows(
 
             components.add(
                 NeuronComponent(
-                    session_id=session_id,
                     neuron_id=neuron_id,
+                    session_id=session_id,
                 )
             )
 

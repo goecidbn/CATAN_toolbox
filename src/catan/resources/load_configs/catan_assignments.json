@@ -30,13 +30,31 @@
                     "attribute": null
                 }
             }
-        }
-    },
-    "subconfigs": {
-        "union": {
-            "path": "/union",
-            "config": "catan_session.json",
-            "required": false
+        },
+        "curation": {
+            "title": "Curation metadata",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+                "review_status": {
+                    "path": "/curation/review_status",
+                    "required": false,
+                    "source": "dataset",
+                    "attribute": null
+                },
+                "manipulation_id": {
+                    "path": "/curation/manipulation_id",
+                    "required": false,
+                    "source": "dataset",
+                    "attribute": null
+                },
+                "manipulations": {
+                    "path": "/curation/manipulations",
+                    "required": false,
+                    "source": "dataset",
+                    "attribute": null
+                }
+            }
         }
     },
     "native": true

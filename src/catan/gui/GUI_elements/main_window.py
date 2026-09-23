@@ -2,10 +2,16 @@ import importlib
 import threading
 
 from PySide6.QtCore import QCoreApplication, QSettings, QThreadPool
-from PySide6.QtGui import QAction, QFont, Qt
+from PySide6.QtGui import QAction, QFont, Qt, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
+    QLineEdit,
+    QTextEdit,
+    QPlainTextEdit,
+    QMessageBox,
     QHBoxLayout,
+    QVBoxLayout,
     QMainWindow,
     QSplitter,
     QWidget,
@@ -16,8 +22,11 @@ from catan.gui.resources import (
     load_stylesheet,
 )
 
+from catan.gui.GUI_elements import NeuronNavigationBar
 from catan.gui.structures import AppState, Data
 from catan.gui.interaction import click_events
+
+from catan.tracking.structures import ReviewStatus
 
 from .display_area import DisplayArea
 from .main_menu import MainMenu
@@ -48,6 +57,10 @@ class MainWindow(QMainWindow):
         """
         connect interaction (make reloadable)
         """
+
+        self._setup_navigation_shortcuts()
+        self._setup_review_shortcuts()
+
         # --- setting up reload logic ---
         reload_action = QAction("Reload plotting logic", self)
         reload_action.setShortcut("Ctrl+R")
@@ -57,9 +70,6 @@ class MainWindow(QMainWindow):
         print_debug = QAction("Print debug info", self)
         print_debug.setShortcut("Ctrl+D")
         print_debug.triggered.connect(self.print_debug_info)
-        # print_debug.triggered.connect(
-        #     self.gui_elements["primary_display"].print_debug_info
-        # )
         self.menuBar().addAction(print_debug)
 
         app = QApplication.instance()
@@ -69,7 +79,6 @@ class MainWindow(QMainWindow):
 
         self.reset_stylesheet()
         app.aboutToQuit.connect(self.debug_shutdown)
-
 
     def _restore_settings(self):
 
@@ -154,8 +163,16 @@ class MainWindow(QMainWindow):
         splitter.addWidget(main_menu)
 
         # =========== RIGHT: DISPLAY AREA ===========
+        display = QWidget(self)
+        display_layout = QVBoxLayout(display)
+
         display_area = DisplayArea(self)
-        splitter.addWidget(display_area)
+        display_layout.addWidget(display_area)
+
+        navigation_bar = NeuronNavigationBar.NeuronNavigationBar(self)
+        display_layout.addWidget(navigation_bar)
+
+        splitter.addWidget(display)
 
         ## --- Build the UI ---
         main_app = QWidget(self)  # MainApp(self)
@@ -169,7 +186,122 @@ class MainWindow(QMainWindow):
         self.gui_elements = {
             "main_menu": main_menu,
             "display_area": display_area,
+            "navigation_bar": navigation_bar,
         }
+
+    ### ================================================ ###
+    ### ============== SHORTKEY METHODS ================ ###
+    ### ================================================ ###
+    def _setup_navigation_shortcuts(self):
+        self._navigation_shortcuts = []
+        # Add a shortcut for navigating to the next neuron
+        next_shortcut = QShortcut(QKeySequence("Right"), self)
+        next_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        next_shortcut.activated.connect(self.on_next_neuron_shortcut)
+        self._navigation_shortcuts.append(next_shortcut)
+
+        # Add a shortcut for navigating to the previous neuron
+        prev_shortcut = QShortcut(QKeySequence("Left"), self)
+        prev_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        prev_shortcut.activated.connect(self.on_previous_neuron_shortcut)
+        self._navigation_shortcuts.append(prev_shortcut)
+
+    def on_previous_neuron_shortcut(self):
+        print("Previous neuron shortcut activated")
+        if self._global_navigation_shortcut_blocked():
+            return
+
+        self.gui_elements["navigation_bar"].on_prev_footprint()
+
+    def on_next_neuron_shortcut(self):
+        print("Next neuron shortcut activated")
+        if self._global_navigation_shortcut_blocked():
+            return
+
+        self.gui_elements["navigation_bar"].on_next_footprint()
+
+    def _global_navigation_shortcut_blocked(self) -> bool:
+
+        widget = QApplication.focusWidget()
+        return isinstance(
+            widget, (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit)
+        )
+
+    def _setup_review_shortcuts(self):
+
+        self._review_shortcuts = []
+        for status in ReviewStatus:
+
+            # Single focused neuron
+            shortcut = QShortcut(QKeySequence(status.shortcut), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(
+                lambda status=status: self._set_review_status_from_shortcut(
+                    status, batch=False
+                )
+            )
+            self._review_shortcuts.append(shortcut)
+
+            # Selected neurons in bulk
+            batch_shortcut = QShortcut(QKeySequence(f"Shift+{status.shortcut}"), self)
+            batch_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            batch_shortcut.activated.connect(
+                lambda status=status: self._set_review_status_from_shortcut(
+                    status, batch=True
+                )
+            )
+            self._review_shortcuts.append(batch_shortcut)
+
+    def _set_review_status_from_shortcut(self, status: ReviewStatus, *, batch: bool):
+
+        if self._review_shortcut_blocked():
+            return
+
+        if batch:
+            self._set_selected_review_status(status)
+            return
+
+        component = self.state.focused_component
+
+        if component is None:
+            return
+
+        self.data.set_review_status([component.neuron_id], status)
+
+    def _review_shortcut_blocked(self) -> bool:
+
+        widget = QApplication.focusWidget()
+        return isinstance(
+            widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)
+        )
+
+    def _set_selected_review_status(self, status: ReviewStatus):
+
+        components = self.state.selected_components or []
+        neuron_ids = sorted({int(component.neuron_id) for component in components})
+
+        if not neuron_ids:
+            return
+
+        n_neurons = len(neuron_ids)
+
+        answer = QMessageBox.question(
+            self,
+            "Change review status",
+            (
+                f"Set {n_neurons} selected "
+                f"neuron"
+                f"{'' if n_neurons == 1 else 's'} "
+                f"to '{status.label}'?"
+            ),
+            (QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel),
+            QMessageBox.StandardButton.Cancel,
+        )
+
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+
+        self.data.set_review_status(neuron_ids, status)
 
     def debug_shutdown(self):
         print("\n=== SHUTDOWN DEBUG ===")

@@ -43,6 +43,9 @@ class SessionData:
     dims: Tuple[int, int] = (512, 512)  #
     footprints: sparse.csc_matrix = sparse.csc_matrix((0, 0))  #
     background: Optional[np.ndarray] = None  #
+    background_origin: Optional[str] = None
+    included: np.ndarray = np.array([], dtype=bool)
+    synthetic: np.ndarray = np.array([], dtype=bool)  #
     # traces
     _traces: dict[str, np.ndarray] = {}
     _default_trace: Optional[str] = None
@@ -51,11 +54,10 @@ class SessionData:
 
     ## to be calculated (from input)
     remap: Optional[Remapping] = None  #
-    n_neurons: int = -1  #
+    n_neurons: int = 0  #
     centroids: Optional[np.ndarray] = None  #
-    idx_eval: Optional[np.ndarray] = None  #
     ## to be calculated (with additional information)
-    idx_kde: np.ndarray
+    # idx_kde: np.ndarray
 
     HDF5_VERSION = 1
 
@@ -66,9 +68,7 @@ class SessionData:
         **kwargs,
     ):
         """ """
-        print("add loading_possible to session? to load config? to session.status?")
         self.name = name
-        # self.id = kwargs.get("id", -1)
         self.path = kwargs.get("path", None)
 
         self.status = {
@@ -109,6 +109,38 @@ class SessionData:
         for key in self.params:
             if key in input:
                 self.params[key] = input[key]
+
+    # def _ensure_component_flags(self, *, included=None, synthetic=None):
+
+    #     n = self.n_neurons
+
+    #     def prepare(supplied, current, default, name):
+    #         if supplied is not None:
+    #             arr = np.asarray(supplied, dtype=bool).reshape(-1)
+
+    #             if arr.shape != (n,):
+    #                 raise ValueError(
+    #                     f"{name} has shape {arr.shape}, " f"expected {(n,)}."
+    #                 )
+
+    #             return arr.copy()
+
+    #         current = np.asarray(current, dtype=bool).reshape(-1)
+
+    #         if current.shape == (n,):
+    #             return current
+
+    #         result = np.full(n, default, dtype=bool)
+
+    #         n_copy = min(len(current), n)
+
+    #         if n_copy:
+    #             result[:n_copy] = current[:n_copy]
+
+    #         return result
+
+    #     self.included = prepare(included, self.included, True, "included")
+    #     self.synthetic = prepare(synthetic, self.synthetic, False, "synthetic")
 
     ### ========================================================= ###
     ### ================= LOAD / SAVE METHODS =================== ###
@@ -235,18 +267,21 @@ class SessionData:
 
         if self.quality:
             self.status["quality_loaded"] = True
-        self.get_idx_eval_from_quality_params()
 
-    def get_idx_eval_from_quality_params(self, component_quality=None):
+        # self.component_evaluation_from_quality_params()
+
+    def component_evaluation_from_quality_params(
+        self, component_quality=None, reset=False
+    ):
         """
-        function to create idx_eval boolean array based on component quality thresholds
+        function to create included boolean array based on component quality thresholds
         defined in self.params
 
         requires:
             * self.params containing SNR, rval, cnn thresholds
 
         returns:
-            * idx_eval boolean array
+            * included boolean array
         """
         if not self.status["quality_loaded"] or self.quality is None:
             # print("no quality info provided, skipping quality-based filtering")
@@ -258,11 +293,12 @@ class SessionData:
             isinstance(self.n_neurons, int) and self.n_neurons > 0
         ), "n_neurons must be a positive integer"
 
-        if self.idx_eval is not None:
-            ## dont overwrite if idx_eval already exists
-            return
+        if reset:
+            self.included = np.ones(self.n_neurons, dtype=bool)
 
-        # self.idx_eval = np.ones(self.n_neurons, dtype=bool)
+        assert (
+            len(self.included) == self.n_neurons
+        ), "Included array length must match number of neurons."
 
         ## provide dummy values if not provided
         SNR_comp = self.quality.get("SNR_comp", np.full(self.n_neurons, np.inf))
@@ -273,18 +309,16 @@ class SessionData:
             component_quality or component_quality_default
         )  # if not provided, use default thresholds
 
-        idx_eval = np.ones(self.n_neurons, dtype=bool)
         ## all components must pass 'lowest' threshold...
-        idx_eval &= SNR_comp >= component_quality["SNR_lowest"]
-        idx_eval &= r_values >= component_quality["rval_lowest"]
-        idx_eval &= cnn_preds >= component_quality["cnn_lowest"]
+        self.included &= SNR_comp >= component_quality["SNR_lowest"]
+        self.included &= r_values >= component_quality["rval_lowest"]
+        self.included &= cnn_preds >= component_quality["cnn_lowest"]
         ## ... and at least pass one 'min' threshold
-        idx_eval &= (
+        self.included &= (
             (SNR_comp >= component_quality["SNR_min"])
             | (r_values >= component_quality["rval_min"])
             | (cnn_preds >= component_quality["cnn_min"])
         )
-        self.idx_eval &= idx_eval
 
     def _clean_quality(self):
         self.quality = {}
@@ -348,10 +382,12 @@ class SessionData:
         footprints_proj = self.footprints.sum(axis=1).reshape(self.dims)
         if self.background is None:
             ## return projection image if no background available
+            self.background_origin = "footprints"
             self.background = np.array(footprints_proj).astype(np.float32)
         else:
             ## check if footprints and background are consistent (e.g. transposition) and adjust if needed
             # print("testing for transpose of background relative to footprints...")
+            self.background_origin = "loaded"
             remap = Remapping(
                 template=footprints_proj,
                 template_reference=self.background,
@@ -369,7 +405,66 @@ class SessionData:
         else:
             self.postprocess_spatial_data()
 
+        # self._ensure_component_flags(
+        #     included=data.get("included"),
+        #     synthetic=data.get("synthetic"),
+        # )
+
         self.evaluate_alignment_status()
+
+    def update_footprints(
+        self,
+        footprints: sparse.csc_matrix,
+        mode="replace",
+        included_values: bool | np.ndarray = True,
+        synthetic_values: bool | np.ndarray = False,
+    ):
+
+        if mode == "replace":
+            n_new = footprints.get_shape()[1] - self.n_neurons
+
+            self.footprints = footprints
+            self.centroids = center_of_mass(
+                self.footprints, *self.dims, convert=self.params.get("pxtomu", 1.0)
+            )
+        elif mode == "append":
+            n_new = footprints.get_shape()[1]
+            self.footprints = sparse.hstack([self.footprints, footprints], format="csc")
+            centroids = center_of_mass(
+                footprints, *self.dims, convert=self.params.get("pxtomu", 1.0)
+            )
+            self.centroids = np.vstack([self.centroids, centroids])
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+        self.n_neurons = self.footprints.get_shape()[1]
+
+        def update_status_arrays(current, n_new, new_values):
+            ## set included values to values according to input:
+            if isinstance(new_values, bool):
+                # if scalar value is given, pad the existing included array with this value for the new neurons
+                current = np.pad(
+                    current,
+                    (0, n_new),
+                    mode="constant",
+                    constant_values=new_values,
+                )
+            else:
+                ## if an array is given, check its length
+                if mode == "replace" and len(new_values) == self.n_neurons:
+                    ## if the length matches the total number of neurons, use it directly
+                    current = new_values
+                elif mode == "append" and len(new_values) == n_new:
+                    ## if the length matches the number of new neurons, append it to the existing included array
+                    current = np.append(current, new_values)
+                else:
+                    raise ValueError(
+                        "Length of included_value array must match the number of new neurons or the total number of neurons."
+                    )
+            return current
+
+        self.included = update_status_arrays(self.included, n_new, included_values)
+        self.synthetic = update_status_arrays(self.synthetic, n_new, synthetic_values)
 
     def postprocess_spatial_data(self):
         if self.footprints is None:
@@ -378,49 +473,123 @@ class SessionData:
             )
 
         self.n_neurons = self.footprints.get_shape()[1]
+        self.included = np.ones(self.n_neurons, dtype=bool)
+        self.synthetic = np.zeros(self.n_neurons, dtype=bool)
 
         self.centroids = center_of_mass(
             self.footprints, *self.dims, convert=self.params.get("pxtomu", 1.0)
         )
-        self.get_idx_eval_from_footprints()
-        self.get_idx_kde()
+        # self.evaluate_components_from_footprints(reset=True)
+        # self.get_idx_kde()
 
-    def get_idx_eval_from_footprints(self, footprints_thr=10):
+    def evaluate_components_from_footprints(self, footprints_thr=10, reset=False):
         """
-        function to create idx_eval boolean array based on component size thresholds
+        function to create included boolean array based on component size thresholds
 
         requires:
             * self.footprints containing spatial footprints
 
         returns:
-            * idx_eval boolean array
+            * included boolean array
         """
 
         if not self.status["spatial_loaded"] or self.footprints is None:
-            # print(
-            #     "Spatial data must be loaded before calculating idx_eval from sizes."
-            # )
             return
         ## finding non-empty rows in sparse array (https://mike.place/2015/sparse/)
-        # idx_eval = np.ones(nA, bool)
-        # idx_eval = np.diff(footprints.indptr) != 0
+        # included = np.ones(nA, bool)
+        # included = np.diff(footprints.indptr) != 0
 
-        if self.idx_eval is not None:
-            ## dont overwrite if idx_eval already exists
-            return
+        if reset:
+            self.included = np.ones(self.n_neurons, dtype=bool)
 
-        self.idx_eval = np.ones(self.n_neurons, dtype=bool)
+        assert (
+            len(self.included) == self.n_neurons
+        ), "Included array length must match number of neurons."
 
         ## only footprints above a certain size should be considered for evaluation
-        idx_eval = self.footprints.getnnz(axis=0) > footprints_thr
-        self.idx_eval &= idx_eval
+        self.included &= self.footprints.getnnz(axis=0) > footprints_thr
 
     def _clean_spatial(self):
         self.dims = (512, 512)
         self.footprints = sparse.csc_matrix((0, 0))
         self.background = None
-        self.idx_eval = None
+        self.background_origin = None
+        self.included = np.array([], dtype=bool)
         self.status["spatial_loaded"] = False
+
+    ### ========================================================= ###
+    ### ================== ALTERATION METHODS =================== ###
+    ### ========================================================= ###
+
+    def append_synthetic_component(self, footprint: sparse.csc_matrix) -> int:
+        """
+        Append one synthetic component.
+
+        Returns its new footprint/component ID.
+        """
+
+        footprint = footprint.tocsc()
+
+        expected_shape = (self.footprints.shape[0], 1)
+
+        if footprint.shape != expected_shape:
+            raise ValueError(
+                f"Synthetic footprint has shape "
+                f"{footprint.shape}, expected "
+                f"{expected_shape}."
+            )
+
+        fp_id = self.n_neurons
+
+        # --------------------------------------------
+        # Spatial footprint
+        # --------------------------------------------
+        self.footprints = sparse.hstack([self.footprints, footprint], format="csc")
+
+        self.n_neurons += 1
+
+        centroid = center_of_mass(
+            footprint,
+            *self.dims,
+            convert=self.params.get("pxtomu", 1.0),
+        )
+
+        if self.centroids is None:
+            self.centroids = centroid
+        else:
+            self.centroids = np.vstack([self.centroids, centroid])
+
+        # --------------------------------------------
+        # Component status
+        # --------------------------------------------
+
+        self.included = np.append(self.included, True)
+        self.synthetic = np.append(self.synthetic, True)
+
+        # --------------------------------------------
+        # Empty trace entries
+        # --------------------------------------------
+
+        def append_nan_row(values):
+            values = np.asarray(values)
+            if not np.issubdtype(values.dtype, np.floating):
+                values = values.astype(float)
+
+            empty = np.full((1,) + values.shape[1:], np.nan, dtype=values.dtype)
+
+            return np.concatenate([values, empty], axis=0)
+
+        for key in list(self._traces):
+            self._traces[key] = append_nan_row(self._traces[key])
+
+        # --------------------------------------------
+        # Empty quality entries
+        # --------------------------------------------
+
+        for key in list(self.quality):
+            self.quality[key] = append_nan_row(self.quality[key])
+
+        return fp_id
 
     ### ========================================================= ###
     ### ==================== ALIGNMENT METHODS ================== ###
@@ -519,41 +688,41 @@ class SessionData:
     ### ===================== KERNEL DENSITY ESTIMATE ==================== ###
     ### ================================================================== ###
 
-    def get_idx_kde(self, params=None, qtl=[0.05, 0.95]):
-        """
-        function to calculate kernel density estimate of neuron density in session s
-        this is optional, but can be used to exclude highly dense and highly sparse regions from statistics in order to not skew statistics
+    # def get_idx_kde(self, params=None, qtl=[0.05, 0.95]):
+    #     """
+    #     function to calculate kernel density estimate of neuron density in session s
+    #     this is optional, but can be used to exclude highly dense and highly sparse regions from statistics in order to not skew statistics
 
-        """
+    #     """
 
-        if not self.use_kde:
-            self.idx_kde = np.ones(self.n_neurons, dtype=bool)
-            return
+    #     if not self.use_kde:
+    #         self.idx_kde = np.ones(self.n_neurons, dtype=bool)
+    #         return
 
-        if self.centroids is None:
-            raise ValueError(
-                "Centroids must be calculated before calculating kernel density estimate."
-            )
+    #     if self.centroids is None:
+    #         raise ValueError(
+    #             "Centroids must be calculated before calculating kernel density estimate."
+    #         )
 
-        from scipy import stats
+    #     from scipy import stats
 
-        params = params or self.params
-        # self.log.info("calculating kernel density estimates for session %d" % s)
+    #     params = params or self.params
+    #     # self.log.info("calculating kernel density estimates for session %d" % s)
 
-        ## calculating kde from center of masses
-        x_grid, y_grid = np.meshgrid(
-            *[np.linspace(0, dim * params.get("pxtomu", 1.0), dim) for dim in self.dims]
-        )
+    #     ## calculating kde from center of masses
+    #     x_grid, y_grid = np.meshgrid(
+    #         *[np.linspace(0, dim * params.get("pxtomu", 1.0), dim) for dim in self.dims]
+    #     )
 
-        positions = np.vstack([x_grid.ravel(), y_grid.ravel()])
-        kde = stats.gaussian_kde(self.centroids[self.idx_eval, :].T)
-        kde_kernel = np.reshape(kde(positions), x_grid.shape)
+    #     positions = np.vstack([x_grid.ravel(), y_grid.ravel()])
+    #     kde = stats.gaussian_kde(self.centroids[self.included, :].T)
+    #     kde_kernel = np.reshape(kde(positions), x_grid.shape)
 
-        cm_px = (self.centroids[self.idx_eval, :] / params.get("pxtomu", 1.0)).astype(
-            "int"
-        )
-        kde_at_com = np.zeros(self.n_neurons) * np.nan
-        kde_at_com[self.idx_eval] = kde_kernel[cm_px[:, 1], cm_px[:, 0]]
-        self.idx_kde = (kde_at_com > np.quantile(kde_kernel, qtl[0])) & (
-            kde_at_com < np.quantile(kde_kernel, qtl[1])
-        )
+    #     cm_px = (self.centroids[self.included, :] / params.get("pxtomu", 1.0)).astype(
+    #         "int"
+    #     )
+    #     kde_at_com = np.zeros(self.n_neurons) * np.nan
+    #     kde_at_com[self.included] = kde_kernel[cm_px[:, 1], cm_px[:, 0]]
+    #     self.idx_kde = (kde_at_com > np.quantile(kde_kernel, qtl[0])) & (
+    #         kde_at_com < np.quantile(kde_kernel, qtl[1])
+    #     )

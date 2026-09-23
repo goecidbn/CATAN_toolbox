@@ -62,8 +62,7 @@ class HDF5Backend(IOBackend):
 
             if spec.attribute == "*":
                 return {
-                    name: normalize_scalar(value)
-                    for name, value in obj.attrs.items()
+                    name: normalize_scalar(value) for name, value in obj.attrs.items()
                 }
 
             if spec.attribute is None or spec.attribute not in obj.attrs:
@@ -73,9 +72,7 @@ class HDF5Backend(IOBackend):
                     )
                 return {}
 
-            return {
-                key or spec.attribute: normalize_scalar(obj.attrs[spec.attribute])
-            }
+            return {key or spec.attribute: normalize_scalar(obj.attrs[spec.attribute])}
 
         if has_wildcard(spec.path):
             parent_path = str(path.parent)
@@ -116,7 +113,9 @@ class HDF5Backend(IOBackend):
 
         if normalized_source(spec.source) == "attribute":
             if spec.attribute is None:
-                raise ValueError(f"Attribute field {entry.label!r} has no attribute name")
+                raise ValueError(
+                    f"Attribute field {entry.label!r} has no attribute name"
+                )
             target = ensure_hdf5_group(base, spec.path)
             target.attrs[spec.attribute] = _hdf5_storable(entry.value)
             return
@@ -201,6 +200,7 @@ class HDF5Backend(IOBackend):
         relative_path = path.strip("/")
 
         return relative_path in ref
+
 
 def resolve_hdf5_path(
     ref: h5py.File | h5py.Group,

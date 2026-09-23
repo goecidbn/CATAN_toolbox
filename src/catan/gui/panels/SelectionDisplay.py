@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
 )
 
-from catan.gui.structures import NeuronComponent, AppState, Data
+from catan.core.structures import NeuronComponent
+from catan.gui.structures import AppState, Data
 from catan.gui.panels import BasePlot, styles, StatisticsData
 from catan.gui.data.statistics import PickTable
 from catan.gui.data.statistics.queries import (
@@ -175,8 +176,8 @@ class StatisticColumnResult:
 
             def masked_component(component, keep_session):
                 return NeuronComponent(
-                    session_id=(component.session_id if keep_session else None),
                     neuron_id=component.neuron_id,
+                    session_id=(component.session_id if keep_session else None),
                 )
 
             # Try both assignments of A/B to i/j.
@@ -349,7 +350,7 @@ class Display(QWidget):
             )
 
             return [
-                NeuronComponent(session_id=None, neuron_id=neuron_id)
+                NeuronComponent(neuron_id=neuron_id, session_id=None)
                 for neuron_id in neuron_ids
             ]
 
@@ -410,8 +411,8 @@ class Display(QWidget):
             return None
 
         return NeuronComponent(
-            session_id=self.state.current_session_id,
             neuron_id=entity.neuron_id,
+            session_id=self.state.current_session_id,
         )
 
     def footprint_for_entity(
@@ -1321,17 +1322,17 @@ class Controller(BasePlot.TableController):
             for row in range(table.n_rows):
 
                 component_i = NeuronComponent(
+                    neuron_id=int(neurons_i[row]),
                     session_id=(
                         int(sessions_i[row]) if sessions_i is not None else None
                     ),
-                    neuron_id=int(neurons_i[row]),
                 )
 
                 component_j = NeuronComponent(
+                    neuron_id=int(neurons_j[row]),
                     session_id=(
                         int(sessions_j[row]) if sessions_j is not None else None
                     ),
-                    neuron_id=int(neurons_j[row]),
                 )
 
                 key = _canonical_component_pair(component_i, component_j)
@@ -1592,8 +1593,8 @@ class Controller(BasePlot.TableController):
 
                 components.append(
                     NeuronComponent(
-                        session_id=int(session_id),
                         neuron_id=int(entity.neuron_id),
+                        session_id=int(session_id),
                     )
                 )
 
@@ -1879,6 +1880,7 @@ class Controller(BasePlot.TableController):
                     update_display=update_display,
                 )
             ),
+            unique=True,
         )
 
     def _on_statistic_columns_ready(

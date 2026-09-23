@@ -49,7 +49,7 @@ REDUCTION_METHODS = {
     },
     "session_series": {
         "session": ("keep", "single"),
-        "neuron": ("mean", "median"),
+        "neuron": ("mean", "median", "sum"),
         "default": ("single", "mean", "median", "max", "min"),
     },
     "neuron_bound": {
@@ -105,6 +105,7 @@ ERROR_METHODS = {
         "neuron": {
             "mean": ("std", "sem", "bootstrap"),
             "median": ("iqr", "bootstrap"),
+            "sum": ("none",),
         },
         "default": {
             "mean": ("none",),

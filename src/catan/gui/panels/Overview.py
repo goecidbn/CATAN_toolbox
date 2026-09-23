@@ -8,21 +8,28 @@ from vispy import scene, color
 from vispy.scene import visuals
 from vispy.scene.visuals import Markers, Image, Rectangle, Text
 
+from PySide6.QtCore import Qt, Signal, Slot, QEvent
 from PySide6.QtWidgets import (
+    QApplication,
+    QWidget,
     QComboBox,
     QCheckBox,
     QLabel,
     QInputDialog,
     QToolTip,
+    QVBoxLayout,
+    QToolButton,
+    QFormLayout,
 )
 
 
-from catan.gui.structures.state import NeuronComponent
+from catan.core.structures import NeuronComponent
 from catan.gui.panels import BasePlot
 from catan.gui.interaction import click_events
 
 from catan.gui.data.statistics.dimensions import SESSION_DIMS, neuron_bound_dim
 from catan.gui.panels.StatisticsData import StatisticQuerySelector
+from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
 
 STATISTIC_CMAPS = {
     "viridis": "viridis",
@@ -73,6 +80,9 @@ class Display(BasePlot.BaseCanvas):
 
         self.changes_on_click = "selected"
 
+        self.control_overlay = None
+        self.events.resize.connect(self._on_canvas_resize)
+
         self.neuron_statistic_values = None
         self.statistic_title = None
 
@@ -96,8 +106,6 @@ class Display(BasePlot.BaseCanvas):
             dtype=np.float32,
         )
         self.statistic_nan_color[3] = 0.55
-
-        # self.plot_components: Dict[int, OverviewVisualRecord] = {}
 
         self.freeze()
 
@@ -158,10 +166,6 @@ class Display(BasePlot.BaseCanvas):
         self.statistic_colorbar_low = Text(
             "",
             pos=self._cbar_low_label_pos,
-            # pos=(
-            #     cbar_center[0] - cbar_size[0] // 2 + 5,
-            #     cbar_center[1] + label_y_offset,
-            # ),
             anchor_x="center",
             anchor_y="top",
             font_size=9,
@@ -172,10 +176,6 @@ class Display(BasePlot.BaseCanvas):
         self.statistic_colorbar_high = Text(
             "",
             pos=self._cbar_high_label_pos,
-            # pos=(
-            #     cbar_center[0] + cbar_size[0] // 2 - 5,
-            #     cbar_center[1] + label_y_offset,
-            # ),
             anchor_x="center",
             anchor_y="top",
             font_size=9,
@@ -233,23 +233,47 @@ class Display(BasePlot.BaseCanvas):
         for style in ["selected", "focused", "highlighted", "hovered"]:
             self.add_overlay(style)
 
-        #     self.plotting["overlays"][style] = Markers(
-        #         parent=self.plot_root,
-        #         scaling="scene",
-        #         symbol="square",
-        #     )
-        #     self.plotting["overlays"][style].set_gl_state(
-        #         blend=True,
-        #         depth_test=False,
-        #         blend_func=("src_alpha", "one_minus_src_alpha"),
-        #     )
-        #     self.plotting["overlays"][style].visible = False
+    def _on_canvas_resize(self, event=None):
+        self._position_overlay_controls()
 
-        # print(f"current overlays: {self.plotting['overlays']}")
-        # self.plotting["overlays"]["hovered"].order = 100
-        # self.plotting["overlays"]["highlighted"].order = 90
-        # self.plotting["overlays"]["focused"].order = 80
-        # self.plotting["overlays"]["selected"].order = 70
+    def attach_control_overlay(self):
+        """
+        Attach the Trace control widgets to the canvas after
+        Controller.build_controls() has created them.
+        """
+
+        control_overlay = self.controls.get("panel")
+
+        if control_overlay is None:
+            return
+
+        self.control_overlay = control_overlay
+
+        self.control_overlay.setParent(self.native)
+        self.control_overlay.show()
+        self.control_overlay.raise_()
+
+        self.control_overlay.overlay_layout_changed.connect(
+            self._position_overlay_controls
+        )
+
+        self._position_overlay_controls()
+
+    def _position_overlay_controls(self):
+
+        if self.control_overlay is None:
+            return
+
+        margin = 8
+        spacing = 6
+
+        palette = self.control_overlay
+        palette.adjustSize()
+
+        x = self.native.width() - palette.width() - margin
+
+        palette.move(max(margin, x), margin)
+        palette.raise_()
 
     def plot_background(self):
 
@@ -291,7 +315,7 @@ class Display(BasePlot.BaseCanvas):
 
     def build_neuron_visuals_union(self):
 
-        if self.data.assignments is None or self.data.assignments.union is None:
+        if not self.data.is_available():
             return
 
         roi_pos, neuron_ids, roi_vals = sparse_A_to_points(
@@ -306,7 +330,7 @@ class Display(BasePlot.BaseCanvas):
             color=None,
         )
 
-    def build_neuron_visuals_session(self, session_id=None, thr=0.2):
+    def build_neuron_visuals_session(self, session_id: Optional[int] = None, thr=0.2):
 
         if session_id is None:
             session_id = self.state.current_session_id
@@ -339,7 +363,7 @@ class Display(BasePlot.BaseCanvas):
                 self.data.sessions[session_id].dims,
                 thr=thr,
             )
-            n_rois = self.data.sessions[session_id].footprints.shape[1]
+            n_rois = self.data.sessions[session_id].footprints.get_shape()[1]
 
             footprint_to_component = np.array(
                 [self.state.get_component_from_footprint(i) for i in range(n_rois)]
@@ -359,7 +383,8 @@ class Display(BasePlot.BaseCanvas):
 
     def plot_neurons_visuals(self):
 
-        for key in self.plotting["data"]:
+        for key, record in self.plotting["data"].items():
+
             if key in self.plotting["visuals"]:
                 continue
 
@@ -377,28 +402,30 @@ class Display(BasePlot.BaseCanvas):
                 ),  # Make overlaps visible
             )
 
-            record = self.plotting["data"][key]
+            # record = self.plotting["data"][key]
 
-            colors, style = self._colors_for_record(
-                key,
-                record,
-            )
+            # colors, style = self._colors_for_record(
+            #     key,
+            #     record,
+            # )
 
-            plot_options = self.styles.get_plot_options(
-                style=style,
-                plot_type="marker",
-                values=record.vals,
-                colors=colors,
-                edge_width=0,
-            )
+            # plot_options = self.styles.get_plot_options(
+            #     style=style,
+            #     plot_type="marker",
+            #     values=record.vals,
+            #     colors=colors,
+            #     edge_width=0,
+            # )
 
-            footprints.set_data(self.plotting["data"][key].pos, **plot_options)
+            footprints.set_data(record.pos)  # , **plot_options)
 
             if key == "union":
                 footprints.order = 0
             else:
                 footprints.order = 1
             self.plotting["visuals"][key] = footprints
+
+        self._update_statistic_colors()
 
     def clean(self, with_union=True):
         for key, visual in self.plotting["visuals"].items():
@@ -436,6 +463,9 @@ class Display(BasePlot.BaseCanvas):
         *,
         title=None,
     ):
+        if not self.data.is_available():
+            return
+
         self.neuron_statistic_values = (
             None if values is None else np.asarray(values, dtype=float)
         )
@@ -553,16 +583,9 @@ class Display(BasePlot.BaseCanvas):
         record: OverviewRecord,
     ):
 
-        ids = np.asarray(
-            record.ids,
-            dtype=int,
-        )
+        ids = np.asarray(record.ids, dtype=int)
 
-        point_values = np.full(
-            ids.shape,
-            np.nan,
-            dtype=float,
-        )
+        point_values = np.full(ids.shape, np.nan, dtype=float)
 
         if self.neuron_statistic_values is not None:
 
@@ -579,10 +602,7 @@ class Display(BasePlot.BaseCanvas):
 
         nan_color[3] = opts["statistic_nan_alpha"]
 
-        rgba = np.tile(
-            nan_color,
-            (len(ids), 1),
-        )
+        rgba = np.tile(nan_color, (len(ids), 1))
 
         if self.statistic_data_clim is None or self.neuron_statistic_values is None:
             return rgba
@@ -600,16 +620,9 @@ class Display(BasePlot.BaseCanvas):
         if hi > lo:
             normalized = (point_values[finite] - lo) / (hi - lo)
         else:
-            normalized = np.full(
-                np.count_nonzero(finite),
-                0.5,
-            )
+            normalized = np.full(np.count_nonzero(finite), 0.5)
 
-        normalized = np.clip(
-            normalized,
-            0.0,
-            1.0,
-        )
+        normalized = np.clip(normalized, 0.0, 1.0)
 
         rgba[finite] = self.statistic_cmap.map(normalized).astype(np.float32)
 
@@ -619,25 +632,13 @@ class Display(BasePlot.BaseCanvas):
             and self.state.current_session_id is not None
         ):
 
-            current = (
-                self.state.assignments[
-                    :,
-                    self.state.current_session_id,
-                ]
-                >= 0
-            )
+            current = self.state.assignments[:, self.state.current_session_id] >= 0
 
-            ids = np.asarray(
-                record.ids,
-                dtype=int,
-            )
+            ids = np.asarray(record.ids, dtype=int)
 
             valid_ids = (ids >= 0) & (ids < len(current))
 
-            point_in_current = np.zeros(
-                len(ids),
-                dtype=bool,
-            )
+            point_in_current = np.zeros(len(ids), dtype=bool)
 
             point_in_current[valid_ids] = current[ids[valid_ids]]
 
@@ -659,10 +660,7 @@ class Display(BasePlot.BaseCanvas):
             abs(pos[0] - target[0]) <= radius_x and abs(pos[1] - target[1]) <= radius_y
         )
 
-    def _colorbar_hit_target(
-        self,
-        pos,
-    ):
+    def _colorbar_hit_target(self, pos):
 
         if not self.statistic_colorbar.visible:
             return None
@@ -678,56 +676,13 @@ class Display(BasePlot.BaseCanvas):
         ):
             return "reset_high"
 
-        if self._point_near(
-            pos,
-            self._cbar_low_label_pos,
-            radius_x=25,
-            radius_y=12,
-        ):
+        if self._point_near(pos, self._cbar_low_label_pos, radius_x=25, radius_y=12):
             return "low"
 
-        if self._point_near(
-            pos,
-            self._cbar_high_label_pos,
-            radius_x=25,
-            radius_y=12,
-        ):
+        if self._point_near(pos, self._cbar_high_label_pos, radius_x=25, radius_y=12):
             return "high"
 
         return None
-
-    # def _colorbar_click_target(
-    #     self,
-    #     pos,
-    # ):
-    #     if not self.statistic_colorbar.visible:
-    #         return None
-
-    #     x, y = pos
-
-    #     label_y = self._cbar_center[1] + 20
-
-    #     low_x = self._cbar_center[0] - self._cbar_size[0] / 2 + 5
-    #     high_x = self._cbar_center[0] + self._cbar_size[0] / 2 - 5
-
-    #     if abs(y - label_y) < 12:
-
-    #         if abs(x - low_x) < 25:
-    #             return "low"
-
-    #         if abs(x - high_x) < 25:
-    #             return "high"
-
-    #     # reset crosses
-    #     if abs(y - label_y) < 12:
-
-    #         if abs(x - (self._cbar_center[0] - self._cbar_size[0] / 2 - 12)) < 10:
-    #             return "reset_low"
-
-    #         if abs(x - (self._cbar_center[0] + self._cbar_size[0] / 2 + 12)) < 10:
-    #             return "reset_high"
-
-    #     return None
 
     def _update_colorbar_hover(self, target):
 
@@ -898,6 +853,15 @@ class Display(BasePlot.BaseCanvas):
                 visual.visible = False
                 continue
 
+            mask = self._review_mask_for_record(record)
+
+            pos = record.pos[mask]
+            if pos.shape[0] == 0:
+                visual.visible = False
+                continue
+
+            vals = record.vals[mask]
+
             # -------------------------------------------
             # No statistic selected:
             # restore ordinary overview colors
@@ -927,18 +891,23 @@ class Display(BasePlot.BaseCanvas):
                 # encode the statistic.
                 style = "default"
 
+            if (
+                isinstance(colors, np.ndarray)
+                and colors.ndim == 2
+                and len(colors) == len(record.ids)
+            ):
+                colors = colors[mask]
+
             plot_options = self.styles.get_plot_options(
                 style=style,
                 plot_type="marker",
-                values=record.vals,
+                values=vals,
                 colors=colors,
                 edge_width=0,
             )
 
-            visual.set_data(
-                record.pos,
-                **plot_options,
-            )
+            visual.visible = True
+            visual.set_data(pos, **plot_options)
 
         self.update()
 
@@ -1046,7 +1015,13 @@ class Display(BasePlot.BaseCanvas):
             return
 
         neuron_ids = [c.neuron_id for c in component]
-        mask = np.isin(self.plotting["data"][key].ids, neuron_ids)
+
+        record = self.plotting["data"][key]
+
+        mask = np.isin(record.ids, neuron_ids)
+        mask &= self._review_mask_for_record(record)
+
+        # mask = np.isin(self.plotting["data"][key].ids, neuron_ids)
         if not np.any(mask):
             self.plotting["overlays"][style][0].visible = False
             self.update()
@@ -1085,15 +1060,36 @@ class Display(BasePlot.BaseCanvas):
         distances = (union_centroids[:, 0] - mouse_pos[0]) ** 2 + (
             union_centroids[:, 1] - mouse_pos[1]
         ) ** 2
+
+        ## filter results for display based on review status
+        neuron_ids = np.arange(len(union_centroids), dtype=int)
+        focused_neuron_id = (
+            None
+            if self.state.focused_component is None
+            else self.state.focused_component.neuron_id
+        )
+
+        review_mask = ReviewStatusFilter.neuron_mask(
+            neuron_ids,
+            self.data.assignments.review_status,
+            (self.controls["panel"].review_filter.visible_statuses),
+            focused_neuron_id=focused_neuron_id,
+            keep_focused=True,
+        )
+        distances[~review_mask] = np.inf
+
         if self.display_mode == "session_overview":
             mask = self.state.assignments[:, self.state.current_session_id] >= 0
             distances[~mask] = np.inf
+
+        if not np.any(np.isfinite(distances)):
+            return None
 
         neuron_id = np.argmin(distances).astype(int)
         if np.sqrt(distances[neuron_id]) > 10.0:
             return None
 
-        return NeuronComponent(self.state.current_session_id, neuron_id)
+        return NeuronComponent(neuron_id, self.state.current_session_id)
 
     def on_mouse_move(self, event):
 
@@ -1138,6 +1134,38 @@ class Display(BasePlot.BaseCanvas):
 
         super().on_mouse_release(event)
 
+    def _review_mask_for_record(self, record: OverviewRecord) -> np.ndarray:
+
+        ids = np.asarray(record.ids, dtype=int)
+
+        mask = np.zeros(ids.shape, dtype=bool)
+
+        if self.data.assignments is None:
+            return mask
+
+        review_status = self.data.assignments.review_status
+
+        valid = (ids >= 0) & (ids < len(review_status))
+
+        if not np.any(valid):
+            return mask
+
+        focused_neuron_id = (
+            None
+            if self.state.focused_component is None
+            else self.state.focused_component.neuron_id
+        )
+
+        mask[valid] = ReviewStatusFilter.neuron_mask(
+            ids[valid],
+            review_status,
+            (self.controls["panel"].review_filter.visible_statuses),
+            focused_neuron_id=focused_neuron_id,
+            keep_focused=True,
+        )
+
+        return mask
+
 
 class Controller(BasePlot.CanvasController):
 
@@ -1147,6 +1175,9 @@ class Controller(BasePlot.CanvasController):
 
         self.current_statistic_query = None
         self.statistic_table = None
+
+        self.controls["panel"] = OverviewControlPanel(self.section)
+        self.canvas.attach_control_overlay()
 
         self.controls["statistics"] = StatisticQuerySelector(
             engine=self.data.statistic_engine,
@@ -1179,6 +1210,10 @@ class Controller(BasePlot.CanvasController):
 
         self.controls["stat_reverse"].toggled.connect(
             self._on_statistic_color_options_changed
+        )
+
+        self.controls["panel"].review_filter.changed.connect(
+            self._on_review_filter_changed
         )
 
     def _on_statistic_query_changed(self, query):
@@ -1335,10 +1370,14 @@ class Controller(BasePlot.CanvasController):
         super()._on_selection_changed()
 
     def _on_focus_changed(self):
-        # self.side_menu.highlight_display()
+        self.canvas._update_statistic_colors()
         super()._on_focus_changed()
 
     def update_neuron_selection(self):
+        self.update_styles()
+
+    def _on_review_filter_changed(self):
+        self.canvas._update_statistic_colors()
         self.update_styles()
 
     def deactivate(self):
@@ -1346,6 +1385,15 @@ class Controller(BasePlot.CanvasController):
         # self.side_menu.deleteLater()
         self.canvas.clean()
         super().deactivate()
+
+
+class OverviewControlPanel(ControlPanel.ControlPanel):
+
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        review_selector = self._build_review_selector()
+        self.form.addRow("Review status", review_selector)
 
 
 def sparse_A_to_points(A_csc, dims, thr=0.2):

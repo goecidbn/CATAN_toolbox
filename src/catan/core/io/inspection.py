@@ -127,5 +127,23 @@ def check_file_compatibility(
     )
 
 
+def evaluate_file_compatibility(
+    path: str | Path,
+    fields_to_load: dict[str, dict[str, FieldSpec]],
+    *,
+    root: str = "/",
+    refresh: bool = False,
+    required_only: bool = False,
+) -> bool:
+    report = check_file_compatibility(path, fields_to_load, root=root, refresh=refresh)
+    possible = True
+    for field in report.fields:
+        is_ok = field.available or (not field.spec.required and required_only)
+        if not is_ok:
+            possible = False
+            break
+    return possible
+
+
 def clear_inspection_cache() -> None:
     _DEFAULT_INSPECTOR.clear()

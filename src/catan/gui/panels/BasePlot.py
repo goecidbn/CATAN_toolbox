@@ -25,8 +25,6 @@ from catan.gui.data.statistics.tabledata import (
 )
 
 
-# importlib.reload(styles)
-# print("reloading BasePlot")
 @dataclass(slots=True)
 class TooltipStatisticResult:
     table: PickTable
@@ -34,10 +32,7 @@ class TooltipStatisticResult:
     row_lookup: dict
     title: str
 
-    def value_for_component(
-        self,
-        component: NeuronComponent,
-    ):
+    def value_for_component(self, component: NeuronComponent):
 
         if self.session_dim is None:
             key = int(component.neuron_id)
@@ -46,9 +41,7 @@ class TooltipStatisticResult:
             if component.session_id is None:
                 return np.nan
 
-            key = (int(component.session_id), int(component.neuron_id))
-
-        row = self.row_lookup.get(key)
+        row = self.row_lookup.get(component.id)
 
         if row is None:
             return np.nan
@@ -106,16 +99,11 @@ class BaseCanvas(scene.SceneCanvas):
     ):
 
         self.handle_tooltip(component)
-
         self.state.update_hovered_components(component)
 
-        # self.update_style(component, "hovered")
-
     def handle_tooltip(
-        self,
-        component: Optional[NeuronComponent | List[NeuronComponent]] = None,
+        self, component: Optional[NeuronComponent | List[NeuronComponent]] = None
     ):
-
         if component is None:
             QToolTip.hideText()
             return
@@ -234,10 +222,7 @@ class BaseCanvas(scene.SceneCanvas):
             self.update()
             return
 
-        records = self.style_records(
-            component,
-            style,
-        )
+        records = self.style_records(component, style)
 
         for index, rec in enumerate(records):
 
@@ -326,9 +311,7 @@ class BaseCanvas(scene.SceneCanvas):
 
         return "footprint"
 
-    def _get_tooltip_statistic_results(
-        self,
-    ) -> list[TooltipStatisticResult]:
+    def _get_tooltip_statistic_results(self) -> list[TooltipStatisticResult]:
 
         entity_mode = self._tooltip_statistic_entity_mode()
 
@@ -403,7 +386,7 @@ class BaseCanvas(scene.SceneCanvas):
                     if sessions is None:
                         key = neuron_id
                     else:
-                        key = (int(sessions[row]), neuron_id)
+                        key = (neuron_id, int(sessions[row]))
 
                     lookup.setdefault(key, row)
 
@@ -434,10 +417,7 @@ class BaseCanvas(scene.SceneCanvas):
 
         return results
 
-    def _tooltip_statistic_lines(
-        self,
-        component: NeuronComponent,
-    ) -> list[str]:
+    def _tooltip_statistic_lines(self, component: NeuronComponent) -> list[str]:
 
         lines = []
 
@@ -619,7 +599,6 @@ class TableController(BaseDisplayController):
 class ControlsController(BaseDisplayController):
 
     def configure_display(self):
-        print("configure display for table controller")
         self.menu = self.section.display_cls(
             self.section, controls=self.controls, config=self.config
         )

@@ -331,7 +331,7 @@ class FieldSelector(QWidget):
             self.field_options[field.group].update_style(field.label, status)
 
         # also, finally color current session properly!!
-        self.source.loading_possible = loading_possible
+        self.source.status["loading_possible"] = loading_possible
 
     def manipulate_fields(
         self, group_name: str, field_name: str, method="edit", **kwargs

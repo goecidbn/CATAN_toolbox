@@ -7,24 +7,28 @@ from dataclasses import dataclass
 from vispy import scene, color
 from vispy.scene import visuals
 from vispy.scene.visuals import Line, Text
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QLineEdit,
+    QHBoxLayout,
     QVBoxLayout,
     QLabel,
     QWidget,
+    QToolButton,
+    QFormLayout,
+    QButtonGroup,
 )
 
+from catan.core.structures import NeuronComponent
 from catan.gui.panels import BasePlot
 
-from catan.gui.structures.state import NeuronComponent
 from catan.gui.interaction import click_events
+from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
 
-from catan.gui.panels.helper.FootprintSlider import (
-    FootprintSliderController,
-)
+
 from catan.gui.panels.helper.cameras import (
     XOnlyLockedPanZoomCamera,
 )
@@ -57,6 +61,9 @@ class Display(BasePlot.BaseCanvas):
         self.labels = {}
 
         self.changes_on_click = "highlighted"  # or "highlighted" or "selected"
+
+        self.control_overlay = None
+        self.events.resize.connect(self._on_canvas_resize)
 
         self.clear()
         self.freeze()
@@ -96,10 +103,50 @@ class Display(BasePlot.BaseCanvas):
             self.axes._view_changed()
             self.update()
 
+    def _on_canvas_resize(self, event=None):
+        self._position_overlay_controls()
+
+    def attach_control_overlay(self):
+        """
+        Attach the Trace control widgets to the canvas after
+        Controller.build_controls() has created them.
+        """
+
+        control_overlay = self.controls.get("panel")
+
+        if control_overlay is None:
+            return
+
+        self.control_overlay = control_overlay
+
+        self.control_overlay.setParent(self.native)
+        self.control_overlay.show()
+        self.control_overlay.raise_()
+
+        self.control_overlay.overlay_layout_changed.connect(
+            self._position_overlay_controls
+        )
+
+        self._position_overlay_controls()
+
+    def _position_overlay_controls(self):
+
+        if self.control_overlay is None:
+            return
+
+        margin = 8
+        spacing = 6
+
+        palette = self.control_overlay
+        palette.adjustSize()
+
+        x = self.native.width() - palette.width() - margin
+
+        palette.move(max(margin, x), margin)
+        palette.raise_()
+
     def update_labels(self, trace_options):
         self.clear_labels()
-
-        # print("Updating trace labels with options:", trace_options)
 
         offset = 0
         for key, opt in trace_options.items():
@@ -114,36 +161,6 @@ class Display(BasePlot.BaseCanvas):
                 font_size=10,
             )
             offset += self.trace_distance
-            # self.labels[key].set_visible(False)
-
-    # def build_overlays(self):
-
-    #     for style in ["hovered", "focused", "highlighted"]:
-
-    #         plot_options = self.styles.get_plot_options(style, "line", values=0.7)
-
-    #         n_overlays = 2 if style == "highlighted" else 1
-    #         self.plotting["overlays"][style] = [None] * n_overlays
-
-    #         for n in range(n_overlays):
-    #             vis = visuals.Line(
-    #                 **plot_options,
-    #                 parent=self.plot_root,
-    #             )
-    #             vis.visible = False
-    #             vis.set_gl_state(
-    #                 blend=True,
-    #                 depth_test=False,
-    #                 blend_func=("src_alpha", "one_minus_src_alpha"),
-    #             )
-    #             if style == "focused":
-    #                 vis.order = 80
-    #             elif style == "highlighted":
-    #                 vis.order = 90
-    #             elif style == "hovered":
-    #                 vis.order = 100
-
-    #             self.plotting["overlays"][style][n] = vis
 
     def plot_single_trace(self, component: NeuronComponent, offset, height=1.0, f=15.0):
 
@@ -234,26 +251,67 @@ class Display(BasePlot.BaseCanvas):
 
         time_lim = [np.inf, -np.inf]
 
-        compare_mode = self.controls["compare_mode"].currentText()
-        if compare_mode == "between sessions":
+        this_neuron = self.state.focused_component.neuron_id
+
+        display_scope = self.controls["panel"].display_scope
+        if display_scope == "across":
             if self.state.focused_component is None:
                 to_plot_components = None
             else:
-                neuron_id = self.state.focused_component.neuron_id
                 session_presence = np.where(
-                    self.data.assignments.ids[neuron_id, :] >= 0
+                    self.data.assignments.ids[this_neuron, :] >= 0
                 )
 
                 to_plot_components = [
-                    NeuronComponent(session_id=s, neuron_id=neuron_id)
+                    NeuronComponent(neuron_id=this_neuron, session_id=s)
                     for s in session_presence[0]
                 ]
-        else:
-            to_plot_components = self.state.selected_components
+        elif display_scope == "adjacent":
 
-        # to_plot_components = [c for c in to_plot_components if c is not None]
+            ## find closeby neurons
+            union_centroids = self.data.assignments.union.centroids
+            distances = np.linalg.norm(
+                union_centroids - union_centroids[this_neuron], axis=1
+            )
+            (to_plot_neurons,) = np.where(distances <= self.state.adjacency_radius)
+            to_plot_components = [
+                NeuronComponent(neuron_id=n, session_id=self.state.current_session_id)
+                for n in to_plot_neurons
+                if self.state.assignments[n, self.state.current_session_id] >= 0
+            ]
+        elif display_scope == "selection":
+            to_plot_components = self.state.selected_components
+        else:
+            raise ValueError(f"Unknown display scope: {display_scope}")
+
         if not to_plot_components:
             return
+
+        neuron_ids = np.asarray(
+            [component.neuron_id for component in to_plot_components], dtype=int
+        )
+
+        focused_neuron_id = (
+            None
+            if self.state.focused_component is None
+            else self.state.focused_component.neuron_id
+        )
+
+        mask = ReviewStatusFilter.neuron_mask(
+            neuron_ids,
+            self.data.assignments.review_status,
+            self.controls["panel"].review_filter.visible_statuses,
+            focused_neuron_id=focused_neuron_id,
+            keep_focused=True,
+        )
+
+        to_plot_components = [
+            component for component, keep in zip(to_plot_components, mask) if keep
+        ]
+
+        if not to_plot_components:
+            return
+
         ## restrict number of traces to plot, to avoid performance drop
         to_plot_components = to_plot_components[:max_components]
 
@@ -303,10 +361,11 @@ class Display(BasePlot.BaseCanvas):
         )
 
         for key, line in self.plotting["visuals"].items():
+            # print("key", key)
             # line = record.visual
             if line.pos is None:
                 continue
-            neuron = NeuronComponent(key[0], key[1])
+            neuron = NeuronComponent(*key)
             dists = np.linalg.norm(line.pos - mouse_pos, axis=1)
             min_dist = np.nanmin(dists)
             if min_dist < 0.1:  # threshold for picking
@@ -341,26 +400,19 @@ class Display(BasePlot.BaseCanvas):
 
 class Controller(BasePlot.CanvasController):
 
-    # def __init__(self, display_section, config=None):
-
-    #     super().__init__(display_section, config)
-    #     # self.canvas = PlotCanvas(display_section, self.controls, config)
-
     def build_controls(self):
         super().build_controls()
-        self.controls["slider"] = FootprintSliderController(self.section)
-        self.section.x_options_layout.addWidget(self.controls["slider"])
 
-        self.controls["compare_mode"] = QComboBox()
-        self.section.x_options_layout.addWidget(self.controls["compare_mode"])
-        self.controls["compare_mode"].addItems(["within session", "between sessions"])
-        self.controls["compare_mode"].currentIndexChanged.connect(self.replot_neurons)
+        self.controls["panel"] = TraceOptionsController(self.section)
+        self.canvas.attach_control_overlay()
 
-        self.controls["trace_options"] = TraceOptionsController(self.section)
-        self.section.y_options_layout.addWidget(self.controls["trace_options"])
+        self.controls["panel"].display_parameter_changed.connect(
+            lambda: self.update_neuron_selection()
+        )
+        self.state.adjacency_radius_changed.connect(self.replot_neurons)
         self.initialize_display()
 
-        self.controls["trace_options"].options_changed.connect(self.replot_neurons)
+        self.controls["panel"].displayed_traces_changed.connect(self.replot_neurons)
 
     def _on_data_changed(self, input: Tuple[str, int]):
         if input[0] == "traces":
@@ -368,24 +420,18 @@ class Controller(BasePlot.CanvasController):
         self.replot_neurons()
 
     def _on_selection_changed(self):
-        self.controls["slider"].update_setup()
         super()._on_selection_changed()
 
     def _on_focus_changed(self):
-        self.controls["slider"].adjust_id()
         super()._on_focus_changed()
 
     def _on_session_changed(self):
-        self.controls["trace_options"].build_trace_checkboxes()
-        self.canvas.update_labels(
-            self.controls["trace_options"].checkbox_traces_options
-        )
+        self.controls["panel"].build_trace_checkboxes()
+        self.canvas.update_labels(self.controls["panel"].checkbox_traces_options)
         super()._on_session_changed()
 
     def replot_neurons(self):
-        self.canvas.update_labels(
-            self.controls["trace_options"].checkbox_traces_options
-        )
+        self.canvas.update_labels(self.controls["panel"].checkbox_traces_options)
         self.canvas.plot_neurons()
         self.update_styles()
 
@@ -394,38 +440,43 @@ class Controller(BasePlot.CanvasController):
         self.update_styles()
 
 
-### Trace options ###
-class TraceOptionsController(QWidget):
-    options_changed = Signal()
+class TraceOptionsController(ControlPanel.ControlPanel):
+
+    data_parameter_changed = Signal()
+
+    displayed_traces_changed = Signal()
+
+    session_only_changed = Signal(bool)
+    reset_camera_requested = Signal()
 
     def __init__(self, parent):
-
         super().__init__(parent)
 
-        self.data = parent.data
+        scope_selector = self._build_display_scope_selection(
+            {
+                "adjacent": {
+                    "label": "Nearby",
+                    "position": "left",
+                },
+                "selection": {
+                    "label": "Selected",
+                    "position": "center",
+                },
+                "across": {
+                    "label": "Across",
+                    "position": "right",
+                },
+            }
+        )
+        self.form.addRow("Show", scope_selector)
 
-        # self.trace_options = QWidget()
-        self.trace_options_layout = QVBoxLayout(self)
+        review_selector = self._build_review_selector()
+        self.form.addRow("Review status", review_selector)
 
-        # self.checkbox_trace_options = self.build_trace_checkboxes()
         self.checkbox_trace_container = QWidget()
         self.checkbox_traces_layout = QVBoxLayout(self.checkbox_trace_container)
         self.checkbox_traces_options = {}
-
-        self.trace_options_layout.addWidget(self.checkbox_trace_container)
-
-        offset_layout = QVBoxLayout()
-        self.trace_offset = QLineEdit()
-        self.trace_offset.setFixedWidth(60)
-        self.trace_offset.setText("0.0")
-        offset_layout.addWidget(
-            QLabel("Trace offset:"), alignment=Qt.AlignmentFlag.AlignLeft
-        )
-        offset_layout.addWidget(self.trace_offset, alignment=Qt.AlignmentFlag.AlignLeft)
-        self.trace_options_layout.addLayout(offset_layout)
-        offset_layout.addStretch(0)
-
-        self.trace_offset.editingFinished.connect(lambda: self.options_changed.emit())
+        self.form.addRow("Traces", self.checkbox_trace_container)
 
     def build_trace_checkboxes(self):
 
@@ -451,5 +502,5 @@ class TraceOptionsController(QWidget):
                 self.checkbox_traces_options[key], alignment=Qt.AlignmentFlag.AlignLeft
             )
             self.checkbox_traces_options[key].toggled.connect(
-                lambda: self.options_changed.emit()
+                lambda: self.displayed_traces_changed.emit()
             )

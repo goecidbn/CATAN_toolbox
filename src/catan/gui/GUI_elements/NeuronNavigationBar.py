@@ -9,13 +9,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QWidget,
     QCheckBox,
+    QDoubleSpinBox,
 )
 
 from catan.core.structures import NeuronComponent
 from catan.tracking.structures import ReviewStatus
 
 
-class FootprintSliderController(QWidget):
+class NeuronNavigationBar(QWidget):
     ### SLIDER CONTROLS ###
 
     def __init__(self, parent):
@@ -54,8 +55,22 @@ class FootprintSliderController(QWidget):
         self.footprint_id_next.clicked.connect(self.on_next_footprint)
         self.footprint_edit.editingFinished.connect(self._on_neuron_edit_return)
 
-        self.state.focused_component_changed.connect(self.adjust_id)
-        self.state.selected_components_changed.connect(self.update_setup)
+        ## add adjacency radius control
+        initial_adj_radius = 15
+        self.adj_radius_spin = QDoubleSpinBox()
+        self.adj_radius_spin.setDecimals(1)
+        self.adj_radius_spin.setRange(0.0, 50.0)
+        self.adj_radius_spin.setSingleStep(1.0)
+        self.adj_radius_spin.setValue(initial_adj_radius)
+        selector_layout.addWidget(QLabel("Neighborhood radius:"))
+        selector_layout.addWidget(self.adj_radius_spin)
+
+        self.adj_radius_spin.valueChanged.connect(
+            lambda value: self.update_adj_radius(value)
+        )
+
+        self.state.focused_component_changed.connect(self._on_focus_changed)
+        self.state.selected_components_changed.connect(self._on_selection_changed)
 
         self.update_setup()
         # self.footprint_edit.editingFinished.connect(self.on_neuron_edit_return)
@@ -63,6 +78,18 @@ class FootprintSliderController(QWidget):
         # selector_layout = self.controls.build_footprint_selector()
         # self.section.x_options_layout.addLayout(selector_layout)
         # return selector_layout
+
+    def update_adj_radius(self, value: float):
+        self.state.adjacency_radius = value
+
+    def _on_selection_changed(self):
+        self.update_setup()
+
+    def _on_focus_changed(self):
+        self.adjust_id()
+
+    def _on_data_changed(self):
+        self.update_setup()
 
     def update_setup(self):
         self.set_id_range()
@@ -90,7 +117,7 @@ class FootprintSliderController(QWidget):
             current_neuron_id = focused.neuron_id
 
             if focused.neuron_id not in neuron_ids:
-                next_idxs = np.where(neuron_ids >= focused.neuron_id)[0]
+                next_idxs = np.where(np.array(neuron_ids) >= focused.neuron_id)[0]
                 if len(next_idxs) > 0:
                     new_idx = next_idxs[0]
                 else:

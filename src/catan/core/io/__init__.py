@@ -22,6 +22,7 @@ from .inspection import (
     inspect_file,
     browse_file_fields,
     check_file_compatibility,
+    evaluate_file_compatibility,
     clear_inspection_cache,
 )
 from .types import (
@@ -48,6 +49,7 @@ __all__ = [
     "inspect_file",
     "browse_file_fields",
     "check_file_compatibility",
+    "evaluate_file_compatibility",
     "clear_inspection_cache",
     "CompatibilityReport",
     "FieldCompatibility",

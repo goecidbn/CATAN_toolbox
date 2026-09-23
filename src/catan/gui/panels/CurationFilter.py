@@ -29,7 +29,7 @@ from catan.gui.data.curation_filter import (
     empty_filter_group_ids,
 )
 
-from catan.gui.structures import NeuronComponent
+from catan.core.structures import NeuronComponent
 from catan.gui.panels import StatisticsData
 from catan.gui.panels.helper.Threshold import ThresholdSpec
 from catan.gui.data.curation_filter import CurationFilterCondition
@@ -1186,8 +1186,8 @@ class Controller(BasePlot.ControlsController):
 
         components = [
             NeuronComponent(
-                session_id=None,
                 neuron_id=int(neuron_id),
+                session_id=None,
             )
             for neuron_id in sorted(self.current_result.neurons)
         ]

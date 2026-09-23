@@ -66,6 +66,40 @@ def print_debug(state, data):
 
     print("Current session:", state.current_session_id)
     print("Sessions:", data.sessions)
+
+    print("session neurons:", data.sessions[0].n_neurons)
+    print("session included:", data.sessions[0].included.shape)
+
+    print("assignments info")
+    print("IDs:", data.assignments.ids.shape)
+    print("union n neurons:", data.assignments.union.n_neurons)
+    print("union included shape:", data.assignments.union.included.shape)
+    print("union synthetic shape:", data.assignments.union.synthetic.shape)
+    print("union footprints shape:", data.assignments.union.footprints.shape)
+    # print(
+    #     "match state:",
+    #     data.assignments.matched_status.shape,
+    #     data.assignments.matched_status,
+    # )
+    # print("review state:", data.assignments.review_status)
+    # print("manipulations:", data.assignments.manipulations)
+
+    # print("union included:", data.assignments.union.included)
+    # print("union synthetic:", data.assignments.union.synthetic)
+
+    # print("Manipulations:")
+    # print(data.assignments.manipulations)
+
+    # data.rebuild_union_neurons([215])
+    # for s, fp_ids in enumerate(data.assignments.ids[215, :]):
+    #     print(f"Session {s}, footprint IDs: {fp_ids}")
+    #     print(data.sessions[s].footprints[:, fp_ids])
+    # print(data.assignments.ids[215, :])
+    # print(f"footprint 215:", data.assignments.union.footprints[:, 215])
+    # print(f"footprint 477:", data.assignments.union.footprints[:, 477])
+
+    # print(data.model.)
+    # print("Status of first session:", data.sessions[0].status)
     # print("Footprints:", data.sessions[0].footprints.shape)
     # print("Footprints:", data.sessions[0].footprints)
 
@@ -83,10 +117,10 @@ def print_debug(state, data):
             session.evaluate_alignment_status()
             print("aligned:", session.status["aligned"])
 
-    q_params = data.sessions[0].quality.keys()
-    print(f"Session quality params: {q_params}")
-    for q in q_params:
-        print(f"Session {data.sessions[0].id}, {q}: {data.sessions[0].quality[q][:10]}")
+    # q_params = data.sessions[0].quality.keys()
+    # print(f"Session quality params: {q_params}")
+    # for q in q_params:
+    #     print(f"Session {data.sessions[0].id}, {q}: {data.sessions[0].quality[q][:10]}")
 
     # print("Assignments:", data.assignments.ids)
     # print("Assignments (state):", state.assignments)

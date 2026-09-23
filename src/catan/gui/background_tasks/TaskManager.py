@@ -91,6 +91,7 @@ class TaskManager(QObject):
         finished=None,
         on_result=None,
         ready=None,
+        unique=False,
         **kwargs,
     ) -> str:
 
@@ -98,6 +99,11 @@ class TaskManager(QObject):
             raise ValueError(
                 f"Unknown task group {group!r}. " f"Expected one of {self.GROUPS}."
             )
+
+        if unique:
+            for task in self.queues[group]:
+                if task.name == name:
+                    self.cancel(task.id)
 
         worker = Worker(
             fn,

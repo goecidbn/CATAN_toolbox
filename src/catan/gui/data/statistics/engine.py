@@ -66,9 +66,6 @@ class StatisticEngine(QObject):
         self.clear_cache()
         self.values_changed.emit()
 
-    # def _on_data_changed(self, input):
-    #     self.refresh_registry()
-
     def data_version(self):
         # Increase/change this whenever tracking/data/statistics change.
         return getattr(self.state, "data_version", 0)

@@ -17,9 +17,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFrame,
     QVBoxLayout,
-    QPushButton,
-    QToolButton,
-    QStyle,
 )
 from PySide6.QtGui import (
     QCursor,
@@ -27,10 +24,8 @@ from PySide6.QtGui import (
 
 import importlib
 from catan.gui.panels import StatisticsData
-from catan.gui.panels.helper import HistogramMesh, series_with_confidence
-from catan.gui.panels.helper.cameras import (
-    FixedPanZoomCamera,
-)
+from catan.gui.panels.helper import HistogramMesh, series_with_confidence, ControlPanel
+
 
 from catan.gui.data.statistics.engine import StatisticsTaskResult
 from catan.gui.data.statistics.errors import StatisticsPlotError
@@ -43,7 +38,8 @@ from catan.gui.data.statistics import (
 )
 from catan.gui.structures.state import NeuronComponent
 from catan.gui.panels import BasePlot
-from catan.gui.panels.helper import Threshold
+from catan.gui.panels.helper import Threshold, ReviewStatusFilter
+
 from catan.gui.background_tasks.runtime import TaskCancelled
 import catan.gui.data.curation_filter as curation_filter
 from catan.gui.panels.helper.Threshold import ThresholdSpec
@@ -132,6 +128,7 @@ class Display(BasePlot.BaseCanvas):
         self.initialize_axis()
 
         self.plot_root = scene.Node(parent=self.view.scene)
+        self.control_overlay = None
 
         self.signals = DisplaySignals()
 
@@ -199,6 +196,7 @@ class Display(BasePlot.BaseCanvas):
     def _on_canvas_resize(self, event):
 
         self.reset_view_button._reposition()
+        self._position_overlay_controls()
 
         if self.error_overlay.isVisible():
             self._position_error_overlay()
@@ -259,6 +257,45 @@ class Display(BasePlot.BaseCanvas):
         self.axes["y_2nd"].link_view(self.right_view)
 
         self.axes["y_2nd"].visible = False
+
+    def attach_control_overlay(self):
+        """
+        Attach the Trace control widgets to the canvas after
+        Controller.build_controls() has created them.
+        """
+
+        control_overlay = self.controls.get("panel")
+
+        if control_overlay is None:
+            return
+
+        self.control_overlay = control_overlay
+
+        self.control_overlay.setParent(self.native)
+        self.control_overlay.show()
+        self.control_overlay.raise_()
+
+        self.control_overlay.overlay_layout_changed.connect(
+            self._position_overlay_controls
+        )
+
+        self._position_overlay_controls()
+
+    def _position_overlay_controls(self):
+
+        if self.control_overlay is None:
+            return
+
+        margin = 8
+        spacing = 6
+
+        palette = self.control_overlay
+        palette.adjustSize()
+
+        x = self.native.width() - palette.width() - margin
+
+        palette.move(max(margin, x), margin)
+        palette.raise_()
 
     def initialize_status_bar(self):
 
@@ -1744,96 +1781,15 @@ class Controller(BasePlot.CanvasController):
         self.state.tasks.task_cancelled.connect(self._on_statistics_task_stopped)
         self.state.tasks.task_failed.connect(self._on_statistics_task_stopped)
 
-    # def _on_test_button_clicked(self):
-
-    #     if self.current_query["x"] is None:
-    #         return
-
-    #     # query = self.current_query["x"]  # Example: using the current x-axis query
-    #     condition_a = curation_filter.CurationFilterCondition(
-    #         query=self.current_query["x"],
-    #         threshold=ThresholdSpec(
-    #             value=2.5,
-    #             direction="less",
-    #             active=True,
-    #         ),
-    #     )
-    #     condition_b = curation_filter.CurationFilterCondition(
-    #         query=self.current_query["x"],
-    #         threshold=ThresholdSpec(
-    #             value=3.0,
-    #             direction="greater",
-    #             active=True,
-    #         ),
-    #     )
-
-    #     root = curation_filter.CurationFilterGroup(
-    #         operator="and",
-    #         match_level="footprint",
-    #         children=[
-    #             condition_a,
-    #             condition_b,
-    #         ],
-    #     )
-    #     evaluator = curation_filter.CurationFilterEvaluator(self.data.statistic_engine)
-
-    #     result_a = evaluator._evaluate_condition(condition_a)
-    #     result_b = evaluator._evaluate_condition(condition_b)
-
-    #     result = evaluator.evaluate(root)
-
-    #     print(
-    #         "footprint:",
-    #         len(result.neurons),
-    #         sorted(result.neurons)[:20],
-    #     )
-
-    #     print("A neurons:", len(result_a.neurons))
-    #     print("B neurons:", len(result_b.neurons))
-
-    #     print("A components:", len(result_a.components))
-    #     print("B components:", len(result_b.components))
-
-    #     print(
-    #         "neuron intersection:",
-    #         len(result_a.neurons & result_b.neurons),
-    #     )
-
-    #     print(
-    #         "component intersection:",
-    #         len(result_a.components & result_b.components),
-    #     )
-
-    #     print(result_a.table.dims)
-    #     print(result_a.table.refs.keys())
-
-    #     root = curation_filter.CurationFilterGroup(
-    #         operator="and",
-    #         match_level="neuron",
-    #         children=[
-    #             condition_a,
-    #             condition_b,
-    #         ],
-    #     )
-
-    #     # root = CurationFilterGroup(
-    #     #     operator="and",
-    #     #     children=[condition],
-    #     # )
-
-    #     evaluator = curation_filter.CurationFilterEvaluator(self.data.statistic_engine)
-
-    #     result = evaluator.evaluate(root)
-
-    #     print(
-    #         "neuron:",
-    #         len(result.neurons),
-    #         sorted(result.neurons)[:20],
-    #     )
-    #     # print(result)
-
     def build_controls(self):
         super().build_controls()
+
+        self.controls["panel"] = StatisticsControlPanel(self.section)
+        self.canvas.attach_control_overlay()
+
+        self.controls["panel"].display_parameter_changed.connect(
+            self._select_review_statuses
+        )
 
         # print("Building controls for PlotController (statistics display)")
         bin_selector = QDoubleSpinBox()
@@ -1847,10 +1803,6 @@ class Controller(BasePlot.CanvasController):
 
         self.section.x_options_layout.addWidget(self.controls["bin_label"])
         self.section.x_options_layout.addWidget(self.controls["bin_selector"])
-
-        # self.controls["test_button"] = QPushButton("Test Filter")
-        # self.section.x_options_layout.addWidget(self.controls["test_button"])
-        # self.controls["test_button"].clicked.connect(self._on_test_button_clicked)
 
         self.controls["x_selector"] = StatisticsData.StatisticQuerySelector(
             engine=self.data.statistic_engine, axis="x"
@@ -1891,9 +1843,8 @@ class Controller(BasePlot.CanvasController):
         self.canvas._on_threshold_changed = self._on_threshold_changed
 
     def _on_data_changed(self, input: Tuple[str, int]):
-        # if input[0] == "assignments":
-        # self.update_canvas()
-        pass
+
+        self._sync_review_selector_to_selection()
 
     def _on_plot_params_changed(self):
         self.rebuild_plot()
@@ -2332,6 +2283,11 @@ class Controller(BasePlot.CanvasController):
         elif isinstance(self.current_plot_data, plotdata_scatter.PlotData):
             self.update_styles()
 
+    def _on_selection_changed(self):
+
+        self._sync_review_selector_to_selection()
+        super()._on_selection_changed()
+
     def _on_visual_clicked(self, idx: Optional[int], modifiers):
 
         if idx is None:
@@ -2411,7 +2367,6 @@ class Controller(BasePlot.CanvasController):
             )
 
             rows = plot_data.rows_for_markers(markers)
-
             ref_sets = plot_data.ref_sets_for_rows(rows)
 
             self._handle_picked_ref_sets(ref_sets, [])
@@ -2424,10 +2379,7 @@ class Controller(BasePlot.CanvasController):
     ):
 
         if ref_sets is None:
-            self.state.update_selected_components(
-                None,
-                modifiers,
-            )
+            self.state.update_selected_components(None, modifiers)
             return
 
         components = set()
@@ -2535,7 +2487,7 @@ class Controller(BasePlot.CanvasController):
                 add_components(neuron_key, None)
 
         return [
-            NeuronComponent(session_id=session_id, neuron_id=neuron_id)
+            NeuronComponent(neuron_id=neuron_id, session_id=session_id)
             for session_id, neuron_id in component_keys
         ]
 
@@ -2669,6 +2621,86 @@ class Controller(BasePlot.CanvasController):
         self._update_statistics_status()
 
     ### ================================================================== ###
+    ### ====================== REVIEW STATUS HANDLING ==================== ###
+    ### ================================================================== ###
+
+    def _select_review_statuses(self):
+
+        if not self.data.is_available():
+            return
+
+        statuses = self.controls["panel"].review_filter.visible_statuses
+
+        if not statuses:
+            self.state.update_selected_components(None)
+            return
+
+        review_status = np.asarray(self.data.assignments.review_status)
+
+        status_values = np.asarray([int(status) for status in statuses], dtype=int)
+
+        mask = np.isin(review_status, status_values)
+
+        # Review state applies to the active curated dataset.
+        included = np.asarray(self.data.assignments.union.included, dtype=bool)
+        mask &= included
+        neuron_ids = np.flatnonzero(mask)
+
+        if neuron_ids.size == 0:
+            self.state.update_selected_components(None)
+            return
+
+        components = [
+            NeuronComponent(neuron_id=int(neuron_id), session_id=None)
+            for neuron_id in neuron_ids
+        ]
+
+        self.state.update_selected_components(components)
+
+    def _review_selector_neuron_ids(self) -> set[int] | None:
+
+        if not self.data.is_available():
+            return None
+
+        statuses = self.controls["panel"].review_filter.visible_statuses
+
+        if not statuses:
+            return set()
+
+        review_status = np.asarray(self.data.assignments.review_status)
+        status_values = np.asarray([int(status) for status in statuses], dtype=int)
+
+        mask = np.isin(review_status, status_values)
+        included = np.asarray(self.data.assignments.union.included, dtype=bool)
+        mask &= included
+
+        return set(np.flatnonzero(mask).tolist())
+
+    def _sync_review_selector_to_selection(self):
+
+        review_filter = self.controls["panel"].review_filter
+
+        expected = self._review_selector_neuron_ids()
+        if expected is None:
+            return
+
+        selected = self.state.selected_components
+
+        if selected is None:
+            matches = len(expected) == 0
+
+        else:
+            # Review-selector selections are deliberately
+            # neuron-level, i.e. session-independent.
+            matches = (
+                all(component.session_id is None for component in selected)
+                and {int(component.neuron_id) for component in selected} == expected
+                and len(selected) == len(expected)
+            )
+
+        review_filter.set_custom(not matches)
+
+    ### ================================================================== ###
     # Deactivation and session handling
     ### ================================================================== ###
     def deactivate(self):
@@ -2682,6 +2714,16 @@ class Controller(BasePlot.CanvasController):
 
         if isinstance(self.current_plot_data, plotdata_scatter.PlotData):
             super().update_styles()
+
+
+class StatisticsControlPanel(ControlPanel.ControlPanel):
+
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        review_selector = self._build_review_selector()
+        review_selector.set_custom(True)
+        self.form.addRow("Review status", review_selector)
 
 
 def _series_y_range(series: plotdata_series.SessionSeries, *, include_zero=True):
