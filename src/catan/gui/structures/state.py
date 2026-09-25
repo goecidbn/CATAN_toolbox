@@ -424,6 +424,63 @@ class AppState(QObject):
 
         return None
 
+    def apply_assignment_rebuild(
+        self,
+        assignments: np.ndarray,
+        neuron_id_map: dict[int, int],
+        *,
+        from_session_id: int,
+    ):
+        """Publish rebuilt assignments and remap surviving GUI selections."""
+
+        def remap_component(component):
+            if component is None:
+                return None
+
+            # A session-specific selection in the rebuilt suffix may now
+            # belong to a different neuron. Do not silently redirect it.
+            if (
+                component.session_id is not None
+                and component.session_id >= from_session_id
+            ):
+                return None
+
+            new_id = neuron_id_map.get(component.neuron_id)
+            if new_id is None:
+                return None
+
+            return NeuronComponent(
+                neuron_id=new_id,
+                session_id=component.session_id,
+            )
+
+        def remap_components(components):
+            result = []
+            for component in components or []:
+                mapped = remap_component(component)
+                if mapped is not None:
+                    result.append(mapped)
+            return result or None
+
+        selected = remap_components(self._selected_components)
+        focused = remap_component(self._focused_component)
+        highlighted = remap_components(self._highlighted_components)
+
+        # Update everything before emitting any signals. The ordinary
+        # selection setters affect one another and emit immediately.
+        self.assignments = assignments
+        self._selected_components = selected
+        self._focused_component = focused
+        self._highlighted_components = highlighted
+        self._hovered_components = None
+        self._current_request = None
+
+        self.selected_components_changed.emit()
+        self.focused_component_changed.emit()
+        self.highlighted_components_changed.emit()
+        self.hovered_components_changed.emit()
+        self.request_status_changed.emit()
+
     def get_footprint_from_component(self, component: NeuronComponent) -> Optional[int]:
 
         # print(f"Translate component to footprint ID: {component}")

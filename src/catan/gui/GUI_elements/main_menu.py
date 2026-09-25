@@ -12,10 +12,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QFrame,
     QVBoxLayout,
-    QCheckBox,
     QSizePolicy,
     QComboBox,
     QToolButton,
+    QSpinBox,
+    QWidgetAction,
+    QCheckBox,
 )
 from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal
 from PySide6.QtGui import QAction
@@ -83,8 +85,8 @@ class MainMenu(QFrame):
         # layout.addWidget(self.logging)
         layout.addWidget(self.build_root_selector())
 
-        session_list = session_overview.SessionOverview(self)
-        layout.addWidget(session_list, stretch=1)
+        self.session_list = session_overview.SessionOverview(self)
+        layout.addWidget(self.session_list, stretch=1)
 
         layout.addWidget(self.build_app_mode_menu())
 
@@ -96,7 +98,7 @@ class MainMenu(QFrame):
         layout.addWidget(self.task_overview)
         layout.addWidget(ResourceMonitor(parent=self))
 
-        session_list.load_requested.connect(self.process_data_from_session)
+        self.session_list.load_requested.connect(self.process_data_from_session)
 
         self.state.data_changed.connect(self._on_data_changed)
         self.state.busy_changed.connect(self.toggle_busy)
@@ -116,22 +118,18 @@ class MainMenu(QFrame):
         # self.button_cancel.setVisible(busy)
 
     def on_process_all(self):
-        for session in self.data.sessions:
-            self.process_data_from_session(session.id)
+        row = self.session_list.load_row
+        row._on_sessions_registered(
+            [session.id for session in self.data.sessions],
+            actions=row.registration_action_selector.actions(),
+        )
 
     def process_data_from_session(self, session_id: int):
-
-        self.data.queue_load_data(session_id)
-
-        if self.checkbox_update_model.isChecked():
-            self.data.queue_update_model(session_id)
-
-        if self.checkbox_assign_neurons.isChecked():
-            self.data.queue_assign_neurons(session_id)
-
-        # if not task.worker.is_cancelled():
-        #     task.worker.cancel()
-        #     print("Cancelled model update task after loading.")
+        row = self.session_list.load_row
+        row._on_sessions_registered(
+            [session_id],
+            actions=row.registration_action_selector.actions(),
+        )
 
     def _on_data_changed(self, input: tuple[str, int]):
         """
@@ -146,10 +144,7 @@ class MainMenu(QFrame):
 
         ## model buttons
         local_model = (self.data.model is not None) and (not self.data.model.loaded)
-        model_fit_possible = (
-            local_model
-            and sum([session.status["aligned"] for session in self.data.sessions]) > 1
-        )
+        model_fit_possible = local_model and sessions_loaded
         self.loader["model"]["button_execute"].setEnabled(model_fit_possible)
 
         model_fitted = self.data.model is not None and self.data.model.fitted
@@ -216,15 +211,22 @@ class MainMenu(QFrame):
         )
         form.addRow(self.config_constructor.config_options)
 
+        self.checkbox_correct_rotation = QCheckBox("Correct session rotation")
+        self.checkbox_correct_rotation.setChecked(self.data.correct_rotation)
+        self.checkbox_correct_rotation.setToolTip(
+            "Search for rotation as well as translation during new "
+            "alignment calculations. Slower; existing alignments "
+            "are unchanged."
+        )
+
+        def set_rotation_correction(enabled):
+            self.data.correct_rotation = bool(enabled)
+            self.settings.setValue("alignment/correct_rotation", bool(enabled))
+
+        self.checkbox_correct_rotation.toggled.connect(set_rotation_correction)
+        form.addRow(self.checkbox_correct_rotation)
+
         self.paths_layout.addWidget(formFrame, alignment=Qt.AlignmentFlag.AlignTop)
-
-        self.checkbox_update_model = QCheckBox("Register to model after loading")
-        self.checkbox_update_model.setChecked(True)
-        form.addRow(self.checkbox_update_model)
-
-        self.checkbox_assign_neurons = QCheckBox("Track neurons after loading")
-        self.checkbox_assign_neurons.setChecked(True)
-        form.addRow(self.checkbox_assign_neurons)
 
         ### triggering processing
         ## default processing
@@ -288,6 +290,96 @@ class MainMenu(QFrame):
         self.edit_root_path.editingFinished.connect(on_root_path_changed)
         return widget
 
+    def _add_process_menu(self, button, key):
+        menu = QMenu(button)
+        button.setMenu(menu)
+
+        rerun_all = menu.addAction("Rerun all")
+        session_rows = []
+
+        def dispatch(*, session_id=None, from_session_id=None):
+            menu.close()
+
+            kwargs = {"mode": "force"}
+            if session_id is not None:
+                kwargs["session_ids"] = [session_id]
+            elif from_session_id is not None:
+                kwargs["from_session_id"] = from_session_id
+
+            if key == "model":
+                self.data.queue_process_model(**kwargs)
+            else:
+                self.data.queue_process_assignments(**kwargs)
+
+        def add_session_row(label, *, single):
+            row = QWidget(menu)
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(8, 6, 8, 6)
+            layout.addWidget(QLabel(label, row))
+
+            session_index = QSpinBox(row)
+            session_index.setMinimum(0)
+            session_index.setToolTip("Session ID; numbering starts at 0.")
+            layout.addWidget(session_index)
+
+            run_button = QPushButton("Run", row)
+            layout.addWidget(run_button)
+
+            if key == "assignments":
+                run_button.setToolTip(
+                    "Also rebuilds already-registered downstream "
+                    "sessions that depend on this session."
+                )
+            else:
+                run_button.setToolTip(
+                    "Updates counts associated with the selected "
+                    "session(s), then refits the model when possible."
+                )
+
+            action = QWidgetAction(menu)
+            action.setDefaultWidget(row)
+            menu.addAction(action)
+
+            def run():
+                if single:
+                    dispatch(session_id=session_index.value())
+                else:
+                    dispatch(from_session_id=session_index.value())
+
+            run_button.clicked.connect(run)
+            session_rows.append((action, row, session_index))
+
+        add_session_row("Rerun from session", single=False)
+        add_session_row("Rerun session", single=True)
+
+        def refresh_menu():
+            n_sessions = len(self.data.sessions)
+
+            if key == "model":
+                model = self.data.model
+                available = model is not None and not model.loaded and n_sessions > 0
+            else:
+                assignments = self.data.assignments
+                needs_loading = (
+                    assignments is not None
+                    and bool(assignments.path)
+                    and not assignments.status["loaded"]
+                )
+                available = (
+                    assignments is not None and not needs_loading and n_sessions > 0
+                )
+
+            rerun_all.setEnabled(available)
+
+            for action, row, session_index in session_rows:
+                session_index.setMaximum(max(0, n_sessions - 1))
+                action.setEnabled(available)
+                row.setEnabled(available)
+
+        rerun_all.triggered.connect(lambda: dispatch())
+        menu.aboutToShow.connect(refresh_menu)
+        refresh_menu()
+
     def build_load_options(
         self,
         key,
@@ -312,10 +404,26 @@ class MainMenu(QFrame):
         entry_layout.addWidget(self.loader[key]["selector"])
 
         ## load / execute button
-        self.loader[key]["button_execute"] = make_icon_button(
-            "folder-open", tooltip=f"Load {key} data", size=28, icon_size=22
-        )
-        self.loader[key]["button_execute"].setFixedWidth(25)
+        if key in ("model", "assignments"):
+            button = QToolButton(self)
+            button.setFixedSize(46, 28)
+            button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+            set_button_icon(
+                button,
+                "folder-open",
+                tooltip=f"Load {key} data",
+            )
+            self._add_process_menu(button, key)
+        else:
+            button = make_icon_button(
+                "folder-open",
+                tooltip=f"Load {key} data",
+                size=28,
+                icon_size=22,
+            )
+            button.setFixedWidth(25)
+
+        self.loader[key]["button_execute"] = button
         entry_layout.addWidget(self.loader[key]["button_execute"])
 
         ## save button
@@ -337,20 +445,11 @@ class MainMenu(QFrame):
             set_button_icon(
                 self.loader["model"]["button_execute"],
                 "play",
-                tooltip=f"Run model fitting",
+                tooltip="Process pending model counts and fit",
             )
 
             def on_button_click():
-
-                if self.data.model is not None and self.data.model.loaded:
-                    self.state.issue(
-                        "warning",
-                        "Model registration not allowed",
-                        f"Model '{self.data.current_model_name}' was loaded from file and cannot be updated. Please create a new model to fit to data.",
-                    )
-                    return
-                for session in self.data.sessions:
-                    self.data.queue_update_model(session.id)
+                self.data.queue_process_model(mode="pending")
 
         if key == "assignments":
 
@@ -365,9 +464,7 @@ class MainMenu(QFrame):
                 ):
                     self.data.load_assignments()
                 else:
-                    for session in self.data.sessions:
-                        self.data.queue_assign_neurons(session.id)
-                # else:
+                    self.data.queue_process_assignments(mode="pending")
 
         self.loader[key]["button_execute"].clicked.connect(on_button_click)
         self.loader[key]["button_execute"].setEnabled(False)
@@ -483,20 +580,24 @@ class MainMenu(QFrame):
             set_button_icon(
                 self.loader["assignments"]["button_execute"],
                 "play",
-                tooltip=f"Run neuron registration",
+                tooltip="Process missing or outdated neuron registrations",
             )
 
-        if self.data.assignments is None:
-            enable_button = False
-        else:
-            enable_button = loading
-            enable_button |= not all(
-                [
-                    not self.data.session_assigned(s.id) and s.status["spatial_loaded"]
-                    for s in self.data.sessions
-                ]
-            )
-        self.loader["assignments"]["button_execute"].setEnabled(enable_button)
+        self.loader["assignments"]["button_execute"].setEnabled(
+            self.data.assignments is not None and (loading or bool(self.data.sessions))
+        )
+
+        # if self.data.assignments is None:
+        #     enable_button = False
+        # else:
+        #     enable_button = loading
+        #     enable_button |= not all(
+        #         [
+        #             not self.data.session_assigned(s.id) and s.status["spatial_loaded"]
+        #             for s in self.data.sessions
+        #         ]
+        #     )
+        # self.loader["assignments"]["button_execute"].setEnabled(enable_button)
 
     def rebuild_selector(
         self, key: str, options: list[str], add_options: Optional[list[str]] = None

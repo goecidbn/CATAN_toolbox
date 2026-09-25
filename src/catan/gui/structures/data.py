@@ -6,9 +6,16 @@ from pathlib import Path
 from catan import Tracking
 from . import AppState, StatisticDisplayConfig
 from .request_handler import RequestHandler
-from catan.core.io import inspect_file, evaluate_file_compatibility
+from catan.core.io import (
+    inspect_file,
+    evaluate_fields_compatibility,
+    load_file,
+    get_backend,
+)
 from catan.core.structures import NeuronComponent, SessionData, sessiondata_type
+from catan.core.structures.load_config import FieldSpec
 from catan.tracking.structures import Assignments, ReviewStatus
+from catan.tracking.realignment import build_realignment_update
 from catan.gui.panels.colors import CyclicColorMap
 
 from catan.gui.data.statistics.engine import StatisticEngine
@@ -24,6 +31,10 @@ class Data(Tracking):
     def __init__(self, state: AppState):
 
         self.state = state
+        self.correct_rotation = state.settings.value(
+            "alignment/correct_rotation", False, type=bool
+        )
+
         super().__init__()
 
         self.statistic_engine = StatisticEngine(
@@ -41,28 +52,82 @@ class Data(Tracking):
 
         self.state.current_session_changed.connect(self._on_current_session_changed)
 
+        self._model_fit_requested = False
+        self.state.tasks.scheduling_settled.connect(self._try_fit_after_loading)
+
     def is_available(self, what: List[str] | None = None) -> bool:
 
-        available = True
-        available &= len(self.sessions) > 0
-        available &= not (self.assignments is None or self.assignments.union is None)
-        if not available:
-            return available
-        available &= (
-            len(self.assignments.union.included) == self.assignments.union.n_neurons
-        )
+        if len(self.sessions) == 0:
+            return False
+
+        assignments = self.assignments
+
+        if assignments is None or assignments.union is None:
+            return False
+
+        union = assignments.union
+
+        n_neurons = assignments.ids.shape[0]
+
+        if n_neurons == 0:
+            return False
+
+        # All neuron-level structures must describe the
+        # same neuron population.
+        if union.n_neurons != n_neurons:
+            return False
+
+        if union.footprints.shape[1] != n_neurons:
+            return False
+
+        if len(union.included) != n_neurons:
+            return False
+
+        if len(assignments.review_status) != n_neurons:
+            return False
+
+        if union.synthetic is not None and len(union.synthetic) != n_neurons:
+            return False
 
         if what is None:
-            return available
+            return True
 
         if "current_session" in what:
-            available &= self.current_session is not None
 
-        return available
+            if self.current_session is None:
+                return False
+
+        return True
+
+    # def is_available(self, what: List[str] | None = None) -> bool:
+
+    #     available = True
+    #     available &= len(self.sessions) > 0
+    #     available &= not (self.assignments is None or self.assignments.union is None)
+    #     if not available:
+    #         return available
+    #     available &= (
+    #         len(self.assignments.union.included) == self.assignments.union.n_neurons
+    #     )
+
+    #     if what is None:
+    #         return available
+
+    #     if "current_session" in what:
+    #         available &= self.current_session is not None
+
+    #     return available
 
     def notify_change(self, change):
         self.state.data_version += 1
         self.state.data_changed.emit(change)
+
+    def mark_geometry_changed(self, session_id: int):
+        affected_paths = super().mark_geometry_changed(session_id)
+
+        self.notify_change(("session", -1))
+
+        return affected_paths
 
     def _on_current_session_changed(self, session_id: int):
         if len(self.sessions) == 0:
@@ -80,6 +145,62 @@ class Data(Tracking):
             table[key] = self.statistic_engine.evaluate_table(query)
         return table
 
+    def session_field_available(
+        self, session_id: int, group_name: str, field_name: str
+    ) -> bool:
+
+        session = self.sessions[session_id]
+
+        if session.path is None or session.source_config is None:
+            return False
+
+        group = session.source_config.groups.get(group_name)
+
+        if group is None:
+            return False
+
+        spec = group.fields.get(field_name)
+
+        if spec is None:
+            return False
+
+        return evaluate_fields_compatibility(
+            session.path, {group_name: {field_name: spec}}
+        )
+
+    @staticmethod
+    def _missing_session_fields(session, fields_to_load):
+        return {
+            group: dict(fields)
+            for group, fields in fields_to_load.items()
+            if fields
+            and not (
+                group in {"spatial", "traces", "quality"}
+                and session.status[f"{group}_loaded"]
+            )
+        }
+
+    def _load_session_fields(self, session_id: int, fields_to_load):
+        session = self.sessions[session_id]
+
+        fields_to_load = self._missing_session_fields(session, fields_to_load)
+        if not fields_to_load:
+            return
+
+        if "spatial" in fields_to_load:
+            session.params["correct_rotation"] = self.correct_rotation
+
+        session.load_data(
+            fields_to_load,
+            alignment_references=(self.alignment_references_for_session(session_id)),
+            ctx=current_task_context(),
+        )
+
+        self.notify_change(("session", session_id))
+
+        if "traces" in fields_to_load:
+            self.notify_change(("traces", session_id))
+
     def toggle_session_data(
         self,
         session_id: int,
@@ -88,41 +209,355 @@ class Data(Tracking):
         **kwargs,
     ):
 
-        ctx = current_task_context()
-
         session = self.sessions[session_id]
+
         if session.source_config is None:
             raise ValueError("No load configuration selected.")
 
         if which is None:
             fields_to_load = session.source_config.get_fields_to_load()
+
         else:
             fields_to_load = session.source_config.get_fields_to_load([which])
 
             if to_present is None:
-                ## default to "toggle" if nothing provided
                 to_present = not session.status[f"{which}_loaded"]
 
             if not to_present:
                 session.clean_data(which)
+                self.notify_change(("session", session_id))
 
-        session.load_data(
-            fields_to_load,
-            alignment_template=self.alignment_template,
-            ctx=ctx,
-        )
-        self.notify_change(("session", session_id))
-        if "traces" in fields_to_load:
-            self.notify_change(("traces", session_id))
+                if which == "traces":
+                    self.notify_change(("traces", session_id))
 
-    def queue_load_data(self, session_id: int):
+                return
+
+        self._load_session_fields(session_id, fields_to_load)
+
+    def queue_load_data(self, session_id: int, *, fields_to_load=None, finished=None):
+
         session = self.sessions[session_id]
+        if session.source_config is None:
+            raise ValueError("No load configuration selected.")
+
+        if fields_to_load is None:
+            fields_to_load = session.source_config.get_fields_to_load()
+
         self.state.tasks.start(
             "loading",
             f"Loading data for {session.name}",
-            self.toggle_session_data,
+            self._load_session_fields,
             session_id=session_id,
-            to_present=True,
+            fields_to_load=fields_to_load,
+            finished=finished,
+        )
+
+    def queue_registration_actions(
+        self,
+        session_id: int,
+        actions: set[str],
+        *,
+        background_mode: str = "configured",
+        on_alignment_error=None,
+    ):
+        session = self.sessions[session_id]
+
+        actions = set(actions)
+
+        load_all = "load_all" in actions
+        load_requested = load_all or "load_data" in actions
+
+        fields_to_load = None
+
+        # ==================================================
+        # Data loading
+        # ==================================================
+        if load_requested:
+            if session.source_config is None:
+                self.state.issue(
+                    "warning",
+                    "Cannot load session",
+                    "No load configuration is available.",
+                )
+                return
+
+            fields_to_load = session.source_config.get_fields_to_load(
+                enabled_only=not load_all
+            )
+
+            # Make an independent mapping because the
+            # registration-specific background choice must
+            # not alter the load configuration itself.
+            fields_to_load = {
+                group_name: dict(fields)
+                for group_name, fields in fields_to_load.items()
+            }
+            fields_to_load = self._missing_session_fields(session, fields_to_load)
+
+            if not fields_to_load:
+                self._continue_registration_actions(
+                    session_id, actions, on_alignment_error=on_alignment_error
+                )
+                return
+
+            if background_mode == "footprints":
+                fields_to_load.get("spatial", {}).pop("background", None)
+
+            if not evaluate_fields_compatibility(session.path, fields_to_load):
+                self.state.issue(
+                    "warning",
+                    "Session data incompatible",
+                    (
+                        "The fields selected for loading "
+                        "are not compatible with their "
+                        "configured sources."
+                    ),
+                )
+                return
+
+            self.queue_load_data(
+                session_id,
+                fields_to_load=fields_to_load,
+                finished=lambda: self._continue_registration_actions(
+                    session_id, actions, on_alignment_error=on_alignment_error
+                ),
+            )
+        else:
+            self._continue_registration_actions(
+                session_id, actions, on_alignment_error=on_alignment_error
+            )
+
+    def _continue_registration_actions(
+        self,
+        session_id: int,
+        actions: set[str],
+        *,
+        on_alignment_error=None,
+    ):
+
+        session = self.sessions[session_id]
+
+        register_model = "register_model" in actions
+        track_neurons = "track_neurons" in actions
+
+        if not (register_model or track_neurons):
+            return
+
+        if not session.status["spatial_loaded"]:
+            return
+
+        # --------------------------------------------------
+        # Recoverable alignment error
+        # --------------------------------------------------
+        if not session.status["aligned"]:
+
+            self.notify_change(("session", session_id))
+
+            if on_alignment_error is not None:
+                on_alignment_error(
+                    session_id,
+                    (None if session.remap is None else session.remap.report),
+                )
+
+            # Important:
+            # only skip dependent processing for THIS session.
+            return
+
+        # --------------------------------------------------
+        # Normal processing
+        # --------------------------------------------------
+        if register_model:
+
+            callback = None
+
+            if track_neurons:
+                callback = lambda: self.queue_assign_neurons(session_id)
+
+            self.queue_update_model(session_id, callback=callback)
+
+            return
+
+        if track_neurons:
+            self.queue_assign_neurons(session_id)
+
+    def queue_process_alignments(self, *, session_ids, finished=None):
+        """Repair required alignments and stale predecessors in session order."""
+        tasks = self.state.tasks
+
+        if any(
+            tasks.current_task(group) is not None or tasks.queued_tasks(group)
+            for group in tasks.GROUPS
+        ):
+            self.state.issue(
+                "warning",
+                "Alignment update not started",
+                "Finish or cancel existing tasks first.",
+            )
+            return
+
+        try:
+            required = sorted(set(session_ids))
+
+            if any(index < 0 or index >= len(self.sessions) for index in required):
+                raise IndexError("Invalid alignment session selection.")
+
+            last = max(required, default=-1)
+
+            pending = [
+                index
+                for index in range(last + 1)
+                if self.alignment_is_stale(index)
+                or (index in required and not self.sessions[index].status["aligned"])
+            ]
+
+            for index in pending:
+                session = self.sessions[index]
+
+                if not session.status["spatial_loaded"]:
+                    raise ValueError(f"Load spatial data for session {index} first.")
+
+                if session.background_template is None:
+                    raise ValueError(
+                        f"Session {index} has no original background template."
+                    )
+
+        except (ValueError, IndexError) as exc:
+            self.state.issue("warning", "Alignment update not started", str(exc))
+            return
+
+        if not pending:
+            if finished is not None:
+                finished()
+            return
+
+        # This explicit processing chain owns subsequent model fitting.
+        self._model_fit_requested = False
+
+        session_id = pending[0]
+        expected_version = self.state.data_version
+
+        def run():
+            session = self.sessions[session_id]
+            template = session.background_template.copy()
+
+            remap = self.propose_session_remapping(
+                session_id,
+                background_template=template,
+            )
+
+            if not remap.report.success:
+                raise ValueError(
+                    f"Alignment failed for session {session_id}: "
+                    f"{remap.report.reason}. Dependent processing stopped."
+                )
+
+            return build_realignment_update(
+                self,
+                session_id,
+                background_template=template,
+                remap=remap,
+                background_spec=None,
+            )
+
+        def publish(result):
+            if self._publish_realignment_update(result, expected_version):
+                # Recheck dependencies after publishing each alignment.
+                self.queue_process_alignments(
+                    session_ids=required,
+                    finished=finished,
+                )
+
+        return tasks.start(
+            "loading",
+            f"Update alignment for {self.sessions[session_id].name}",
+            run,
+            on_result=publish,
+        )
+
+    def queue_process_model(
+        self,
+        *,
+        session_ids=None,
+        from_session_id=None,
+        mode="pending",
+        session_distances=(1,),
+        finished=None,
+    ):
+        tasks = self.state.tasks
+
+        # This explicit processing run owns count updates and its final fit.
+        # Avoid overlapping an existing loading/count/registration operation.
+        if any(
+            tasks.current_task(group) is not None or tasks.queued_tasks(group)
+            for group in tasks.GROUPS
+        ):
+            self.state.issue(
+                "warning",
+                "Model update not started",
+                "Finish or cancel existing tasks first.",
+            )
+            return
+
+        try:
+            plan = self.plan_model_update(
+                session_ids=session_ids,
+                from_session_id=from_session_id,
+                mode=mode,
+                session_distances=session_distances,
+            )
+
+            if plan["load_sessions"]:
+                raise ValueError(
+                    f"Load spatial data for sessions {plan['load_sessions']} first."
+                )
+
+        except (ValueError, IndexError) as exc:
+            self.state.issue(
+                "warning",
+                "Model update not started",
+                str(exc),
+            )
+            return
+
+        if plan["alignment_sessions"]:
+            return self.queue_process_alignments(
+                session_ids=plan["alignment_sessions"],
+                finished=lambda: self.queue_process_model(
+                    session_ids=plan["session_ids"],
+                    mode=mode,
+                    session_distances=plan["session_distances"],
+                    finished=finished,
+                ),
+            )
+
+        self._model_fit_requested = False
+
+        if not (plan["same_sessions"] or plan["cross_pairs"] or plan["check_fit"]):
+            if finished is not None:
+                finished()
+            return
+
+        def run():
+            try:
+                # Rebuild the plan at execution time.
+                return self.process_model_updates(
+                    session_ids=plan["session_ids"],
+                    mode=mode,
+                    session_distances=plan["session_distances"],
+                )
+            finally:
+                # Also expose any completed records if a later step fails.
+                self.notify_change(("model", -1))
+
+        return tasks.start(
+            "model update",
+            (
+                "Process pending model evidence"
+                if mode == "pending"
+                else f"Process model evidence ({mode})"
+            ),
+            run,
+            finished=finished,
         )
 
     def queue_update_model(
@@ -163,20 +598,41 @@ class Data(Tracking):
         self.notify_change(("model", session_id))
 
     def fit_after_loading(self, key: str = "model update"):
-        """
-        ensures the fit is only executed once all current
-        processes of session loading have finished
-        """
+        # Called by the model-count completion callback.
+        # TaskManager checks the request after callbacks finish.
+        self._model_fit_requested = True
 
-        sessions_loaded = [s.status["spatial_loaded"] for s in self.sessions]
-        if (
-            np.sum(sessions_loaded) < 2
-            or self.state.tasks.current[key] is not None
-            or len(self.state.tasks.queues[key]) > 0
+    def _try_fit_after_loading(self):
+        if not self._model_fit_requested:
+            return
+
+        tasks = self.state.tasks
+
+        if any(
+            tasks.current_task(group) is not None or tasks.queued_tasks(group)
+            for group in ("loading", "model update")
         ):
             return
 
-        self.state.tasks.start(
+        self._model_fit_requested = False
+
+        if self.model is None or self.model.loaded:
+            return
+
+        counts = self.model.aggregate_counts(
+            session_order=[
+                str(session.path)
+                for session in self.sessions
+                if session.path is not None
+            ],
+            session_distances=(1,),
+        )
+
+        # Match the current minimum in Model.fit_model_to_counts().
+        if counts["cross"][..., 0].sum() < 20:
+            return
+
+        tasks.start(
             "model update",
             "Fit model to data",
             self.fit_model,
@@ -185,65 +641,190 @@ class Data(Tracking):
     def fit_model(self, **kwargs):
         if self.model is None:
             raise ValueError("No model to fit. Please add a model before fitting.")
-        self.model.fit_model_to_counts(self.counts["cross"])
-        self.notify_change(("assignments", -1))  # Notify that model has changed
 
-    def register_session(
+        counts = super().fit_model(**kwargs)
+
+        self.notify_change(("model", -1))  # Notify that model has changed
+        return counts
+
+    def propose_session_remapping(self, session_id: int, *, background_template=None):
+
+        session = self.sessions[session_id]
+        if any(self.alignment_is_stale(i) for i in range(session_id)):
+            raise ValueError("Update earlier stale alignments first.")
+
+        references = self.alignment_references_for_session(session_id)
+
+        return session.propose_remapping(
+            references,
+            background_template=(background_template),
+            use_optical_flow=False,
+            correct_rotation=self.correct_rotation,
+        )
+
+    def propose_background_remapping(
         self,
-        from_file: str | Path,
-        **kwargs,
+        session_id: int,
+        *,
+        source_path: str | Path,
+        field_path: str,
+        source="dataset",
+        attribute=None,
     ):
-        """
-        Loads and registers session data from a file `fname`.
-        """
-        structure = inspect_file(from_file)
-        sessions = [
-            key
-            for key, val in structure.entries.items()
-            if (Path(key).name.startswith("session") and val.kind == "group")
-        ]
-        if len(sessions):
-            ## dirty way to check between single and multiple session files
-            sessions_data = super().load_session_data(from_file, {})
+
+        session = self.sessions[session_id]
+
+        spec = FieldSpec(
+            path=field_path, source=source, attribute=attribute, required=True
+        )
+
+        data = load_file(source_path, {"spatial": {"background": spec}})
+
+        background = data["spatial"]["background"]
+
+        candidate_template = session.prepare_background_template(background)
+
+        candidate_remap = self.propose_session_remapping(
+            session_id, background_template=(candidate_template)
+        )
+
+        return (candidate_template, candidate_remap)
+
+    def queue_commit_session_realignment(
+        self,
+        session_id,
+        *,
+        background_template,
+        remap,
+        background_spec,
+        expected_version,
+    ):
+        if self.state.data_version != expected_version:
+            self.state.issue(
+                "warning",
+                "Alignment preview outdated",
+                "The data changed. Generate a new alignment preview.",
+            )
+            return
+
+        tasks = self.state.tasks
+        if any(tasks.current.values()) or any(
+            tasks.queued_tasks(group) for group in tasks.current
+        ):
+            self.state.issue(
+                "warning",
+                "Realignment not started",
+                "Finish or cancel existing tasks first.",
+            )
+            return
+
+        def publish(result):
+            self._publish_realignment_update(result, expected_version)
+
+        tasks.start(
+            "loading",
+            f"Commit alignment for {self.sessions[session_id].name}",
+            build_realignment_update,
+            self,
+            session_id,
+            background_template=background_template,
+            remap=remap,
+            background_spec=background_spec,
+            on_result=publish,
+        )
+
+    def _publish_realignment_update(self, result, expected_version):
+        if (
+            self.state.data_version != expected_version
+            or len(self.sessions) != len(result["sessions"])
+            or any(a is not b for a, b in zip(self.sessions, result["sessions"]))
+        ):
+            self.state.issue(
+                "warning",
+                "Realignment discarded",
+                "The data changed while preparing the new geometry. "
+                "Generate a new preview.",
+            )
+            return False
+
+        for sid, values in result["updates"].items():
+            self.sessions[sid].__dict__.update(values)
+
+        Tracking.mark_geometry_changed(self, result["session_id"])
+
+        extra_ids = set(result["updates"]) - {result["session_id"]}
+        extra_paths = {
+            str(self.sessions[sid].path)
+            for sid in extra_ids
+            if self.sessions[sid].path is not None
+        }
+
+        for sid in extra_ids:
+            self._processing_state(sid).geometry_revision += 1
+
+        for model in self._model.values():
+            model.invalidate_counts_for_paths(extra_paths)
+
+        # Dependent synthetic copies can precede the realigned session.
+        first = min(result["updates"])
+        assignment_paths = {
+            str(item.path) for item in self.sessions[first:] if item.path is not None
+        }
+
+        for name in self._assignments:
+            self._stale_assignments.setdefault(name, set()).update(assignment_paths)
+
+        self.notify_change(("session", -1))
+        self.notify_change(("assignments", -1))
+        return True
+
+    def register_session(self, from_file: str | Path, **kwargs) -> list[int]:
+        backend = get_backend(from_file)
+
+        with backend.open_read(from_file) as ref:
+            object_type = backend.get_attribute(ref, "/", "object_type")
+
+        if object_type in {"SessionData", "SessionList"}:
+            sessions = super().load_session_data(from_file)
         else:
-            sessions_data = [
-                {"metadata": {"path": from_file}}
-            ]  # Wrap single session data in a list for uniform processing
+            sessions = [SessionData(path=str(Path(from_file).expanduser().resolve()))]
 
-        for session_data in sessions_data:
+        registered_ids = []
+
+        for session in sessions:
             session_id = super().register_session(
-                from_data=SessionData._from_dict(session_data), align=True, **kwargs
+                from_data=session,
+                **kwargs,
             )
-            session = self.sessions[session_id]
-            assert session.path is not None, "Session path should not be None"
-            session.source_config = self.state.config_manager.suggest_config_for(
-                path=session.path, source_type="session"
-            )
+            registered_ids.append(session_id)
 
-            if session.source_config is not None:
-                fields_to_load = session.source_config.get_fields_to_load()
-                loading_possible = evaluate_file_compatibility(
-                    session.path,
-                    fields_to_load,
+            saved_state = session.__dict__.pop("_restored_processing", None)
+            if saved_state is not None:
+                processing = self._processing_state(session_id)
+                processing.geometry_revision = int(saved_state["geometry_revision"])
+                processing.alignment_stale = bool(saved_state["alignment_stale"])
+
+            # Preserve restored field mappings and source overrides.
+            if session.source_config is None:
+                session.source_config = self.state.config_manager.suggest_config_for(
+                    path=session.path,
+                    source_type="session",
                 )
-                if loading_possible and all(
-                    not session.status[f"{field}_loaded"] for field in fields_to_load
-                ):
-                    self.toggle_session_data(session_id, to_present=True)
 
             if not session.name:
                 session.name = Path(session.path).parent.name
 
-            self.state.session_color = (session_id, self.session_colors.next())
-
-            if session_id == 0 and session.status["aligned"]:
-                self.assign_neurons(from_session_index=session_id)
+            self.state.session_color = (
+                session_id,
+                self.session_colors.next(),
+            )
 
             if self.state.current_session_id is None:
                 self.state.current_session_id = session_id
 
-            # Notify that sessions have changed
             self.notify_change(("session_added", session_id))
+
+        return registered_ids
 
     def remove_session(self, session_id: int):
 
@@ -361,6 +942,139 @@ class Data(Tracking):
         self.state.assignments = self.assignments.ids
         self.notify_change(("assignments", -1))  # Notify that assignments have changed
 
+    def queue_process_assignments(
+        self,
+        *,
+        session_ids=None,
+        from_session_id=None,
+        mode="pending",
+        _model_attempted=False,
+    ):
+        tasks = self.state.tasks
+
+        if any(
+            tasks.current_task(group) is not None or tasks.queued_tasks(group)
+            for group in tasks.GROUPS
+        ):
+            self.state.issue(
+                "warning",
+                "Assignment update not started",
+                "Wait for existing tasks to finish, or cancel "
+                "queued tasks before starting this rebuild.",
+            )
+            return
+
+        try:
+            plan = self.plan_assignment_update(
+                session_ids=session_ids,
+                from_session_id=from_session_id,
+                mode=mode,
+            )
+
+            if not plan["register_sessions"]:
+                return
+
+            if plan["load_sessions"]:
+                raise ValueError(
+                    f"Load spatial data for sessions {plan['load_sessions']} first."
+                )
+
+        except (ValueError, IndexError) as exc:
+            self.state.issue(
+                "warning",
+                "Assignment update not started",
+                str(exc),
+            )
+            return
+
+        if plan["alignment_sessions"]:
+            return self.queue_process_alignments(
+                session_ids=plan["alignment_sessions"],
+                finished=lambda: self.queue_process_assignments(
+                    session_ids=plan["session_ids"],
+                    mode=mode,
+                    _model_attempted=_model_attempted,
+                ),
+            )
+
+        if plan["model_state"] in ("missing", "stale"):
+            if _model_attempted:
+                self.state.issue(
+                    "warning",
+                    "Assignment update stopped",
+                    "The model is still unavailable or outdated after updating "
+                    "its counts. There may be insufficient cross-session evidence.",
+                )
+                return
+
+            required = sorted(
+                set(plan["preserved_sessions"] + plan["register_sessions"])
+            )
+
+            return self.queue_process_model(
+                session_ids=required,
+                mode="pending",
+                finished=lambda: self.queue_process_assignments(
+                    session_ids=plan["session_ids"],
+                    mode=mode,
+                    _model_attempted=True,
+                ),
+            )
+
+        source = self.assignments
+        assignment_name = self.current_assignments
+        model = self.model
+        data_version = self.state.data_version
+
+        def publish(result):
+            if result is None:
+                return
+
+            if (
+                self.state.data_version != data_version
+                or self.assignments is not source
+                or self.current_assignments != assignment_name
+                or self.model is not model
+            ):
+                self.state.issue(
+                    "warning",
+                    "Assignment update discarded",
+                    "Data or the active model/assignments changed "
+                    "during processing. Run the update again.",
+                )
+                return
+
+            candidate = result["candidate"]
+            completed_plan = result["plan"]
+
+            # Preserve object identity for existing GUI/config references.
+            source.__dict__.update(candidate.__dict__)
+
+            completed_paths = {
+                str(self.sessions[index].path)
+                for index in completed_plan["register_sessions"]
+                if self.sessions[index].path is not None
+            }
+            self._stale_assignments.setdefault(
+                assignment_name, set()
+            ).difference_update(completed_paths)
+
+            self.state.apply_assignment_rebuild(
+                source.ids,
+                result["neuron_id_map"],
+                from_session_id=completed_plan["from_session_id"],
+            )
+            self.notify_change(("assignments", -1))
+
+        return tasks.start(
+            "calculating",
+            "Process pending neuron registrations",
+            self.build_assignment_update,
+            session_ids=plan["session_ids"],
+            mode=mode,
+            on_result=publish,
+        )
+
     def queue_assign_neurons(self, session_id: int, to_present=True, callback=None):
         session = self.sessions[session_id]
 
@@ -377,9 +1091,23 @@ class Data(Tracking):
             f"Register neurons for {session.name}",
             fn,
             ready=lambda session=session, session_id=session_id: (
-                (session_id == 0) or (self.model is not None and self.model.fitted)
-            )
-            and session.status["aligned"],
+                session.status["aligned"]
+                and not self.alignment_is_stale(session_id)
+                and (
+                    session_id == 0
+                    or (
+                        self.model is not None
+                        and self.model.fitted
+                        and not self.model.fit_stale
+                        and not self._model_fit_requested
+                        and all(
+                            self.state.tasks.current_task(group) is None
+                            and not self.state.tasks.queued_tasks(group)
+                            for group in ("loading", "model update")
+                        )
+                    )
+                )
+            ),
             finished=callback,
         )
 

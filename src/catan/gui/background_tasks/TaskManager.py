@@ -35,6 +35,7 @@ class TaskManager(QObject):
     task_error = Signal(str, str, str)  # group, task_id, traceback
 
     queue_changed = Signal(str)
+    scheduling_settled = Signal()
 
     GROUPS = (
         "loading",
@@ -325,6 +326,7 @@ class TaskManager(QObject):
             # Release the queue and immediately look for another
             # runnable task.
             self._start_next(group)
+            self.scheduling_settled.emit()
 
     # ------------------------------------------------------------------
     # Cancellation
@@ -371,6 +373,7 @@ class TaskManager(QObject):
         # If this happened while the queue was idle,
         # another ready task may now be runnable.
         self._start_next(group)
+        self.scheduling_settled.emit()
 
     def cancel_group(
         self,

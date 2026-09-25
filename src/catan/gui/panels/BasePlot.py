@@ -23,6 +23,7 @@ from catan.gui.data.statistics.tabledata import (
     prepare_neuron_table_query,
     prepare_component_table_query,
 )
+from catan.gui.GUI_elements.fragments import SaveDisplayButton
 
 
 @dataclass(slots=True)
@@ -89,7 +90,39 @@ class BaseCanvas(scene.SceneCanvas):
         }
         self.changes_on_click = "focused"  # or "highlighted"
 
+        self.save_display_button = SaveDisplayButton.SaveDisplayButton(
+            self,
+            get_directory=lambda: self.data.root,
+            settings=self.state.settings,
+            filename=f"catan_{self.display_mode}",
+        )
+
         self.freeze()
+
+    def _update_transforms(self):
+        super()._update_transforms()
+
+        if not self._fb_stack:
+            return
+
+        framebuffer, origin, canvas_size = self._fb_stack[-1]
+        height, width = framebuffer.color_buffer.shape[:2]
+
+        scale = self.pixel_scale
+        framebuffer_rect = (
+            origin[0] * scale,
+            origin[1] * scale,
+            canvas_size[0] * scale,
+            canvas_size[1] * scale,
+        )
+
+        viewport = self._vp_stack[-1] if self._vp_stack else None
+
+        self.transforms.configure(
+            viewport=viewport,
+            fbo_size=(width, height),
+            fbo_rect=framebuffer_rect,
+        )
 
     def plot_neurons(self, reset=False):
         pass

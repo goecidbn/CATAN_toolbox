@@ -1,6 +1,7 @@
-from pathlib import Path
-from typing import Any, Dict, Optional, Literal, List
 from dataclasses import dataclass
+from typing import Any, Dict, Optional, Literal, List
+from pathlib import Path
+from copy import deepcopy
 
 from catan.core.io import load_file, save_file, NATIVE_ASSIGNMENTS_CONFIG
 from catan.core.structures.load_config import LoadConfig, FieldSpec
@@ -124,6 +125,53 @@ class Assignments:
         new_instance.stats_default_value = self.stats_default_value.copy()
         # new_instance.union = self.union.copy() if self.union is not None else None
         return new_instance
+
+    def copy_prefix(self, from_session_id: int):
+        """Copy assignments before from_session_id, preserving session columns."""
+        n_sessions = self.ids.shape[1]
+
+        if not 0 <= from_session_id <= n_sessions:
+            raise IndexError(f"Invalid session_id {from_session_id}.")
+
+        keep = np.any(
+            self.ids[:, :from_session_id] >= 0,
+            axis=1,
+        )
+
+        neuron_id_map = {
+            int(old_id): new_id for new_id, old_id in enumerate(np.flatnonzero(keep))
+        }
+
+        result = Assignments()
+        result.path = self.path
+        result.source_config = self.source_config
+        result.status = self.status.copy()
+
+        result.ids = self.ids[keep].copy()
+        result.ids[:, from_session_id:] = -1
+
+        result.stats = {key: values[keep].copy() for key, values in self.stats.items()}
+        for values in result.stats.values():
+            values[:, from_session_id:, ...] = np.nan
+
+        result.stats_default_value = deepcopy(self.stats_default_value)
+        result.review_status = self.review_status[keep].copy()
+
+        result.matched_status = self.matched_status.copy()
+        result.matched_status[from_session_id:] = False
+
+        # Retain history; remap the lookup for surviving neuron identities.
+        result.manipulations = deepcopy(self.manipulations)
+        result.next_manipulation_id = self.next_manipulation_id
+        result.manipulation_id = {
+            neuron_id_map[old_id]: manipulation_id
+            for old_id, manipulation_id in self.manipulation_id.items()
+            if old_id in neuron_id_map
+        }
+
+        # result.union is deliberately empty.
+        # Rebuild it from the retained sessions before registering the suffix.
+        return result, neuron_id_map
 
     def pad_empty(self, n_neurons: int, n_sessions: int, mode="new"):
         """

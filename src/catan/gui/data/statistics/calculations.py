@@ -78,19 +78,20 @@ def get_stat_from_session(
     )
 
     for j, session_id in enumerate(session_ids):
-        session = data.sessions[session_id]
 
+        fp_ids = state.assignments[neuron_ids, session_id]
+        present = fp_ids >= 0
+
+        # Registered-but-untracked sessions deliberately
+        # have an empty assignment column.
+        if not np.any(present):
+            continue
+
+        session = data.sessions[session_id]
         stat_session = get_stat(session)
 
         if stat_session is None:
             continue
-
-        fp_ids = state.assignments[
-            neuron_ids,
-            session_id,
-        ]
-
-        present = fp_ids >= 0
 
         values[present, j] = stat_session[fp_ids[present]]
 
@@ -149,17 +150,23 @@ def get_match_metric(
 
 
 def normalize_csc_columns_to_max(A):
+
     A = A.tocsc(copy=True)
+
+    if A.shape[0] == 0 or A.shape[1] == 0:
+        return A
 
     col_max = A.max(axis=0).toarray().ravel()
     col_max = np.asarray(col_max, dtype=A.dtype)
 
     scale = np.ones(A.shape[1], dtype=A.dtype)
+
     nonzero = col_max > 0
     scale[nonzero] = 1.0 / col_max[nonzero]
 
     for j in range(A.shape[1]):
-        start, end = A.indptr[j], A.indptr[j + 1]
+        start, end = (A.indptr[j], A.indptr[j + 1])
+
         A.data[start:end] *= scale[j]
 
     return A

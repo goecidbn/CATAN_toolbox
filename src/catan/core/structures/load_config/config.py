@@ -71,6 +71,7 @@ class LoadConfig:
         source: FieldSource = "dataset",
         attribute: str | None = None,
         required: bool = False,
+        source_path: str | None = None,
     ) -> None:
         self.get_group(group).add_field(
             field_name,
@@ -79,6 +80,7 @@ class LoadConfig:
                 source=source,
                 attribute=attribute,
                 required=required,
+                source_path=source_path,
             ),
         )
 
@@ -90,7 +92,7 @@ class LoadConfig:
 
     def update_field(self, group: str, field_name: str, **changes) -> None:
         spec = self.get_group(group).fields[field_name]
-        valid = {"path", "source", "attribute", "required"}
+        valid = {"path", "source", "attribute", "required", "source_path"}
         unknown = set(changes) - valid
         if unknown:
             raise ValueError(f"Unknown FieldSpec properties: {sorted(unknown)}")

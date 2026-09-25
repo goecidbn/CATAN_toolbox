@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
 )
 
-from catan.core.io.inspection import check_file_compatibility
+from catan.core.io.inspection import check_fields_compatibility
 from catan.core.structures.load_config import FieldGroupSpec, FieldSpec
 from catan.tracking.structures import Assignments
 from catan.gui.structures import SessionData, data, state
@@ -272,10 +272,8 @@ class FieldSelector(QWidget):
 
         self.clear()
 
-        if self.source is None:
+        if self.source is None or self.source.source_config is None:
             return
-        assert self.source.source_config is not None, "Load config is not initialized."
-
         ## loading options
         for group_name, group_spec in self.source.source_config.groups.items():
             self.field_options[group_name] = OptionList(
@@ -311,7 +309,7 @@ class FieldSelector(QWidget):
         ):
             return
 
-        report = check_file_compatibility(
+        report = check_fields_compatibility(
             self.source.path,
             self.source.source_config.get_fields_to_load(
                 list(self.source.source_config.groups.keys())
@@ -336,7 +334,7 @@ class FieldSelector(QWidget):
     def manipulate_fields(
         self, group_name: str, field_name: str, method="edit", **kwargs
     ):
-
+        assert self.source is not None, "Source is not set."
         assert self.source.path is not None, "Path is not set."
         assert self.source.source_config is not None, "Load config is not initialized."
 
@@ -389,37 +387,66 @@ class FieldSelector(QWidget):
 
         if method == "edit_path":
 
-            if (field_path := kwargs.get("field_path")) is None:
-                field_path = FieldSelectDialog.get_field(
-                    path=self.source.path, key=field_name
-                )
-                if field_path is None:
-                    return
-            assert isinstance(field_path, str), "Field path must be a string."
+            field_path = kwargs.get("field_path")
 
-            self.source.source_config.update_field(
-                group_name,
-                field_name,
-                path=field_path,
-            )
+            if field_path is not None:
+
+                self.source.source_config.update_field(
+                    group_name, field_name, path=field_path
+                )
+
+            else:
+
+                spec = self.source.source_config.groups[group_name].fields[field_name]
+                selection = FieldSelectDialog.get_field(
+                    path=self.source.path, key=field_name, parent=self, spec=spec
+                )
+
+                if selection is None:
+                    return
+
+                field_path = selection.path
+                self.source.source_config.update_field(
+                    group_name,
+                    field_name,
+                    path=selection.path,
+                    source=selection.source,
+                    attribute=selection.attribute,
+                    source_path=selection.source_path,
+                )
 
         if method == "add":
-            field_path = FieldSelectDialog.get_field(
-                path=self.source.path, key=field_name
+            selection = FieldSelectDialog.get_field(
+                path=self.source.path, key=field_name, parent=self
             )
-            if field_path is None:
+
+            if selection is None:
                 return
+
+            field_path = selection.path
 
             ## check, if a field with the same path already exists in the group
             fields_to_load = self.source.source_config.get_fields_to_load([group_name])
-            if field_path in [
-                field.path for field in fields_to_load[group_name].values()
-            ]:
+
+            duplicate = any(
+                field.path == selection.path
+                and field.source_path == selection.source_path
+                and field.source == selection.source
+                and field.attribute == selection.attribute
+                for field in fields_to_load[group_name].values()
+            )
+
+            if duplicate:
+
                 self.state.issue(
                     "warning",
                     "Adding field is not possible",
-                    f"Field {field_path} already exists in load options for {group_name}.",
+                    (
+                        f"Field {selection.path} from this source already "
+                        f"exists in {group_name}."
+                    ),
                 )
+
                 return
 
             field_name = QInputDialog.getText(
@@ -435,7 +462,10 @@ class FieldSelector(QWidget):
                 self.source.source_config.add_field(
                     group_name,
                     field_name,
-                    path=field_path,
+                    path=selection.path,
+                    source=selection.source,
+                    attribute=selection.attribute,
+                    source_path=selection.source_path,
                 )
             except KeyError as e:
                 self.state.issue(

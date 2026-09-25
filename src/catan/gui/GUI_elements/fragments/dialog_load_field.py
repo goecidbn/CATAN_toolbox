@@ -1,12 +1,10 @@
 from dataclasses import dataclass
-from catan.core.io.inspection import browse_file_fields
+from typing import List, Optional, Tuple
 
-# import h5py
 import numpy as np
 from pathlib import Path, PurePosixPath
 
-# from scipy.io import loadmat
-from typing import List, Optional, Tuple
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QTreeWidgetItem,
@@ -18,8 +16,26 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QDialogButtonBox,
     QHeaderView,
+    QFileDialog,
+    QHBoxLayout,
+    QToolButton,
+    QMenu,
 )
 from PySide6.QtCore import Qt
+
+from catan.core.io import resolve_source_path
+from catan.core.io.types import FieldSource
+from catan.core.io.inspection import browse_file_fields
+from catan.core.structures.load_config import FieldSpec
+
+
+@dataclass(frozen=True)
+class FieldSelection:
+
+    path: str
+    source_path: str | None = None
+    source: FieldSource = "dataset"
+    attribute: str | None = None
 
 
 class FieldSelectDialog(QDialog):
@@ -31,19 +47,72 @@ class FieldSelectDialog(QDialog):
         parent=None,
         key: str | None = None,
         subpath: str = "/",
+        spec: FieldSpec | None = None,
+        context: str | None = None,
     ):
         super().__init__(parent)
 
-        self.path = path
-        self.current_path = self._normalize_path(subpath)
+        self.primary_path = str(path)
+        self.source_path = None if spec is None else spec.source_path
 
-        self.selected_field: str | None = None
+        self.path = str(resolve_source_path(self.primary_path, self.source_path))
+
+        self.selected_field: FieldSelection | None = None
+
+        if spec is not None:
+            selected_path = PurePosixPath(spec.path)
+            parent_path = str(selected_path.parent)
+            self.current_path = (
+                "/" if parent_path in ("", ".") else self._normalize_path(parent_path)
+            )
+            self.initial_field_path = spec.path
+
+        else:
+            self.current_path = self._normalize_path(subpath)
+            self.initial_field_path = None
+
         self.initial_key = key
 
         self.setWindowTitle(title)
         self.resize(500, 400)
 
         layout = QVBoxLayout(self)
+        if context:
+            self.context_label = QLabel(context)
+            self.context_label.setStyleSheet("font-weight: 600;")
+            layout.addWidget(self.context_label)
+
+        source_layout = QHBoxLayout()
+
+        self.source_label = QLabel()
+        source_layout.addWidget(self.source_label, stretch=1)
+
+        self.source_button = QToolButton()
+        self.source_button.setText("Source…")
+        self.source_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+
+        self.source_menu = QMenu(self.source_button)
+
+        choose_file = QAction("Load from different file…", self.source_menu)
+        choose_file.triggered.connect(self._choose_source_file)
+        self.source_menu.addAction(choose_file)
+
+        choose_directory = QAction("Load from source directory…", self.source_menu)
+        choose_directory.triggered.connect(self._choose_source_directory)
+        self.source_menu.addAction(choose_directory)
+
+        self.source_menu.addSeparator()
+
+        self.revert_source_action = QAction(
+            "Revert to session source", self.source_menu
+        )
+        self.revert_source_action.triggered.connect(self._revert_source)
+        self.source_menu.addAction(self.revert_source_action)
+
+        self.source_button.setMenu(self.source_menu)
+        source_layout.addWidget(self.source_button)
+        layout.addLayout(source_layout)
+        self._update_source_display()
 
         self.path_label = QLabel()
         layout.addWidget(self.path_label)
@@ -108,23 +177,19 @@ class FieldSelectDialog(QDialog):
         return path if path != "" else "/"
 
     def _populate(self):
+
         self.tree_widget.clear()
-
         self.path_label.setText(f"Path: {self.current_path}")
-
-        fields = browse_file_fields(
-            self.path,
-            subpath=self.current_path,
-        )
-        # list_file_fields(
-        #     self.path,
-        #     subpath=self.current_path,
-        # )
+        fields = browse_file_fields(self.path, subpath=self.current_path)
 
         selected_item = None
 
-        # Add '..' first
+        # ---------------------------------------------------------
+        # Parent directory entry
+        # ---------------------------------------------------------
+
         if self.current_path != "/":
+
             item = QTreeWidgetItem(["📁  ..", "", ""])
 
             item.setData(
@@ -133,61 +198,79 @@ class FieldSelectDialog(QDialog):
                 {
                     "kind": "parent",
                     "name": "..",
+                    "path": None,
+                    "attribute": None,
                 },
             )
 
             self.tree_widget.addTopLevelItem(item)
 
-        # groups first, then datasets
+        # ---------------------------------------------------------
+        # Groups first, then selectable fields / attributes
+        # ---------------------------------------------------------
+
         fields = sorted(
             fields,
-            key=lambda f: (
-                f.kind != "group",
-                f.name.lower(),
-            ),
+            key=lambda field: (field.kind != "group", field.name.lower()),
         )
 
         for field in fields:
 
             if field.kind == "group":
-                item = QTreeWidgetItem(
-                    [
-                        f"📁  {field.name}",
-                        "",
-                        "",
-                    ]
-                )
+
+                item = QTreeWidgetItem([f"📁  {field.name}", "", ""])
+
                 font = item.font(0)
                 font.setBold(True)
                 item.setFont(0, font)
 
             else:
+
                 item = QTreeWidgetItem(
-                    [
-                        field.name,
-                        field.display_shape,
-                        field.display_dtype,
-                    ]
+                    [field.name, field.display_shape, field.display_dtype]
                 )
 
+            # Keep the complete FieldInfo identity on the tree item.
+            # In particular, do not reconstruct the path later from
+            # current_path + name.
             item.setData(
                 0,
                 Qt.ItemDataRole.UserRole,
                 {
                     "kind": field.kind,
                     "name": field.name,
+                    "path": field.path,
+                    "attribute": field.attribute,
                 },
             )
 
             self.tree_widget.addTopLevelItem(item)
 
-            if self.initial_key is not None and field.name == self.initial_key:
+            # -----------------------------------------------------
+            # Preselect the currently configured field
+            # -----------------------------------------------------
+
+            if (
+                self.initial_field_path is not None
+                and field.path == self.initial_field_path
+            ):
                 selected_item = item
 
+            elif (
+                self.initial_field_path is None
+                and self.initial_key is not None
+                and field.name == self.initial_key
+            ):
+                selected_item = item
+
+        # ---------------------------------------------------------
+        # Apply preselection
+        # ---------------------------------------------------------
+
         if selected_item is not None:
+
             self.tree_widget.setCurrentItem(selected_item)
             selected_item.setSelected(True)
-
             self.tree_widget.scrollToItem(selected_item)
 
     def _item_double_clicked(
@@ -209,7 +292,7 @@ class FieldSelectDialog(QDialog):
         elif kind == "group":
             self._enter_group(name)
 
-        elif kind == "field":
+        elif kind in ("field", "attribute"):
             self.accept()
 
     def _enter_group(self, name: str):
@@ -238,28 +321,35 @@ class FieldSelectDialog(QDialog):
         self._populate()
 
     def accept(self):
+
         item = self.tree_widget.currentItem()
 
         if item is None:
             return
 
-        data = item.data(
-            0,
-            Qt.ItemDataRole.UserRole,
-        )
+        data = item.data(0, Qt.ItemDataRole.UserRole)
 
-        if data["kind"] != "field":
+        kind = data["kind"]
+        if kind not in ("field", "attribute"):
             return
 
-        path = PurePosixPath(self.current_path, data["name"])
-        self.selected_field = str(path)
+        if kind == "attribute":
 
-        # if self.current_path == "/":
-        #     self.selected_field = name
-        # else:
-        #     self.selected_field = (
-        #         f"{self.current_path.strip('/')}/{name}"
-        #     )
+            self.selected_field = FieldSelection(
+                path=data["path"],
+                source_path=self.source_path,
+                source="attribute",
+                attribute=data["attribute"],
+            )
+
+        else:
+
+            self.selected_field = FieldSelection(
+                path=data["path"],
+                source_path=self.source_path,
+                source="dataset",
+                attribute=None,
+            )
 
         super().accept()
 
@@ -270,6 +360,8 @@ class FieldSelectDialog(QDialog):
         parent=None,
         key: str | None = None,
         subpath: str = "/",
+        spec: FieldSpec | None = None,
+        context: str | None = None,
     ):
         dlg = FieldSelectDialog(
             path=path,
@@ -277,6 +369,8 @@ class FieldSelectDialog(QDialog):
             parent=parent,
             key=key,
             subpath=subpath,
+            spec=spec,
+            context=context,
         )
 
         result = dlg.exec()
@@ -287,115 +381,54 @@ class FieldSelectDialog(QDialog):
 
         return None
 
+    def _update_source_display(self):
 
-# @dataclass
-# class FieldInfo:
-#     name: str
-#     kind: str          # "group" or "dataset"
-#     shape: str = ""
-#     dtype: str = ""
+        if self.source_path is None:
+            self.source_label.setText("Source: session source")
+            self.source_label.setToolTip(self.primary_path)
+            self.revert_source_action.setEnabled(False)
 
-# def list_hdf5_datasets(path: str, subpath: str = "/") -> List[FieldInfo]:
-#     """
-#     Return a list of (name, shape, dtype) for an HDF5 file.
+        else:
+            self.source_label.setText(f"Source: {Path(self.path).name}")
+            self.source_label.setToolTip(self.path)
+            self.revert_source_action.setEnabled(True)
 
-#     Special case:
-#       - Groups that look like CaImAn sparse matrices (with datasets
-#         'indptr', 'indices', 'data', 'shape') are shown as a *single*
-#         logical field with:
-#             name  = group name (e.g. "A")
-#             shape = tuple from 'shape' dataset
-#             dtype = dtype of 'data' dataset
+    def _set_source(self, source_path: str | None):
 
-#       - Other groups: we list their immediate datasets as 'group/dset'.
-#       - Top-level datasets are listed as usual.
-#     """
-#     fields = []
+        self.source_path = source_path
 
-#     with h5py.File(path, "r") as f:
-#         group = f[subpath]
+        self.path = str(resolve_source_path(self.primary_path, source_path))
 
-#         if not isinstance(group, h5py.Group):
-#             raise ValueError(
-#                 f"{subpath!r} is not an HDF5 group."
-#             )
+        self.current_path = "/"
+        self.initial_key = None
+        self.initial_field_path = None
 
-#         for name, obj in group.items():
+        self._update_source_display()
+        self._populate()
 
-#             if isinstance(obj, h5py.Group):
+    def _choose_source_file(self):
 
-#                 # CaImAn sparse matrix:
-#                 # treat the whole group as one selectable logical field
-#                 if all(
-#                     key in obj
-#                     for key in ("indptr", "indices", "data", "shape")
-#                 ):
-#                     shape_ds = obj["shape"][()]
-#                     shape_tuple = tuple(
-#                         int(x)
-#                         for x in np.atleast_1d(shape_ds)
-#                     )
+        start = str(Path(self.path).parent)
 
-#                     fields.append(
-#                         FieldInfo(
-#                             name=name,
-#                             kind="dataset",
-#                             shape=str(shape_tuple),
-#                             dtype=str(obj["data"].dtype),
-#                         )
-#                     )
+        path, _ = QFileDialog.getOpenFileName(self, "Select field source", start)
 
-#                 else:
-#                     fields.append(
-#                         FieldInfo(
-#                             name=name,
-#                             kind="group",
-#                         )
-#                     )
+        if not path:
+            return
 
-#             elif isinstance(obj, h5py.Dataset):
-#                 fields.append(
-#                     FieldInfo(
-#                         name=name,
-#                         kind="dataset",
-#                         shape=str(obj.shape),
-#                         dtype=str(obj.dtype),
-#                     )
-#                 )
+        self._set_source(path)
 
-#     return fields
+    def _choose_source_directory(self):
 
+        start = str(Path(self.path).parent)
 
-# def list_mat_fields(path: str, subpath="/") -> List[FieldInfo]:
-#     """Return top-level variables (name, shape, dtype) from a MAT file."""
-#     data = loadmat(path)
-#     fields: List[FieldInfo] = []
-#     for k, v in data.items():
-#         if k.startswith("__"):
-#             continue
-#         if isinstance(v, np.ndarray):
-#             shape_str = str(v.shape)
-#             dtype_str = str(v.dtype)
-#         else:
-#             shape_str = "-"
-#             dtype_str = type(v).__name__
-#         fields.append(
-#             FieldInfo(
-#                 name=k,
-#                 kind="dataset",
-#                 shape=shape_str,
-#                 dtype=dtype_str,
-#             )
-#         )
-#     return fields
+        path = QFileDialog.getExistingDirectory(
+            self, "Select field source directory", start
+        )
 
+        if not path:
+            return
 
-# def list_file_fields(path: str, subpath="/") -> List[FieldInfo]:
-#     """Dispatch depending on extension (.h5/.hdf5/.mat)."""
-#     ext = Path(path).suffix.lower()
-#     if ext in (".h5", ".hdf5"):
-#         return list_hdf5_datasets(path, subpath)
-#     elif ext == ".mat":
-#         return list_mat_fields(path, subpath)
-#     else:
-#         raise ValueError(f"Unsupported file type for field listing: {ext}")
+        self._set_source(path)
+
+    def _revert_source(self):
+        self._set_source(None)

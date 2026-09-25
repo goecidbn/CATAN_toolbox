@@ -2,6 +2,8 @@ import numpy as np
 from typing import Optional
 import vispy.scene as visuals
 
+from catan.gui.structures import Data, AppState
+
 
 def scene_to_data(scene, data):
 
@@ -62,20 +64,31 @@ def get_footprint_id_from_mouse_pos(canvas, pos, centroids) -> Optional[int]:
     return footprint_id
 
 
-def print_debug(state, data):
+def print_debug(state: AppState, data: Data):
 
     print("Current session:", state.current_session_id)
     print("Sessions:", data.sessions)
 
     print("session neurons:", data.sessions[0].n_neurons)
-    print("session included:", data.sessions[0].included.shape)
 
-    print("assignments info")
-    print("IDs:", data.assignments.ids.shape)
-    print("union n neurons:", data.assignments.union.n_neurons)
-    print("union included shape:", data.assignments.union.included.shape)
-    print("union synthetic shape:", data.assignments.union.synthetic.shape)
-    print("union footprints shape:", data.assignments.union.footprints.shape)
+    print("Model")
+    print("Model details:", data.model)
+    print("Model counts:", data.model.aggregate_counts())
+    print("Model single counts", data.model.counts)
+
+    # for session in data.sessions:
+    #     print(f"remap {session.id}:", session.remap.report)
+
+    # print("background:", data.sessions[0].background)
+    # print("background:", np.percentile(data.sessions[0].background, [5, 50, 95]))
+    # print("session included:", data.sessions[0].included.shape)
+
+    # print("assignments info")
+    # print("IDs:", data.assignments.ids.shape)
+    # print("union n neurons:", data.assignments.union.n_neurons)
+    # print("union included shape:", data.assignments.union.included.shape)
+    # print("union synthetic shape:", data.assignments.union.synthetic.shape)
+    # print("union footprints shape:", data.assignments.union.footprints.shape)
     # print(
     #     "match state:",
     #     data.assignments.matched_status.shape,

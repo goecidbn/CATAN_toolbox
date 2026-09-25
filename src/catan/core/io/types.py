@@ -15,12 +15,15 @@ class FileFormat(str, Enum):
     MAT73 = "mat73"
     NPZ = "npz"
     ZARR = "zarr"
+    IMAGE = "image"
+
 
 SourceTypes = Literal["session", "assignments", "model", "remapping"]
 
 FieldKind = Literal["group", "field", "attribute"]
 FieldSource = Literal["dataset", "field", "attribute"]
 GroupType = Literal["static", "dynamic"]
+
 
 @dataclass
 class FieldSpec:
@@ -31,12 +34,20 @@ class FieldSpec:
     attribute: str | None = None
     required: bool = False
 
+    # Optional override for the physical source containing this field.
+    #
+    # None:             use the primary source of the object/session.
+    # Relative path:    resolve relative to the primary source directory.
+    # Absolute path:    use exactly this source.
+    source_path: str | None = None
+
     def to_dict(self) -> dict:
         return {
             "path": self.path,
             "source": self.source,
             "attribute": self.attribute,
             "required": self.required,
+            "source_path": self.source_path,
         }
 
     @classmethod
@@ -46,6 +57,7 @@ class FieldSpec:
             source=data.get("source", "dataset"),
             attribute=data.get("attribute"),
             required=data.get("required", False),
+            source_path=data.get("source_path"),
         )
 
 
@@ -73,7 +85,7 @@ class FieldGroupSpec:
     def rename_field(self, old_name: str, new_name: str) -> None:
         if old_name == new_name:
             return
-        
+
         if self.type != "dynamic":
             raise ValueError(f"Cannot rename fields in static group {self.title!r}")
         if old_name not in self.fields:
@@ -106,6 +118,7 @@ class FieldGroupSpec:
                 for name, spec in data.get("fields", {}).items()
             },
         )
+
 
 @dataclass(slots=True)
 class FieldInfo:
@@ -226,27 +239,54 @@ class CompatibilityReport:
     @property
     def compatible(self) -> bool:
         return not any(
-            (not item.available) and item.spec.required
-            for item in self.fields
+            (not item.available) and item.spec.required for item in self.fields
         )
 
     @property
     def missing_required(self) -> list[FieldCompatibility]:
         return [
-            item for item in self.fields
-            if (not item.available) and item.spec.required
+            item for item in self.fields if (not item.available) and item.spec.required
         ]
 
     @property
     def missing_optional(self) -> list[FieldCompatibility]:
         return [
-            item for item in self.fields
+            item
+            for item in self.fields
             if (not item.available) and not item.spec.required
         ]
 
     @property
     def available(self) -> list[FieldCompatibility]:
         return [item for item in self.fields if item.available]
+
+
+@dataclass(slots=True)
+class MultiSourceCompatibilityReport:
+
+    fields: list[FieldCompatibility]
+
+    @property
+    def compatible(self) -> bool:
+        return not any(
+            (not item.available) and item.spec.required for item in self.fields
+        )
+
+    @property
+    def missing_required(self) -> list[FieldCompatibility]:
+
+        return [
+            item for item in self.fields if (not item.available and item.spec.required)
+        ]
+
+    @property
+    def missing_optional(self) -> list[FieldCompatibility]:
+
+        return [
+            item
+            for item in self.fields
+            if (not item.available and not item.spec.required)
+        ]
 
 
 @dataclass(slots=True)
@@ -284,7 +324,7 @@ def relative_path(path: str, root: str) -> str:
     prefix = root.rstrip("/") + "/"
     if not path.startswith(prefix):
         raise ValueError(f"{path!r} is not below logical root {root!r}")
-    return "/" + path[len(prefix):]
+    return "/" + path[len(prefix) :]
 
 
 def has_wildcard(path: str) -> bool:

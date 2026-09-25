@@ -4,6 +4,8 @@ function written by Alexander Schmidt, allowing for complete registration of neu
 last updated on September 7th, 2026
 """
 
+from dataclasses import dataclass, field
+
 import os
 import numpy as np
 from typing import Any, Dict, Optional, Tuple, List, Union, Literal
@@ -18,12 +20,38 @@ from catan.core.data import center_of_mass
 from catan.core.structures.load_config.config import LoadConfig, FieldSpec
 
 from catan.core.structures import SessionData, NeuronComponent
+from catan.core.structures.session_snapshot import (
+    read_session_snapshot,
+    write_session_snapshot,
+)
 from catan.core.analysis import calculate_statistics, calculate_p
 from catan.core.alignment import _shift_sparse_bilinear
 
 from .structures import Model, Assignments
 
 logging.basicConfig(level=logging.INFO)
+
+
+@dataclass(slots=True)
+class ModelCountCalculation:
+
+    counts: np.ndarray
+
+    # These originate from the same expensive
+    # calculate_statistics() call.
+    idx_remove: np.ndarray
+    remove_info: Any
+
+
+@dataclass(slots=True)
+class SessionProcessingState:
+
+    geometry_revision: int = 0
+
+    # The session currently has geometry/remapping,
+    # but it depends on upstream geometry that has
+    # subsequently changed.
+    alignment_stale: bool = False
 
 
 class Tracking:
@@ -83,23 +111,10 @@ class Tracking:
 
         self._update_bins(bins)
 
-        # self.load_configs = LoadConfigManager(
-        #     user_dir=(
-        #         Path(user_config_dir("CATAN"))
-        #         / "load_configs"
-        #     ),
-        #     default_config="CaImAn",
-        # )
-
-        # self.kernel = {"idxes": {}, "kde": {}}
-        self.reference_data = None
+        self._session_processing = {}
+        self._stale_assignments = {}
 
         self.reset_data()
-
-        self.counts = {
-            "same": np.zeros((self.params["nbins"], self.params["nbins"]), int),
-            "cross": np.zeros((self.params["nbins"], self.params["nbins"], 3), int),
-        }
 
         self.add_model("local")
         self.add_assignments("local")
@@ -163,19 +178,6 @@ class Tracking:
 
         self.update_sessions_with_assignments()
 
-    # def register_assignments(self, path: str, name: str):
-
-    #     # name = QMessageBox.getText(self, "Register Assignments", "Enter a name for the new assignments:")[0]
-    #     assignments = Assignments()
-    #     assignments.source_config = self.state.config_manager.suggest_config_for(
-    #         path=self.sessions[session_id].path, source_type="session"
-    #     )
-
-    #     self._assignments[name] = assignments
-    #     self._current_assignments = name
-
-    #     pass
-
     def add_assignments(
         self, name: str, assignments: Optional[str | Assignments] = None
     ):
@@ -202,6 +204,9 @@ class Tracking:
         self._assignments[name] = assignments
         self._current_assignments = name
 
+        self._stale_assignments.setdefault(name, set())
+        self._ensure_assignment_session_count(assignments)
+
         if copied:
             self.rebuild_union()
         self.update_sessions_with_assignments()
@@ -213,6 +218,8 @@ class Tracking:
             raise ValueError(f"Assignments '{name}' does not exist.")
 
         del self._assignments[name]
+        self._stale_assignments.pop(name, None)
+
         if self._current_assignments == name:
             self.change_assignments("local")
 
@@ -299,7 +306,7 @@ class Tracking:
             this_data = SessionData._from_file(
                 str(from_file),
                 fields_to_load,
-                self.alignment_template if align_to_reference else None,
+                self.alignment_references if align_to_reference else None,
             )
         elif from_data is not None:
             assert isinstance(
@@ -322,6 +329,132 @@ class Tracking:
 
     def reset_data(self):
         self.sessions: List[SessionData] = []
+
+    def _processing_state(self, session_id: int) -> SessionProcessingState:
+
+        session = self.sessions[session_id]
+
+        state = self._session_processing.get(session)
+        if state is None:
+            state = SessionProcessingState()
+
+            self._session_processing[session] = state
+
+        return state
+
+    def geometry_revision(self, session_id: int) -> int:
+        return self._processing_state(session_id).geometry_revision
+
+    def alignment_is_stale(self, session_id: int) -> bool:
+        return self._processing_state(session_id).alignment_stale
+
+    def require_current_alignment(self, session_id: int):
+        session = self.sessions[session_id]
+
+        if not session.status["spatial_loaded"] or session.footprints is None:
+            raise ValueError(f"Session {session_id}: spatial data must be loaded.")
+
+        if not session.status["aligned"]:
+            raise ValueError(f"Session {session_id}: alignment has not succeeded.")
+
+        if self.alignment_is_stale(session_id):
+            raise ValueError(
+                f"Session {session_id}: alignment is outdated; "
+                "realign this session before further processing."
+            )
+
+    def mark_geometry_changed(self, session_id: int):
+        """
+        Mark dependencies invalid after the aligned geometry of one session has changed.
+
+        The changed session itself is assumed to have a valid newly committed alignment.
+
+        All later sessions have stale alignment because their remapping may depend on this session.
+        """
+
+        if not (0 <= session_id < len(self.sessions)):
+            raise IndexError(f"Invalid session_id {session_id}.")
+
+        changed = self.sessions[session_id]
+
+        changed_state = self._processing_state(session_id)
+
+        changed_state.geometry_revision += 1
+        changed_state.alignment_stale = False
+
+        # ============================================
+        # Downstream remappings
+        # ============================================
+        for downstream_id in range(session_id + 1, len(self.sessions)):
+            self._processing_state(downstream_id).alignment_stale = True
+
+        # ============================================
+        # Model evidence
+        # ============================================
+        affected_sessions = self.sessions[session_id:]
+        affected_paths = {
+            str(session.path)
+            for session in affected_sessions
+            if session.path is not None
+        }
+
+        for model in self._model.values():
+            model.invalidate_counts_for_paths(affected_paths)
+
+        # ============================================
+        # Assignments
+        # ============================================
+        for name in self._assignments:
+
+            self._stale_assignments.setdefault(name, set()).update(affected_paths)
+
+        # Compatibility flags for existing GUI code.
+        for session in affected_sessions:
+            session.status["registered_to_model"] = False
+
+        return affected_paths
+
+    def mark_alignment_current(self, session_id: int):
+
+        state = self._processing_state(session_id)
+
+        state.alignment_stale = False
+
+    def assignment_is_stale(
+        self, session_id: int, *, assignment_name: str | None = None
+    ) -> bool:
+
+        if assignment_name is None:
+            assignment_name = self._current_assignments
+
+        if assignment_name is None:
+            return False
+
+        session = self.sessions[session_id]
+
+        if session.path is None:
+            return False
+
+        return str(session.path) in self._stale_assignments.get(assignment_name, set())
+
+    def mark_assignment_current(
+        self, session_id: int, *, assignment_name: str | None = None
+    ):
+
+        if assignment_name is None:
+            assignment_name = self._current_assignments
+
+        if assignment_name is None:
+            return
+
+        session = self.sessions[session_id]
+
+        if session.path is None:
+            return
+
+        self._stale_assignments.setdefault(assignment_name, set()).discard(
+            str(session.path)
+        )
 
     def register_session(
         self,
@@ -391,27 +524,61 @@ class Tracking:
         this_data.id = len(self.sessions)
 
         self.sessions.append(this_data)
+        self._ensure_assignment_session_count()
 
         return this_data.id
 
-    @property
-    def alignment_template(self):
+    def alignment_references_for_session(self, session_id: int | None = None):
 
-        if len(self.sessions) == 0:
-            return None
+        if session_id is None:
+            candidate_sessions = self.sessions
+
+        else:
+            if not (0 <= session_id <= len(self.sessions)):
+                raise IndexError(f"Invalid session_id {session_id}.")
+
+            # Alignment of a session is defined
+            # relative to earlier sessions only.
+            candidate_sessions = self.sessions[:session_id]
 
         aligned_sessions = [
-            session for session in self.sessions if session.status["aligned"]
+            session
+            for session in candidate_sessions
+            if (
+                session.status["aligned"]
+                and session.path is not None
+                and session.background_template is not None
+            )
         ]
-        if len(aligned_sessions) == 0:
+
+        if not aligned_sessions:
             return None
 
         alignment_window = min(len(aligned_sessions), 10)
 
-        return np.stack(
-            [session.background for session in aligned_sessions[-alignment_window:]],
-            axis=0,
-        )
+        references = {}
+
+        for session in aligned_sessions[-alignment_window:]:
+
+            assert session.path is not None
+
+            matrix = (
+                np.eye(3, dtype=float)
+                if session.remap is None
+                else session.remap.matrix
+            )
+
+            references[str(session.path)] = {
+                "template": (session.background_template.copy()),
+                "matrix": (np.asarray(matrix, dtype=float).copy()),
+            }
+
+        return references
+
+    @property
+    def alignment_references(self):
+
+        return self.alignment_references_for_session()
 
     ### ============================================ ###
     ### ============= COUNT REGISTRATION =========== ###
@@ -423,64 +590,60 @@ class Tracking:
         from_data: Optional[SessionData] = None,
         from_session_index: Optional[int] = None,
         align_to_reference=True,
+        *,
+        session_distances=(1,),
+        apply_removals=True,
     ):
-        """
-        takes existing model and adds new data from footprints to it
-        """
+
         this_data = self.get_session(
             from_file=from_file,
             from_data=from_data,
-            from_session_index=from_session_index,
-            align_to_reference=align_to_reference,
+            from_session_index=(from_session_index),
+            align_to_reference=(align_to_reference),
         )
 
-        if not this_data.status["aligned"]:
-            print(
-                f"[model update] Session {this_data.id} ({this_data.path}) did not pass quality criteria, skipping."
+        session_id = this_data.id
+
+        if not (0 <= session_id < len(self.sessions)):
+            raise ValueError(
+                "Model-count registration " "requires a registered session."
             )
-            return
 
-        if this_data.status["registered_to_model"]:
-            # print(
-            #     f"[model update] Session {this_data.id} ({this_data.path}) already registered to model, skipping."
-            # )
-            return
+        return self.update_model_counts(
+            session_id,
+            session_distances=(session_distances),
+            apply_removals=(apply_removals),
+        )
 
-        # build both models: self and cross (nNN from self and NN from cross)
-        self.update_model_counts(this_data, mode="same")
-        # self.this_data = this_data
-
-        if self.reference_data is not None:
-            self.update_model_counts(this_data, mode="to_reference")
-        this_data.status["registered_to_model"] = True
-        # self.alignment_template = copy.deepcopy(this_data.background)
-        self.reference_data = copy.deepcopy(this_data)
-
-    def update_model_counts(self, this_data: SessionData, mode="to_reference"):
+    def calculate_model_counts(
+        self,
+        this_data: SessionData,
+        *,
+        ref_data: SessionData | None = None,
+        mode: Literal["same", "cross"] = "cross",
+    ) -> ModelCountCalculation:
         """
-        Function to update counts in the joint model
+        Calculate one model-count contribution.
 
-        inputs:
-        - s,s_ref: int / string
-            key of current (s) and reference (s_ref) session
-        - use_kde: bool
-            defines, whether kde (kernel density estimation) is used to ...
+        This method does not modify SessionData and does not modify Model.
 
-            TODO:
+        TODO:
             * might just change everything to require "total counts" only, removing NN-calculation
             * change how correlation is calculated: just apply centroid distance shift! (test performance/timing before that)
+
         """
 
-        # print(this_data)
-        if mode == "to_reference":
-            ## compare to reference session
-            ref_data = self.reference_data
-        elif mode == "same":
-            ## find and mark potential duplicates of neuron footprints in session
+        if mode == "same":
             ref_data = this_data
+
+        elif mode == "cross":
+            if ref_data is None:
+                raise ValueError("ref_data must be provided for cross-session counts.")
+
         else:
-            raise ValueError("mode must be 'to_reference' or 'same'")
-        assert isinstance(ref_data, SessionData), "Reference data not defined!"
+            raise ValueError("mode must be 'same' or 'cross'.")
+
+        assert isinstance(ref_data, SessionData)
 
         (
             footprint_shifts,
@@ -496,35 +659,50 @@ class Tracking:
             params=self.params,
         )
 
-        if mode == "same" and len(idx_remove) > 0:
-            this_data.included[idx_remove] = False
+        idx_remove = np.asarray(idx_remove, dtype=int).reshape(-1)
 
-        idx_this = this_data.included
-        idx_ref = ref_data.included
+        # ============================================
+        # Local inclusion masks
+        # ============================================
+        #
+        # For same-session calculations, removal candidates do not
+        # participate in the NN mask used below.
 
-        ### ======================================== ###
-        ### =========== define neighbours ========== ###
-        ### ======================================== ###
-        ## find all neuron pairs below a distance threshold
+        idx_this = np.asarray(this_data.included, dtype=bool).copy()
+        idx_ref = np.asarray(ref_data.included, dtype=bool).copy()
+
+        if mode == "same" and idx_remove.size:
+            idx_this[idx_remove] = False
+
+            # ref_data is this_data in same mode.
+            idx_ref = idx_this
+
+        # ============================================
+        # Neighbours / nearest neighbours
+        # ============================================
+
         neighbors = footprint_distances < self.params.get("neighbor_distance", 15.0)
-        is_NN = np.zeros((ref_data.n_neurons, this_data.n_neurons), bool)
-        if mode == "to_reference":
+
+        is_NN = np.zeros((ref_data.n_neurons, this_data.n_neurons), dtype=bool)
+
+        if mode == "cross":
             min_distance = np.nanmin(footprint_distances, axis=1)
+
             idx_finite = ~np.isnan(min_distance)
 
             min_distance_idx = np.nanargmin(
                 footprint_distances[idx_ref & idx_finite, :], axis=1
             )
-            # min_distance_idx = np.nanargmin(footprint_distances, axis=1)
-            is_NN[
-                idx_ref & idx_finite,
-                min_distance_idx,
-            ] = True
+
+            is_NN[idx_ref & idx_finite, min_distance_idx] = True
+
         else:
             is_NN[idx_this, idx_this] = True
 
-        # print(f"number of neighbor pairs: {np.sum(neighbors)} ({np.sum(is_NN)} NN)")
-        t_start = time.time()
+        # ============================================
+        # Histograms
+        # ============================================
+
         histo_options = {
             "bins": self.params["nbins"],
             "range": [
@@ -532,48 +710,459 @@ class Tracking:
                 self.params["arrays"]["correlation_bounds"][[0, -1]],
             ],
         }
-        if mode == "same":
-            # idxes = neighbors & ~is_NN & ref_data.idx_kde[:, None]
-            idxes = neighbors & ~is_NN
-            # print(idxes.sum(), "counts to add")
 
-            self.counts["same"] += np.histogram2d(
+        if mode == "same":
+
+            idxes = neighbors & ~is_NN
+            counts = np.histogram2d(
                 footprint_distances[idxes],
-                # footprint_correlations["shifted"][idxes],
                 footprint_correlations[idxes],
                 **histo_options,
             )[0].astype(int)
 
         else:
-            # idxes = neighbors & ref_data.idx_kde[:, None]
+
+            counts = np.zeros(
+                (self.params["nbins"], self.params["nbins"], 3), dtype=int
+            )
+
             idxes = neighbors
-            self.counts["cross"][..., 0] += np.histogram2d(
+            counts[..., 0] = np.histogram2d(
                 footprint_distances[idxes],
-                # footprint_correlations["shifted"][idxes],
                 footprint_correlations[idxes],
                 **histo_options,
             )[0].astype(int)
 
-            # idxes = neighbors & is_NN & ref_data.idx_kde[:, None]
             idxes = neighbors & is_NN
-            self.counts["cross"][..., 1] += np.histogram2d(
+            counts[..., 1] = np.histogram2d(
                 footprint_distances[idxes],
-                # footprint_correlations["shifted"][idxes],
                 footprint_correlations[idxes],
                 **histo_options,
             )[0].astype(int)
 
-            # idxes = neighbors & ~is_NN & ref_data.idx_kde[:, None]
             idxes = neighbors & ~is_NN
-            self.counts["cross"][..., 2] += np.histogram2d(
+            counts[..., 2] = np.histogram2d(
                 footprint_distances[idxes],
-                # footprint_correlations["shifted"][idxes],
                 footprint_correlations[idxes],
                 **histo_options,
             )[0].astype(int)
 
-        t_end = time.time()
-        # print(f"Updating joint model took {t_end - t_start:.2f} seconds.")
+        return ModelCountCalculation(
+            counts=counts, idx_remove=idx_remove, remove_info=remove_info
+        )
+
+    def update_model_pair_counts(self, reference_session_id: int, session_id: int):
+
+        if self.model is None:
+            raise ValueError("No current model available.")
+
+        if reference_session_id == session_id:
+            raise ValueError(
+                "Cross-session count calculation requires two different sessions."
+            )
+
+        reference = self.sessions[reference_session_id]
+
+        session = self.sessions[session_id]
+
+        self.require_current_alignment(reference_session_id)
+        self.require_current_alignment(session_id)
+
+        if reference.path is None or session.path is None:
+            raise ValueError(
+                "Both sessions require paths for model count registration."
+            )
+
+        result = self.calculate_model_counts(session, ref_data=reference, mode="cross")
+
+        self.model.set_cross_counts(
+            str(reference.path),
+            str(session.path),
+            result.counts,
+            source_revisions=(
+                self.geometry_revision(reference_session_id),
+                self.geometry_revision(session_id),
+            ),
+        )
+
+        return result
+
+    def update_model_same_counts(self, session_id: int, *, apply_removals=True):
+
+        if self.model is None:
+            raise ValueError("No current model available.")
+
+        session = self.sessions[session_id]
+
+        self.require_current_alignment(session_id)
+
+        if session.path is None:
+            raise ValueError(f"Session {session_id} has no path.")
+
+        result = self.calculate_model_counts(session, mode="same")
+
+        if apply_removals and result.idx_remove.size:
+            session.included[result.idx_remove] = False
+
+        self.model.set_same_counts(
+            str(session.path),
+            result.counts,
+            source_revision=(self.geometry_revision(session_id)),
+        )
+
+        return result
+
+    def update_model_counts(
+        self, session_id: int, *, session_distances=(1,), apply_removals: bool = True
+    ):
+
+        if self.model is None:
+            raise ValueError("No current model available.")
+
+        if not (0 <= session_id < len(self.sessions)):
+            raise IndexError(f"Invalid session_id {session_id}.")
+
+        session = self.sessions[session_id]
+
+        self.require_current_alignment(session_id)
+
+        distances = self._normalize_session_distances(session_id, session_distances)
+
+        results = {"same": None, "cross": {}}
+
+        # ============================================
+        # Same-session evidence
+        # ============================================
+        results["same"] = self.update_model_same_counts(
+            session_id, apply_removals=apply_removals
+        )
+
+        # ============================================
+        # Cross-session evidence
+        # ============================================
+        for distance in distances:
+
+            reference_session_id = session_id - distance
+
+            if reference_session_id < 0:
+                continue
+
+            reference = self.sessions[reference_session_id]
+
+            # The pair is structurally requested, but
+            # cannot currently be calculated.
+            if not reference.status["aligned"]:
+                continue
+
+            result = self.update_model_pair_counts(reference_session_id, session_id)
+
+            results["cross"][(reference_session_id, session_id)] = result
+
+        # Temporary compatibility flag.
+        # Later this will be derived from count-record
+        # completeness / staleness instead.
+        session.status["registered_to_model"] = True
+
+        return results
+
+    @staticmethod
+    def _normalize_session_distances(
+        session_id: int, session_distances
+    ) -> tuple[int, ...]:
+
+        if session_distances is None:
+            return tuple(range(1, session_id + 1))
+
+        distances = tuple(sorted({int(distance) for distance in session_distances}))
+
+        if any(distance <= 0 for distance in distances):
+            raise ValueError("session_distances must contain positive integers.")
+
+        return distances
+
+    def model_count_state(self, session_id: int, *, session_distances=(1,)):
+        """Inspect required count records without calculating or modifying them."""
+        if self.model is None:
+            raise ValueError("No current model available.")
+
+        if not (0 <= session_id < len(self.sessions)):
+            raise IndexError(f"Invalid session_id {session_id}.")
+
+        distances = self._normalize_session_distances(session_id, session_distances)
+
+        def session_path(index):
+            path = self.sessions[index].path
+            if path is None:
+                raise ValueError(f"Session {index} has no path.")
+            return str(path)
+
+        def record_state(kind, key, source_ids):
+            if key not in self.model.counts[kind]:
+                return "missing"
+
+            if key in self.model.stale_counts[kind]:
+                return "stale"
+
+            if any(self.alignment_is_stale(index) for index in source_ids):
+                return "stale"
+
+            revisions = tuple(self.geometry_revision(index) for index in source_ids)
+            expected = revisions[0] if kind == "same" else revisions
+            recorded = self.model.count_revisions[kind].get(key)
+
+            if recorded != expected:
+                return "stale"
+
+            return "current"
+
+        path = session_path(session_id)
+
+        cross = {}
+        for distance in distances:
+            reference_id = session_id - distance
+            if reference_id < 0:
+                continue
+
+            key = (session_path(reference_id), path)
+            cross[reference_id] = record_state("cross", key, (reference_id, session_id))
+
+        return {
+            "same": record_state("same", path, (session_id,)),
+            "cross": cross,
+        }
+
+    def plan_model_update(
+        self,
+        *,
+        session_ids=None,
+        from_session_id=None,
+        mode="pending",
+        session_distances=(1,),
+    ):
+        if self.model is None:
+            raise ValueError("No current model available.")
+
+        if self.model.loaded:
+            raise ValueError(
+                "The current model was loaded from file and cannot be updated."
+            )
+
+        accepted = {
+            "pending": {"missing", "stale"},
+            "missing": {"missing"},
+            "stale": {"stale"},
+            "force": {"missing", "stale", "current"},
+        }
+        if mode not in accepted:
+            raise ValueError(f"Unknown processing mode {mode!r}.")
+
+        if session_ids is not None and from_session_id is not None:
+            raise ValueError("Specify session_ids or from_session_id, not both.")
+
+        n_sessions = len(self.sessions)
+
+        if from_session_id is not None:
+            if not 0 <= from_session_id < n_sessions:
+                raise IndexError(f"Invalid session_id {from_session_id}.")
+            selected = set(range(from_session_id, n_sessions))
+        else:
+            selected = set(range(n_sessions) if session_ids is None else session_ids)
+
+        if any(index < 0 or index >= n_sessions for index in selected):
+            raise IndexError("Selection contains an invalid session_id.")
+
+        distances = (
+            None
+            if session_distances is None
+            else self._normalize_session_distances(0, session_distances)
+        )
+
+        same_sessions = []
+        cross_pairs = []
+
+        for target_id in range(n_sessions):
+            reference_ids = [
+                target_id - distance
+                for distance in self._normalize_session_distances(target_id, distances)
+                if target_id - distance >= 0
+            ]
+
+            relevant_references = [
+                index
+                for index in reference_ids
+                if index in selected or target_id in selected
+            ]
+
+            if target_id not in selected and not relevant_references:
+                continue
+
+            state = self.model_count_state(target_id, session_distances=distances)
+
+            if target_id in selected and state["same"] in accepted[mode]:
+                same_sessions.append(target_id)
+
+            for reference_id in relevant_references:
+                if state["cross"][reference_id] in accepted[mode]:
+                    cross_pairs.append((reference_id, target_id))
+
+        required = set(same_sessions)
+        for reference_id, target_id in cross_pairs:
+            required.update((reference_id, target_id))
+
+        return {
+            "session_ids": sorted(selected),
+            "session_distances": distances,
+            "same_sessions": same_sessions,
+            "cross_pairs": cross_pairs,
+            "load_sessions": [
+                index
+                for index in sorted(required)
+                if not self.sessions[index].status["spatial_loaded"]
+                or self.sessions[index].footprints is None
+            ],
+            "alignment_sessions": [
+                index
+                for index in sorted(required)
+                if not self.sessions[index].status["aligned"]
+                or self.alignment_is_stale(index)
+            ],
+            "check_fit": bool(selected)
+            and (bool(cross_pairs) or not self.model.fitted or self.model.fit_stale),
+        }
+
+    def process_model_updates(
+        self,
+        *,
+        session_ids=None,
+        from_session_id=None,
+        mode="pending",
+        session_distances=(1,),
+    ):
+        plan = self.plan_model_update(
+            session_ids=session_ids,
+            from_session_id=from_session_id,
+            mode=mode,
+            session_distances=session_distances,
+        )
+
+        if plan["load_sessions"] or plan["alignment_sessions"]:
+            raise ValueError(
+                "Model update requires current spatial data and alignment. "
+                f"Load sessions: {plan['load_sessions']}; "
+                f"align sessions: {plan['alignment_sessions']}."
+            )
+
+        required = set(plan["same_sessions"])
+        for reference_id, target_id in plan["cross_pairs"]:
+            required.update((reference_id, target_id))
+
+        # Validate every dependency before modifying any count records.
+        for session_id in sorted(required):
+            self.require_current_alignment(session_id)
+
+        for session_id in plan["same_sessions"]:
+            self.update_model_same_counts(
+                session_id,
+                apply_removals=False,
+            )
+
+        for reference_id, target_id in plan["cross_pairs"]:
+            self.update_model_pair_counts(reference_id, target_id)
+
+        # Refresh the existing GUI flag from actual record completeness.
+        for session_id in sorted(required | set(plan["session_ids"])):
+            state = self.model_count_state(
+                session_id,
+                session_distances=plan["session_distances"],
+            )
+            self.sessions[session_id].status["registered_to_model"] = state[
+                "same"
+            ] == "current" and all(
+                value == "current" for value in state["cross"].values()
+            )
+
+        counts = self.model.aggregate_counts(
+            session_order=[
+                str(session.path)
+                for session in self.sessions
+                if session.path is not None
+            ],
+            session_distances=plan["session_distances"],
+        )
+
+        cross_count = int(counts["cross"][..., 0].sum())
+
+        fitted = False
+        if plan["check_fit"] and cross_count >= 20:
+            self.fit_model(
+                session_distances=plan["session_distances"],
+            )
+            fitted = True
+
+        return {
+            "plan": plan,
+            "fitted": fitted,
+            "cross_count": cross_count,
+        }
+
+    def fit_model(self, *, session_ids=None, session_distances=(1,), use_cdf=True):
+        """
+        Fit the current model from registered count records.
+
+        Parameters
+        ----------
+        session_ids:
+            Optional subset of currently registered sessions
+            to use for model fitting.
+
+        session_distances:
+            Allowed differences in current session order for
+            cross-session count records. ``None`` uses all
+            currently order-compatible pairs.
+
+        use_cdf:
+            Passed to Model.fit_model_to_counts().
+        """
+
+        if self.model is None:
+            raise ValueError("No model available to fit.")
+
+        # Current session order is deliberately supplied here,
+        # rather than stored inside Model.
+        session_order = []
+        for session in self.sessions:
+
+            if session.path is None:
+                continue
+
+            session_order.append(str(session.path))
+
+        selected_paths = None
+        if session_ids is not None:
+            selected_paths = []
+
+            for session_id in session_ids:
+                session = self.sessions[int(session_id)]
+
+                if session.path is None:
+                    raise ValueError(f"Session {session_id} " "has no path.")
+
+                selected_paths.append(str(session.path))
+
+        if session_distances is not None:
+            session_distances = tuple(
+                sorted({int(distance) for distance in session_distances})
+            )
+
+        counts = self.model.aggregate_counts(
+            session_order=session_order,
+            session_paths=selected_paths,
+            session_distances=(session_distances),
+        )
+
+        self.model.fit_model_to_counts(counts["cross"], use_cdf=use_cdf)
+
+        return counts
 
     ### ============================================ ###
     ### =========== ASSIGNMENT FUNCTIONS =========== ###
@@ -585,6 +1174,206 @@ class Tracking:
         if session_id >= self.assignments.matched_status.shape[0]:
             return False
         return self.assignments.matched_status[session_id]
+
+    def plan_assignment_update(
+        self, *, session_ids=None, from_session_id=None, mode="pending"
+    ):
+        if self.assignments is None:
+            raise ValueError("No current assignments available.")
+
+        accepted = {
+            "pending": {"missing", "stale"},
+            "missing": {"missing"},
+            "stale": {"stale"},
+            "force": {"missing", "stale", "current"},
+        }
+        if mode not in accepted:
+            raise ValueError(f"Unknown processing mode {mode!r}.")
+
+        if session_ids is not None and from_session_id is not None:
+            raise ValueError("Specify session_ids or from_session_id, not both.")
+
+        n_sessions = len(self.sessions)
+
+        if from_session_id is not None:
+            if not 0 <= from_session_id < n_sessions:
+                raise IndexError(f"Invalid session_id {from_session_id}.")
+            selected = set(range(from_session_id, n_sessions))
+        else:
+            selected = set(range(n_sessions) if session_ids is None else session_ids)
+
+        if any(index < 0 or index >= n_sessions for index in selected):
+            raise IndexError("Selection contains an invalid session_id.")
+
+        assigned = {
+            index for index in range(n_sessions) if self.session_assigned(index)
+        }
+
+        def assignment_state(index):
+            if index not in assigned:
+                return "missing"
+            if self.assignment_is_stale(index):
+                return "stale"
+            return "current"
+
+        requested = {
+            index for index in selected if assignment_state(index) in accepted[mode]
+        }
+
+        first = None
+        preserved = []
+        clear_sessions = []
+        register_sessions = []
+
+        if requested:
+            first = min(requested)
+
+            # A stale earlier assignment cannot provide a current prefix.
+            stale_prefix = [
+                index
+                for index in assigned
+                if index < first and self.assignment_is_stale(index)
+            ]
+            if stale_prefix:
+                first = min(stale_prefix)
+
+            preserved = sorted(index for index in assigned if index < first)
+            clear_sessions = sorted(index for index in assigned if index >= first)
+
+            # Include requested missing sessions and every existing
+            # registration whose union dependency will change.
+            register_sessions = sorted(requested | set(clear_sessions))
+
+        required = sorted(set(preserved) | set(register_sessions))
+
+        model_state = "not_required"
+        if len(required) > 1:
+            if self.model is None or not self.model.fitted:
+                model_state = "missing"
+            elif self.model.fit_stale:
+                model_state = "stale"
+            else:
+                model_state = "current"
+
+        return {
+            "session_ids": sorted(selected),
+            "from_session_id": first,
+            "preserved_sessions": preserved,
+            "clear_sessions": clear_sessions,
+            "register_sessions": register_sessions,
+            "load_sessions": [
+                index
+                for index in required
+                if not self.sessions[index].status["spatial_loaded"]
+                or self.sessions[index].footprints is None
+            ],
+            "alignment_sessions": [
+                index
+                for index in required
+                if not self.sessions[index].status["aligned"]
+                or self.alignment_is_stale(index)
+            ],
+            "model_state": model_state,
+        }
+
+    def build_assignment_update(
+        self,
+        *,
+        session_ids=None,
+        from_session_id=None,
+        mode="pending",
+    ):
+        plan = self.plan_assignment_update(
+            session_ids=session_ids,
+            from_session_id=from_session_id,
+            mode=mode,
+        )
+
+        if not plan["register_sessions"]:
+            return None
+
+        if plan["load_sessions"] or plan["alignment_sessions"]:
+            raise ValueError(
+                "Assignment update requires current spatial data and alignment. "
+                f"Load sessions: {plan['load_sessions']}; "
+                f"align sessions: {plan['alignment_sessions']}."
+            )
+
+        if plan["model_state"] in ("missing", "stale"):
+            raise ValueError(
+                "Update model counts and fit the model before "
+                "reprocessing assignments."
+            )
+
+        required = plan["preserved_sessions"] + plan["register_sessions"]
+        for session_id in required:
+            self.require_current_alignment(session_id)
+
+        source = self.assignments
+        name = self.current_assignments
+        candidate, neuron_id_map = source.copy_prefix(plan["from_session_id"])
+
+        # Borrow session data without copying footprints or traces.
+        # All assignment/union mutations belong to the candidate.
+        worker = copy.copy(self)
+        worker.sessions = list(self.sessions)
+        worker._model = dict(self._model)
+        worker._assignments = {name: candidate}
+        worker._current_assignments = name
+        worker._stale_assignments = {
+            name: set(self._stale_assignments.get(name, set()))
+        }
+
+        Tracking.rebuild_union(worker)
+
+        for session_id in plan["register_sessions"]:
+            # Use the core implementation, bypassing GUI notifications.
+            Tracking.assign_neurons(
+                worker,
+                from_session_index=session_id,
+                align_to_reference=False,
+                clean_traces=False,
+            )
+
+            if not worker.session_assigned(session_id):
+                raise RuntimeError(f"Session {session_id} was not registered.")
+
+        # Recover manipulation associations through stable footprint refs.
+        # Later history entries supersede earlier entries for a neuron.
+        for manipulation_id in sorted(candidate.manipulations):
+            record = candidate.manipulations[manipulation_id]
+
+            for ref in record.get("results", []):
+                session_id = int(ref["session_id"])
+                footprint_id = int(ref["footprint_id"])
+
+                if not 0 <= session_id < candidate.ids.shape[1]:
+                    raise ValueError(
+                        f"Manipulation {manipulation_id} references "
+                        f"invalid session {session_id}."
+                    )
+                if footprint_id < 0:
+                    raise ValueError(
+                        f"Manipulation {manipulation_id} has "
+                        "an invalid footprint reference."
+                    )
+
+                rows = np.flatnonzero(candidate.ids[:, session_id] == footprint_id)
+                if rows.size > 1:
+                    raise ValueError(
+                        f"Footprint {footprint_id} in session "
+                        f"{session_id} belongs to multiple neurons."
+                    )
+                if rows.size:
+                    candidate.manipulation_id[int(rows[0])] = manipulation_id
+
+        return {
+            "plan": plan,
+            "source": source,
+            "assignment_name": name,
+            "candidate": candidate,
+            "neuron_id_map": neuron_id_map,
+        }
 
     def assign_neurons(
         self,
@@ -608,199 +1397,227 @@ class Tracking:
             from_session_index=from_session_index,
             align_to_reference=align_to_reference,
         )
-        assert (
-            this_data.included is not None
-        ), "Session data must have included defined before registering neurons - run session.get_included_from_footprints() or session.get_included_from_quality() first."
+        try:
+            assert (
+                this_data.included is not None
+            ), "Session data must have included defined before registering neurons - run session.get_included_from_footprints() or session.get_included_from_quality() first."
 
-        if force_registration:
-            self.unassign_neurons(this_data.id)
+            if self.session_assigned(this_data.id) and not force_registration:
+                return
 
-        if self.session_assigned(this_data.id):
+            # Validate dependencies before removing existing assignments.
+            self.require_current_alignment(this_data.id)
+
+            other_sessions_assigned = any(
+                self.session_assigned(session_id)
+                for session_id in range(len(self.sessions))
+                if session_id != this_data.id
+            )
+
+            if other_sessions_assigned:
+                if self.model is None or not self.model.fitted:
+                    raise ValueError(
+                        "A fitted model is required before registering "
+                        "neurons against existing assignments."
+                    )
+
+                if self.model.fit_stale:
+                    raise ValueError(
+                        "The current model fit is outdated; "
+                        "update model counts and refit before registering neurons."
+                    )
+
+            if force_registration:
+                self.unassign_neurons(this_data.id)
+
+            if self.assignments.union is None or self.assignments.union.n_neurons == 0:
+                ## first session to be registered, just add all neurons to union and assignments
+                self.rebuild_union()
+                footprints = this_data.footprints[:, this_data.included]
+                self.assignments.union.update_footprints(
+                    footprints=footprints,
+                    mode="replace",
+                    included_values=True,
+                    synthetic_values=False,
+                )
+
+                actually_good = np.where(this_data.included)[0]
+                N_add = len(actually_good)
+
+                self.assignments.pad_empty(n_neurons=N_add, n_sessions=0)
+
+                self.assignments.ids[:, this_data.id] = actually_good
+
+                # # first occurence of neuron defined as p_match = 1, shift = 0
+                # self.assignments.stats["p_matched"][:, this_data.id, 0] = 1.0
+                # self.assignments.stats["shifts"][:, this_data.id, :] = 0.0
+                # self.assignments.stats["fp_corr"][:, this_data.id] = 1.0
+
+                self.assignments.matched_status[this_data.id] = True
+                self.mark_assignment_current(this_data.id)
+
+                return
+
+            if self.model is None or not self.model.fitted:
+                raise ValueError(
+                    "No model is defined. Please add a model before registering neurons."
+                )
+
+            ### obtain matching probability from cross session statistics and model
+            footprint_shifts, footprint_distances, footprint_correlations, _, _ = (
+                calculate_statistics(
+                    this_data,
+                    self.assignments.union,
+                    distance_threshold=self.model.distance_cutoff,
+                    nP=12,
+                    # params=self.params,
+                )
+            )
+            p_same = calculate_p(
+                footprint_distances,
+                footprint_correlations,
+                self.model.f_same,
+                self.params["neighbor_distance"],
+            )
+
+            ### ======================================== ###
+            ### ==== Hungarian Algorithm (matching) ==== ###
+            ### ======================================== ###
+            ### run hungarian algorithm (HA)
+            ### with (1-p_same) as score
+            ### ======================================== ###
+
+            matches = linear_sum_assignment(1 - p_same.toarray())
+            p_matched = p_same.toarray()[matches]
+            # print("\n \t ## Matching results ##")
+
+            ## thresholds for accepting matches and removing non-matches
+            ## (HA matches all pairs, but we only want matches above p_thr)
+            idx_TP = np.where(p_matched > p_thr[0])[0]
+            # print(matches)
+            if len(idx_TP) > 0:
+                matched_ref = matches[0][idx_TP]  # matched neurons in s_ref
+                matched = matches[1][idx_TP]  # matched neurons in s
+            else:
+                matched_ref = np.array([], "int")
+                matched = np.array([], "int")
+
+            ## find neurons which were not matched in current and reference session
+            non_matched_ref = np.setdiff1d(
+                list(range(self.assignments.union.n_neurons)), matched_ref
+            )
+            non_matched = np.setdiff1d(
+                list(np.where(this_data.included)[0]), matches[1][idx_TP]
+            )
+            non_matched = non_matched[this_data.included[non_matched]]
+
+            ## calculate number of matches found
+            # TP = np.sum(p_matched > p_thr[0]).astype("float32")
+
+            ## removing footprints from the data which were competing with another one
+            ## to be matched and lost, but have significant probability to be the same
+            ## this step ensures, that downstream session don't confuse this one and the
+            ## 'winner', leading to arbitrary assignments between two clusters
+            for nm in non_matched:
+                p_all = p_same[:, nm].todense()
+                if np.any(p_all > p_thr[1]):
+                    #    print(f'!! neuron {nm} is removed, as it is nonmatched and has high match probability:',p_all)[p_all>0])
+                    non_matched = non_matched[non_matched != nm]
+
+            ### =================================================== ###
+            ### ============== store matching results ============= ###
+            ### =================================================== ###
+
+            N_add = len(non_matched)  ## assuming there are never empty rows
+
+            # print(f"Previous shape of assignments: {self.assignments.shape}")
             # print(
-            #     f"[register] Session {this_data.name} already registered, skipping."
+            #     f"Session {this_data.path} matched {len(matched)} neurons and added {N_add} new neurons to the union."
             # )
-            return
 
-        if not this_data.status["aligned"] or this_data.footprints is None:
+            ## prepare to hold new results by padding existing arrays
+            assert (
+                self.assignments.ids.shape[1] > this_data.id
+            ), "Assignments session axis is not synchronized with registered sessions."
 
-            print(
-                f"[register] Session {this_data.path} did not pass quality criteria, skipping."
-            )
-            self.assignments.pad_empty(n_neurons=0, n_sessions=1)
-
-            if clean_traces:
-                this_data.clean_data("traces")
-            return
-
-        if self.assignments.union is None or self.assignments.union.n_neurons == 0:
-            ## first session to be registered, just add all neurons to union and assignments
-            self.rebuild_union()
-            footprints = this_data.footprints[:, this_data.included]
-            self.assignments.union.update_footprints(
-                footprints=footprints,
-                mode="replace",
-                included_values=True,
-                synthetic_values=False,
-            )
-
-            actually_good = np.where(this_data.included)[0]
-            N_add = len(actually_good)
-
-            self.assignments.pad_empty(n_neurons=N_add, n_sessions=1)
-
-            self.assignments.ids[:, this_data.id] = actually_good
-
-            # # first occurence of neuron defined as p_match = 1, shift = 0
-            # self.assignments.stats["p_matched"][:, this_data.id, 0] = 1.0
-            # self.assignments.stats["shifts"][:, this_data.id, :] = 0.0
-            # self.assignments.stats["fp_corr"][:, this_data.id] = 1.0
-
-            self.assignments.matched_status[this_data.id] = True
-            if clean_traces:
-                this_data.clean_data("traces")
-            return
-
-        if self.model is None or not self.model.fitted:
-            raise ValueError(
-                "No model is defined. Please add a model before registering neurons."
-            )
-
-        ### obtain matching probability from cross session statistics and model
-        footprint_shifts, footprint_distances, footprint_correlations, _, _ = (
-            calculate_statistics(
-                this_data,
-                self.assignments.union,
-                distance_threshold=self.model.distance_cutoff,
-                nP=12,
-                # params=self.params,
-            )
-        )
-        p_same = calculate_p(
-            footprint_distances,
-            footprint_correlations,
-            self.model.f_same,
-            self.params["neighbor_distance"],
-        )
-
-        ### ======================================== ###
-        ### ==== Hungarian Algorithm (matching) ==== ###
-        ### ======================================== ###
-        ### run hungarian algorithm (HA)
-        ### with (1-p_same) as score
-        ### ======================================== ###
-
-        matches = linear_sum_assignment(1 - p_same.toarray())
-        p_matched = p_same.toarray()[matches]
-        # print("\n \t ## Matching results ##")
-
-        ## thresholds for accepting matches and removing non-matches
-        ## (HA matches all pairs, but we only want matches above p_thr)
-        idx_TP = np.where(p_matched > p_thr[0])[0]
-        # print(matches)
-        if len(idx_TP) > 0:
-            matched_ref = matches[0][idx_TP]  # matched neurons in s_ref
-            matched = matches[1][idx_TP]  # matched neurons in s
-        else:
-            matched_ref = np.array([], "int")
-            matched = np.array([], "int")
-
-        ## find neurons which were not matched in current and reference session
-        non_matched_ref = np.setdiff1d(
-            list(range(self.assignments.union.n_neurons)), matched_ref
-        )
-        non_matched = np.setdiff1d(
-            list(np.where(this_data.included)[0]), matches[1][idx_TP]
-        )
-        non_matched = non_matched[this_data.included[non_matched]]
-
-        ## calculate number of matches found
-        # TP = np.sum(p_matched > p_thr[0]).astype("float32")
-
-        ## removing footprints from the data which were competing with another one
-        ## to be matched and lost, but have significant probability to be the same
-        ## this step ensures, that downstream session don't confuse this one and the
-        ## 'winner', leading to arbitrary assignments between two clusters
-        for nm in non_matched:
-            p_all = p_same[:, nm].todense()
-            if np.any(p_all > p_thr[1]):
-                #    print(f'!! neuron {nm} is removed, as it is nonmatched and has high match probability:',p_all)[p_all>0])
-                non_matched = non_matched[non_matched != nm]
-
-        ### =================================================== ###
-        ### ============== store matching results ============= ###
-        ### =================================================== ###
-
-        N_add = len(non_matched)  ## assuming there are never empty rows
-
-        # print(f"Previous shape of assignments: {self.assignments.shape}")
-        # print(
-        #     f"Session {this_data.path} matched {len(matched)} neurons and added {N_add} new neurons to the union."
-        # )
-
-        ## prepare to hold new results by padding existing arrays
-        if self.assignments.ids.shape[1] <= this_data.id:
-            ## either append to end
-            self.assignments.pad_empty(n_neurons=N_add, n_sessions=1)
-        else:
-            ## or just write into already existing rows, if possible
             assert np.all(
                 self.assignments.ids[:, this_data.id] == -1
-            ), "Session already has assignments, cannot overwrite!"
-            # print(f"adding {N_add} new neurons to union for session {this_data.id}")
+            ), "Session already has assignments; cannot overwrite."
             self.assignments.pad_empty(n_neurons=N_add, n_sessions=0)
 
-        # ... matched neurons are added
-        self.assignments.ids[matched_ref, this_data.id] = matched
+            # ... matched neurons are added
+            self.assignments.ids[matched_ref, this_data.id] = matched
 
-        self.assignments.stats["p_matched"][matched_ref, this_data.id, 0] = p_matched[
-            idx_TP
-        ]
-        self.assignments.stats["shifts"][matched_ref, this_data.id, :] = (
-            footprint_shifts[matched_ref, matched]
-        )
-        self.assignments.stats["fp_corr"][matched_ref, this_data.id] = (
-            footprint_correlations[matched_ref, matched]
-        )
-
-        if N_add > 0:
-            ## ... and non-matched (new) neurons are appended
-            self.assignments.ids[-N_add:, this_data.id] = non_matched
-            # self.assignments.stats["p_matched"][-N_add:, this_data.id, 0] = 1.0
-
-        ## write best non-matching probability
-        p_all = p_same.toarray()
-        self.assignments.stats["p_matched"][matched_ref, this_data.id, 1] = [
-            max(
-                p_all[
-                    c,
-                    np.where(
-                        p_all[c, :]
-                        != self.assignments.stats["p_matched"][c, this_data.id, 0]
-                    )[0],
-                ]
+            self.assignments.stats["p_matched"][matched_ref, this_data.id, 0] = (
+                p_matched[idx_TP]
             )
-            for c in matched_ref
-        ]
+            self.assignments.stats["shifts"][matched_ref, this_data.id, :] = (
+                footprint_shifts[matched_ref, matched]
+            )
+            self.assignments.stats["fp_corr"][matched_ref, this_data.id] = (
+                footprint_correlations[matched_ref, matched]
+            )
 
-        self.assignments.stats["p_matched"][non_matched, this_data.id, 1] = np.max(
-            p_all[non_matched, :], axis=1
-        )
+            if N_add > 0:
+                ## ... and non-matched (new) neurons are appended
+                self.assignments.ids[-N_add:, this_data.id] = non_matched
+                # self.assignments.stats["p_matched"][-N_add:, this_data.id, 0] = 1.0
 
-        self.update_union_footprints(
-            this_data.footprints,
-            self.assignments.ids[:, this_data.id],
-            weights=self.assignments.stats["fp_corr"][:, this_data.id],
-            shifts=self.assignments.stats["shifts"][:, this_data.id, :],
-        )
+            ## write best non-matching probability
+            p_all = p_same.toarray()
 
-        ## ... and finalize!
-        self.assignments.matched_status[this_data.id] = True
-        if clean_traces:
-            this_data.clean_data("traces")
+            for reference_id, footprint_id in zip(matched_ref, matched):
+                alternatives = p_all[reference_id].copy()
+                alternatives[footprint_id] = 0.0
 
-        # if np.any(np.all(self.tracking["p_matched"] > 0.9, axis=2)):
-        #     print("double match!")
-        #     return
+                self.assignments.stats["p_matched"][reference_id, this_data.id, 1] = (
+                    alternatives.max(initial=0.0)
+                )
+
+            if N_add > 0:
+                new_rows = np.arange(
+                    self.assignments.ids.shape[0] - N_add,
+                    self.assignments.ids.shape[0],
+                )
+                self.assignments.stats["p_matched"][new_rows, this_data.id, 1] = p_all[
+                    :, non_matched
+                ].max(axis=0, initial=0.0)
+            # p_all = p_same.toarray()
+            # self.assignments.stats["p_matched"][matched_ref, this_data.id, 1] = [
+            #     max(
+            #         p_all[
+            #             c,
+            #             np.where(
+            #                 p_all[c, :]
+            #                 != self.assignments.stats["p_matched"][c, this_data.id, 0]
+            #             )[0],
+            #         ]
+            #     )
+            #     for c in matched_ref
+            # ]
+
+            # self.assignments.stats["p_matched"][non_matched, this_data.id, 1] = np.max(
+            #     p_all[non_matched, :], axis=1
+            # )
+
+            self.update_union_footprints(
+                this_data.footprints,
+                self.assignments.ids[:, this_data.id],
+                weights=self.assignments.stats["fp_corr"][:, this_data.id],
+                shifts=self.assignments.stats["shifts"][:, this_data.id, :],
+            )
+
+            ## ... and finalize!
+            self.assignments.matched_status[this_data.id] = True
+
+            # if np.any(np.all(self.tracking["p_matched"] > 0.9, axis=2)):
+            #     print("double match!")
+            #     return
+
+            self.mark_assignment_current(this_data.id)
+        finally:
+            if clean_traces:
+                this_data.clean_data("traces")
 
     def exclude_component(self, component: NeuronComponent) -> NeuronComponent:
 
@@ -1093,20 +1910,32 @@ class Tracking:
             return
 
         self.assignments.union = SessionData(name="union")
+
         for session_id, assignment_ids in enumerate(self.assignments.ids.T):
+
+            # A registered session may deliberately have an
+            # empty assignments column:
+            #
+            # - not loaded yet
+            # - alignment failed
+            # - tracking postponed
+            #
+            # Such a session contributes nothing to the union.
+            if not np.any(assignment_ids >= 0):
+                continue
+
             weights = self.assignments.stats.get("fp_corr")
+
             if weights is not None:
                 weights = weights[:, session_id]
 
             shifts = self.assignments.stats.get("shifts")
+
             if shifts is not None:
                 shifts = shifts[:, session_id]
 
             self.update_union_footprints(
-                self.sessions[session_id].footprints,
-                assignment_ids,
-                weights,
-                shifts,
+                self.sessions[session_id].footprints, assignment_ids, weights, shifts
             )
 
         self.rebuild_union_included()
@@ -1123,6 +1952,8 @@ class Tracking:
         included = np.zeros(self.assignments.ids.shape, dtype=bool)
         for session_id, ids in enumerate(self.assignments.ids.T):
             neuron_ids = np.where(ids >= 0)[0]
+            if neuron_ids.size == 0:
+                continue
             included[neuron_ids, session_id] = self.sessions[session_id].included[
                 ids[neuron_ids]
             ]
@@ -1180,15 +2011,6 @@ class Tracking:
                     ((0, n_add), (0, 0)),
                     constant_values=np.nan,
                 )
-
-            # pad these only if pad_empty() hasn't
-            # already done so
-            # if len(union.idx_kde) < n_neurons:
-            #     union.idx_kde = np.pad(
-            #         union.idx_kde,
-            #         (0, n_neurons - len(union.idx_kde)),
-            #         constant_values=False,
-            #     )
 
             if len(union.included) < n_neurons:
                 union.included = np.pad(
@@ -1327,6 +2149,29 @@ class Tracking:
             if session is None:
                 continue
             session.id = session_id
+
+    def _ensure_assignment_session_count(
+        self, assignments: Assignments | None = None
+    ) -> None:
+
+        assignment_sets = (
+            [assignments]
+            if assignments is not None
+            else list(self._assignments.values())
+        )
+
+        n_sessions = len(self.sessions)
+
+        for assignment in assignment_sets:
+            missing = n_sessions - assignment.ids.shape[1]
+            if missing < 0:
+                raise ValueError(
+                    "Assignments contain more session "
+                    "columns than registered sessions."
+                )
+
+            for _ in range(missing):
+                assignment.pad_empty(n_neurons=0, n_sessions=1)
 
     def classify_sessions(self, interval=None, **kwargs):
         # max_shift=50.0, min_zscore=4.0):
@@ -1666,176 +2511,80 @@ class Tracking:
     ### ============== saving and loading methods ============== ###
     ### ======================================================== ###
 
-    def load_session_data(
-        self,
-        path: str | Path,
-        fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
-        *,
-        # mat_version: Literal["pre73", "7.3"] = "7.3",
-        test_object_type: str = "SessionData",
-    ) -> list[dict[str, Any]]:
-        """Load a CATAN-native session container."""
-        data = []
+    def load_session_data(self, path: str | Path) -> list[SessionData]:
+        backend = get_backend(path)
 
-        backend = get_backend(path, for_write=False)
         with backend.open_read(path) as ref:
             object_type = backend.get_attribute(ref, "/", "object_type")
-            if object_type == test_object_type:
-                #     raise ValueError(
-                #         f"Invalid object type: expected 'SessionData', got '{object_type}'"
-                #     )
+            if object_type not in {"SessionData", "SessionList"}:
+                raise ValueError("Not a CATAN session file.")
 
-                fields_to_load = LoadConfig.fields_from_resource(
-                    NATIVE_SESSION_CONFIG,
-                    enabled_only=False,
-                )
-                # n_sessions = backend.get_attribute(ref, "/", "n_sessions")
-                n_sessions = 9
-                for s in range(n_sessions):
-                    data.append(
-                        backend.load(ref, fields_to_load, root=f"/session_{s:03d}")
+            version = int(backend.get_attribute(ref, "/", "format_version", default=1))
+            if version not in (1, 2):
+                raise ValueError(f"Unsupported session format version: {version}")
+
+            roots = sorted(
+                (
+                    name
+                    for name in backend.list_groups(ref)
+                    if name.startswith("session_") and name[8:].isdigit()
+                ),
+                key=lambda name: int(name[8:]),
+            )
+            roots = [f"/{name}" for name in roots] or ["/"]
+
+            if version == 2:
+                return [
+                    read_session_snapshot(backend, ref, root=root) for root in roots
+                ]
+
+            # Legacy files lack reliable alignment/source-config state.
+            # Restore source references; subsequent loading uses raw data.
+            result = []
+
+            for root in roots:
+                original_path = backend.get_attribute(ref, "/", "path", root=root)
+                if isinstance(original_path, bytes):
+                    original_path = original_path.decode("utf-8")
+
+                if not original_path:
+                    raise ValueError(
+                        f"Legacy session at {root} has no original source path."
                     )
 
-            else:
-                if fields_to_load is None:
-                    fields_to_load = LoadConfig.fields_from_resource(
-                        NATIVE_SESSION_CONFIG,
-                        enabled_only=False,
-                    )
-                data_out = backend.load(ref, fields_to_load)
-                if data_out.get("metadata") is None:
-                    data_out["metadata"] = {}
-                if data_out["metadata"].get("path") is None:
-                    data_out["metadata"]["path"] = str(path)
-                data.append(data_out)
+                result.append(SessionData(path=str(original_path)))
 
-        return data
+            return result
 
     def save_sessions(
         self,
         path: str | Path,
         *,
         mat_version: Literal["pre73", "7.3"] = "7.3",
-        object_type: str = "SessionData",
+        object_type: str = "SessionList",
     ) -> None:
-        """Save one or several sessions as a CATAN-native session container.
+        if not self.sessions:
+            raise ValueError("No sessions to save.")
 
-        If ``fields_to_save`` is omitted, the packaged ``catan_session.json``
-        structure is used. A single SessionData object is still stored below
-        ``session_000`` so the native container layout remains uniform.
-        """
-
-        fields_to_save = LoadConfig.fields_from_resource(
-            NATIVE_SESSION_CONFIG,
-            enabled_only=False,
-        )
         backend = get_backend(path, for_write=True, mat_version=mat_version)
 
         with backend.open_write(path) as ref:
             backend.set_attribute(ref, "/", "object_type", object_type)
-            backend.set_attribute(ref, "/", "format_version", 1)
+            backend.set_attribute(ref, "/", "format_version", 2)
 
-            for session in self.sessions:
-                backend.write(
-                    ref, session, fields_to_save, root=f"/session_{session.id:03d}"
+            for session_id, session in enumerate(self.sessions):
+                state = self._processing_state(session_id)
+
+                write_session_snapshot(
+                    backend,
+                    ref,
+                    session,
+                    root=f"/session_{session_id:03d}",
+                    processing={
+                        "geometry_revision": state.geometry_revision,
+                        "alignment_stale": state.alignment_stale,
+                    },
                 )
-
-    # def save_sessions(
-    #     self,
-    #     output_fname: Optional[str | Path] = None,
-    #     suffix: str = "",
-    #     ext: str = ".hdf5",
-    # ):
-    #     if output_fname is None:
-    #         output_fname = self.get_result_directory() / f"catan_model{fix_suffix(suffix)}{ext}"
-    #     else:
-    #         self.get_result_directory(Path(output_fname).parent)
-
-    #     print(f"Saving session data to {output_fname}...")
-
-    #     if ext in [".h5", ".hdf5"]:
-    #         with h5py.File(
-    #             output_fname, "w"
-    #         ) as f:
-    #             self.save_sessions_to_hdf5(f)
-    #     else:
-    #         raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
-    #     print(f"Saved session data to {output_fname}")
-
-    # def save_sessions_to_hdf5(self, h5ref: h5py.Group | h5py.File) -> None:
-    #     print("Saving session data to HDF5...")
-    #     h5ref.attrs["object_type"] = "SessionData"
-    #     h5ref.attrs["schema_version"] = self.HDF5_VERSION
-
-    #     # sessions_group = group.create_group("sessions")
-    #     h5ref.attrs["n_sessions"] = len(self.sessions)
-
-    #     for session in self.sessions:
-    #         session_group = h5ref.create_group(f"session_{session.id:03d}")
-    #         session.to_hdf5(session_group)
-
-    # def load_session_data(self, fname: str | Path, fields_to_load: Optional[dict] = None) -> List[SessionData]:
-    #     """
-    #     Triggers loading data from a file. Depending on the provided file, it either loads a single session or multiple sessions (informed by hdf5 attributes).
-    #     """
-    #     ext = Path(fname).suffix
-    #     if ext in [".h5", ".hdf5"]:
-    #         with h5py.File(fname, "r") as h5ref:
-
-    #             if h5ref.attrs.get("object_type") == "SessionData":
-    #                 return self.load_sessions_from_hdf5(h5ref)
-    #             else:
-    #                 this_data = SessionData(path=fname)
-    #                 this_data.from_hdf5(h5ref, fields_to_load=fields_to_load)
-    #                 if this_data.path is None:
-    #                     this_data.path = str(fname)
-    #                 return [this_data]
-    #     elif ext == ".mat":
-    #         this_data = SessionData(path=fname)
-    #         this_data.from_mat(str(fname), fields_to_load=fields_to_load)
-    #         # load_mat(fname, fields_to_load=fields_to_load)
-    #         return [this_data]
-    #     else:
-    #         raise ValueError(f"Unsupported file extension: {ext}. Use '.h5' or '.hdf5'.")
-
-    # def load_sessions_from_hdf5(
-    #     self, h5ref: h5py.Group | h5py.File
-    # ) -> List[SessionData]:
-    #     """
-    #     Loads and returns session data from an HDF5 group
-    #     """
-    #     if h5ref.attrs.get("object_type") != "SessionData":
-    #         raise ValueError(
-    #             "The provided HDF5 group does not contain a SessionData object."
-    #         )
-
-    #     if h5ref.attrs.get("schema_version") != self.HDF5_VERSION:
-    #         raise ValueError(
-    #             f"Schema version mismatch: expected {self.HDF5_VERSION}, found {h5ref.attrs.get('schema_version')}"
-    #         )
-
-    #     ## define fields as found in saved hdf5 structure
-    #     # self.load_configs.select("CATAN session")
-    #     # assert self.load_configs.current is not None, "No load configuration found for 'CATAN session'."
-    #     fields_to_load = LoadConfig.fields_from_resource("catan_session.json")
-
-    #     n_sessions = h5ref.attrs["n_sessions"]
-    #     assert isinstance(n_sessions, numbers.Integral), "Number of sessions should be an integer"
-
-    #     sessions = []
-    #     for s in range(n_sessions):
-    #         session_group = h5ref[f"session_{s:03d}"]
-    #         assert isinstance(
-    #             session_group, h5py.Group
-    #         ), f"Session group for session {s} is not a valid HDF5 group"
-    #         session = SessionData()
-    #         data = session.from_hdf5(session_group, fields_to_load)
-    #         # print("fields_to_load:", fields_to_load)
-    #         # print("\n\t data keys: ", data.keys())
-    #         session.register_data(self.alignment_template,**data)
-    #         sessions.append(session)
-
-    #     return sessions
 
     ### ================================================= ###
     ### === HANDOVER FUNCTIONS FOR SAVING AND LOADING === ###

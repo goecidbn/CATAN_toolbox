@@ -157,7 +157,9 @@ class TrackingAnalysis(Tracking):
         # clusters = getattr(self, self.cluster_field)
 
         # cm_mean = np.nanmean(clusters["cm"], axis=1)
-        cm_dists = spatial.distance.squareform(spatial.distance.pdist(self.union.centroids))
+        cm_dists = spatial.distance.squareform(
+            spatial.distance.pdist(self.union.centroids)
+        )
 
         confusion_candidates = np.where(
             np.logical_and(cm_dists > 0, cm_dists < confusion_distance)
@@ -445,7 +447,7 @@ class TrackingAnalysis(Tracking):
         plt.setp(
             ax_phase,
             # xlim=arrays["correlation_bounds"][[0, -1]],
-            xlim=[0.5,1],
+            xlim=[0.5, 1],
             ylim=arrays["distance_bounds"][[0, -1]],
             xlabel="correlation",
             ylabel="distance",
@@ -540,10 +542,10 @@ class TrackingAnalysis(Tracking):
             label="p_same",
         )
         plt.setp(ax_dist_p_same, xlabel="$p_{same}$", xlim=[1.1, 0])
-        ax_dist_p_same.spines[["left","bottom"]].set_visible(False)
+        ax_dist_p_same.spines[["left", "bottom"]].set_visible(False)
 
         plt.setp(ax_dist, ylim=[0, self.params["neighbor_distance"]], xlabel="counts")
-        ax_dist.spines[["top","left"]].set_visible(False)
+        ax_dist.spines[["top", "left"]].set_visible(False)
         ax_dist.tick_params(
             axis="y",
             which="both",
@@ -621,8 +623,8 @@ class TrackingAnalysis(Tracking):
             color="tab:blue",
             label="p_same",
         )
-        plt.setp(ax_corr_p_same, ylabel="$p_{same}$", ylim=[0,1.1])
-        ax_corr_p_same.spines[["left","top"]].set_visible(False)
+        plt.setp(ax_corr_p_same, ylabel="$p_{same}$", ylim=[0, 1.1])
+        ax_corr_p_same.spines[["left", "top"]].set_visible(False)
 
         ### =============================================== ###
         ### ===================== p same ================== ###
@@ -644,8 +646,7 @@ class TrackingAnalysis(Tracking):
         )
         ax_fsame.view_init(elev=30, azim=40)
         plt.setp(ax_fsame, xlabel="correlation", ylabel="distance", zlabel="$p_{same}$")
-        
-        
+
         # ### --------------------------------------------- ###
         # ### ---------- RoC & further stats plot --------- ###
         # ### --------------------------------------------- ###
@@ -834,7 +835,7 @@ class TrackingAnalysis(Tracking):
             A_ref = ref_data.A
             Cn_ref = ref_data.Cn
 
-            this_data = self.get_data(s, alignment_template=ref_data.Cn)
+            this_data = self.get_data(s, alignment_references=ref_data.Cn)
             self.register_neurons(from_data=this_data, p_thr=p_thr)
             A = this_data.A
             Cn = this_data.Cn
@@ -1194,8 +1195,8 @@ class TrackingAnalysis(Tracking):
             #     if fp_id>=0:
             #         centroids[s, :] = self.sessions[s].centroids[fp_id, :]
             ax_3D.scatter(
-                centroids[n,:, 0],
-                centroids[n,:, 1],
+                centroids[n, :, 0],
+                centroids[n, :, 1],
                 np.arange(nSes),
                 s=0.5,
             )  # linewidth=2)
@@ -1361,7 +1362,7 @@ class TrackingAnalysis(Tracking):
 
         centroids = np.full(self.assignments.shape + (2,), np.nan)
 
-        for s,session in enumerate(self.sessions):
+        for s, session in enumerate(self.sessions):
             active_neurons = np.where(self.assignments[:, s] >= 0)[0]
             fp_ids = self.assignments[active_neurons, s]
             centroids[active_neurons, s, :] = session.centroids[fp_ids, :]
@@ -1388,7 +1389,6 @@ class TrackingAnalysis(Tracking):
 
         ref_data = self.sessions[s_ref]
         this_data = self.sessions[s]
-        
 
         A_ref = ref_data.A
         Cn_ref = ref_data.Cn
@@ -1702,7 +1702,6 @@ class TrackingAnalysis(Tracking):
             and shift arrow shows shift wrt all (already corrected) reference sessions, not the actual raw one
         """
 
-
         nC, nS = self.assignments.shape
         self.classify_sessions()
         active = self.assignments >= 0
@@ -1711,7 +1710,7 @@ class TrackingAnalysis(Tracking):
 
         # com_mean = np.nanmean(clusters["cm"], 1)
 
-        # self.alignment_template = session_alignment["template"]
+        # self.alignment_references = session_alignment["template"]
 
         # path = session_alignment["file_paths"][s_ref]
         # A, Cn, quality, trace = self.get_data(path=path)
@@ -2141,9 +2140,7 @@ class TrackingAnalysis(Tracking):
                 )
 
             margin = 15
-            com = (
-                self.union.centroids# / self.params["pxtomu"]
-            )
+            com = self.union.centroids  # / self.params["pxtomu"]
             ax.update_layout(
                 scene=dict(
                     xaxis=dict(range=[com[0] - margin, com[0] + margin]),
@@ -2181,7 +2178,7 @@ class TrackingAnalysis(Tracking):
                 )
 
             margin = 15
-            com = self.union.centroids[c,:]
+            com = self.union.centroids[c, :]
             # print()
             plt.setp(
                 ax,

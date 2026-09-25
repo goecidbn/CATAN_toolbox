@@ -289,7 +289,6 @@ class Display(BasePlot.BaseCanvas):
         if background is None:
             return
 
-        background /= np.percentile(background, 90)
         self.plotting["background"] = Image(
             background.astype(np.float32),  # .T,
             cmap="grays",
@@ -1008,7 +1007,7 @@ class Display(BasePlot.BaseCanvas):
         else:
             key = "union"
 
-        if key is None:
+        if key is None or key not in self.plotting["data"]:
             ## can happen on session unregistration
             self.plotting["overlays"][style][0].visible = False
             self.update()

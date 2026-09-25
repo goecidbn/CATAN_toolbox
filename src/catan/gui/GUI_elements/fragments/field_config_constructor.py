@@ -107,10 +107,19 @@ class FieldConfigConstructor(QObject):
         layout.addStretch()
 
         def load_config_changed(idx):
-            if self.source is None:
+
+            if self.source is None or idx < 0:
                 return
 
-            name = self.state.config_manager.names()[idx]
+            names = self.state.config_manager.names(
+                public_only=False, source_type=self.source.source_type
+            )
+
+            if idx >= len(names):
+                return
+
+            name = names[idx]
+
             self.source.source_config = self.state.config_manager.select(name)
 
             self.config_field_options.rebuild()
@@ -165,6 +174,10 @@ class FieldConfigConstructor(QObject):
             public_only=False, source_type=self.source.source_type
         )
         selector.addItems(names)
+
+        if self.source.source_config is None:
+            selector.setCurrentIndex(-1)
+
         for i, name in enumerate(names):
             selector.setItemData(
                 i,

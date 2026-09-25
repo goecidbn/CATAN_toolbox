@@ -5,7 +5,24 @@ import h5py
 from .types import FileFormat
 from .matlab import is_mat73
 
-SUPPORTED_SUFFIXES = (".h5", ".hdf5", ".mat", ".npz", ".zarr")
+IMAGE_SUFFIXES = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".bmp",
+)
+
+SUPPORTED_SUFFIXES = (
+    ".h5",
+    ".hdf5",
+    ".mat",
+    ".npz",
+    ".zarr",
+    *IMAGE_SUFFIXES,
+)
+
 
 def detect_file_format(
     path: str | Path,
@@ -28,7 +45,8 @@ def detect_file_format(
         return FileFormat.NPZ
     if suffix == ".zarr" or (path.is_dir() and path.name.lower().endswith(".zarr")):
         return FileFormat.ZARR
-
+    if suffix in IMAGE_SUFFIXES:
+        return FileFormat.IMAGE
     return None
     # raise ValueError(
     #     f"Unsupported file type {suffix!r}. Supported: {', '.join(SUPPORTED_SUFFIXES)}"

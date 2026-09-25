@@ -48,6 +48,13 @@ def match_model(
     ]
     params = {name: val for name, val in zip(names, p_in)}
 
+    def invalid_model(reason):
+        if return_1D:
+            raise ValueError(reason)
+
+        # fit_histogram_params.objective() rejects nonfinite probabilities.
+        return np.full((nbins, nbins), np.nan, dtype=float)
+
     t_ref = timeit(timing)
 
     # Only consider bins up to R_cut
@@ -75,8 +82,7 @@ def match_model(
     )
     t_ref = timeit(t_ref, "match_model: diff distance model time", timing)
     if pdf_r_diff is None:
-        penalty = (lambda_ * np.pi * params["h"] ** 2 > 1 - np.e) * 1e6
-        return np.full((nbins, nbins), penalty, dtype=float)
+        return invalid_model("Different-neuron distance PDF is unavailable.")
 
     # t_ref = timeit(t_ref,"match_model: distance model time")
     ### correlation model
@@ -95,14 +101,25 @@ def match_model(
     )
     t_ref = timeit(t_ref, "match_model: correlation model time", timing)
 
-    if return_1D:
+    distributions = {
+        "correlation_same": pdf_c_same,
+        "correlation_diff": pdf_c_diff,
+        "distance_same": pdf_r_same,
+        "distance_diff": pdf_r_diff,
+    }
 
-        return {
-            "correlation_same": pdf_c_same,
-            "correlation_diff": pdf_c_diff,
-            "distance_same": pdf_r_same,
-            "distance_diff": pdf_r_diff,
-        }
+    for name, pdf in distributions.items():
+        values = np.asarray(pdf, dtype=float)
+        if (
+            values.ndim != 1
+            or not np.all(np.isfinite(values))
+            or np.any(values < 0)
+            or values.sum() <= 0
+        ):
+            return invalid_model(f"Invalid PDF: {name}.")
+
+    if return_1D:
+        return distributions
 
     # integrate into bins (1D) - normalizes all to 1.
     Pr_s = bin_integral_1d(pdf_r_same, r_grid, r_edges)
