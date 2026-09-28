@@ -4,7 +4,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal, QSettings
 from typing import Literal, Tuple, Optional, List
 import logging
-
+from weakref import WeakSet
 
 from catan.core.structures import NeuronComponent
 from .request_handler import RequestHandler
@@ -44,6 +44,11 @@ class AppState(QObject):
 
     adjacency_radius_changed = Signal()
 
+    alignment_draft_changed = Signal()
+    alignment_failed = Signal(object, str, object)
+    alignment_review_changed = Signal()
+    alignment_review_finished = Signal(object)
+
     def __init__(self, settings: QSettings):
         super().__init__()
 
@@ -77,6 +82,10 @@ class AppState(QObject):
 
         ## global parameters
         self._adjacency_radius = 15.0
+
+        self.alignment_draft = None
+        self.alignment_panels = WeakSet()
+        self.alignment_review = None
 
     def issue(self, level, title, message):
         from PySide6.QtWidgets import QMessageBox

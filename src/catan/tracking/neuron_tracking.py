@@ -15,6 +15,7 @@ from scipy.optimize import linear_sum_assignment
 
 from pathlib import Path
 
+from catan.core.changes import ASSIGNMENT_CONTENT_CHANGES
 from catan.core.io import NATIVE_SESSION_CONFIG, get_backend
 from catan.core.data import center_of_mass
 from catan.core.structures.load_config.config import LoadConfig, FieldSpec
@@ -1668,7 +1669,7 @@ class Tracking:
         # GUI mirror.
         self.state.assignments = self.assignments.ids
 
-        self.notify_change(("assignments", -1))
+        self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
         return NeuronComponent(neuron_id=retired_neuron_id, session_id=session_id)
 

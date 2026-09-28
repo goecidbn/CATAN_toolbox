@@ -6,8 +6,6 @@ from fnmatch import fnmatch
 from pathlib import PurePosixPath
 from typing import Iterable, Literal
 
-# from catan.core.structures.load_config import FieldSpec
-
 
 class FileFormat(str, Enum):
     HDF5 = "hdf5"

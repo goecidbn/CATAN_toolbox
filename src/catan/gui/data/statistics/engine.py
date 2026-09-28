@@ -1,21 +1,23 @@
-from PySide6.QtCore import QObject, Qt, Signal
+from dataclasses import dataclass
 
 from typing import Optional
 from collections.abc import Callable
 
-from dataclasses import dataclass
+from PySide6.QtCore import QObject, Qt, Signal
 import numpy as np
+from threading import RLock
+from functools import partial
 
+from catan.core.changes import Change, ChangeKind, DataChange
 from .table import PickTable
 from .types import StatisticArray
 from .queries import ReductionSpec, StatisticQuery
-
 
 @dataclass(frozen=True, slots=True)
 class StatisticsTaskResult:
     slot: str
     query: StatisticQuery
-    data_version: int
+    statistic_revision: int
 
     table: PickTable | None = None
     error: str | None = None
@@ -29,7 +31,7 @@ class StatisticsTaskResult:
 class StatisticEngine(QObject):
 
     registry_changed = Signal()
-    values_changed = Signal()
+    values_changed = Signal(object)
 
     def __init__(
         self,
@@ -45,51 +47,206 @@ class StatisticEngine(QObject):
         self.registry_factory = registry_factory
 
         self._cache = {}
+        self._revisions = {}
+        self._cache_lock = RLock()
+
+        self._registry_signatures = {}
+        self.registry_changes = frozenset()
 
         self.refresh_registry()
 
         self.state.data_changed.connect(self._on_data_changed)
         self.state.statistics_sources_changed.connect(self.refresh_registry)
 
-    def refresh_registry(self):
-        self.registry = self.registry_factory(
-            self.data,
-            self.state,
-        )
-
-        self.clear_cache()
-        self.registry_changed.emit()
-
-    def _on_data_changed(self, _change):
-        # Values changed, but the catalogue of available
-        # statistics did not necessarily change.
-        self.clear_cache()
-        self.values_changed.emit()
 
     def data_version(self):
         # Increase/change this whenever tracking/data/statistics change.
         return getattr(self.state, "data_version", 0)
 
+    def _on_data_changed(self, event: DataChange):
+        if not isinstance(event, DataChange):
+            raise TypeError("data_changed must carry a DataChange.")
+
+        check_registry = event.has(
+            ChangeKind.SESSION_ADDED,
+            ChangeKind.SESSION_REMOVED,
+            ChangeKind.SESSION_ORDER,
+            ChangeKind.ASSIGNMENT_SET,
+            ChangeKind.ASSIGNMENT_MAPPING,
+            ChangeKind.QUALITY_VALUES,
+            ChangeKind.MATCH_VALUES,
+            ChangeKind.DATA_AVAILABILITY,
+        )
+
+        registry_changes = (
+            self.refresh_registry(emit=False)
+            if check_registry
+            else frozenset()
+        )
+
+        value_changes = self._invalidate(
+            key
+            for key, definition in self.registry.items()
+            if key not in registry_changes
+            and definition.is_affected_by(event)
+        )
+
+        if registry_changes:
+            self.registry_changed.emit()
+
+        if value_changes:
+            self.values_changed.emit(value_changes)
+            
+    def _definition_signature(self, definition):
+        # Registry factories recreate partials; compare their configuration,
+        # not the identity of the newly created partial object.
+        getter = definition.getter
+        if isinstance(getter, partial):
+            getter = (
+                getter.func,
+                getter.args,
+                tuple(sorted((getter.keywords or {}).items())),
+            )
+
+        coordinates = None
+        if (
+            definition.dims
+            and getattr(self.state, "assignments", None) is not None
+        ):
+            coords = definition.coord_getter(self.state)
+            coordinates = tuple(
+                (dim, tuple(np.asarray(coords[dim]).tolist()))
+                for dim in definition.dims
+            )
+
+        # Renaming a loaded quality field can change which sessions supply
+        # a statistic even when both names already exist in the registry.
+        sources = None
+        if definition.key.startswith("session:"):
+            name = definition.key.split(":", 1)[1]
+            sources = tuple(
+                (str(session.path), name in session.quality)
+                for session in self.data.sessions
+                if session is not None
+            )
+
+        return (
+            definition.title,
+            definition.description,
+            definition.category,
+            tuple(definition.dims),
+            getter,
+            coordinates,
+            (
+                None
+                if definition.allowed_reductions is None
+                else tuple(
+                    sorted(
+                        (dim, tuple(methods))
+                        for dim, methods in definition.allowed_reductions.items()
+                    )
+                )
+            ),
+            (
+                None
+                if definition.default_reductions is None
+                else tuple(sorted(definition.default_reductions.items()))
+            ),
+            definition.dependencies,
+            definition.availability_dependencies,
+            sources,
+        )
+
+    def refresh_registry(self, *, emit=True):
+        registry = self.registry_factory(self.data, self.state)
+        signatures = {
+            key: self._definition_signature(definition)
+            for key, definition in registry.items()
+        }
+
+        with self._cache_lock:
+            previous = self._registry_signatures
+
+            changed = frozenset(
+                key
+                for key in previous.keys() | signatures.keys()
+                if previous.get(key) != signatures.get(key)
+            )
+
+            self.registry = registry
+            self._registry_signatures = signatures
+            self.registry_changes = changed
+
+            if changed:
+                self._invalidate(changed)
+
+        if changed and emit:
+            self.registry_changed.emit()
+
+        return changed
+
+
+    def query_revision(self, query):
+        if query is None:
+            return 0
+
+        with self._cache_lock:
+            return self._revisions.get(query.statistic_key, 0)
+
+
+    def _invalidate(self, keys):
+        keys = frozenset(keys)
+
+        with self._cache_lock:
+            for key in keys:
+                self._revisions[key] = self._revisions.get(key, 0) + 1
+
+            self._cache = {
+                cache_key: value
+                for cache_key, value in self._cache.items()
+                if cache_key[0].statistic_key not in keys
+            }
+
+        return keys
+
     def clear_cache(self):
-        self._cache.clear()
+        with self._cache_lock:
+            self._cache.clear()
 
-    def evaluate(self, query: Optional[StatisticQuery]) -> Optional[StatisticArray]:
-
+    def evaluate(
+        self,
+        query: Optional[StatisticQuery],
+    ) -> Optional[StatisticArray]:
         if self.data is None or len(self.data.sessions) == 0 or query is None:
             return None
 
-        key = (query, self.data_version())
+        with self._cache_lock:
+            revision = self._revisions.get(query.statistic_key, 0)
+            key = (query, revision)
 
-        if self._cache and key in self._cache:
-            return self._cache[key]
+            if key in self._cache:
+                return self._cache[key]
 
-        result = self._evaluate_uncached(query)
+            definition = self.registry[query.statistic_key]
 
-        self._cache[key] = result
+        # Calculation happens outside the cache lock.
+        result = self._evaluate_uncached(query, definition)
+
+        with self._cache_lock:
+            # A relevant change during calculation must not repopulate
+            # the cache with an obsolete result.
+            if self._revisions.get(query.statistic_key, 0) == revision:
+                self._cache[key] = result
+
         return result
 
-    def _evaluate_uncached(self, query: StatisticQuery) -> StatisticArray:
-        stat_def = self.registry[query.statistic_key]
+    def _evaluate_uncached(
+        self,
+        query: StatisticQuery,
+        stat_def=None,
+    ) -> StatisticArray:
+        if stat_def is None:
+            stat_def = self.registry[query.statistic_key]
         reductions = query.reduction_dict()
 
         indexers = {

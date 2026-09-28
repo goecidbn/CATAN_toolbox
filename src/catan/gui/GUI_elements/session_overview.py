@@ -4,6 +4,7 @@ from unicodedata import name
 from PySide6.QtCore import QSize, QTimer, Qt, Signal, QPoint
 from PySide6.QtGui import QColor, QAction
 from PySide6.QtWidgets import (
+    QApplication,
     QAbstractItemView,
     QComboBox,
     QDialog,
@@ -29,6 +30,11 @@ from PySide6.QtWidgets import (
 import numpy as np
 from pathlib import Path
 
+from catan.core.changes import (
+    ChangeKind as C,
+    DataChange,
+    SESSION_STRUCTURE_CHANGES,
+)
 from catan.gui.structures import AppState, Data, SessionData
 from catan.core.structures import sessiondata_type
 from catan.core.structures.load_config import FieldSpec
@@ -46,6 +52,10 @@ from .fragments.dialog_load_field import (
     FieldSelectDialog,
     FieldSelection,
 )
+from .fragments.manual_alignment_dialog import (
+    open_manual_alignment,
+    select_alignment_draft,
+)
 
 
 class SessionRowWidget(QFrame):
@@ -59,6 +69,7 @@ class SessionRowWidget(QFrame):
 
     loadRequested = Signal(int)  # session_id
     backgroundRequested = Signal(int)
+    manualAlignmentRequested = Signal(int)
 
     traceToggled = Signal(int)
     qualityToggled = Signal(int)
@@ -224,22 +235,26 @@ class SessionRowWidget(QFrame):
 
         self.refresh(current=current)
 
-    def _on_data_changed(self, input):
-
-        data_type, data_var = input
-
-        relevant_session = data_var in (self.session.id, -1)
-
-        if data_type in ("session", "sessions") and relevant_session:
+    def _on_data_changed(self, event: DataChange):
+        if event.has(
+            C.DATA_AVAILABILITY,
+            C.SESSION_METADATA,
+            C.SESSION_ACTIVITY,
+            C.SESSION_TIMEBASE,
+            C.FOOTPRINT_GEOMETRY,
+            C.BACKGROUND_IMAGE,
+            C.ASSIGNMENT_SET,
+            C.ASSIGNMENT_MAPPING,
+            C.INCLUSION,
+            C.MODEL_COUNTS,
+            C.MODEL_PARAMETERS,
+            C.PROCESSING_STATUS,
+        ):
             self._update_buttons()
             self._update_status()
 
+        if event.has(C.DATA_AVAILABILITY):
             self.config_constructor.config_field_options.rebuild()
-            return
-
-        if data_type in ("assignments", "model"):
-            self._update_buttons()
-            self._update_status()
 
     def refresh(self, current=False):
         name = getattr(self.session, "name", f"Session{self.index:02d}")
@@ -267,7 +282,7 @@ class SessionRowWidget(QFrame):
         self._update_buttons()
         self._update_status()
         self._update_background(current=current)
-        self.config_constructor._on_fields_changed()
+        self.config_constructor.refresh()
 
     def _update_status(self):
 
@@ -358,7 +373,23 @@ class SessionRowWidget(QFrame):
         outdated = []
 
         if self.data.alignment_is_stale(session_id):
-            outdated.append("alignment")
+            blocker = next(
+                (sid for sid in range(session_id) if self.data.alignment_is_stale(sid)),
+                None,
+            )
+
+            if blocker is not None:
+                return (
+                    "stale",
+                    f"Alignment outdated — review S{blocker} first",
+                    "#f2b84b",
+                )
+
+            return (
+                "stale",
+                "Alignment needs review — blocks later sessions",
+                "#f2b84b",
+            )
 
         if (
             model is not None
@@ -637,6 +668,10 @@ class SessionRowWidget(QFrame):
             menu.addAction(
                 "Change background…",
                 lambda: (self.backgroundRequested.emit(self.index)),
+            )
+            menu.addAction(
+                "Adjust alignment…",
+                lambda: self.manualAlignmentRequested.emit(self.index),
             )
 
         menu.addSeparator()
@@ -1252,9 +1287,7 @@ class LoadSessionRowWidget(QFrame):
             if report.correlation is not None:
                 text += f"\nCorrelation: {report.correlation:.3f}"
 
-        text += "\n\nYou can inspect and correct " "the alignment later."
-
-        QMessageBox.information(self, "Alignment error", text)
+        self.state.alignment_failed.emit(session, text, session.remap)
 
     def on_register_session(self):
 
@@ -1381,6 +1414,16 @@ class SessionOverview(QWidget):
         self.state.current_session_changed.connect(self._on_current_session_changed)
         self.list_widget.drag_n_dropped.connect(self.move_session)
         self.list_widget.refresh_requested.connect(self.refresh_rows)
+
+        self._alignment_failures = []
+        self._alignment_popup_active = False
+        self._alignment_failure_timer = QTimer(self)
+        self._alignment_failure_timer.setSingleShot(True)
+        self._alignment_failure_timer.timeout.connect(self._open_next_alignment_failure)
+        self.state.alignment_failed.connect(self._queue_alignment_failure)
+        self.state.alignment_review_finished.connect(self._finish_alignment_review)
+        self.state.alignment_review_changed.connect(self._schedule_alignment_review)
+
         self.rebuild()
 
     def rebuild(self):
@@ -1391,24 +1434,6 @@ class SessionOverview(QWidget):
         for session in self.data.sessions:
             # print("Adding session row:", session.id, getattr(session, "name", None))
             self._add_session_row(session.id, session)
-
-        # self._add_load_row()
-
-    # def _add_load_row(self):
-    #     item = QListWidgetItem()
-    #     flags = item.flags()
-    #     flags &= ~Qt.ItemFlag.ItemIsDragEnabled
-    #     flags &= ~Qt.ItemFlag.ItemIsDropEnabled
-    #     item.setFlags(flags)
-
-    #     row = LoadSessionRowWidget(self,item)
-
-    #     item.setSizeHint(row.sizeHint())
-    #     # self.list_widget.addItem(item)
-    #     # self.list_widget.setItemWidget(item, row)
-    #     # self._row_widgets[-1] = row
-
-    #     # self.list_widget.set_fixed_last_item(item)
 
     def _add_session_row(self, session_id: int, session):
         item = QListWidgetItem()
@@ -1432,6 +1457,8 @@ class SessionOverview(QWidget):
 
         row.loadRequested.connect(lambda id=session_id: self.load_requested.emit(id))
         row.backgroundRequested.connect(self.change_session_background)
+        row.manualAlignmentRequested.connect(self.adjust_session_alignment)
+
         row.traceToggled.connect(
             lambda id, which="traces": self.toggle_session_data(id, which)
         )
@@ -1466,16 +1493,25 @@ class SessionOverview(QWidget):
         row.adjustSize()
         item.setSizeHint(row.sizeHint())
 
-    def _on_data_changed(self, input):
-        data_type, data_var = input
-        # if data_type in ["sessions", "assignments"]:
-        if data_type in ["session_added"]:  # ,"sessions","assignments"]:
-            session_id = data_var
-            self._add_session_row(session_id, self.data.sessions[session_id])
-            # self.rebuild()
-        elif data_type in ["session_removed", "session_moved"]:
+    def _on_data_changed(self, event: DataChange):
+        if event.has(*SESSION_STRUCTURE_CHANGES):
             self.rebuild()
-        else:
+            return
+
+        if event.has(
+            C.SESSION_METADATA,
+            C.SESSION_ACTIVITY,
+            C.SESSION_TIMEBASE,
+            C.DATA_AVAILABILITY,
+            C.FOOTPRINT_GEOMETRY,
+            C.BACKGROUND_IMAGE,
+            C.ASSIGNMENT_SET,
+            C.ASSIGNMENT_MAPPING,
+            C.INCLUSION,
+            C.MODEL_COUNTS,
+            C.MODEL_PARAMETERS,
+            C.PROCESSING_STATUS,
+        ):
             self.refresh_rows()
 
     def _on_current_session_changed(self):
@@ -1514,7 +1550,10 @@ class SessionOverview(QWidget):
         session = self.data.sessions[session_id]
         session.active = active
 
-        self.data.notify_change(("session", session_id))
+        self.data.notify_change(
+            C.SESSION_ACTIVITY,
+            session_id=session_id,
+        )
 
     def rename_session(self, session_id: int, name: str):
         if not name:
@@ -1522,6 +1561,10 @@ class SessionOverview(QWidget):
             return
 
         self.data.sessions[session_id].name = name
+        self.data.notify_change(
+            C.SESSION_METADATA,
+            session_id=session_id,
+        )
 
     def edit_time_offset(self, session_id: int):
         session = self.data.sessions[session_id]
@@ -1547,7 +1590,13 @@ class SessionOverview(QWidget):
         session.time_offset = value
         self.refresh_rows()
 
-        self.data.notify_change(("sessions", session_id))
+        self.data.notify_change(
+            C.SESSION_TIMEBASE,
+            session_id=session_id,
+        )
+
+    def adjust_session_alignment(self, session_id):
+        open_manual_alignment(self.data, session_id, self)
 
     def change_session_background(self, session_id: int):
 
@@ -1591,6 +1640,119 @@ class SessionOverview(QWidget):
                 session_id, selection, result, expected_version=expected_version
             ),
         )
+
+    def _queue_alignment_failure(self, session, message, proposal):
+        self._alignment_failures = [
+            entry for entry in self._alignment_failures if entry[0] is not session
+        ]
+        self._alignment_failures.append((session, message, proposal))
+        self._schedule_alignment_review()
+
+    def _schedule_alignment_review(self, *_):
+        if not self._alignment_popup_active:
+            self._alignment_failure_timer.start(0)
+
+    def _finish_alignment_review(self, session):
+        review = self.state.alignment_review
+        if review is None or review["session"] is not session:
+            return
+
+        self.state.alignment_review = None
+        self.state.alignment_review_changed.emit()
+        self._schedule_alignment_review()
+
+    def _open_next_alignment_failure(self):
+        if self._alignment_popup_active:
+            return
+
+        review = self.state.alignment_review
+        if review is None and not self._alignment_failures:
+            return
+
+        tasks = self.state.tasks
+        if (
+            tasks.processing_busy()
+            or tasks.processing_requested
+            or QApplication.activeModalWidget() is not None
+        ):
+            self._alignment_failure_timer.start(150)
+            return
+
+        panels = sorted(
+            (panel for panel in self.state.alignment_panels if not panel._disposed),
+            key=lambda panel: not panel.isVisible(),
+        )
+
+        if review is None:
+            session, message, proposal = self._alignment_failures[0]
+            session_id = next(
+                (
+                    index
+                    for index, item in enumerate(self.data.sessions)
+                    if item is session
+                ),
+                None,
+            )
+
+            if (
+                session_id is None
+                or not session.status["spatial_loaded"]
+                or session.background_template is None
+            ):
+                self._alignment_failures.pop(0)
+                self._schedule_alignment_review()
+                return
+
+            parent = panels[0] if panels else self
+            draft = select_alignment_draft(
+                self.data,
+                session_id,
+                parent,
+                proposal=proposal,
+            )
+            if draft is None:
+                # Keep the request queued when discarding an existing draft
+                # was declined. Do not repeatedly reopen that confirmation.
+                return
+
+            self._alignment_failures.pop(0)
+            review = {
+                "session": session,
+                "message": message,
+                "proposal": proposal,
+            }
+            self.state.alignment_review = review
+            self.state.alignment_review_changed.emit()
+
+            if panels:
+                panel = panels[0]
+                panel._sync_draft()
+                panel.raise_()
+                panel.setFocus()
+                return
+
+        elif panels:
+            # A panel already owns this review. Wait for Use / Remove / Later.
+            return
+
+        session = review["session"]
+        session_id = next(
+            (index for index, item in enumerate(self.data.sessions) if item is session),
+            None,
+        )
+        if session_id is None:
+            self._finish_alignment_review(session)
+            return
+
+        self._alignment_popup_active = True
+        try:
+            # The shared draft already contains the reviewed proposal.
+            # The editor displays the shared failure message.
+            open_manual_alignment(self.data, session_id, self)
+        finally:
+            self._alignment_popup_active = False
+            self._finish_alignment_review(session)
+            self._schedule_alignment_review()
 
     def toggle_session_data(
         self, session_id: int, which: Optional[sessiondata_type] = None
@@ -1679,6 +1841,8 @@ class SessionOverview(QWidget):
 
         if report.correlation_zscore is not None:
             lines.append("z-score: " f"{report.correlation_zscore:.2f}")
+
+        lines.append(f"method: {report.method}")
 
         return "\n".join(lines)
 

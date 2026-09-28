@@ -306,7 +306,8 @@ class TaskOverviewDisplay(QWidget):
 
         self.task_manager = task_manager
 
-        # self.summary_label = QLabel()
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
 
         # ============================================================
         # Expand/collapse button
@@ -335,6 +336,7 @@ class TaskOverviewDisplay(QWidget):
             QLabel("Tasks")
         )
 
+        header.addWidget(self.summary_label, 1)
         # header.addWidget(
         #     self.summary_label
         # )
@@ -392,32 +394,33 @@ class TaskOverviewDisplay(QWidget):
         # TaskManager signals
         # ============================================================
 
-        # self.task_manager.queue_changed.connect(
-        #     lambda group:
-        #         self.refresh_summary()
-        # )
+        self.task_manager.queue_changed.connect(
+            lambda group:
+                self.refresh_summary()
+        )
 
-        # self.task_manager.task_started.connect(
-        #     lambda group, task_id:
-        #         self.refresh_summary()
-        # )
+        self.task_manager.task_started.connect(
+            lambda group, task_id:
+                self.refresh_summary()
+        )
 
-        # self.task_manager.task_finished.connect(
-        #     lambda group, task_id:
-        #         self.refresh_summary()
-        # )
+        self.task_manager.task_finished.connect(
+            lambda group, task_id:
+                self.refresh_summary()
+        )
 
-        # self.task_manager.task_cancelled.connect(
-        #     lambda group, task_id:
-        #         self.refresh_summary()
-        # )
+        self.task_manager.task_cancelled.connect(
+            lambda group, task_id:
+                self.refresh_summary()
+        )
 
-        # self.task_manager.task_failed.connect(
-        #     lambda group, task_id:
-        #         self.refresh_summary()
-        # )
+        self.task_manager.task_failed.connect(
+            lambda group, task_id:
+                self.refresh_summary()
+        )
+        self.task_manager.scheduling_settled.connect(self.refresh_summary)
 
-        # self.refresh_summary()
+        self.refresh_summary()
 
     def _toggle_details(
         self,
@@ -432,7 +435,33 @@ class TaskOverviewDisplay(QWidget):
             if expanded
             else Qt.ArrowType.RightArrow
         )
+        if expanded:
+            for display in self.queue_displays.values():
+                display.refresh()
 
+    def refresh_summary(self, *_):
+        parts = []
+
+        for group in self.task_manager.GROUPS:
+            summary = self.task_manager.group_summary(group)
+
+            if summary["running"] or summary["queued_count"]:
+                status = (
+                    "cancelling"
+                    if summary["current_cancelling"]
+                    else "running"
+                    if summary["running"]
+                    else "idle"
+                )
+                parts.append(
+                    f"{group}: {status}, "
+                    f"{summary['queued_count']} queued"
+                )
+
+        if self.task_manager.processing_requested:
+            parts.append("Processing requested; waiting for display calculation")
+
+        self.summary_label.setText("\n".join(parts) or "Idle")
     # def refresh_summary(self):
     #     parts = []
 

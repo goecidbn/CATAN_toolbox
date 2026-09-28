@@ -29,6 +29,11 @@ from PySide6.QtWidgets import (
 
 import importlib
 
+from catan.core.changes import (
+    ChangeKind as C,
+    DataChange,
+    SESSION_STRUCTURE_CHANGES,
+)
 from catan.core.structures import NeuronComponent, sessiondata_type
 from catan.gui.panels import BasePlot
 from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
@@ -1120,16 +1125,10 @@ class Controller(BasePlot.CanvasController):
 
     request_status_changed = Signal()
 
-    def disconnect_signals(self):
-        super().disconnect_signals()
-        self.controls["parameter"].data_parameter_changed.disconnect()
-        self.controls["parameter"].display_parameter_changed.disconnect()
-        self.state.request_status_changed.disconnect(self._on_request_status_changed)
-
     def build_controls(self):
         super().build_controls()
 
-        self.state.adjacency_radius_changed.connect(self.replot_neurons)
+        self.connect_signal(self.state.adjacency_radius_changed, self.replot_neurons)
         self.controls["parameter"] = FootprintParametersController(self.section)
         self.canvas.attach_parameter_overlay()
 
@@ -1158,24 +1157,31 @@ class Controller(BasePlot.CanvasController):
             lambda _: self.update_neuron_selection()
         )
 
-        self.state.request_status_changed.connect(self._on_request_status_changed)
+        self.connect_signal(self.state.request_status_changed, self._on_request_status_changed,controls=True)
+        self.connect_signal(self.canvas.request_display.cancel_requested, self.canvas.cancel_request,controls=True)
+        self.connect_signal(self.canvas.request_display.confirm_requested, self.canvas.advance_or_confirm_request,controls=True)
 
-        self.canvas.request_display.cancel_requested.connect(self.canvas.cancel_request)
-
-        self.canvas.request_display.confirm_requested.connect(
-            self.canvas.advance_or_confirm_request
-        )
-
-        # Important for hot reload:
-        # there may already be a pending request.
         self._on_request_status_changed()
 
-    def _on_data_changed(self, input: Tuple[str, int]):
+    def _on_data_changed(self, event: DataChange):
+        if event.has(*SESSION_STRUCTURE_CHANGES, C.ASSIGNMENT_SET):
+            self.initialize_display()
 
-        if input[0] in ["sessions", "assignments"]:
+        elif event.has(
+            C.ASSIGNMENT_MAPPING,
+            C.UNION_GEOMETRY,
+            C.FOOTPRINT_GEOMETRY,
+            C.INCLUSION,
+            C.SESSION_ACTIVITY,
+            C.SESSION_METADATA,
+        ) or event.has_availability("spatial"):
             self.replot_neurons()
 
-        elif input[0] == "review_status":
+        if event.has(
+            C.REVIEW_STATUS,
+            C.ASSIGNMENT_SET,
+            C.ASSIGNMENT_MAPPING,
+        ):
             self.canvas.update_review_status_tag()
 
     def initialize_display(self):

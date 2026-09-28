@@ -520,6 +520,8 @@ class StatisticQuerySelector(QWidget):
     def __init__(self, engine: StatisticEngine, axis=None, parent=None):
         super().__init__(parent)
 
+        self._disposed = False
+
         self.engine = engine
         self.axis = axis
 
@@ -581,6 +583,19 @@ class StatisticQuerySelector(QWidget):
         self._on_statistic_changed()
         self._update_filter_visibility()
 
+    def dispose(self):
+        if self._disposed:
+            return
+
+        self._disposed = True
+        self.engine.registry_changed.disconnect(self.refresh_statistics)
+
+        if self._popup is not None:
+            self._popup.blockSignals(True)
+            self._popup.close()
+            self._popup.deleteLater()
+            self._popup = None
+
     def set_popup_bounds(
         self,
         bounds: QWidget,
@@ -631,6 +646,9 @@ class StatisticQuerySelector(QWidget):
             self._emit_query_changed_once()
 
     def refresh_statistics(self):
+        if self._disposed:
+            return
+        
         old_key = self._current_stat_key
 
         if old_key not in self.engine.registry:
@@ -642,9 +660,17 @@ class StatisticQuerySelector(QWidget):
             self._on_statistic_changed()
             return
 
-        # Registry changed, but current statistic still exists.
-        # Its underlying sources/data may nevertheless have changed.
-        if self._current_stat_key != "none":
+        # Refresh labels/menu without requesting a calculation when another
+        # statistic changed.
+        self._update_stat_button()
+        self._update_summary()
+        self._update_filter_visibility()
+
+        if (
+            self._current_stat_key != "none"
+            and self._current_stat_key in self.engine.registry_changes
+        ):
+            self.sync_visible_reductions_from_effective_query()
             self._update_summary()
             self._emit_query_changed_once()
 
@@ -659,6 +685,8 @@ class StatisticQuerySelector(QWidget):
             self._emitting_query = False
 
     def set_query_preparer(self, preparer):
+        if preparer is self.query_preparer:
+            return
         self.query_preparer = preparer
         self.sync_visible_reductions_from_effective_query()
         self._emit_query_changed_once()

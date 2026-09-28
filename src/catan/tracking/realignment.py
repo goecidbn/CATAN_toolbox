@@ -9,6 +9,82 @@ from catan.core.data import center_of_mass
 from catan.core.io import load_fields_from_sources
 
 
+def _build_comparison_updates(tracking, sessions, session_id, template, remap):
+    """Refresh comparison evidence without changing committed transforms."""
+    changed = sessions[session_id]
+    changed_path = str(changed.path)
+    template_changed = changed.background_template is None or not np.array_equal(
+        changed.background_template, template
+    )
+    updates = {}
+
+    for sid in range(session_id, len(sessions)):
+        item = sessions[sid]
+        target_remap = remap if sid == session_id else item.remap
+        target_template = template if sid == session_id else item.background_template
+        if target_remap is None or target_template is None:
+            continue
+
+        references = tracking.alignment_references_for_session(sid) or {}
+        if sid != session_id and changed_path not in references:
+            continue
+
+        # Use the proposed geometry/template before it becomes live.
+        if changed_path in references:
+            references[changed_path] = {
+                "template": template,
+                "matrix": remap.matrix,
+            }
+
+        # Manual drafts intentionally contain no pairwise records.
+        # Recover reusable evidence from the currently committed remap.
+        cached = getattr(item.remap, "remap_data", {}) or {}
+        if sid == session_id and remap.remap_data:
+            cached = remap.remap_data
+
+        records = {}
+        pending = {}
+
+        for path, reference in references.items():
+            record = cached.get(path)
+            must_recalculate = (
+                record is None
+                or (template_changed and (sid == session_id or path == changed_path))
+                or (record.get("success", False) and record.get("matrix") is None)
+            )
+            if must_recalculate:
+                pending[path] = reference
+            else:
+                records[path] = deepcopy(record)
+
+        if pending:
+            # evaluate() changes its remap's aggregate transform.
+            # Run it on a disposable copy and retain only the records.
+            probe = deepcopy(target_remap)
+            if not getattr(tracking, "correct_rotation", False):
+                probe.max_rotation = 0.0
+
+            probe.evaluate(
+                target_template,
+                pending,
+                use_optical_flow=False,
+            )
+            records.update(probe.remap_data)
+
+        for path, record in records.items():
+            matrix = record.get("matrix")
+            record["global_matrix"] = (
+                np.asarray(references[path]["matrix"], dtype=float)
+                @ np.asarray(matrix, dtype=float)
+                if record.get("success", False) and matrix is not None
+                else None
+            )
+
+        updates[sid] = records
+
+    return updates
+
+
 def build_realignment_update(
     tracking, session_id, *, background_template, remap, background_spec
 ):
@@ -183,4 +259,13 @@ def build_realignment_update(
         if sid == session_id:
             values["status"]["aligned"] = True
 
-    return {"sessions": sessions, "updates": updates, "session_id": session_id}
+    comparison_updates = _build_comparison_updates(
+        tracking, sessions, session_id, template, remap
+    )
+
+    return {
+        "sessions": sessions,
+        "updates": updates,
+        "comparison_updates": comparison_updates,
+        "session_id": session_id,
+    }

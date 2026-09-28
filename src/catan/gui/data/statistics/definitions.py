@@ -2,6 +2,11 @@ from .types import StatisticDefinition
 from .queries import ReductionSpec
 from . import calculations
 
+from catan.core.changes import (
+    ChangeKind,
+    TRACKED_STATISTIC_STRUCTURE,
+)
+
 CALCULATED_STATISTICS = {
     "none": StatisticDefinition(
         key="none",
@@ -103,3 +108,41 @@ CALCULATED_STATISTICS = {
         },
     ),
 }
+
+_CALCULATED_DEPENDENCIES = {
+    "footprint_size": (
+        frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
+        frozenset({"spatial"}),
+    ),
+    "border_proximity": (
+        frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
+        frozenset({"spatial"}),
+    ),
+    "occurence": (
+        frozenset(),
+        frozenset(),
+    ),
+    "centroid_shift": (
+        frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
+        frozenset({"spatial"}),
+    ),
+    "temporal_corr": (
+        frozenset({ChangeKind.TRACE_VALUES}),
+        frozenset({"traces"}),
+    ),
+    "distances": (
+        frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
+        frozenset({"spatial"}),
+    ),
+    "footprint_similarity": (
+        frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
+        frozenset({"spatial"}),
+    ),
+}
+
+CALCULATED_STATISTICS["none"].dependencies = frozenset()
+
+for key, (dependencies, availability) in _CALCULATED_DEPENDENCIES.items():
+    definition = CALCULATED_STATISTICS[key]
+    definition.dependencies = TRACKED_STATISTIC_STRUCTURE | dependencies
+    definition.availability_dependencies = availability

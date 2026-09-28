@@ -25,6 +25,7 @@ from catan.gui.panels import (
     SelectionDisplay,
     Traces,
     CurationFilter,
+    SessionAlignment,
 )
 
 display_modes = {
@@ -57,9 +58,10 @@ display_modes = {
         },
     },
     "controls": {
-        "title": "Controls",
+        "title": "Curation",
         "options": {
-            "curator": "Curator",
+            "match_curator": "Statistics Filter",
+            "session_alignment": "Session alignment"
         },
     },
 }
@@ -72,7 +74,8 @@ DISPLAY_CONTROLLERS = {
     "traces": Traces,
     "statistics": Statistics,
     "selection_display": SelectionDisplay,
-    "curator": CurationFilter,
+    "match_curator": CurationFilter,
+    "session_alignment": SessionAlignment,
 }
 
 
@@ -302,8 +305,6 @@ class DisplaySection(QFrame):
     def _clear_option_panels(self):
         for layout in self.opts:
             clear_layout(layout)
-
-        self.opts = []
 
     def build_split_options(self) -> QHBoxLayout:
 

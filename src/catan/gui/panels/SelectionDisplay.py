@@ -20,6 +20,16 @@ from PySide6.QtWidgets import (
     QHeaderView,
 )
 
+from catan.core.changes import (
+    ChangeKind as C,
+    DataChange,
+    SESSION_STRUCTURE_CHANGES,
+)
+from catan.gui.background_tasks.runtime import (
+    TaskCancelled,
+    current_task_context,
+)
+
 from catan.core.structures import NeuronComponent
 from catan.gui.structures import AppState, Data
 from catan.gui.panels import BasePlot, styles, StatisticsData
@@ -291,8 +301,16 @@ class Display(QWidget):
     def add_column_index(self) -> int:
         return self.stats_table.columnCount() - 1
 
-    def _on_data_changed(self):
-        self.update_display()
+    def _on_data_changed(self, event: DataChange):
+        if event.has(
+            *SESSION_STRUCTURE_CHANGES,
+            C.ASSIGNMENT_SET,
+            C.ASSIGNMENT_MAPPING,
+            C.INCLUSION,
+            C.SESSION_METADATA,
+            C.SESSION_ACTIVITY,
+        ):
+            self.update_display()
 
     def _show_pair_warning(
         self,
@@ -984,6 +1002,16 @@ class Display(QWidget):
 
         return QBrush(color)
 
+    def dispose(self):
+        if getattr(self, "_disposed", False):
+            return
+
+        self._disposed = True
+        self.state.data_changed.disconnect(self._on_data_changed)
+
+        for popup in self.findChildren(AddStatisticPopup):
+            popup.close()
+
 
 class Controller(BasePlot.TableController):
 
@@ -1002,14 +1030,15 @@ class Controller(BasePlot.TableController):
                 self.row_mode,
             )
         ]
-        self.statistic_config.changed.connect(self._on_statistic_display_config_changed)
+
+        self._statistic_task_id = None
 
         self.statistic_results: list[StatisticColumnResult] = []
         self._statistic_rebuild_generation = 0
 
-        self.data.statistic_engine.registry_changed.connect(
-            self._on_statistics_registry_changed
-        )
+        self.connect_signal(self.statistic_config.changed,self._on_statistic_display_config_changed)
+        self.connect_signal(self.data.statistic_engine.registry_changed,self._on_statistics_registry_changed)
+        self.connect_signal(self.data.statistic_engine.values_changed, self._on_statistics_values_changed)
 
     @property
     def table_binding(self) -> SelectionTableBinding:
@@ -1017,6 +1046,13 @@ class Controller(BasePlot.TableController):
             entity_mode=self.entity_mode,
             row_mode=self.row_mode,
         )
+
+    def _on_statistics_values_changed(self, statistic_keys):
+        if any(
+            column.raw_query.statistic_key in statistic_keys
+            for column in self.statistic_columns
+        ):
+            self._rebuild_statistic_columns()
 
     def _table_mode_key(self):
         return self.entity_mode, self.row_mode
@@ -1049,19 +1085,16 @@ class Controller(BasePlot.TableController):
 
         self.table.set_mode(entity_mode=self.entity_mode, row_mode=self.row_mode)
 
-        self.table.statistic_header_context_requested.connect(
-            self._on_statistic_header_context_requested
-        )
-
-        self.table.statistic_columns_reordered.connect(
-            self._on_statistic_columns_reordered
-        )
+        self.connect_signal(self.table.statistic_header_context_requested, self._on_statistic_header_context_requested,controls=True)
+        self.connect_signal(self.table.statistic_columns_reordered, self._on_statistic_columns_reordered,controls=True)
 
     def configure_display(self):
 
         super().configure_display()
-
-        self.table.add_statistic_requested.connect(self._open_add_statistic_dialog)
+        self.connect_signal(
+            self.table.add_statistic_requested,
+            self._open_add_statistic_dialog,
+        )
 
     def _open_add_statistic_dialog(self, _global_pos):
 
@@ -1357,14 +1390,31 @@ class Controller(BasePlot.TableController):
         raise ValueError(f"Unknown row mode: {self.row_mode!r}")
 
     def _on_statistics_registry_changed(self):
-        """
-        Re-evaluate the currently configured columns because
-        their underlying data may have changed.
-        """
+        previous_queries = tuple(
+            column.raw_query
+            for column in self.statistic_columns
+        )
+
+        queries = tuple(
+            query
+            for query in self.statistic_config.queries(
+                self.entity_mode,
+                self.row_mode,
+            )
+            if query.statistic_key in self.data.statistic_engine.registry
+        )
+
+        changed_keys = self.data.statistic_engine.registry_changes
+
+        if queries == previous_queries and not any(
+            query.statistic_key in changed_keys
+            for query in queries
+        ):
+            return
 
         self.statistic_columns = [
             StatisticColumn(raw_query=query)
-            for query in self.statistic_config.queries(self.entity_mode, self.row_mode)
+            for query in queries
         ]
 
         self._rebuild_statistic_columns()
@@ -1747,7 +1797,10 @@ class Controller(BasePlot.TableController):
             dtype=float,
         )
 
+        ctx = current_task_context()
         for row_index, components in enumerate(pair_rows):
+            if ctx is not None:
+                ctx.check_cancelled()
 
             if components is None:
                 continue
@@ -1793,6 +1846,10 @@ class Controller(BasePlot.TableController):
         update_display=True,
     ):
 
+        if self._statistic_task_id is not None:
+            self.state.tasks.cancel(self._statistic_task_id)
+            self._statistic_task_id = None
+    
         self._statistic_rebuild_generation += 1
         generation = self._statistic_rebuild_generation
 
@@ -1827,9 +1884,13 @@ class Controller(BasePlot.TableController):
 
         def evaluate():
 
+            ctx = current_task_context()
             evaluated = []
 
             for column, query in prepared:
+
+                if ctx is not None:
+                    ctx.check_cancelled()
 
                 table = None
                 pair_result = None
@@ -1848,7 +1909,8 @@ class Controller(BasePlot.TableController):
                         table = self.data.statistic_engine.evaluate_table(query)
 
                     error = None
-
+                except TaskCancelled:
+                    raise
                 except Exception as exc:
                     table = None
                     pair_result = None
@@ -1866,9 +1928,9 @@ class Controller(BasePlot.TableController):
 
             return evaluated
 
-        self.state.tasks.start(
+        self._statistic_task_id = self.state.tasks.start(
             "calculating",
-            "Calculate Selection Display statistics",
+            f"Selection Display statistics [{self.section.section_id}]",
             evaluate,
             on_result=lambda evaluated: (
                 self._on_statistic_columns_ready(
@@ -1881,6 +1943,7 @@ class Controller(BasePlot.TableController):
                 )
             ),
             unique=True,
+            background=True,
         )
 
     def _on_statistic_columns_ready(
@@ -1893,7 +1956,9 @@ class Controller(BasePlot.TableController):
         rows,
         update_display: bool,
     ):
-
+        if self._deactivated:
+            return
+        
         # A newer calculation has already been requested.
         if generation != self._statistic_rebuild_generation:
             return
@@ -1951,7 +2016,15 @@ class Controller(BasePlot.TableController):
     def update_styles(self):
         self.table.update_styles()
 
-    # ----- saving / loading options
+
+    def _cancel_background_tasks(self):
+        self._statistic_rebuild_generation += 1
+
+        task_id = getattr(self, "_statistic_task_id", None)
+        self._statistic_task_id = None
+
+        if task_id is not None:
+            self.state.tasks.cancel(task_id)
 
 
 class AddStatisticPopup(QDialog):
@@ -1966,6 +2039,7 @@ class AddStatisticPopup(QDialog):
         parent=None,
     ):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         self.setWindowFlags(Qt.WindowType.Popup)
 
@@ -2034,3 +2108,7 @@ class AddStatisticPopup(QDialog):
         self.statisticAccepted.emit(query)
 
         self.close()
+
+    def closeEvent(self, event):
+        self.selector.dispose()
+        super().closeEvent(event)

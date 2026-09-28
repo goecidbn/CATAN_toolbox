@@ -45,18 +45,30 @@ def calculate_img_correlation(
 
         dims = A1.shape
 
-        # t_start = time.time()
         if mode == "correlation":
             C_max, C_zscored, img_shift = _from_correlation(A1, A2)
+
         elif mode == "cosine_union":
-            C_max, C_zscored, img_shift = _from_cosine_union(A1, A2, **kwargs)
+            C_max, C_zscored, img_shift = _from_cosine_union(
+                A1, A2, **kwargs
+            )
+
+        elif mode in ("cosine", "pearson"):
+            score_map = calculate_shift_score_map(
+                A1,
+                A2,
+                mode=mode,
+                **kwargs,
+            )
+            C_max, C_zscored, img_shift = subpixel_shift_from_score_map(
+                score_map,
+                A2.shape,
+                window_radius=3,
+                threshold_rel=0.1,
+            )
+
         else:
             raise ValueError(f"Invalid mode: {mode}")
-        # print(
-        #     f"mode: {mode}, C_max: {C_max}, C_zscored: {C_zscored}, img_shift: {img_shift}"
-        # )
-        # t_end = time.time()
-        # print('corr-computation --- time taken: %5.3g'%(t_end-t_start))
 
         if np.isnan(C_max) | (C_max == 0):
             return np.nan, np.nan, np.ones(2) * np.nan
@@ -83,19 +95,28 @@ def calculate_img_correlation(
         )
 
 
-def _from_correlation(A1, A2):
+def _from_correlation(A1, A2, *, return_score_map=False):
     C = signal.convolve(A1 - A1.mean(), A2[::-1, ::-1] - A2.mean(), mode="full") / (
         np.prod(A1.shape) * A1.std() * A2.std()
     )
     # allowed_mask = _shift_mask(A1.shape, A2.shape, expected_shift, max_shift_radius)
 
+    if return_score_map:
+        return C
     return subpixel_shift_from_score_map(
         C, A2.shape, window_radius=3, threshold_rel=0.1
     )
 
 
 def _from_cosine_union(
-    A1, A2, thr1=0.0, thr2=0.0, gamma=0.1, eps=1e-12, shift_optimized=True
+    A1,
+    A2,
+    thr1=0.0,
+    thr2=0.0,
+    gamma=0.1,
+    eps=1e-12,
+    shift_optimized=True,
+    return_score_map=False,
 ):
 
     M1 = (A1 > thr1).astype(float)
@@ -127,7 +148,9 @@ def _from_cosine_union(
         overlap_coeff_map = np.clip(inter / denom_overlap, 0.0, 1.0)
 
         robust_map = overlap_cosine_map * np.power(overlap_coeff_map, gamma)
-
+        if return_score_map:
+            return robust_map
+        
         return subpixel_shift_from_score_map(
             robust_map, A2.shape, window_radius=3, threshold_rel=0.1
         )
@@ -164,6 +187,103 @@ def _from_cosine_union(
             (0.0, 0.0),
         )  # no shift optimization in this branch
 
+def calculate_shift_score_map(
+    A1,
+    A2,
+    *,
+    mode="correlation",
+    min_overlap=0.25,
+    **kwargs,
+):
+    """Return the full translation score surface for two 2D images."""
+    A = np.asarray(A1, dtype=np.float64)
+    B = np.asarray(A2, dtype=np.float64)
+
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError("Expected two 2D images.")
+
+    if not np.isfinite(A).all() or not np.isfinite(B).all():
+        raise ValueError("Images must contain only finite values.")
+
+    if mode == "correlation":
+        if A.std() == 0 or B.std() == 0:
+            shape = tuple(a + b - 1 for a, b in zip(A.shape, B.shape))
+            return np.full(shape, np.nan)
+
+        return _from_correlation(A, B, return_score_map=True)
+
+    if mode == "cosine_union":
+        return _from_cosine_union(
+            A,
+            B,
+            return_score_map=True,
+            **kwargs,
+        )
+
+    if mode in ("cosine", "pearson"):
+        return _additional_score_map(
+            A,
+            B,
+            mode=mode,
+            min_overlap=min_overlap,
+        )
+
+    raise ValueError(f"Invalid correlation mode: {mode}")
+
+
+def _additional_score_map(A, B, *, mode, min_overlap):
+    """Ordinary cosine or overlap-specific Pearson correlation."""
+    if not 0 < min_overlap <= 1:
+        raise ValueError("min_overlap must be in (0, 1].")
+
+    def corr(a, b):
+        return fftconvolve(a, b[::-1, ::-1], mode="full")
+
+    ones_a = np.ones_like(A)
+    ones_b = np.ones_like(B)
+
+    # Number of overlapping image pixels at each translation.
+    n = np.rint(np.maximum(corr(ones_a, ones_b), 0))
+    valid = n >= max(3, min_overlap * min(A.size, B.size))
+    result = np.full(n.shape, np.nan)
+
+    if mode == "cosine":
+        # Whole-image norms: shifted images are interpreted as zero-padded.
+        numerator = corr(A, B)
+        denominator = np.sqrt(np.sum(A * A) * np.sum(B * B))
+
+        if denominator > 0:
+            result[valid] = np.clip(
+                numerator[valid] / denominator, -1, 1
+            )
+
+        return result
+
+    # Subtracting global means improves numerical conditioning.
+    # Local overlap means are still removed below.
+    A = A - A.mean()
+    B = B - B.mean()
+
+    sa = corr(A, ones_b)
+    sb = corr(ones_a, B)
+    safe_n = np.maximum(n, 1)
+
+    va = np.maximum(corr(A * A, ones_b) - sa * sa / safe_n, 0)
+    vb = np.maximum(corr(ones_a, B * B) - sb * sb / safe_n, 0)
+    covariance = corr(A, B) - sa * sb / safe_n
+
+    # Exclude constant overlaps and numerical cancellation near zero.
+    tiny = np.finfo(float).tiny
+    valid &= va > 1e-12 * max(float(np.sum(A * A)), tiny)
+    valid &= vb > 1e-12 * max(float(np.sum(B * B)), tiny)
+
+    result[valid] = np.clip(
+        covariance[valid] / np.sqrt(va[valid] * vb[valid]),
+        -1,
+        1,
+    )
+
+    return result
 
 def subpixel_shift_from_score_map(
     score_map, shape2, window_radius=2, threshold_rel=0.5
@@ -190,6 +310,8 @@ def subpixel_shift_from_score_map(
         peak_score      : max score
     """
     score_map = np.asarray(score_map, dtype=float)
+    if not np.isfinite(score_map).any():
+        return np.nan, np.nan, (np.nan, np.nan)
 
     iy0, ix0 = np.unravel_index(np.nanargmax(score_map), score_map.shape)
     score_max = float(score_map[iy0, ix0])
@@ -205,7 +327,12 @@ def subpixel_shift_from_score_map(
     Y, X = np.meshgrid(np.arange(y0, y1), np.arange(x0, x1), indexing="ij")
 
     # threshold relative to local peak
-    w = patch.copy()
+    w = np.nan_to_num(
+        patch,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     w[w < threshold_rel * score_max] = 0.0
 
     # optional baseline subtraction
@@ -226,6 +353,11 @@ def subpixel_shift_from_score_map(
 
     shift = (dy, dx)
 
-    score_zscored = float((score_max - np.nanmedian(score_map)) / np.nanstd(score_map))
+    score_std = float(np.nanstd(score_map))
+    score_zscored = (
+        float((score_max - np.nanmedian(score_map)) / score_std)
+        if score_std > 0
+        else np.nan
+    )
 
     return score_max, score_zscored, shift

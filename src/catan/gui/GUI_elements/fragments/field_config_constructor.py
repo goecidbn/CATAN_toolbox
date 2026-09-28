@@ -1,5 +1,5 @@
 from pathlib import Path
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, Signal, QSignalBlocker
 
 from PySide6.QtWidgets import (
     QInputDialog,
@@ -71,6 +71,7 @@ class FieldConfigConstructor(QObject):
     def _on_source_changed(self):
         self.config_field_options.update_source(self.source)
         self.rebuild_config_selector()
+        self.refresh()
 
     def build_toggle_config_options(self):
         ## define and set toggle
@@ -123,7 +124,7 @@ class FieldConfigConstructor(QObject):
             self.source.source_config = self.state.config_manager.select(name)
 
             self.config_field_options.rebuild()
-            self.expanded_changed.emit()
+            self._on_fields_changed()
 
         self.load_config_selector.currentIndexChanged.connect(
             lambda idx: load_config_changed(idx)
@@ -261,37 +262,48 @@ class FieldConfigConstructor(QObject):
         self.state.config_manager.set_default_for_format(
             self.source.path, self.source.source_config
         )
-        self._on_fields_changed()
+        self.refresh()
 
-    def _on_fields_changed(self):
-
+    def refresh(self):
+        """Refresh configuration controls without announcing data changes."""
         if self.source is None:
             return
 
-        ## changes to config file options
-        self.expanded_changed.emit()
-        if self.source.source_config is None:
+        config = self.source.source_config
+
+        if config is None:
+            self.load_config_save_button.setEnabled(False)
+            self.load_config_set_default_button.setEnabled(False)
+            self.expanded_changed.emit()
             return
 
         is_default = self.state.config_manager.is_default(
-            self.source.path, self.source.source_config
+            self.source.path, config
         )
-        is_modified = self.state.config_manager.modified(self.source.source_config)
+        is_modified = self.state.config_manager.modified(config)
 
-        ## enable / disable buttons based on current modified status
         self.load_config_save_button.setEnabled(is_modified)
         self.load_config_set_default_button.setEnabled(
             not is_default and not is_modified
         )
 
-        ## adjust display of current config file to highlight if it is modified
-        self.load_config_selector.setEditable(is_modified)
-        self.load_config_selector.setCurrentText(
-            "* "
-            + getattr(self.source.source_config, "name", "")
-            + (" (modified)" if is_modified else "")
-        )
+        # Updating the displayed text must not select another configuration.
+        with QSignalBlocker(self.load_config_selector):
+            self.load_config_selector.setEditable(is_modified)
+            self.load_config_selector.setCurrentText(
+                "* "
+                + getattr(config, "name", "")
+                + (" (modified)" if is_modified else "")
+            )
+
+        self.expanded_changed.emit()
+
+
+    def _on_fields_changed(self):
+        """Handle a field-change notification from FieldSelector."""
+        self.refresh()
+
+        if self.source is None or self.source.source_config is None:
+            return
 
         self.state.statistics_sources_changed.emit()
-
-        # loading_possible = self.field_selector.loading_possible

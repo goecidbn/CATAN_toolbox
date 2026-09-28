@@ -10,6 +10,12 @@ from .dimensions import (
 from . import calculations
 
 
+from catan.core.changes import (
+    ChangeKind,
+    TRACKED_STATISTIC_STRUCTURE,
+)
+
+
 def make_session_stat_definition(
     name: str,
 ) -> StatisticDefinition:
@@ -24,6 +30,11 @@ def make_session_stat_definition(
             calculations.get_quality_metric,
             key=name,
         ),
+        dependencies=(
+            TRACKED_STATISTIC_STRUCTURE
+            | {ChangeKind.QUALITY_VALUES}
+        ),
+        availability_dependencies=frozenset({"quality"}),
     )
 
 
@@ -49,6 +60,10 @@ def make_match_stat_definition(
         coord_getter=make_match_coord_getter(
             dims,
             values.shape,
+        ),
+        dependencies=(
+            TRACKED_STATISTIC_STRUCTURE
+            | {ChangeKind.MATCH_VALUES}
         ),
     )
 

@@ -65,12 +65,12 @@ class MainWindow(QMainWindow):
         reload_action = QAction("Reload plotting logic", self)
         reload_action.setShortcut("Ctrl+R")
         reload_action.triggered.connect(self.reload_logic)
-        self.menuBar().addAction(reload_action)
+        # self.menuBar().addAction(reload_action)
 
-        print_debug = QAction("Print debug info", self)
-        print_debug.setShortcut("Ctrl+D")
-        print_debug.triggered.connect(self.print_debug_info)
-        self.menuBar().addAction(print_debug)
+        # print_debug = QAction("Print debug info", self)
+        # print_debug.setShortcut("Ctrl+D")
+        # print_debug.triggered.connect(self.print_debug_info)
+        # self.menuBar().addAction(print_debug)
 
         app = QApplication.instance()
         if app is None:
@@ -78,7 +78,7 @@ class MainWindow(QMainWindow):
         self.style_sheet = app.styleSheet()
 
         self.reset_stylesheet()
-        app.aboutToQuit.connect(self.debug_shutdown)
+        # app.aboutToQuit.connect(self.debug_shutdown)
 
     def _restore_settings(self):
 
@@ -93,11 +93,35 @@ class MainWindow(QMainWindow):
         self.settings.sync()
 
     def reload_logic(self):
-        self.state.data_version += 1
+        tasks = self.state.tasks
+
+        # Avoid reloading module globals while workers are using them.
+        if (
+            tasks.processing_busy()
+            or tasks.processing_requested
+            or any(task is not None for task in tasks.current.values())
+        ):
+            QMessageBox.information(
+                self,
+                "Reload plotting logic",
+                "Wait for running tasks to finish, or cancel them, "
+                "then press Ctrl+R again.",
+            )
+            return
+
+        # A standalone editor must be closed before its module is reloaded.
+        if QApplication.activeModalWidget() is not None:
+            return
+
+        display_area = self.gui_elements["display_area"]
+
+        # Preserve the current panel configuration and splitter positions.
+        display_area._collect_live_leaf_configs(display_area.tree)
+        display_area._collect_splitter_sizes(display_area.tree)
 
         importlib.reload(click_events)
 
-        self.gui_elements["display_area"].rebuild()
+        display_area.rebuild(reload_alignment=True)
         self.gui_elements["main_menu"].rebuild()
         self.reset_stylesheet()
 
@@ -119,31 +143,31 @@ class MainWindow(QMainWindow):
         click_events.print_debug(self.state, self.data)
 
     def closeEvent(self, event):
-        print("MainWindow closeEvent")
+        # print("MainWindow closeEvent")
         self._save_settings()
         for gui in self.gui_elements.values():
             if hasattr(gui, "_save_settings"):
                 gui._save_settings()
         # self.gui_elements._save_settings()
         super().closeEvent(event)
-        print("MainWindow closeEvent finished")
+        # print("MainWindow closeEvent finished")
 
         app = QApplication.instance()
-        print("quitOnLastWindowClosed:", app.quitOnLastWindowClosed())
+        # print("quitOnLastWindowClosed:", app.quitOnLastWindowClosed())
 
-        print("top-level widgets:")
-        for widget in app.topLevelWidgets():
-            print(
-                " ",
-                type(widget).__name__,
-                repr(widget.objectName()),
-                "visible=",
-                widget.isVisible(),
-                "window=",
-                widget.isWindow(),
-                "parent=",
-                type(widget.parent()).__name__ if widget.parent() is not None else None,
-            )
+        # print("top-level widgets:")
+        # for widget in app.topLevelWidgets():
+        #     print(
+        #         " ",
+        #         type(widget).__name__,
+        #         repr(widget.objectName()),
+        #         "visible=",
+        #         widget.isVisible(),
+        #         "window=",
+        #         widget.isWindow(),
+        #         "parent=",
+        #         type(widget.parent()).__name__ if widget.parent() is not None else None,
+        #     )
 
     ### ------------------------------------------###
     ###            UI initialization              ###
@@ -207,14 +231,12 @@ class MainWindow(QMainWindow):
         self._navigation_shortcuts.append(prev_shortcut)
 
     def on_previous_neuron_shortcut(self):
-        print("Previous neuron shortcut activated")
         if self._global_navigation_shortcut_blocked():
             return
 
         self.gui_elements["navigation_bar"].on_prev_footprint()
 
     def on_next_neuron_shortcut(self):
-        print("Next neuron shortcut activated")
         if self._global_navigation_shortcut_blocked():
             return
 

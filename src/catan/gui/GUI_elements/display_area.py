@@ -76,18 +76,30 @@ class DisplayArea(QWidget):
 
     # ---------- build / rebuild ----------
 
-    def rebuild(self):
+    def rebuild(self, *, reload_alignment=False):
         self._clear_layout()
         self.splitter_widgets.clear()
         self.section_widgets.clear()
 
         importlib.reload(BasePlot)
 
+        if reload_alignment:
+            from catan.core import image_correlation
+            from catan.gui.GUI_elements.fragments import (
+                alignment_shift_inset,
+                manual_alignment_dialog,
+            )
+
+            importlib.reload(image_correlation)
+            importlib.reload(alignment_shift_inset)
+            importlib.reload(manual_alignment_dialog)
+
         widget = self._build_node(self.tree)
         self.root_layout.addWidget(widget)
 
         self._update_section_buttons()
 
+        
     def _build_node(self, node):
         if node["type"] == "leaf":
             # print(f"Building leaf node {node['id']} with config {node.get('config')}")
@@ -123,12 +135,18 @@ class DisplayArea(QWidget):
         return splitter
 
     def _clear_layout(self):
+        # Disconnect signals and dispose canvases before reloading modules.
+        for section in tuple(self.section_widgets.values()):
+            controller = section.active_controller
+            if controller is not None:
+                controller.deactivate()
+                section.active_controller = None
+
         while self.root_layout.count():
             item = self.root_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                # w.setParent(None)
-                w.deleteLater()
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
     # ---------- split / close ----------
 

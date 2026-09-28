@@ -2,10 +2,17 @@ from typing import Dict, Optional, Tuple, List, Union
 from catan.tracking.structures.model import Model
 import numpy as np
 from pathlib import Path
+from functools import wraps
 
 from catan import Tracking
 from . import AppState, StatisticDisplayConfig
 from .request_handler import RequestHandler
+from catan.core.changes import (
+    Change,
+    ChangeKind as C,
+    DataChange,
+    ASSIGNMENT_CONTENT_CHANGES,
+)
 from catan.core.io import (
     inspect_file,
     evaluate_fields_compatibility,
@@ -22,6 +29,17 @@ from catan.gui.data.statistics.engine import StatisticEngine
 from catan.gui.data.statistics.registry import build_statistics_registry
 
 from catan.gui.background_tasks.runtime import current_task_context
+
+
+def after_display_tasks(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if self.state.tasks.defer_for_background(lambda: method(self, *args, **kwargs)):
+            return
+
+        return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 class Data(Tracking):
@@ -118,14 +136,59 @@ class Data(Tracking):
 
     #     return available
 
-    def notify_change(self, change):
+    def notify_change(
+        self,
+        *changes,
+        session_id=None,
+        session_paths=None,
+        neuron_ids=None,
+        fields=None,
+    ):
+        if session_id is not None:
+            if session_paths is not None:
+                raise ValueError("Use session_id or session_paths, not both.")
+
+            path = self.sessions[session_id].path
+            session_paths = None if path is None else {str(path)}
+
+        entries = []
+
+        for change in changes:
+            if isinstance(change, Change):
+                # Explicit entries retain their individual scopes.
+                entries.append(change)
+
+            elif isinstance(change, C):
+                entries.append(
+                    Change(
+                        change,
+                        session_paths=session_paths,
+                        neuron_ids=neuron_ids,
+                        fields=fields,
+                    )
+                )
+
+            else:
+                raise TypeError("notify_change expects ChangeKind or Change entries.")
+
+        event = DataChange(tuple(entries))
+
+        # Preserve the existing guards for asynchronous processing.
         self.state.data_version += 1
-        self.state.data_changed.emit(change)
+        self.state.data_changed.emit(event)
 
     def mark_geometry_changed(self, session_id: int):
         affected_paths = super().mark_geometry_changed(session_id)
 
-        self.notify_change(("session", -1))
+        path = self.sessions[session_id].path
+
+        self.notify_change(
+            Change(
+                C.FOOTPRINT_GEOMETRY,
+                session_paths=None if path is None else {str(path)},
+            ),
+            Change(C.PROCESSING_STATUS),
+        )
 
         return affected_paths
 
@@ -196,10 +259,12 @@ class Data(Tracking):
             ctx=current_task_context(),
         )
 
-        self.notify_change(("session", session_id))
-
-        if "traces" in fields_to_load:
-            self.notify_change(("traces", session_id))
+        self.notify_change(
+            C.DATA_AVAILABILITY,
+            C.PROCESSING_STATUS,
+            session_id=session_id,
+            fields=set(fields_to_load),
+        )
 
     def toggle_session_data(
         self,
@@ -225,10 +290,12 @@ class Data(Tracking):
 
             if not to_present:
                 session.clean_data(which)
-                self.notify_change(("session", session_id))
-
-                if which == "traces":
-                    self.notify_change(("traces", session_id))
+                self.notify_change(
+                    C.DATA_AVAILABILITY,
+                    C.PROCESSING_STATUS,
+                    session_id=session_id,
+                    fields={which},
+                )
 
                 return
 
@@ -340,9 +407,6 @@ class Data(Tracking):
         register_model = "register_model" in actions
         track_neurons = "track_neurons" in actions
 
-        if not (register_model or track_neurons):
-            return
-
         if not session.status["spatial_loaded"]:
             return
 
@@ -351,7 +415,10 @@ class Data(Tracking):
         # --------------------------------------------------
         if not session.status["aligned"]:
 
-            self.notify_change(("session", session_id))
+            self.notify_change(
+                C.PROCESSING_STATUS,
+                session_id=session_id,
+            )
 
             if on_alignment_error is not None:
                 on_alignment_error(
@@ -361,6 +428,9 @@ class Data(Tracking):
 
             # Important:
             # only skip dependent processing for THIS session.
+            return
+
+        if not (register_model or track_neurons):
             return
 
         # --------------------------------------------------
@@ -380,18 +450,18 @@ class Data(Tracking):
         if track_neurons:
             self.queue_assign_neurons(session_id)
 
+    @after_display_tasks
     def queue_process_alignments(self, *, session_ids, finished=None):
         """Repair required alignments and stale predecessors in session order."""
         tasks = self.state.tasks
 
-        if any(
-            tasks.current_task(group) is not None or tasks.queued_tasks(group)
-            for group in tasks.GROUPS
-        ):
+        if tasks.processing_busy():
+            details = tasks.describe_work()
+            self.state.logger.warning("Alignment processing blocked:\n%s", details)
             self.state.issue(
                 "warning",
                 "Alignment update not started",
-                "Finish or cancel existing tasks first.",
+                "Finish or cancel existing tasks first.\n\n" + details,
             )
             return
 
@@ -440,16 +510,26 @@ class Data(Tracking):
             session = self.sessions[session_id]
             template = session.background_template.copy()
 
-            remap = self.propose_session_remapping(
-                session_id,
-                background_template=template,
-            )
+            if session.remap is not None and session.remap.method == "manual":
+                # Manual transforms are specified in the common/global frame.
+                # Refresh dependent geometry without replacing the chosen transform.
+                remap = session.remap
+            else:
+                remap = self.propose_session_remapping(
+                    session_id,
+                    background_template=template,
+                )
 
             if not remap.report.success:
-                raise ValueError(
-                    f"Alignment failed for session {session_id}: "
-                    f"{remap.report.reason}. Dependent processing stopped."
-                )
+                return {
+                    "alignment_failure": (
+                        session,
+                        f"Automatic alignment failed for {session.name!r}.\n"
+                        f"Reason: {remap.report.reason or 'unknown'}.\n"
+                        "Dependent processing stopped.",
+                        remap,
+                    )
+                }
 
             return build_realignment_update(
                 self,
@@ -460,6 +540,14 @@ class Data(Tracking):
             )
 
         def publish(result):
+            if "alignment_failure" in result:
+                session, message, proposal = result["alignment_failure"]
+                if self.state.data_version == expected_version and any(
+                    item is session for item in self.sessions
+                ):
+                    self.state.alignment_failed.emit(session, message, proposal)
+                return
+
             if self._publish_realignment_update(result, expected_version):
                 # Recheck dependencies after publishing each alignment.
                 self.queue_process_alignments(
@@ -474,6 +562,7 @@ class Data(Tracking):
             on_result=publish,
         )
 
+    @after_display_tasks
     def queue_process_model(
         self,
         *,
@@ -487,10 +576,7 @@ class Data(Tracking):
 
         # This explicit processing run owns count updates and its final fit.
         # Avoid overlapping an existing loading/count/registration operation.
-        if any(
-            tasks.current_task(group) is not None or tasks.queued_tasks(group)
-            for group in tasks.GROUPS
-        ):
+        if tasks.processing_busy():
             self.state.issue(
                 "warning",
                 "Model update not started",
@@ -547,7 +633,9 @@ class Data(Tracking):
                 )
             finally:
                 # Also expose any completed records if a later step fails.
-                self.notify_change(("model", -1))
+                self.notify_change(
+                    C.MODEL_COUNTS, C.MODEL_PARAMETERS, C.PROCESSING_STATUS
+                )
 
         return tasks.start(
             "model update",
@@ -595,7 +683,12 @@ class Data(Tracking):
             from_session_index=session_id,
             align_to_reference=True,
         )
-        self.notify_change(("model", session_id))
+        self.notify_change(
+            C.MODEL_COUNTS,
+            C.INCLUSION,
+            C.PROCESSING_STATUS,
+            session_id=session_id,
+        )
 
     def fit_after_loading(self, key: str = "model update"):
         # Called by the model-count completion callback.
@@ -644,7 +737,10 @@ class Data(Tracking):
 
         counts = super().fit_model(**kwargs)
 
-        self.notify_change(("model", -1))  # Notify that model has changed
+        self.notify_change(
+            C.MODEL_PARAMETERS,
+            C.PROCESSING_STATUS,
+        )
         return counts
 
     def propose_session_remapping(self, session_id: int, *, background_template=None):
@@ -690,6 +786,7 @@ class Data(Tracking):
 
         return (candidate_template, candidate_remap)
 
+    @after_display_tasks
     def queue_commit_session_realignment(
         self,
         session_id,
@@ -708,9 +805,7 @@ class Data(Tracking):
             return
 
         tasks = self.state.tasks
-        if any(tasks.current.values()) or any(
-            tasks.queued_tasks(group) for group in tasks.current
-        ):
+        if tasks.processing_busy():
             self.state.issue(
                 "warning",
                 "Realignment not started",
@@ -719,7 +814,17 @@ class Data(Tracking):
             return
 
         def publish(result):
-            self._publish_realignment_update(result, expected_version)
+            if not self._publish_realignment_update(result, expected_version):
+                return
+
+            draft = self.state.alignment_draft
+            if (
+                draft is not None
+                and draft.session_id == session_id
+                and draft.expected_version == expected_version
+            ):
+                self.state.alignment_draft = None
+                self.state.alignment_draft_changed.emit()
 
         tasks.start(
             "loading",
@@ -750,6 +855,9 @@ class Data(Tracking):
         for sid, values in result["updates"].items():
             self.sessions[sid].__dict__.update(values)
 
+        for sid, records in result["comparison_updates"].items():
+            self.sessions[sid].remap.remap_data = records
+
         Tracking.mark_geometry_changed(self, result["session_id"])
 
         extra_ids = set(result["updates"]) - {result["session_id"]}
@@ -774,8 +882,24 @@ class Data(Tracking):
         for name in self._assignments:
             self._stale_assignments.setdefault(name, set()).update(assignment_paths)
 
-        self.notify_change(("session", -1))
-        self.notify_change(("assignments", -1))
+        changed_paths = {
+            str(self.sessions[sid].path)
+            for sid in result["updates"]
+            if self.sessions[sid].path is not None
+        }
+
+        self.notify_change(
+            Change(
+                C.FOOTPRINT_GEOMETRY,
+                session_paths=changed_paths or None,
+            ),
+            Change(
+                C.BACKGROUND_IMAGE,
+                session_paths=changed_paths or None,
+            ),
+            Change(C.PROCESSING_STATUS),
+        )
+        self.state.alignment_review_finished.emit(self.sessions[result["session_id"]])
         return True
 
     def register_session(self, from_file: str | Path, **kwargs) -> list[int]:
@@ -822,25 +946,51 @@ class Data(Tracking):
             if self.state.current_session_id is None:
                 self.state.current_session_id = session_id
 
-            self.notify_change(("session_added", session_id))
+            self.notify_change(C.SESSION_ADDED, session_id=session_id)
 
         return registered_ids
 
     def remove_session(self, session_id: int):
 
+        removed_session = self.sessions[session_id]
+        previous_current = self.current_session
+
+        removed_path = self.sessions[session_id].path
         super().move_session(session_id, -1)
-        self.state.assignments = self.assignments.ids
+        self.state.assignments = (
+            None if self.assignments is None else self.assignments.ids
+        )
 
-        self.adjust_selected_components_after_data_change(session_id, -1)
+        if self.state.assignments is None:
+            self.state.update_selected_components(None)
+        else:
+            self.adjust_selected_components_after_data_change(session_id, -1)
 
-        if self.current_session is not None:
-            self.state.current_session_id = (
-                self.current_session.id if len(self.sessions) > 0 else None
+        if previous_current is not None:
+            current_id = next(
+                (
+                    index
+                    for index, item in enumerate(self.sessions)
+                    if item is previous_current
+                ),
+                None,
             )
+            if current_id is None and self.sessions:
+                current_id = min(session_id, len(self.sessions) - 1)
+
+            self.state.current_session_id = current_id
 
         self.notify_change(
-            ("session_removed", session_id)
-        )  # Notify that sessions have changed
+            C.SESSION_REMOVED,
+            session_paths=(None if removed_path is None else {str(removed_path)}),
+        )
+
+        draft = self.state.alignment_draft
+        if draft is not None and draft.session is removed_session:
+            self.state.alignment_draft = None
+            self.state.alignment_draft_changed.emit()
+
+        self.state.alignment_review_finished.emit(removed_session)
 
     def move_session(self, session_id: int, new_session_id: int):
         """
@@ -870,15 +1020,19 @@ class Data(Tracking):
         if self.current_session is not None:
             self.state.current_session_id = self.current_session.id
 
-        self.notify_change(("session_moved", -1))  # Notify that sessions have changed
+        self.notify_change(C.SESSION_ORDER)  # Notify that sessions have changed
 
     def add_model(self, name: str, model: Optional[str | Model] = None):
         super().add_model(name, model)
-        self.notify_change(("model", -1))  # Notify that model has changed
+        self.notify_change(
+            C.MODEL_COUNTS, C.MODEL_PARAMETERS, C.PROCESSING_STATUS
+        )  # Notify that model has changed
 
     def change_model(self, name: str):
         super().change_model(name)
-        self.notify_change(("model", -1))  # Notify that model has changed
+        self.notify_change(
+            C.MODEL_COUNTS, C.MODEL_PARAMETERS, C.PROCESSING_STATUS
+        )  # Notify that model has changed
 
     def register_assignments(self, path: str, name: str):
 
@@ -906,7 +1060,11 @@ class Data(Tracking):
 
         self.state.assignments = self.assignments.ids
 
-        self.notify_change(("assignments", -1))
+        self.notify_change(
+            C.ASSIGNMENT_SET,
+            C.FOOTPRINT_GEOMETRY,
+            *ASSIGNMENT_CONTENT_CHANGES,
+        )
 
     def add_assignments(
         self, name: str, assignments: Optional[str | Assignments] = None
@@ -935,13 +1093,18 @@ class Data(Tracking):
                 "No assignments file was added. Please provide valid assignments."
             )
         self.state.assignments = self.assignments.ids
-        self.notify_change(("assignments", -1))  # Notify that assignments have changed
+        self.notify_change(
+            *ASSIGNMENT_CONTENT_CHANGES
+        )  # Notify that assignments have changed
 
     def change_assignments(self, name: str):
         super().change_assignments(name)
         self.state.assignments = self.assignments.ids
-        self.notify_change(("assignments", -1))  # Notify that assignments have changed
+        self.notify_change(
+            *ASSIGNMENT_CONTENT_CHANGES
+        )  # Notify that assignments have changed
 
+    @after_display_tasks
     def queue_process_assignments(
         self,
         *,
@@ -952,10 +1115,7 @@ class Data(Tracking):
     ):
         tasks = self.state.tasks
 
-        if any(
-            tasks.current_task(group) is not None or tasks.queued_tasks(group)
-            for group in tasks.GROUPS
-        ):
+        if tasks.processing_busy():
             self.state.issue(
                 "warning",
                 "Assignment update not started",
@@ -1064,7 +1224,7 @@ class Data(Tracking):
                 result["neuron_id_map"],
                 from_session_id=completed_plan["from_session_id"],
             )
-            self.notify_change(("assignments", -1))
+            self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
         return tasks.start(
             "calculating",
@@ -1133,7 +1293,9 @@ class Data(Tracking):
             p_thr=p_thr,
         )
         self.state.assignments = self.assignments.ids
-        self.notify_change(("assignments", -1))  # Notify that neurons have changed
+        self.notify_change(
+            *ASSIGNMENT_CONTENT_CHANGES
+        )  # Notify that neurons have changed
 
     def is_included(self, component: NeuronComponent | int) -> bool:
 
@@ -1239,7 +1401,7 @@ class Data(Tracking):
 
         self.state.assignments = self.assignments.ids
         if notify:
-            self.notify_change(("assignments", -1))
+            self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
         return NeuronComponent(neuron_id=retired_neuron_id, session_id=session_id)
 
@@ -1257,7 +1419,10 @@ class Data(Tracking):
                 continue
             self.sessions[session_id].included[fp_id] = False
 
-        self.notify_change(("assignments", -1))
+        self.notify_change(
+            C.INCLUSION,
+            neuron_ids={neuron_id},
+        )
         return NeuronComponent(neuron_id=neuron_id, session_id=None)
 
     def reinclude_component(self, component: NeuronComponent | int) -> None:
@@ -1287,7 +1452,10 @@ class Data(Tracking):
         # tracked-neuron identity.
         self.assignments.union.included[neuron_id] = True
 
-        self.notify_change(("assignments", -1))
+        self.notify_change(
+            C.INCLUSION,
+            neuron_ids={neuron_id},
+        )
 
     def reinclude_neuron(self, neuron_id: int) -> None:
 
@@ -1331,7 +1499,7 @@ class Data(Tracking):
         if notify:
             self.rebuild_union_neurons([neuron_id])
             self.assignments.updating_neuron_presence()
-            self.notify_change(("assignments", -1))
+            self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
     def remove_neuron(self, neuron_id: int) -> None:
 
@@ -1346,7 +1514,7 @@ class Data(Tracking):
         self.assignments.updating_neuron_presence()
         self.state.assignments = self.assignments.ids
         self.rebuild_union_neurons([neuron_id])
-        self.notify_change(("assignments", -1))
+        self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
     def add_synthetic_component(
         self,
@@ -1414,14 +1582,17 @@ class Data(Tracking):
         self.state.assignments = self.assignments.ids
 
         if notify:
-            self.notify_change(("assignments", -1))
+            self.notify_change(
+                C.FOOTPRINT_GEOMETRY,
+                *ASSIGNMENT_CONTENT_CHANGES,
+            )
 
         return target_neuron
 
     def change_review_status(self, neuron_id: int, status: ReviewStatus):
 
         self.assignments.review_status[neuron_id] = status
-        self.notify_change(("review_status", -1))
+        self.notify_change(C.REVIEW_STATUS)
 
     def unassign_neurons(self, session_id: int, **kwargs):
 
@@ -1431,7 +1602,7 @@ class Data(Tracking):
             self.state.current_session_id = None
 
         self.adjust_selected_components_after_data_change(session_id, -1)
-        self.notify_change(("assignments", -1))
+        self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
     def adjust_selected_components_after_data_change(
         self, session_id: int, new_session_id: int
@@ -1567,7 +1738,10 @@ class Data(Tracking):
             affected_neurons=target_neurons,
         )
 
-        self.notify_change(("assignments", -1))
+        self.notify_change(
+            C.FOOTPRINT_GEOMETRY,
+            *ASSIGNMENT_CONTENT_CHANGES,
+        )
 
     def restore_manipulations(self) -> None:
         """
@@ -1693,4 +1867,4 @@ class Data(Tracking):
         neuron_ids = neuron_ids[valid]
 
         self.assignments.review_status[neuron_ids] = int(status)
-        self.notify_change(("review_status", -1))
+        self.notify_change(C.REVIEW_STATUS)

@@ -119,85 +119,14 @@ def _shift_sparse_bilinear(
     return out
 
 
-# def _shift_sparse_bilinear(A, dy, dx) -> sparse.csc_matrix:  # , output_format="csr"):
-#     """
-#     Apply subpixel shift to sparse matrix using bilinear splatting.
-#     Way faster than using cv2.remap on a dense matrix, and keeps the matrix sparse.
-
-#     Works best when A has clustered support (like neuron footprints).
-
-#     Parameters
-#     ----------
-#     A : sparse matrix
-#         Input footprint
-#     dy, dx : float
-#         Shift in pixels
-
-#     Returns
-#     -------
-#     shifted sparse matrix (COO)
-#     """
-#     A = A.tocoo()
-
-#     print(f"Shifting sparse matrix by dy={dy}, dx={dx}")
-#     r = A.row.astype(float) - dx
-#     c = A.col.astype(float) - dy
-#     v = A.data
-
-#     r0 = np.floor(r).astype(int)
-#     c0 = np.floor(c).astype(int)
-
-#     fr = r - r0
-#     fc = c - c0
-
-#     # Bilinear weights
-#     w00 = (1 - fr) * (1 - fc)
-#     w01 = (1 - fr) * fc
-#     w10 = fr * (1 - fc)
-#     w11 = fr * fc
-
-#     rows = np.concatenate([r0, r0, r0 + 1, r0 + 1])
-#     cols = np.concatenate([c0, c0 + 1, c0, c0 + 1])
-#     data = np.concatenate([v * w00, v * w01, v * w10, v * w11])
-
-#     # Remove out-of-bounds entries
-#     m = (
-#         (rows >= 0)
-#         & (rows < A.shape[0])
-#         & (cols >= 0)
-#         & (cols < A.shape[1])
-#         & (data != 0)
-#     )
-
-#     rows = rows[m]
-#     cols = cols[m]
-#     data = data[m]
-
-#     out = sparse.csc_matrix((data, (rows, cols)), shape=A.shape)
-#     out.sum_duplicates()
-#     return out
-
-#     # if output_format == "coo":
-#     #     return out
-#     # elif output_format == "csr":
-#     #     return out.tocsr()
-#     # elif output_format == "csc":
-#     # return out.tocsc()
-#     # elif output_format == "lil":
-#     #     return out.tolil()
-#     # elif output_format == "dok":
-#     #     return out.todok()
-#     # else:
-#     #     raise ValueError(f"Unsupported output_format: {output_format}")
-
-
-# def get_shift_and_flow(
 def get_session_remap(
     A1: np.ndarray,
     A2: np.ndarray,
     dims: Tuple[int, int] = (512, 512),
     projection: Optional[int] = -1,
     use_optical_flow: bool = False,
+    correlation_mode: str = "correlation",
+    correlation_kwargs: Optional[dict] = None,
 ):
     ## dims:          shape of the (projected) image
     ## projection:    axis, along which to project. If None, no projection needed
@@ -216,10 +145,20 @@ def get_session_remap(
 
     A1 = normalize_array(A1, "uint", 8)
     A2 = normalize_array(A2, "uint", 8)
-    c, c_zscored, shift = calculate_img_correlation(A1, A2, mode="correlation")
+    c, c_zscored, shift = calculate_img_correlation(
+        A1,
+        A2,
+        dims=dims,
+        mode=correlation_mode,
+        **(correlation_kwargs or {}),
+    )
+
+    if not np.isfinite(shift).all():
+        return shift, None, c, c_zscored
 
     if not use_optical_flow:
         return shift, None, c, c_zscored
+    
     y_remap, x_remap = _build_remap(dims, shift)
 
     A2 = cv2.remap(A2, x_remap, y_remap, interpolation=cv2.INTER_CUBIC)

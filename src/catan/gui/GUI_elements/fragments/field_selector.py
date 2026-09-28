@@ -287,18 +287,20 @@ class FieldSelector(QWidget):
                 group_spec,
                 self.field_options[group_name],
                 self.source.source_config.groups[group_name].enabled,
-                lambda checked, group_name=group_name: self.source.source_config.set_group_enabled(
+                lambda checked, group_name=group_name: self._set_group_enabled(
                     group_name, checked
                 ),
             )
             self.opts_layout.addWidget(opts_widget)
 
-        self.fields_changed.emit()
+        # Refresh compatibility indicators without announcing a configuration edit.
+        self._on_fields_changed()
 
     def clear(self):
         while (child := self.opts_layout.takeAt(0)) is not None:
             if child.widget() is not None:
                 child.widget().deleteLater()
+        self.field_options.clear()
 
     def _on_fields_changed(self):
 
@@ -330,6 +332,19 @@ class FieldSelector(QWidget):
 
         # also, finally color current session properly!!
         self.source.status["loading_possible"] = loading_possible
+    
+    def _set_group_enabled(self, group_name: str, enabled: bool):
+        if self.source is None or self.source.source_config is None:
+            return
+
+        config = self.source.source_config
+        enabled = bool(enabled)
+
+        if config.groups[group_name].enabled == enabled:
+            return
+
+        config.set_group_enabled(group_name, enabled)
+        self.fields_changed.emit()
 
     def manipulate_fields(
         self, group_name: str, field_name: str, method="edit", **kwargs
@@ -357,7 +372,7 @@ class FieldSelector(QWidget):
                 "Enter new title:",
                 text=field_name,
             )
-            if not ok or not new_name:
+            if not ok or not new_name or new_name == field_name:
                 return
             try:
                 self.source.source_config.rename_field(
@@ -386,23 +401,44 @@ class FieldSelector(QWidget):
                 field_name = new_name
 
         if method == "edit_path":
-
+            spec = self.source.source_config.groups[group_name].fields[field_name]
             field_path = kwargs.get("field_path")
 
             if field_path is not None:
+                if field_path == spec.path:
+                    return
 
                 self.source.source_config.update_field(
-                    group_name, field_name, path=field_path
+                    group_name,
+                    field_name,
+                    path=field_path,
                 )
 
             else:
-
-                spec = self.source.source_config.groups[group_name].fields[field_name]
                 selection = FieldSelectDialog.get_field(
-                    path=self.source.path, key=field_name, parent=self, spec=spec
+                    path=self.source.path,
+                    key=field_name,
+                    parent=self,
+                    spec=spec,
                 )
 
                 if selection is None:
+                    return
+
+                previous = (
+                    spec.path,
+                    spec.source,
+                    spec.attribute,
+                    spec.source_path,
+                )
+                selected = (
+                    selection.path,
+                    selection.source,
+                    selection.attribute,
+                    selection.source_path,
+                )
+
+                if selected == previous:
                     return
 
                 field_path = selection.path

@@ -23,6 +23,12 @@ from PySide6.QtGui import (
 )
 
 import importlib
+
+from catan.core.changes import (
+    ChangeKind as C,
+    DataChange,
+    SESSION_STRUCTURE_CHANGES,
+)
 from catan.gui.panels import StatisticsData
 from catan.gui.panels.helper import HistogramMesh, series_with_confidence, ControlPanel
 
@@ -1777,9 +1783,10 @@ class Controller(BasePlot.CanvasController):
         self.displayed_results = {}
         self.current_plot_data = None
 
-        self.state.tasks.task_progress.connect(self._on_task_progress)
-        self.state.tasks.task_cancelled.connect(self._on_statistics_task_stopped)
-        self.state.tasks.task_failed.connect(self._on_statistics_task_stopped)
+        self.connect_signal(self.state.tasks.task_progress,self._on_task_progress)
+        self.connect_signal(self.state.tasks.task_cancelled,self._on_statistics_task_stopped)
+        self.connect_signal(self.state.tasks.task_failed,self._on_statistics_task_stopped)
+
 
     def build_controls(self):
         super().build_controls()
@@ -1834,17 +1841,28 @@ class Controller(BasePlot.CanvasController):
         self.section.y_options_layout.addStretch()
 
         self.controls["bin_selector"].valueChanged.connect(self._on_plot_params_changed)
-        self.canvas.signals.marker_hovered.connect(self._on_marker_hovered)
-        self.canvas.signals.marker_clicked.connect(self._on_visual_clicked)
-        self.canvas.signals.bin_clicked.connect(self._on_visual_clicked)
+        self.connect_signal(self.canvas.signals.marker_hovered, self._on_marker_hovered,controls=True)
+        self.connect_signal(self.canvas.signals.marker_clicked, self._on_visual_clicked,controls=True)
+        self.connect_signal(self.canvas.signals.bin_clicked, self._on_visual_clicked,controls=True)
 
-        self.data.statistic_engine.values_changed.connect(self.recalculate_statistics)
-
+        self.connect_signal(self.data.statistic_engine.values_changed, self._on_statistics_values_changed, controls=True)
+        
         self.canvas._on_threshold_changed = self._on_threshold_changed
 
-    def _on_data_changed(self, input: Tuple[str, int]):
+    def _on_data_changed(self, event: DataChange):
+        if event.has(
+            *SESSION_STRUCTURE_CHANGES,
+            C.ASSIGNMENT_SET,
+            C.ASSIGNMENT_MAPPING,
+            C.INCLUSION,
+            C.REVIEW_STATUS,
+        ):
+            self._sync_review_selector_to_selection()
 
-        self._sync_review_selector_to_selection()
+    def _on_statistics_values_changed(self, statistic_keys):
+        for slot, query in tuple(self.current_query.items()):
+            if query is not None and query.statistic_key in statistic_keys:
+                self._recalculate_statistic(slot)
 
     def _on_plot_params_changed(self):
         self.rebuild_plot()
@@ -1972,14 +1990,16 @@ class Controller(BasePlot.CanvasController):
             not force
             and existing is not None
             and existing.query == query
-            and existing.data_version == self.state.data_version
+            and existing.statistic_revision == self.data.statistic_engine.query_revision(query)
         ):
             self.rebuild_plot()
             return
 
         # Important: snapshot the query.
         requested_query = query
-        requested_data_version = self.state.data_version
+        requested_revision = self.data.statistic_engine.query_revision(
+            requested_query
+        )
 
         def evaluate():
 
@@ -1989,7 +2009,7 @@ class Controller(BasePlot.CanvasController):
                 return StatisticsTaskResult(
                     slot=which,
                     query=requested_query,
-                    data_version=requested_data_version,
+                    statistic_revision=requested_revision,
                     table=table,
                 )
 
@@ -2001,7 +2021,7 @@ class Controller(BasePlot.CanvasController):
                 return StatisticsTaskResult(
                     slot=which,
                     query=requested_query,
-                    data_version=requested_data_version,
+                    statistic_revision=requested_revision,
                     error=(f"{type(exc).__name__}: {exc}"),
                     traceback=traceback.format_exc(),
                 )
@@ -2011,6 +2031,7 @@ class Controller(BasePlot.CanvasController):
             f"Calculate {which}: {requested_query.statistic_key}",
             evaluate,
             on_result=self._on_statistic_ready,
+            background=True,
         )
 
         self.statistic_tasks[which] = task_id
@@ -2052,7 +2073,9 @@ class Controller(BasePlot.CanvasController):
         self,
         result: StatisticsTaskResult,
     ):
-
+        if self._deactivated:
+            return
+        
         which = result.slot
 
         # A newer query has replaced this one.
@@ -2060,7 +2083,10 @@ class Controller(BasePlot.CanvasController):
             return
 
         # Data changed while this calculation was running.
-        if result.data_version != self.state.data_version:
+        if (
+            result.statistic_revision
+            != self.data.statistic_engine.query_revision(result.query)
+        ):
             return
 
         self.statistic_tasks[which] = None
@@ -2081,7 +2107,7 @@ class Controller(BasePlot.CanvasController):
         return (
             result is not None
             and result.query == query
-            and result.data_version == self.state.data_version
+            and result.statistic_revision == self.data.statistic_engine.query_revision(query)
         )
 
     def _required_statistic_slots(self):
@@ -2714,6 +2740,19 @@ class Controller(BasePlot.CanvasController):
 
         if isinstance(self.current_plot_data, plotdata_scatter.PlotData):
             super().update_styles()
+
+    def _cancel_background_tasks(self):
+        task_ids = tuple(
+            task_id
+            for task_id in self.statistic_tasks.values()
+            if task_id is not None
+        )
+
+        for slot in self.statistic_tasks:
+            self.statistic_tasks[slot] = None
+
+        for task_id in task_ids:
+            self.state.tasks.cancel(task_id)
 
 
 class StatisticsControlPanel(ControlPanel.ControlPanel):

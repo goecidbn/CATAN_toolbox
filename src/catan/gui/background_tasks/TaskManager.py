@@ -19,6 +19,7 @@ class QueuedTask:
     finished: Callable | None = None
     on_result: Callable | None = None
     ready: Callable[[], bool] | None = None
+    background: bool = False
 
 
 class TaskManager(QObject):
@@ -65,6 +66,10 @@ class TaskManager(QObject):
         self._queue_timer.setInterval(1000)
         self._queue_timer.timeout.connect(self.process_queues)
 
+        self._pending_processing = None
+        self._finishing_depth = 0
+        self._processing_queues = False
+
     # ------------------------------------------------------------------
     # Timer
     # ------------------------------------------------------------------
@@ -76,6 +81,45 @@ class TaskManager(QObject):
     def stop_queue_timer(self) -> None:
         self._queue_timer.stop()
 
+    # ------------------------------------------------------------------
+    # Status inquiries
+    # ------------------------------------------------------------------
+    
+    @property
+    def processing_requested(self):
+        return self._pending_processing is not None
+
+    def processing_busy(self):
+        """Registered processing work; excludes display-only calculations."""
+        return any(
+            not task.background
+            for task in self.tasks.values()
+        )
+
+    def _background_running(self):
+        return any(
+            task is not None and task.background
+            for task in self.current.values()
+        )
+
+    def defer_for_background(self, callback):
+        # Keep the first explicit request while a display worker stops.
+        if self._pending_processing is not None:
+            return True
+
+        # Existing processing conflicts are handled by the caller.
+        if self.processing_busy() or not self._background_running():
+            return False
+
+        self._pending_processing = callback
+
+        # Cancellation remains cooperative: do not clear current here.
+        for task in list(self.current.values()):
+            if task is not None and task.background:
+                self.cancel(task.id)
+
+        return True
+    
     # ------------------------------------------------------------------
     # Task creation
     # ------------------------------------------------------------------
@@ -93,6 +137,7 @@ class TaskManager(QObject):
         on_result=None,
         ready=None,
         unique=False,
+        background=False,
         **kwargs,
     ) -> str:
 
@@ -102,7 +147,7 @@ class TaskManager(QObject):
             )
 
         if unique:
-            for task in self.queues[group]:
+            for task in list(self.queued_tasks(group)):
                 if task.name == name:
                     self.cancel(task.id)
 
@@ -120,6 +165,7 @@ class TaskManager(QObject):
             finished=finished,
             on_result=on_result,
             ready=ready,
+            background=background,
         )
 
         self.tasks[task.id] = task
@@ -140,9 +186,25 @@ class TaskManager(QObject):
     # Queue processing
     # ------------------------------------------------------------------
 
-    def process_queues(self) -> None:
-        for group in self.GROUPS:
-            self._start_next(group)
+    def process_queues(self):
+        if self._finishing_depth or self._processing_queues:
+            return
+
+        self._processing_queues = True
+        try:
+            if (
+                self._pending_processing is not None
+                and not self.processing_busy()
+                and not self._background_running()
+            ):
+                callback = self._pending_processing
+                self._pending_processing = None
+                callback()
+
+            for group in self.GROUPS:
+                self._start_next(group)
+        finally:
+            self._processing_queues = False
 
     def _task_is_ready(
         self,
@@ -178,6 +240,10 @@ class TaskManager(QObject):
         if self.current[group] is not None:
             return
 
+        # A display worker reads live data. Let it stop before processing.
+        if self._background_running():
+            return
+
         queue = self.queues[group]
 
         runnable_index = None
@@ -187,6 +253,13 @@ class TaskManager(QObject):
             # Cancelled/removed tasks may still physically exist
             # in the deque.
             if task.id not in self.tasks:
+                continue
+
+            if task.background and (
+                self._finishing_depth
+                or self._pending_processing is not None
+                or self.processing_busy()
+            ):
                 continue
 
             if self._task_is_ready(task):
@@ -281,6 +354,8 @@ class TaskManager(QObject):
         group = task.group
         worker = task.worker
 
+        self._finishing_depth += 1
+        
         # Remove from active task lookup.
         self.tasks.pop(
             task.id,
@@ -323,9 +398,10 @@ class TaskManager(QObject):
         finally:
             self.queue_changed.emit(group)
 
-            # Release the queue and immediately look for another
-            # runnable task.
-            self._start_next(group)
+            # Publishing results and scheduling their continuation are
+            # complete. Display calculations may now be reconsidered.
+            self._finishing_depth -= 1
+            self.process_queues()
             self.scheduling_settled.emit()
 
     # ------------------------------------------------------------------
@@ -483,3 +559,20 @@ class TaskManager(QObject):
             ),
             "queued_count": len(queued),
         }
+
+    def describe_work(self):
+        lines = []
+
+        for group in self.GROUPS:
+            current = self.current_task(group)
+            if current is not None:
+                lines.append(
+                    f"{group}: current {current.id} — {current.name}"
+                )
+
+            for task in self.queued_tasks(group):
+                lines.append(
+                    f"{group}: queued {task.id} — {task.name}"
+                )
+
+        return "\n".join(lines) or "No current or queued tasks found."

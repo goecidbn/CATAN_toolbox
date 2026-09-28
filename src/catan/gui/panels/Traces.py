@@ -22,6 +22,11 @@ from PySide6.QtWidgets import (
     QButtonGroup,
 )
 
+from catan.core.changes import (
+    ChangeKind as C,
+    DataChange,
+    SESSION_STRUCTURE_CHANGES,
+)
 from catan.core.structures import NeuronComponent
 from catan.gui.panels import BasePlot
 
@@ -409,15 +414,32 @@ class Controller(BasePlot.CanvasController):
         self.controls["panel"].display_parameter_changed.connect(
             lambda: self.update_neuron_selection()
         )
-        self.state.adjacency_radius_changed.connect(self.replot_neurons)
+        self.connect_signal(self.state.adjacency_radius_changed, self.replot_neurons,controls=True)
         self.initialize_display()
 
         self.controls["panel"].displayed_traces_changed.connect(self.replot_neurons)
 
-    def _on_data_changed(self, input: Tuple[str, int]):
-        if input[0] == "traces":
-            self.build_controls()
-        self.replot_neurons()
+    def _on_data_changed(self, event: DataChange):
+        traces_changed = (
+            event.has(C.TRACE_VALUES)
+            or event.has_availability("traces")
+        )
+
+        if traces_changed or event.has(*SESSION_STRUCTURE_CHANGES):
+            self.controls["panel"].build_trace_checkboxes()
+
+        if traces_changed or event.has(
+            *SESSION_STRUCTURE_CHANGES,
+            C.ASSIGNMENT_SET,
+            C.ASSIGNMENT_MAPPING,
+            C.FOOTPRINT_GEOMETRY,
+            C.UNION_GEOMETRY,
+            C.INCLUSION,
+            C.SESSION_ACTIVITY,
+            C.SESSION_TIMEBASE,
+            C.SESSION_METADATA,
+        ) or event.has_availability("spatial"):
+            self.replot_neurons()
 
     def _on_selection_changed(self):
         super()._on_selection_changed()

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QSizePolicy, QToolTip
 from PySide6.QtGui import QCursor
 
 import importlib
+from catan.core.changes import DataChange
 from catan.gui.panels import StatisticsData, styles
 from catan.gui.structures.state import NeuronComponent, AppState
 from catan.gui.structures.data import Data
@@ -359,9 +360,10 @@ class BaseCanvas(scene.SceneCanvas):
         # - the statistics registry was rebuilt
         signature = (
             entity_mode,
-            tuple(raw_queries),
-            engine.data_version(),
-            id(engine.registry),
+            tuple(
+                (query, engine.query_revision(query))
+                for query in raw_queries
+            ),
         )
 
         if signature == self._tooltip_statistic_signature:
@@ -483,19 +485,43 @@ class BaseDisplayController(QObject):
 
         self.plot_type = None
 
-        self.state.hovered_components_changed.connect(self._on_hover_changed)
-        self.state.selected_components_changed.connect(self._on_selection_changed)
-        self.state.focused_component_changed.connect(self._on_focus_changed)
-        self.state.highlighted_components_changed.connect(self._on_highlight_changed)
+        self._deactivated = False
+        self._connections = []
+        self._control_connections = []
 
-        self.state.current_session_changed.connect(self._on_session_changed)
-        self.state.session_color_changed.connect(self._on_session_style_changed)
-        # self.state.session_toggled.connect(self._on_session_style_changed)
+        for signal, slot in (
+            (self.state.hovered_components_changed, self._on_hover_changed),
+            (self.state.selected_components_changed, self._on_selection_changed),
+            (self.state.focused_component_changed, self._on_focus_changed),
+            (self.state.highlighted_components_changed, self._on_highlight_changed),
+            (self.state.current_session_changed, self._on_session_changed),
+            (self.state.session_color_changed, self._on_session_style_changed),
+            (self.state.plot_update_required, self.initialize_display),
+            (self.state.data_changed, self._on_data_changed),
+        ):
+            self.connect_signal(signal, slot)
 
-        self.state.plot_update_required.connect(self.initialize_display)
-        self.state.data_changed.connect(self._on_data_changed)
+    def connect_signal(self, signal, slot, *, controls=False):
+        connection = signal.connect(slot)
 
-        self.destroyed.connect(self.deactivate)
+        connections = (
+            self._control_connections if controls else self._connections
+        )
+        connections.append(connection)
+
+    @staticmethod
+    def _disconnect_connections(connections):
+        while connections:
+            connection = connections.pop()
+            try:
+                QObject.disconnect(connection)
+            except RuntimeError:
+                # The sender or receiver was already deleted.
+                pass
+
+    def _cancel_background_tasks(self):
+        """Overridden by controllers that own background calculations."""
+        pass
 
     def activate(self):
         self.state.logger.debug("Activating plot controller")
@@ -513,21 +539,36 @@ class BaseDisplayController(QObject):
         raise NotImplementedError("Subclasses must implement configure_display()")
 
     def deactivate(self):
-        self.state.logger.debug("Deactivating plot controller")
+        if self._deactivated:
+            return
+
+        self._deactivated = True
+
         self.disconnect_signals()
+        self._cancel_background_tasks()
         self.clean_controls()
 
         if self.display_widget is not None:
+            dispose = getattr(self.display_widget, "dispose", None)
+            if callable(dispose):
+                dispose()
+
             self.section.clear_display_widget()
-            self.display_widget.parent = None
             self.display_widget.deleteLater()
             self.display_widget = None
 
-    def clean_controls(self):
+        self.deleteLater()
 
-        for key in self.controls:
-            self.controls[key].parent = None
-            self.controls[key].deleteLater()
+    def clean_controls(self):
+        self._disconnect_connections(self._control_connections)
+
+        for control in tuple(self.controls.values()):
+            control.blockSignals(True)
+
+            if isinstance(control, StatisticsData.StatisticQuerySelector):
+                control.dispose()
+
+            control.deleteLater()
 
         self.controls.clear()
 
@@ -543,7 +584,7 @@ class BaseDisplayController(QObject):
     def get_config(self):
         return dict(self.config)
 
-    def _on_data_changed(self, input: Tuple[str, int]):
+    def _on_data_changed(self, event: DataChange):
         pass
 
     def _on_session_style_changed(self):

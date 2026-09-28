@@ -22,7 +22,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
 )
 
-
+from catan.core.changes import (
+    ChangeKind as C,
+    DataChange,
+    SESSION_STRUCTURE_CHANGES,
+)
 from catan.core.structures import NeuronComponent
 from catan.gui.panels import BasePlot
 from catan.gui.interaction import click_events
@@ -185,7 +189,7 @@ class Display(BasePlot.BaseCanvas):
 
         self.statistic_colorbar_title = Text(
             "",
-            pos=(cbar_center[0], cbar_center[1] + label_y_offset + 10),
+            pos=(cbar_center[0], cbar_center[1] + label_y_offset + 13),
             anchor_x="center",
             anchor_y="top",
             font_size=10,
@@ -377,7 +381,8 @@ class Display(BasePlot.BaseCanvas):
             ids=neuron_ids,
             vals=roi_vals,
             n_rois=n_rois,
-            color=self.state.session_colors[session_id],
+            # color=self.state.session_colors[session_id],
+            color="white",
         )
 
     def plot_neurons_visuals(self):
@@ -427,6 +432,7 @@ class Display(BasePlot.BaseCanvas):
         self._update_statistic_colors()
 
     def clean(self, with_union=True):
+
         for key, visual in self.plotting["visuals"].items():
             if visual is None or (not with_union and key == "union"):
                 continue
@@ -871,7 +877,8 @@ class Display(BasePlot.BaseCanvas):
                     colors = self._tracked_union_colors(record)
                     style = "default"
                 else:
-                    colors = self.state.session_colors[key]
+                    # colors = self.state.session_colors[key]
+                    colors = "white"
 
                     style = (
                         "default"
@@ -948,7 +955,8 @@ class Display(BasePlot.BaseCanvas):
         current_session = self.state.current_session_id or 0
         # Current-session neurons get the actual session colour.
         current_color = np.asarray(
-            color.Color(self.state.session_colors[current_session]).rgba,
+            # color.Color(self.state.session_colors[current_session]).rgba,
+            color.Color("white").rgba,
             dtype=np.float32,
         )
 
@@ -1190,7 +1198,12 @@ class Controller(BasePlot.CanvasController):
             self._on_statistic_query_changed
         )
         self.controls["statistics"].set_query_mode("neuron_bound")
-        self.data.statistic_engine.values_changed.connect(self._recalculate_statistic)
+
+        self.connect_signal(
+            self.data.statistic_engine.values_changed,
+            self._on_statistics_values_changed,
+            controls=True,
+        )
 
         self.controls["stat_cmap_label"] = QLabel("Colormap:")
 
@@ -1219,7 +1232,17 @@ class Controller(BasePlot.CanvasController):
         self.current_statistic_query = query
         self._recalculate_statistic()
 
+    def _on_statistics_values_changed(self, statistic_keys):
+        query = self.current_statistic_query
+
+        if query is not None and query.statistic_key in statistic_keys:
+            self._recalculate_statistic()
+
     def _recalculate_statistic(self):
+        if self._deactivated:
+            return
+
+        self._cancel_background_tasks()
 
         query = self.current_statistic_query
 
@@ -1231,27 +1254,29 @@ class Controller(BasePlot.CanvasController):
             )
             return
 
+        revision = self.data.statistic_engine.query_revision(query)
+
         def evaluate():
             return self.data.statistic_engine.evaluate_table(query)
 
-        self.state.tasks.start(
+        self._statistic_task_id = self.state.tasks.start(
             "calculating",
             f"Calculate {query.statistic_key}",
             evaluate,
-            on_result=lambda table, query=query: self._on_statistic_ready(
-                query,
-                table,
+            on_result=lambda table, query=query, revision=revision: (
+                self._on_statistic_ready(query, table, revision)
             ),
+            background=True,
         )
 
-    def _on_statistic_ready(
-        self,
-        query,
-        table,
-    ):
-        # User changed the selector while this calculation
-        # was queued/running.
+    def _on_statistic_ready(self, query, table, revision):
+        if self._deactivated:
+            return
+
         if query != self.current_statistic_query:
+            return
+
+        if revision != self.data.statistic_engine.query_revision(query):
             return
 
         self.statistic_table = table
@@ -1323,17 +1348,23 @@ class Controller(BasePlot.CanvasController):
 
         self._on_session_changed()
 
-    def _on_data_changed(self, input: Tuple[str, int]):
-        data_type, data_val = input
+    def _on_data_changed(self, event: DataChange):
+        rebuild = event.has(
+            *SESSION_STRUCTURE_CHANGES,
+            C.ASSIGNMENT_SET,
+            C.ASSIGNMENT_MAPPING,
+            C.UNION_GEOMETRY,
+            C.FOOTPRINT_GEOMETRY,
+            C.BACKGROUND_IMAGE,
+            C.INCLUSION,
+            C.SESSION_ACTIVITY,
+            C.SESSION_METADATA,
+        ) or event.has_availability("spatial")
 
-        if (
-            data_type == "sessions"
-            and self.section.display_mode == "session_overview"
-            and data_val != self.state.current_session_id
-        ):
-            return
-
-        self.initialize_display()
+        if rebuild:
+            self.initialize_display()
+        elif event.has(C.REVIEW_STATUS):
+            self._on_review_filter_changed()
 
     def _on_session_changed(self):
         if (
@@ -1380,10 +1411,18 @@ class Controller(BasePlot.CanvasController):
         self.update_styles()
 
     def deactivate(self):
-        # self.side_menu.parent = None
-        # self.side_menu.deleteLater()
+
+        if self._deactivated:
+            return
         self.canvas.clean()
         super().deactivate()
+
+    def _cancel_background_tasks(self):
+        task_id = getattr(self, "_statistic_task_id", None)
+        self._statistic_task_id = None
+
+        if task_id is not None:
+            self.state.tasks.cancel(task_id)
 
 
 class OverviewControlPanel(ControlPanel.ControlPanel):

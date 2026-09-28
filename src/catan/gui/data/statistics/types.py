@@ -7,6 +7,8 @@ import numpy as np
 from .dimensions import Dimension, DimensionInfo, get_default_coords
 from .queries import ReductionSpec, DEFAULT_REDUCTIONS
 
+from catan.core.changes import ChangeKind, DataChange
+
 StatisticCategory = Literal[
     "session_loaded",
     "match_loaded",
@@ -436,6 +438,35 @@ class StatisticDefinition:
 
     allowed_reductions: Optional[dict[str, tuple[str, ...]]] = None
     default_reductions: Optional[dict[str, ReductionSpec]] = None
+
+    # None: undeclared dependencies, conservatively invalidate.
+    # Empty set: independent of data changes.
+    dependencies: frozenset[ChangeKind] | None = None
+
+    # Field groups whose loading/unloading affects this statistic.
+    availability_dependencies: frozenset[str] = frozenset()
+
+    def is_affected_by(self, event: DataChange) -> bool:
+        if self.dependencies is None:
+            return True
+
+        for change in event.changes:
+            if change.kind in self.dependencies:
+                return True
+
+            if (
+                change.kind == ChangeKind.DATA_AVAILABILITY
+                and self.availability_dependencies
+            ):
+                if (
+                    change.fields is None
+                    or self.availability_dependencies.intersection(
+                        change.fields
+                    )
+                ):
+                    return True
+
+        return False
 
     def get_values(
         self,

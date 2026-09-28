@@ -48,6 +48,7 @@ REMAP_FIELDS = (
     "rotation_refine_step",
     "c_max",
     "c_zscored",
+    "method",
 )
 
 
@@ -145,6 +146,8 @@ def read_session_snapshot(backend, ref, *, root="/"):
     if payload["remap"] is not None:
         session.remap = Remapping(evaluate=False)
         for key in REMAP_FIELDS:
+            if key == "method" and key not in payload["remap"]:
+                continue  # Older snapshots retain the constructor default.
             setattr(session.remap, key, payload["remap"][key])
         if session.remap.dims is not None:
             session.remap.dims = tuple(session.remap.dims)

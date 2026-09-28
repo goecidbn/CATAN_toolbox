@@ -35,6 +35,7 @@ class AlignmentReport:
     n_successful_references: int
 
     remap_data: dict[str, dict]
+    method: str = "automatic"
 
 
 @dataclass
@@ -98,13 +99,15 @@ class Remapping:
         rotation_refine_step: float = 0.1,
     ):
 
-        self.shift: np.ndarray | None = None
-        self.rotation: float | None = None
 
         # Transform from THIS SESSION'S original template
         # into CATAN's common/global coordinate system.
         self.matrix = np.eye(3, dtype=np.float64)
 
+        self.method = "automatic"
+
+        self.shift: np.ndarray | None = None
+        self.rotation: float | None = None
         self.flow = None
         self.transpose = False
 
@@ -117,7 +120,6 @@ class Remapping:
         self.min_zcorr = float(min_zcorr)
 
         self.rotation_step = float(rotation_step)
-
         self.rotation_refine_step = float(rotation_refine_step)
 
         self.success = False
@@ -496,14 +498,18 @@ class Remapping:
 
         rotation = 0.0 if self.rotation is None else self.rotation
         shift = np.zeros(2) if self.shift is None else self.shift
-        use_rigid = np.linalg.norm(shift) > 1.0 or abs(rotation) > 0.05
-
+        # use_rigid = np.linalg.norm(shift) > 1.0 or abs(rotation) > 0.05
+        use_rigid = (
+            np.linalg.norm(shift) > 1e-8
+            or abs(rotation) > 1e-8
+        )
         # Fast path for identity.
         if not use_rigid and (not use_optical_flow or self.flow is None):
             return A
 
         # Translation-only sparse fast path.
-        if abs(rotation) <= 0.05 and self.flow is None and sparse.issparse(A):
+        # if abs(rotation) <= 0.05 and self.flow is None and sparse.issparse(A):
+        if abs(rotation) <= 1e-8 and self.flow is None and sparse.issparse(A):
             return _shift_sparse_bilinear(A, self.dims, *shift, order="C")
 
         matrix = self.matrix
@@ -603,6 +609,7 @@ class Remapping:
     def identity(cls, dims) -> "Remapping":
 
         remap = cls(evaluate=False)
+        remap.method = "identity"
 
         remap.dims = tuple(dims)
         remap.shift = np.zeros(2, dtype=float)
@@ -774,6 +781,7 @@ class Remapping:
             n_references=len(entries),
             n_successful_references=len(successful),
             remap_data=self.remap_data,
+            method=self.method,
         )
 
     def save(

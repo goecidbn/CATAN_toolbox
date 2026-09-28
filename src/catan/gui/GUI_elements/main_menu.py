@@ -25,6 +25,7 @@ from shiboken6 import isValid
 
 from pathlib import Path
 
+from catan.core.changes import DataChange
 from catan.gui.structures import data, state
 
 from .resource_monitor import ResourceMonitor
@@ -131,7 +132,7 @@ class MainMenu(QFrame):
             actions=row.registration_action_selector.actions(),
         )
 
-    def _on_data_changed(self, input: tuple[str, int]):
+    def _on_data_changed(self, event: DataChange):
         """
         updates GUI element availability based on the current state of the data
         """
