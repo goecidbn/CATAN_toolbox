@@ -205,8 +205,10 @@ def pdf_diff_distance(
     if "hard-core" in extensions:
         # feasibility for Matérn-I
         if lambda_ * np.pi * h**2 > 1 / np.e:
+            print("Infeasible Matérn-I parameters: lambda_ * pi * h^2 > 1/e")
+            print(lambda_ * np.pi * h**2, " vs ", 1 / np.e)
             return None
-        
+
         g = matern1_g(d_grid, lambda_, h)
     else:
         g = 1.0
