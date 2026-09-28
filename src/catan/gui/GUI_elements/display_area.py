@@ -158,6 +158,10 @@ class DisplayArea(QWidget):
         if target is None:
             return
 
+        # Capture all panels before changing the tree or destroying widgets.
+        self._collect_live_leaf_configs(self.tree)
+        self._collect_splitter_sizes(self.tree)
+
         # Get live config from the actual existing widget
         section_widget = self.section_widgets.get(section_id)
 
@@ -181,6 +185,9 @@ class DisplayArea(QWidget):
         if self._count_leaves(self.tree) <= 1:
             return
 
+        self._collect_live_leaf_configs(self.tree)
+        self._collect_splitter_sizes(self.tree)
+        
         self.tree = self._remove_leaf(self.tree, section_id)
         self.rebuild()
 

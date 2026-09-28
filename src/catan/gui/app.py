@@ -1,17 +1,35 @@
 from __future__ import annotations
 
-import os, sys, platform
+import argparse
+import atexit
+import os
+import sys
+from tempfile import TemporaryDirectory
 
 from catan.gui.utils.graphics_backend import configure_graphics_backend
 
 
 def main() -> int:
 
+    parser = argparse.ArgumentParser(
+        description="Start the CATAN GUI.",
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--fresh",
+        "-fresh",
+        action="store_true",
+        help="Use temporary, empty settings without changing saved preferences.",
+    )
+    options, qt_arguments = parser.parse_known_args(sys.argv[1:])
+
     configure_graphics_backend()
 
     try:
         from PySide6.QtGui import QFont
         from PySide6.QtWidgets import QApplication
+
+        from PySide6.QtCore import QSettings
 
     except ModuleNotFoundError as exc:
         if exc.name == "PySide6":
@@ -31,7 +49,7 @@ def main() -> int:
     owns_application = app is None
 
     if app is None:
-        app = QApplication(sys.argv)
+        app = QApplication([sys.argv[0], *qt_arguments])
     qdarktheme.setup_theme("dark")
 
     font = QFont("Noto Sans", 10)
@@ -41,7 +59,29 @@ def main() -> int:
     # app.lastWindowClosed.connect(lambda: print("lastWindowClosed"))
     # app.aboutToQuit.connect(lambda: print("aboutToQuit"))
 
-    window = MainWindow(*sys.argv[1:])
+    settings = None
+
+    if options.fresh:
+        settings_directory = TemporaryDirectory(prefix="catan-fresh-")
+        settings = QSettings(
+            os.path.join(settings_directory.name, "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        settings.setFallbacksEnabled(False)
+
+        def discard_fresh_settings():
+            # Keep both objects alive until shutdown, including when an
+            # existing QApplication owns the event loop.
+            settings.sync()
+            settings_directory.cleanup()
+
+        atexit.register(discard_fresh_settings)
+
+    window = MainWindow(settings=settings)
+
+    if options.fresh:
+        window.setWindowTitle(f"{window.windowTitle()} [fresh settings]")
+
     window.show()
 
     if owns_application:
@@ -50,9 +90,9 @@ def main() -> int:
     return 0
 
 
-import threading
+# import threading
 
-from PySide6.QtCore import QThreadPool
+# from PySide6.QtCore import QThreadPool
 
 if __name__ == "__main__":
     raise SystemExit(main())

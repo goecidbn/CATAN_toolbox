@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QSplitter,
     QWidget,
+    QSizePolicy,
 )
 
 from catan.gui.resources import (
@@ -36,10 +37,14 @@ class MainWindow(QMainWindow):
 
     settings = QSettings()
 
-    def __init__(self):
+    def __init__(self, *, settings=None):
         super().__init__()
 
+        if settings is not None:
+            self.settings = settings
+
         self.state = AppState(settings=self.settings)
+        
         self.data: Data = Data(self.state)
         self.state.tasks.start_queue_timer()
 
@@ -191,10 +196,18 @@ class MainWindow(QMainWindow):
         display_layout = QVBoxLayout(display)
 
         display_area = DisplayArea(self)
-        display_layout.addWidget(display_area)
+        display_area.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        display_layout.addWidget(display_area, 1)
 
         navigation_bar = NeuronNavigationBar.NeuronNavigationBar(self)
-        display_layout.addWidget(navigation_bar)
+        navigation_bar.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        display_layout.addWidget(navigation_bar, 0)
 
         splitter.addWidget(display)
 
