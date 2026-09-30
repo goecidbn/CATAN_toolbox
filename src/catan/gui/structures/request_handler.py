@@ -1,6 +1,8 @@
 from typing import Optional
 from typing_extensions import Literal
 
+import numpy as np
+
 from catan.gui.structures.state import NeuronComponent
 
 
@@ -200,3 +202,91 @@ class RequestHandler:
             f"{len(self.destination)}/"
             f"{self.n_components_destination}" + (f" — {selected}" if selected else "")
         )
+
+
+class NeuronMergeRequest:
+    type = "neuron_merge"
+    stage = "destination"
+
+    def __init__(self, assignments, source_id, target_id):
+        self.assignments = assignments
+        self.source_id = int(source_id)
+        self.target_id = int(target_id)
+        self.highlight_mode = "footprints"
+        self.conflicts = ()
+        self.origin = []
+        self.destination = []
+        self.error = None
+        self.refresh()
+
+        if self.conflicts:
+            self.highlight_mode = "conflicts"
+
+    def refresh(self):
+        ids = self.assignments.ids
+        self.error = None
+        self.origin = []
+        self.destination = []
+        self.conflicts = ()
+
+        if (
+            self.source_id == self.target_id
+            or not 0 <= self.source_id < len(ids)
+            or not 0 <= self.target_id < len(ids)
+        ):
+            self.error = "The source or destination neuron is no longer available."
+            return
+
+        source_sessions = np.flatnonzero(ids[self.source_id] >= 0)
+        target_sessions = np.flatnonzero(ids[self.target_id] >= 0)
+
+        self.origin = [
+            NeuronComponent(self.source_id, int(s))
+            for s in source_sessions
+        ]
+        self.destination = [
+            NeuronComponent(self.target_id, int(s))
+            for s in target_sessions
+        ]
+        self.conflicts = tuple(
+            int(s)
+            for s in np.intersect1d(source_sessions, target_sessions)
+        )
+
+        if not self.origin or not self.destination:
+            self.error = "The source or destination neuron is empty."
+        elif self.conflicts:
+            self.error = "Resolve conflicts before merging"
+
+        if not self.conflicts:
+            self.highlight_mode = "footprints"
+
+    @property
+    def components(self):
+        if self.highlight_mode == "conflicts" and self.conflicts:
+            return [
+                NeuronComponent(neuron_id, session_id)
+                for session_id in self.conflicts
+                for neuron_id in (self.source_id, self.target_id)
+            ]
+        return list(self.origin)
+
+    @property
+    def is_complete(self):
+        return self.error is None
+
+    @property
+    def stage_complete(self):
+        return self.is_complete
+
+    def remap_rows(self, neuron_id_map):
+        source = neuron_id_map.get(self.source_id)
+        target = neuron_id_map.get(self.target_id)
+
+        if source is None or target is None or source == target:
+            return None
+
+        self.source_id = source
+        self.target_id = target
+        self.refresh()
+        return self

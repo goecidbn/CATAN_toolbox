@@ -1679,6 +1679,8 @@ class Tracking:
         assignments_new,
         weights: Optional[np.ndarray] = None,
         shifts: Optional[np.ndarray] = None,
+        *,
+        finalize: bool = True,
     ):
         if self.assignments is None:
             return
@@ -1698,6 +1700,9 @@ class Tracking:
         ## get proper references:
         nA_prev = self.assignments.union.footprints.shape[1]
         nA_post = len(assignments_new)
+        previous_mass = np.asarray(
+            self.assignments.union.footprints.sum(axis=0)
+        ).ravel()
         # print(f"Updating union footprints: nA_prev={nA_prev}, nA_post={nA_post}")
 
         ## shift union footprints to "new" location of neuron to ensure proper union construction
@@ -1712,8 +1717,7 @@ class Tracking:
         for n_idx, fp_idx in enumerate(assignments_new):
 
             footprint_existed = (
-                n_idx < nA_prev
-                and self.assignments.union.footprints[:, n_idx].sum() > 0
+                n_idx < nA_prev and previous_mass[n_idx] > 0
             )
 
             if fp_idx < 0 and footprint_existed:
@@ -1754,12 +1758,19 @@ class Tracking:
                 fp_updated.append(footprints_new[:, fp_idx])
 
         # ## update union data
-        self.assignments.union.update_footprints(
-            footprints=sparse.hstack(fp_updated, format="csc"),
-            mode="replace",
-            included_values=True,
-            synthetic_values=False,
-        )
+        combined = sparse.hstack(fp_updated, format="csc")
+
+        if finalize:
+            self.assignments.union.update_footprints(
+                footprints=combined,
+                mode="replace",
+                included_values=True,
+                synthetic_values=False,
+            )
+        else:
+            # Intermediate rebuild step: subsequent sessions only need
+            # the footprint matrix, not updated centroids/status arrays.
+            self.assignments.union.footprints = combined
 
     def _build_union_footprint_for_neuron(self, neuron_id: int) -> sparse.csc_matrix:
         """
@@ -1905,7 +1916,7 @@ class Tracking:
             shape=matrix.shape,
         )
 
-    def rebuild_union(self):
+    def rebuild_union(self,*,ctx=None):
 
         if self.assignments is None:
             return
@@ -1914,6 +1925,8 @@ class Tracking:
 
         for session_id, assignment_ids in enumerate(self.assignments.ids.T):
 
+            if ctx is not None:
+                ctx.check_cancelled()
             # A registered session may deliberately have an
             # empty assignments column:
             #
@@ -1936,7 +1949,22 @@ class Tracking:
                 shifts = shifts[:, session_id]
 
             self.update_union_footprints(
-                self.sessions[session_id].footprints, assignment_ids, weights, shifts
+                self.sessions[session_id].footprints,
+                assignment_ids,
+                weights,
+                shifts,
+                finalize=False,
+            )
+
+        if ctx is not None:
+            ctx.check_cancelled()
+        union = self.assignments.union
+        if union.footprints.shape[1] > 0:
+            union.update_footprints(
+                footprints=union.footprints,
+                mode="replace",
+                included_values=True,
+                synthetic_values=False,
             )
 
         self.rebuild_union_included()

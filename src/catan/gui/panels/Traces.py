@@ -7,19 +7,10 @@ from dataclasses import dataclass
 from vispy import scene, color
 from vispy.scene import visuals
 from vispy.scene.visuals import Line, Text
-from PySide6.QtCore import Qt, Signal, QEvent
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer
 from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QLineEdit,
-    QHBoxLayout,
-    QVBoxLayout,
-    QLabel,
-    QWidget,
     QToolButton,
-    QFormLayout,
-    QButtonGroup,
+    QDoubleSpinBox,
 )
 
 from catan.core.changes import (
@@ -64,6 +55,7 @@ class Display(BasePlot.BaseCanvas):
         self.initialize_axis()
         self.trace_distance = 1.3
         self.labels = {}
+        self.trace_tags = {}
 
         self.changes_on_click = "highlighted"  # or "highlighted" or "selected"
 
@@ -95,8 +87,8 @@ class Display(BasePlot.BaseCanvas):
         self.axes.link_view(self.view)
 
         # # 🔑 Control layout sizing
-        self.axes.height_min = 20
-        self.axes.height_max = 35
+        self.axes.height_min = 64
+        self.axes.height_max = 64
 
         # Tell the layout who should expand
         self.axes.stretch = (1, 0.05)  # don't take extra vertical space
@@ -106,10 +98,12 @@ class Display(BasePlot.BaseCanvas):
     def refresh_axis(self):
         if self.axes is not None:
             self.axes._view_changed()
+            self._position_trace_tags()
             self.update()
 
     def _on_canvas_resize(self, event=None):
         self._position_overlay_controls()
+        QTimer.singleShot(0, self._position_trace_tags)
 
     def attach_control_overlay(self):
         """
@@ -151,21 +145,121 @@ class Display(BasePlot.BaseCanvas):
         palette.raise_()
 
     def update_labels(self, trace_options):
-        self.clear_labels()
+        for key in tuple(self.trace_tags):
+            if key not in trace_options:
+                button = self.trace_tags.pop(key)
+                button.hide()
+                button.deleteLater()
 
-        offset = 0
-        for key, opt in trace_options.items():
-            if not opt.isChecked():
+        for key, enabled in trace_options.items():
+            button = self.trace_tags.get(key)
+
+            if button is None:
+                button = QToolButton(self.native)
+                button.setText(key)
+                button.setCheckable(True)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+                button.setStyleSheet("""
+                    QToolButton {
+                        background: #e5e7eb;
+                        color: #4b5563;
+                        border: 1px solid #6b7280;
+                        border-radius: 5px;
+                        padding: 3px 8px;
+                    }
+                    QToolButton:checked {
+                        background: #174b3c;
+                        color: #ffffff;
+                        border: 1px solid #123d31;
+                    }
+                    QToolButton:hover {
+                        border: 2px solid #2563eb;
+                    }
+                """)
+
+                button.toggled.connect(
+                    lambda checked, name=key:
+                    self.controls["panel"].set_trace_visible(name, checked)
+                )
+
+                self.trace_tags[key] = button
+
+            button.blockSignals(True)
+            button.setChecked(enabled)
+            button.blockSignals(False)
+            button.setToolTip(f"{'Hide' if enabled else 'Show'} {key}")
+            button.adjustSize()
+            button.show()
+
+        # Preserve the active-trace ordering used by plot_single_trace().
+        self.labels = {
+            key: self.trace_tags[key]
+            for key, enabled in trace_options.items()
+            if enabled
+        }
+
+        self._position_trace_tags()
+
+    def _position_trace_tags(self):
+        if not self.trace_tags:
+            return
+
+        margin, gap = 8, 6
+        x, y, row_height = margin, margin, 0
+        right = self.native.width() - margin
+
+        if (
+            self.control_overlay is not None
+            and self.control_overlay.isVisible()
+        ):
+            right = min(right, self.control_overlay.x() - gap)
+
+        right = max(margin + 1, right)
+
+        # Inactive tags occupy a wrapping row at the canvas top left.
+        for key, button in self.trace_tags.items():
+            if key in self.labels:
                 continue
-            self.labels[key] = Text(
-                key,
-                pos=[0, -offset + 0.5 * self.trace_distance],
-                anchor_x="left",
-                parent=self.plot_root,
-                color="black",
-                font_size=10,
+
+            if x > margin and x + button.width() > right:
+                x = margin
+                y += row_height + gap
+                row_height = 0
+
+            button.move(x, y)
+            button.raise_()
+
+            x += button.width() + gap
+            row_height = max(row_height, button.height())
+
+        inactive_bottom = (
+            y + row_height + gap if row_height else margin
+        )
+
+        # The buttons belong to the canvas. Their x position is fixed;
+        # only each band's vertical centre is mapped from data coordinates.
+        transform = self.plot_root.node_transform(self.scene)
+
+        for index, button in enumerate(self.labels.values()):
+            centre = transform.map(
+                (0, -index * self.trace_distance + 0.5, 0, 1)
             )
-            offset += self.trace_distance
+
+            top = int(round(centre[1] - button.height() / 2))
+            top = min(
+                max(inactive_bottom, top),
+                max(
+                    margin,
+                    self.native.height() - button.height() - margin,
+                ),
+            )
+
+            button.move(margin, top)
+            button.raise_()
+
+        if self.control_overlay is not None:
+            self.control_overlay.raise_()
 
     def plot_single_trace(self, component: NeuronComponent, offset, height=1.0, f=15.0):
 
@@ -180,22 +274,43 @@ class Display(BasePlot.BaseCanvas):
         if not session.status["traces_loaded"] or session.trace is None:
             return
 
-        time_axis = (np.arange(session.trace.shape[1]) + session.time_offset) / f
-
         ## build one big line with NaN separators for better performance
         parts = []
         for i, key in enumerate(self.labels):
             if key not in traces:
                 continue
 
-            y_vals = traces[key][footprint_id, :].copy()
-            y_vals *= height * 0.9 / y_vals.max()
+            y_vals = np.array(
+                traces[key][footprint_id, :],
+                dtype=np.float32,
+                copy=True,
+            )
+
+            if not y_vals.size:
+                continue
+
+            time_axis = (
+                np.arange(y_vals.size) + session.time_offset
+            ) / f
+
+            finite = np.isfinite(y_vals)
+            scale = (
+                np.max(np.abs(y_vals[finite]))
+                if finite.any()
+                else 0.0
+            )
+
+            if scale > 0:
+                y_vals *= height * 0.9 / scale
 
             baseline = -i * self.trace_distance + offset
             y_vals += baseline
 
             if key in ["S", "S_dff"]:
-                segments = np.empty((3 * len(time_axis), 2))
+                segments = np.empty(
+                    (3 * len(time_axis), 2),
+                    dtype=np.float32,
+                )
 
                 # start of each vertical line: baseline
                 segments[0::3, 0] = time_axis
@@ -214,6 +329,8 @@ class Display(BasePlot.BaseCanvas):
             parts.append(xy)
             parts.append(np.array([[np.nan, np.nan]], dtype=np.float32))
 
+        if not parts:
+            return
         parts = np.vstack(parts)
 
         # col = self.state.session_colors[self.state.current_session_id]
@@ -240,10 +357,11 @@ class Display(BasePlot.BaseCanvas):
 
     def plot_neurons(self, max_components=10):
 
-        f = 15.0  # sampling frequency - could be specified in GUI
+        f = self.controls["panel"].sampling_frequency.value()
         self.state.logger.debug(f"Updating traces for current neurons")
         t_start = time.time()
         self.clear_traces()
+        self.clear_overlays()
 
         if (
             self.data is None
@@ -256,7 +374,8 @@ class Display(BasePlot.BaseCanvas):
 
         time_lim = [np.inf, -np.inf]
 
-        this_neuron = self.state.focused_component.neuron_id
+        focused = self.state.focused_component
+        this_neuron = None if focused is None else focused.neuron_id
 
         display_scope = self.controls["panel"].display_scope
         if display_scope == "across":
@@ -272,6 +391,9 @@ class Display(BasePlot.BaseCanvas):
                     for s in session_presence[0]
                 ]
         elif display_scope == "adjacent":
+
+            if focused is None:
+                return
 
             ## find closeby neurons
             union_centroids = self.data.assignments.union.centroids
@@ -329,14 +451,27 @@ class Display(BasePlot.BaseCanvas):
             if not self.data.sessions[component.session_id].traces:
                 continue
 
-            self.plot_single_trace(component, n * height, height=height)
+            self.plot_single_trace(
+                component,
+                n * height,
+                height=height,
+                f=f,
+            )
 
-            ## update time range based on this component's session
+            session = self.data.sessions[component.session_id]
+
+            lengths = [
+                session.traces[key].shape[1]
+                for key in self.labels
+                if key in session.traces
+            ]
+
+            if not lengths or max(lengths) == 0:
+                continue
+
             time_range = (
-                np.array(
-                    [0, self.data.sessions[component.session_id].traces["C"].shape[1]]
-                )
-                + self.data.current_session.time_offset
+                np.array([0, max(1, max(lengths) - 1)])
+                + session.time_offset
             ) / f
 
             time_lim[0] = min(time_lim[0], time_range[0])
@@ -359,7 +494,13 @@ class Display(BasePlot.BaseCanvas):
 
         self.axes._view_changed()
 
+        self._position_trace_tags()
+        QTimer.singleShot(0, self._position_trace_tags)
+
     def find_closest_component(self, mouse_pos):
+
+        if not self.plotting["visuals"]:
+            return None
 
         mouse_pos = click_events.canvas_to_visual(
             list(self.plotting["visuals"].values())[0], mouse_pos
@@ -383,11 +524,12 @@ class Display(BasePlot.BaseCanvas):
         return {"pos": rec.pos, **plot_options}
 
     def clear_labels(self):
+        for button in self.trace_tags.values():
+            button.hide()
+            button.deleteLater()
 
-        for child in list(self.plot_root.children):
-            if isinstance(child, Text):
-                child.parent = None
-        self.labels = {}
+        self.trace_tags.clear()
+        self.labels.clear()
 
     def clear_traces(self):
         for visual in self.plotting["visuals"].values():
@@ -415,6 +557,7 @@ class Controller(BasePlot.CanvasController):
             lambda: self.update_neuron_selection()
         )
         self.connect_signal(self.state.adjacency_radius_changed, self.replot_neurons,controls=True)
+        self.controls["panel"].refresh_trace_options()
         self.initialize_display()
 
         self.controls["panel"].displayed_traces_changed.connect(self.replot_neurons)
@@ -426,7 +569,7 @@ class Controller(BasePlot.CanvasController):
         )
 
         if traces_changed or event.has(*SESSION_STRUCTURE_CHANGES):
-            self.controls["panel"].build_trace_checkboxes()
+            self.controls["panel"].refresh_trace_options()
 
         if traces_changed or event.has(
             *SESSION_STRUCTURE_CHANGES,
@@ -448,18 +591,20 @@ class Controller(BasePlot.CanvasController):
         super()._on_focus_changed()
 
     def _on_session_changed(self):
-        self.controls["panel"].build_trace_checkboxes()
-        self.canvas.update_labels(self.controls["panel"].checkbox_traces_options)
+        panel = self.controls["panel"]
+        panel.refresh_trace_options()
+        self.canvas.update_labels(panel.trace_visibility)
         super()._on_session_changed()
 
     def replot_neurons(self):
-        self.canvas.update_labels(self.controls["panel"].checkbox_traces_options)
+        panel = self.controls["panel"]
+        panel.refresh_trace_options()
+        self.canvas.update_labels(panel.trace_visibility)
         self.canvas.plot_neurons()
         self.update_styles()
 
     def update_neuron_selection(self):
-        self.canvas.plot_neurons()
-        self.update_styles()
+        self.replot_neurons()
 
 
 class TraceOptionsController(ControlPanel.ControlPanel):
@@ -495,34 +640,32 @@ class TraceOptionsController(ControlPanel.ControlPanel):
         review_selector = self._build_review_selector()
         self.form.addRow("Review status", review_selector)
 
-        self.checkbox_trace_container = QWidget()
-        self.checkbox_traces_layout = QVBoxLayout(self.checkbox_trace_container)
-        self.checkbox_traces_options = {}
-        self.form.addRow("Traces", self.checkbox_trace_container)
+        self.trace_visibility = {}
+        self._trace_preferences = {}
 
-    def build_trace_checkboxes(self):
+        self.sampling_frequency = QDoubleSpinBox()
+        self.sampling_frequency.setRange(0.001, 1000.0)
+        self.sampling_frequency.setDecimals(3)
+        self.sampling_frequency.setValue(15.0)
+        self.sampling_frequency.setSuffix(" Hz")
+        self.sampling_frequency.setKeyboardTracking(False)
 
-        current_session = self.data.current_session
+        self.form.addRow("Sampling frequency", self.sampling_frequency)
 
-        for key, chkbox in self.checkbox_traces_options.items():
-            try:
-                chkbox.toggled.disconnect()
-            except TypeError:
-                pass
-            chkbox.deleteLater()
+        self.sampling_frequency.valueChanged.connect(
+            lambda _value: self.displayed_traces_changed.emit()
+        )
+    
+    def refresh_trace_options(self):
+        session = None if self.data is None else self.data.current_session
+        keys = () if session is None else session.traces.keys()
 
-        self.checkbox_traces_options.clear()
+        self.trace_visibility = {
+            key: self._trace_preferences.get(key, True)
+            for key in keys
+        }
 
-        if self.data is None or self.data.current_session is None:
-            return
-
-        for key in current_session.traces.keys():
-            self.checkbox_traces_options[key] = QCheckBox(key)
-            self.checkbox_traces_options[key].setChecked(True)
-
-            self.checkbox_traces_layout.addWidget(
-                self.checkbox_traces_options[key], alignment=Qt.AlignmentFlag.AlignLeft
-            )
-            self.checkbox_traces_options[key].toggled.connect(
-                lambda: self.displayed_traces_changed.emit()
-            )
+    def set_trace_visible(self, key, enabled):
+        self._trace_preferences[key] = bool(enabled)
+        self.trace_visibility[key] = bool(enabled)
+        self.displayed_traces_changed.emit()

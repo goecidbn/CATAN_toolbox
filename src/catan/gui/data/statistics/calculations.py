@@ -232,31 +232,63 @@ def calculate_temporal_correlation(
         valid_i = fp_i >= 0
         valid_j = fp_j >= 0
 
-        traces_i = session.traces[key][fp_i[valid_i]]
-        traces_j = session.traces[key][fp_j[valid_j]]
-
         if not valid_i.any() or not valid_j.any():
             continue
 
-        # pair-wise Pearson correlation
-        ti = traces_i - traces_i.mean(axis=1, keepdims=True)
-        tj = traces_j - traces_j.mean(axis=1, keepdims=True)
+        ctx = current_task_context()
+        if ctx is not None:
+            ctx.check_cancelled()
 
-        numerator = ti @ tj.T
+        source = session.traces[key]
 
-        denominator = np.sqrt(
-            np.sum(ti**2, axis=1)[:, None] * np.sum(tj**2, axis=1)[None, :]
+        def normalized_rows(indices):
+            # Advanced indexing creates an owned array, so these
+            # in-place operations cannot modify session traces.
+            rows = source[indices].astype(
+                np.result_type(source.dtype, np.float32),
+                copy=False,
+            )
+
+            rows -= rows.mean(axis=1, keepdims=True)
+
+            lengths = np.sqrt(
+                np.einsum("ij,ij->i", rows, rows)
+            )
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rows /= lengths[:, None]
+
+            return rows
+
+        ids_i = fp_i[valid_i]
+        ids_j = fp_j[valid_j]
+
+        ti = normalized_rows(ids_i)
+        tj = (
+            ti
+            if np.array_equal(ids_i, ids_j)
+            else normalized_rows(ids_j)
         )
 
-        corr = numerator / denominator
+        rows_i = np.flatnonzero(valid_i)
+        rows_j = np.flatnonzero(valid_j)
 
-        values[
-            np.ix_(
-                valid_i,
-                valid_j,
-                [k],
-            )
-        ] = corr[..., None]
+        # Pearson correlation of centred, unit-normalized traces.
+        # Calculate a row block at a time.
+        for start in range(0, len(rows_i), 256):
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            stop = min(start + 256, len(rows_i))
+            corr = ti[start:stop] @ tj.T
+
+            values[
+                np.ix_(rows_i[start:stop], rows_j, [k])
+            ] = corr[..., None]
+
+            del corr
+
+        del ti, tj
 
     return drop_indexed_axes(
         values,
@@ -444,150 +476,12 @@ def calculate_centroid_shift(
 
 
 def calculate_footprint_similarity(
-    data: Data,
-    state: AppState,
-    indexers=None,
-    filters=(),
-    neighborhood_thr=10,
+    data, state, indexers=None, filters=(), neighborhood_thr=10,
 ):
-    indexers = indexers or {}
-
-    ctx = current_task_context()
-
-    N, S = state.assignments.shape
-
-    neuron_i_ids = requested_indices(N, "neuron_i", indexers)
-    neuron_j_ids = requested_indices(N, "neuron_j", indexers)
-
-    session_i_ids = requested_indices(S, "session_i", indexers)
-    session_j_ids = requested_indices(S, "session_j", indexers)
-
-    values = np.full(
-        (
-            len(neuron_i_ids),
-            len(neuron_j_ids),
-            len(session_i_ids),
-            len(session_j_ids),
-        ),
-        np.nan,
-    )
-
-    session_relation = get_pair_relation(
-        filters,
-        "session",
-    )
-
-    for si, session_i_id in enumerate(session_i_ids):
-        session_i = data.sessions[session_i_id]
-
-        if (
-            session_i is None
-            or session_i.centroids is None
-            or session_i.footprints is None
-        ):
-            continue
-
-        fp_i = state.assignments[
-            neuron_i_ids,
-            session_i_id,
-        ]
-
-        valid_i = fp_i >= 0
-        pos_i = np.flatnonzero(valid_i)
-
-        if not valid_i.any():
-            continue
-
-        for sj, session_j_id in enumerate(session_j_ids):
-            ctx.progress(
-                int(
-                    (si * len(session_j_ids) + sj)
-                    / (len(session_i_ids) * len(session_j_ids))
-                    * 100
-                )
-            )
-            ctx.check_cancelled()
-            session_j = data.sessions[session_j_id]
-
-            if (
-                session_j is None
-                or session_j.centroids is None
-                or session_j.footprints is None
-            ):
-                continue
-
-            if session_relation == "same" and session_i_id != session_j_id:
-                continue
-
-            if session_relation == "different" and session_i_id == session_j_id:
-                continue
-
-            if session_relation == "with previous" and session_j_id != session_i_id - 1:
-                continue
-
-            fp_j = state.assignments[
-                neuron_j_ids,
-                session_j_id,
-            ]
-
-            valid_j = fp_j >= 0
-            pos_j = np.flatnonzero(valid_j)
-
-            if not valid_j.any():
-                continue
-
-            ctr_i = session_i.centroids[fp_i[valid_i]]
-            ctr_j = session_j.centroids[fp_j[valid_j]]
-
-            distances = spatial.distance.cdist(
-                ctr_i,
-                ctr_j,
-            )
-
-            # Do not calculate similarity of a neuron with itself
-            # within the same session.
-            if session_i_id == session_j_id:
-                valid_neuron_i = neuron_i_ids[valid_i]
-                valid_neuron_j = neuron_j_ids[valid_j]
-
-                self_pairs = valid_neuron_i[:, None] == valid_neuron_j[None, :]
-
-                distances[self_pairs] = np.inf
-
-            similarity = np.full(
-                distances.shape,
-                np.nan,
-            )
-
-            for ii, jj in zip(*np.where(distances < neighborhood_thr)):
-                similarity[ii, jj], _, _ = calculate_img_correlation(
-                    session_i.footprints[:, fp_i[valid_i][ii]],
-                    session_j.footprints[:, fp_j[valid_j][jj]],
-                    crop=True,
-                    shift=True,
-                    mode="cosine_union",
-                    gamma=0.1,
-                    shift_optimized=True,
-                )
-
-            values[
-                np.ix_(
-                    pos_i,
-                    pos_j,
-                    [si],
-                    [sj],
-                )
-            ] = similarity[:, :, None, None]
-
-    return drop_indexed_axes(
-        values,
-        (
-            "neuron_i",
-            "neuron_j",
-            "session_i",
-            "session_j",
-        ),
-        indexers,
+    from .footprint_pairs import calculate_footprint_pairs
+    return calculate_footprint_pairs(
+        data, state, indexers=indexers, filters=filters,
+        neighborhood_thr=neighborhood_thr,
     )
 
 
@@ -600,3 +494,4 @@ def get_pair_relation(
             return f.relation
 
     return "all"
+

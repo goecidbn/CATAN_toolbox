@@ -76,11 +76,19 @@ class DisplayArea(QWidget):
 
     # ---------- build / rebuild ----------
 
-    def rebuild(self, *, reload_alignment=False):
+    def rebuild(
+        self,
+        *,
+        reload_alignment=False,
+        reload_statistics=False,
+    ):
         self._clear_layout()
         self.splitter_widgets.clear()
         self.section_widgets.clear()
 
+        if reload_statistics:
+            self._reload_statistics_logic()
+        
         importlib.reload(BasePlot)
 
         if reload_alignment:
@@ -99,6 +107,42 @@ class DisplayArea(QWidget):
 
         self._update_section_buttons()
 
+    def _reload_statistics_logic(self):
+        importlib.invalidate_caches()
+
+        queries = importlib.import_module(
+            "catan.gui.data.statistics.queries"
+        )
+
+        # Preserve identities used by existing queries, imported aliases,
+        # and dictionary/cache keys.
+        existing_classes = {
+            name: getattr(queries, name)
+            for name in (
+                "ReductionSpec",
+                "PairFilter",
+                "StatisticQuery",
+            )
+        }
+
+        importlib.reload(queries)
+
+        for name, cls in existing_classes.items():
+            setattr(queries, name, cls)
+
+        # Reload consumers after their dependencies, refreshing
+        # functions imported through `from ... import ...`.
+        for module_name in (
+            "catan.gui.data.statistics.tabledata",
+            "catan.gui.data.statistics.plotdata_histogram",
+            "catan.gui.data.statistics.plotdata_scatter",
+            "catan.gui.data.statistics.plotdata_series",
+            "catan.gui.panels.StatisticsData",
+            "catan.gui.panels.helper.series_with_confidence",
+        ):
+            importlib.reload(importlib.import_module(module_name))
+
+        self.data.statistic_engine.clear_cache()
         
     def _build_node(self, node):
         if node["type"] == "leaf":
@@ -187,7 +231,7 @@ class DisplayArea(QWidget):
 
         self._collect_live_leaf_configs(self.tree)
         self._collect_splitter_sizes(self.tree)
-        
+
         self.tree = self._remove_leaf(self.tree, section_id)
         self.rebuild()
 

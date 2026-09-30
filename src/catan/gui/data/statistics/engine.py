@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 from typing import Optional
 from collections.abc import Callable
@@ -12,6 +12,42 @@ from catan.core.changes import Change, ChangeKind, DataChange
 from .table import PickTable
 from .types import StatisticArray
 from .queries import ReductionSpec, StatisticQuery
+
+
+def _retained_array_bytes(value):
+    """Count unique NumPy backing allocations, including sparse coordinates."""
+    seen = set()
+
+    def visit(item):
+        if isinstance(item, np.ndarray):
+            while isinstance(item.base, np.ndarray):
+                item = item.base
+
+        identity = id(item)
+
+        if identity in seen:
+            return 0
+
+        seen.add(identity)
+
+        if isinstance(item, np.ndarray):
+            return item.nbytes
+
+        if is_dataclass(item) and not isinstance(item, type):
+            return sum(
+                visit(getattr(item, field.name))
+                for field in fields(item)
+            )
+
+        if isinstance(item, dict):
+            return sum(visit(value) for value in item.values())
+
+        if isinstance(item, (tuple, list)):
+            return sum(visit(value) for value in item)
+
+        return 0
+
+    return visit(value)
 
 @dataclass(frozen=True, slots=True)
 class StatisticsTaskResult:
@@ -47,6 +83,9 @@ class StatisticEngine(QObject):
         self.registry_factory = registry_factory
 
         self._cache = {}
+        self.cache_max_bytes = 128 * 1024**2
+        self.cache_max_entries = 8
+
         self._revisions = {}
         self._cache_lock = RLock()
 
@@ -225,7 +264,10 @@ class StatisticEngine(QObject):
             key = (query, revision)
 
             if key in self._cache:
-                return self._cache[key]
+                ## move entry to the end of the dict
+                result = self._cache.pop(key)
+                self._cache[key] = result
+                return result
 
             definition = self.registry[query.statistic_key]
 
@@ -236,7 +278,19 @@ class StatisticEngine(QObject):
             # A relevant change during calculation must not repopulate
             # the cache with an obsolete result.
             if self._revisions.get(query.statistic_key, 0) == revision:
-                self._cache[key] = result
+                if (
+                    self.cache_max_entries > 0
+                    and _retained_array_bytes(result) <= self.cache_max_bytes
+                ):
+                    self._cache[key] = result
+
+                    while (
+                        len(self._cache) > self.cache_max_entries
+                        or _retained_array_bytes(list(self._cache.values()))
+                        > self.cache_max_bytes
+                    ):
+                        oldest_key = next(iter(self._cache))
+                        self._cache.pop(oldest_key)
 
         return result
 
@@ -248,6 +302,12 @@ class StatisticEngine(QObject):
         if stat_def is None:
             stat_def = self.registry[query.statistic_key]
         reductions = query.reduction_dict()
+        if stat_def.key == "footprint_similarity":
+            from .queries import normalize_footprint_pair_reductions
+            reductions = normalize_footprint_pair_reductions(
+                stat_def, reductions, query.filters,
+                session_series=query.context == "session_series",
+            )
 
         indexers = {
             dim: spec.index
@@ -262,29 +322,39 @@ class StatisticEngine(QObject):
             filters=query.filters,
         )
 
-        reduction_order = query.reduction_order
+        requested_order = tuple(query.reduction_order or ())
+        reduction_order = requested_order + tuple(
+            dim for dim in stat_def.dims
+            if dim not in requested_order
+            and reductions.get(dim, ReductionSpec("keep")).method
+            not in ("keep", "single")
+        )
 
-        if not reduction_order:
-            reduction_order = tuple(
-                dim
-                for dim in stat_def.dims
-                if reductions.get(dim, ReductionSpec("keep")).method
-                not in ("keep", "single")
-            )
+        planned_reductions = {}
 
         for dim in reduction_order:
             spec = reductions.get(dim)
 
-            if spec is None:
+            if spec is None or spec.method in ("keep", "single"):
                 continue
 
-            if spec.method in ("keep", "single"):
+            target = stat.reduction_aliases.get(dim, dim)
+
+            if target not in stat.dims:
                 continue
 
-            if dim not in stat.dims:
-                continue
+            previous = planned_reductions.get(target)
+            if previous is not None and previous != spec:
+                raise ValueError(
+                    f"Linked dimensions map to {target!r}, but "
+                    "have conflicting reductions. Choose the same "
+                    "reduction for both, or keep one."
+                )
 
-            stat.reduce_dimension(dim, spec)
+            planned_reductions[target] = spec
+
+        for target, spec in planned_reductions.items():
+            stat.reduce_dimension(target, spec)
 
         return stat
 
@@ -302,8 +372,14 @@ class StatisticEngine(QObject):
 
         table = PickTable.from_stat(stat)
 
-        if getattr(query, "filters", None):
-            table = table.filtered(query.filters)
+        remaining_filters = tuple(
+            f
+            for f in (query.filters or ())
+            if f.target not in stat.applied_pair_filters
+        )
+
+        if remaining_filters:
+            table = table.filtered(remaining_filters)
 
         return table
 

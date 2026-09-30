@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import prod
 
 import numpy as np
 
@@ -6,6 +7,107 @@ from .dimensions import canonical_dim
 from .queries import PairFilter
 from .types import StatisticArray
 
+ROW_BLOCK_SIZE = 65_536
+
+
+@dataclass(eq=False)
+class GridRef(np.lib.mixins.NDArrayOperatorsMixin):
+    """A flattened coordinate column without allocating the full column."""
+
+    coords: np.ndarray
+    grid_shape: tuple[int, ...]
+    axis: int
+    row_ids: np.ndarray | None = None
+
+    @property
+    def size(self):
+        if self.row_ids is None:
+            return prod(self.grid_shape)
+        return self.row_ids.size
+
+    @property
+    def shape(self):
+        return (self.size,)
+
+    @property
+    def dtype(self):
+        return self.coords.dtype
+
+    @property
+    def ndim(self):
+        return 1
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, rows):
+        if self.row_ids is not None:
+            rows = self.row_ids[rows]
+
+        shape = [1] * len(self.grid_shape)
+        shape[self.axis] = len(self.coords)
+
+        grid = np.broadcast_to(
+            self.coords.reshape(shape),
+            self.grid_shape,
+        )
+
+        # Index the broadcast view directly. Do not reshape/ravel it,
+        # because that could allocate the entire coordinate column.
+        return grid.flat[rows]
+
+    def __array__(self, dtype=None, copy=None):
+        # Explicit conversion remains available for existing callers.
+        if copy is False:
+            raise ValueError(
+                "GridRef cannot expose a contiguous array without copying."
+            )
+        return np.asarray(self[:], dtype=dtype)
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        if kwargs.get("out") is not None:
+            return NotImplemented
+
+        inputs = tuple(
+            np.asarray(value) if isinstance(value, GridRef) else value
+            for value in inputs
+        )
+
+        return getattr(ufunc, method)(*inputs, **kwargs)
+
+
+def refs_equal(left, right):
+    """Compare coordinate columns without expanding both full columns."""
+    if left is right:
+        return True
+
+    if left.shape != right.shape:
+        return False
+
+    if isinstance(left, GridRef) and isinstance(right, GridRef):
+        same_rows = left.row_ids is right.row_ids
+
+        if left.row_ids is not None and right.row_ids is not None:
+            same_rows = same_rows or refs_equal(
+                left.row_ids,
+                right.row_ids,
+            )
+
+        if (
+            same_rows
+            and left.axis == right.axis
+            and left.grid_shape == right.grid_shape
+            and np.array_equal(left.coords, right.coords)
+        ):
+            return True
+
+    return all(
+        np.array_equal(
+            left[start:start + ROW_BLOCK_SIZE],
+            right[start:start + ROW_BLOCK_SIZE],
+        )
+        for start in range(0, left.size, ROW_BLOCK_SIZE)
+    )
 
 @dataclass
 class PickTable:
@@ -25,7 +127,7 @@ class PickTable:
     stat: StatisticArray
     values: np.ndarray  # shape: (n_rows,)
     dims: tuple[str, ...]  # remaining dimensions
-    refs: dict[str, np.ndarray]  # dim -> shape: (n_rows,)
+    refs: dict[str, np.ndarray | GridRef]  # dim -> shape: (n_rows,)
 
     errors_low: np.ndarray | None = None
     errors_high: np.ndarray | None = None
@@ -41,28 +143,30 @@ class PickTable:
 
     @classmethod
     def from_stat(cls, stat: StatisticArray) -> "PickTable":
+        from .sparse_values import SparseStatisticArray
+        if isinstance(stat, SparseStatisticArray):
+            return stat.to_pick_table()
         stat.validate()
 
         values = np.asarray(stat.values).reshape(-1)
         dims = stat.dims
 
-        refs: dict[str, np.ndarray] = {}
+        refs = {}
+        grid_shape = np.asarray(stat.values).shape
 
-        if dims:
-            coord_arrays = []
+        for axis, dim_name in enumerate(dims):
+            coords = stat.dimensions[dim_name].coords
 
-            for dim_name in dims:
-                dim = stat.dimensions[dim_name]
-                coords = dim.coords
+            if coords is None:
+                raise ValueError(
+                    f"Remaining dimension {dim_name!r} has no coords."
+                )
 
-                if coords is None:
-                    raise ValueError(f"Remaining dimension {dim_name!r} has no coords.")
-
-                coord_arrays.append(np.asarray(coords))
-
-            grids = np.meshgrid(*coord_arrays, indexing="ij")
-
-            refs = {dim_name: grid.reshape(-1) for dim_name, grid in zip(dims, grids)}
+            refs[dim_name] = GridRef(
+                coords=np.asarray(coords),
+                grid_shape=grid_shape,
+                axis=axis,
+            )
 
         errors_low = None
         errors_high = None
@@ -123,35 +227,55 @@ class PickTable:
         else:
             raise ValueError(pair_filter.target)
 
-        ref_i = self._values_for_dim(dim_i)
-        ref_j = self._values_for_dim(dim_j)
-
-        if ref_i is None or ref_j is None:
-            return self
-
         if pair_filter.relation == "all":
             return self
 
-        elif pair_filter.relation == "same":
-            mask = ref_i == ref_j
+        # Check whether both dimensions are available without expanding
+        # their coordinates across the whole table.
+        probe = self._row_block(slice(0, min(1, self.n_rows)))
 
-        elif pair_filter.relation == "different":
-            mask = ref_i != ref_j
+        if (
+            probe._values_for_dim(dim_i) is None
+            or probe._values_for_dim(dim_j) is None
+        ):
+            return self
 
-        elif pair_filter.relation == "with previous":
-            if pair_filter.target != "session":
-                raise ValueError(
-                    "'with previous' is only meaningful for session pairs."
-                )
-
-            # session_i = current session
-            # session_j = previous/reference session
-            mask = ref_j == ref_i - 1
-
-        else:
+        if pair_filter.relation not in (
+            "same",
+            "different",
+            "with previous",
+        ):
             raise ValueError(pair_filter.relation)
 
-        table = self.subset_rows(np.flatnonzero(mask))
+        if (
+            pair_filter.relation == "with previous"
+            and pair_filter.target != "session"
+        ):
+            raise ValueError(
+                "'with previous' is only meaningful for session pairs."
+            )
+
+        def select(block):
+            ref_i = block._values_for_dim(dim_i)
+            ref_j = block._values_for_dim(dim_j)
+
+            if pair_filter.relation == "same":
+                mask = ref_i == ref_j
+            elif pair_filter.relation == "different":
+                mask = ref_i != ref_j
+            else:
+                # session_i = current; session_j = previous/reference.
+                mask = ref_j == ref_i - 1
+
+            return np.flatnonzero(mask)
+
+        rows = self._collect_rows(select)
+
+        table = (
+            self
+            if rows.size == self.n_rows
+            else self.subset_rows(rows)
+        )
 
         if not pair_filter.collapse_same:
             return table
@@ -182,34 +306,104 @@ class PickTable:
 
         return table
 
-    def subset_rows(self, rows) -> "PickTable":
-        rows = np.atleast_1d(np.asarray(rows, dtype=int))
+    def iter_row_blocks(self):
+        for start in range(0, self.n_rows, ROW_BLOCK_SIZE):
+            rows = slice(start, start + ROW_BLOCK_SIZE)
+            yield start, self._row_block(rows)
 
-        return PickTable(
-            stat=self.stat,
+    def _row_block(self, rows):
+        """Create a small table with ordinary coordinate arrays."""
+        return replace(
+            self,
             values=self.values[rows],
-            dims=self.dims,
             refs={
-                dim_name: ref_values[rows] for dim_name, ref_values in self.refs.items()
+                name: column[rows]
+                for name, column in self.refs.items()
             },
-            errors_low=None if self.errors_low is None else self.errors_low[rows],
-            errors_high=None if self.errors_high is None else self.errors_high[rows],
+            errors_low=(
+                None if self.errors_low is None
+                else self.errors_low[rows]
+            ),
+            errors_high=(
+                None if self.errors_high is None
+                else self.errors_high[rows]
+            ),
             n=None if self.n is None else self.n[rows],
         )
 
+    def _collect_rows(self, select):
+        """Collect selected row indices from bounded table blocks."""
+        parts = []
+
+        for start, block in self.iter_row_blocks():
+            rows = select(block)
+
+            if rows.size:
+                parts.append(rows + start)
+
+        if not parts:
+            return np.empty(0, dtype=np.intp)
+
+        if len(parts) == 1:
+            return parts[0]
+
+        return np.concatenate(parts)
+
+    def subset_rows(self, rows) -> "PickTable":
+        rows = np.atleast_1d(np.asarray(rows, dtype=np.intp))
+
+        refs = {}
+        row_maps = {}
+
+        for name, column in self.refs.items():
+            if isinstance(column, GridRef):
+                # Coordinate columns using the same original row mapping
+                # share their new mapping too.
+                key = id(column.row_ids)
+
+                if key not in row_maps:
+                    row_maps[key] = (
+                        rows
+                        if column.row_ids is None
+                        else column.row_ids[rows]
+                    )
+
+                refs[name] = replace(
+                    column,
+                    row_ids=row_maps[key],
+                )
+            else:
+                refs[name] = column[rows]
+
+        return replace(
+            self,
+            values=self.values[rows],
+            refs=refs,
+            errors_low=(
+                None if self.errors_low is None
+                else self.errors_low[rows]
+            ),
+            errors_high=(
+                None if self.errors_high is None
+                else self.errors_high[rows]
+            ),
+            n=None if self.n is None else self.n[rows],
+        )
+    
     def collapse_pair_dims(
         self,
         *,
         dim_i: str,
         dim_j: str,
         new_dim: str,
-        coords: np.ndarray,
+        coords: np.ndarray | GridRef,
     ) -> "PickTable":
 
         if dim_i not in self.refs or dim_j not in self.refs:
             raise ValueError(f"Cannot collapse {dim_i!r}/{dim_j!r}; missing refs.")
 
-        coords = np.asarray(coords)
+        if not isinstance(coords, GridRef):
+            coords = np.asarray(coords)
 
         if coords.shape != (self.n_rows,):
             raise ValueError(
@@ -259,7 +453,7 @@ class PickTable:
         if dim_i not in self.refs or dim_j not in self.refs:
             raise ValueError(f"Cannot collapse {dim_i!r}/{dim_j!r}; missing refs.")
 
-        if not np.array_equal(
+        if not refs_equal(
             self.refs[dim_i],
             self.refs[dim_j],
         ):
@@ -352,8 +546,11 @@ class PickTable:
             return np.asarray([], dtype=int)
 
         values = np.asarray(list(values))
-        mask = np.isin(self.refs[dim_name], values)
-        return np.flatnonzero(mask)
+        return self._collect_rows(
+            lambda block: np.flatnonzero(
+                np.isin(block.refs[dim_name], values)
+            )
+        )
 
     def tooltip_for_row(self, row: int, *, value_name: str = "value") -> str:
         """
@@ -395,6 +592,18 @@ class PickTable:
         if dim_name in self.refs:
             return self.refs[dim_name]
 
+        # A compact previous-session pair is labelled by its current
+        # session; its reference coordinate is one session earlier.
+        binding = getattr(self.stat, "reference_aliases", {}).get(dim_name)
+        if binding is not None:
+            compact, offset = binding
+            if compact in self.refs:
+                return self.refs[compact] + offset
+            info = self.stat.dimensions.get(compact)
+            if info is not None and info.mode == "fixed":
+                return np.full(self.n_rows, info.parameter + offset)
+            return None
+
         # 2. Collapsed alias, e.g. neuron_i -> neuron
         alias = canonical_dim(dim_name)
         if alias is not None and alias in self.refs:
@@ -425,6 +634,26 @@ class PickTable:
         return None
 
     def rows_matching_components(
+        self,
+        components,
+        *,
+        use_session_filter=True,
+        include_self_pairs=True,
+    ) -> np.ndarray:
+        components = [] if components is None else list(components)
+
+        if not components:
+            return np.empty(0, dtype=np.intp)
+
+        return self._collect_rows(
+            lambda block: block._rows_matching_components(
+                components,
+                use_session_filter=use_session_filter,
+                include_self_pairs=include_self_pairs,
+            )
+        )
+    
+    def _rows_matching_components(
         self,
         components,
         *,
@@ -461,51 +690,58 @@ class PickTable:
         if not neuron_arrays:
             return np.asarray([], dtype=int)
 
-        def component_mask(
-            neuron_values,
-            session_arrays,
-        ):
-            """
-            Rows on one semantic neuron axis matching at least one
-            selected component.
-            """
+        all_neuron_ids = np.asarray(sorted(selected_neurons), dtype=int)
 
+        wildcard_neurons = set()
+        neurons_by_session = {}
+
+        for component in components:
+            neuron_id = int(component.neuron_id)
+
+            if component.session_id is None:
+                wildcard_neurons.add(neuron_id)
+            else:
+                neurons_by_session.setdefault(
+                    int(component.session_id), set()
+                ).add(neuron_id)
+
+        wildcard_ids = np.asarray(sorted(wildcard_neurons), dtype=int)
+
+        session_groups = [
+            (
+                session_id,
+                np.asarray(sorted(neurons - wildcard_neurons), dtype=int),
+            )
+            for session_id, neurons in neurons_by_session.items()
+            if neurons - wildcard_neurons
+        ]
+
+        def component_mask(neuron_values, session_arrays):
             neuron_values = np.asarray(neuron_values)
 
-            mask = np.zeros(
-                self.n_rows,
-                dtype=bool,
-            )
+            if not use_session_filter or not session_arrays:
+                return np.isin(neuron_values, all_neuron_ids)
 
-            for component in components:
+            # Session-independent selections match this neuron everywhere.
+            mask = np.isin(neuron_values, wildcard_ids)
 
-                component_mask = (
-                    neuron_values
-                    == int(component.neuron_id)
-                )
+            # Process each selected session once, rather than scanning
+            # the whole table separately for every selected component.
+            for session_id, neuron_ids in session_groups:
+                session_mask = np.zeros(self.n_rows, dtype=bool)
 
-                # None = tracked-neuron identity,
-                # independent of session.
-                if (
-                    use_session_filter
-                    and component.session_id is not None
-                    and session_arrays
-                ):
-
-                    session_mask = np.zeros(
-                        self.n_rows,
-                        dtype=bool,
+                for session_values in session_arrays:
+                    session_mask |= (
+                        np.asarray(session_values) == session_id
                     )
 
-                    for session_values in session_arrays:
-                        session_mask |= (
-                            np.asarray(session_values)
-                            == int(component.session_id)
-                        )
+                rows = np.flatnonzero(session_mask & ~mask)
 
-                    component_mask &= session_mask
-
-                mask |= component_mask
+                if rows.size:
+                    mask[rows] |= np.isin(
+                        neuron_values[rows],
+                        neuron_ids,
+                    )
 
             return mask
 

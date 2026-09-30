@@ -463,7 +463,7 @@ class MainMenu(QFrame):
                     and self.data.assignments.path
                     and not self.data.assignments.status["loaded"]
                 ):
-                    self.data.load_assignments()
+                    self.data.queue_load_assignments()
                 else:
                     self.data.queue_process_assignments(mode="pending")
 

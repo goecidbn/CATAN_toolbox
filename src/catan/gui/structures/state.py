@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from time import time
 import numpy as np
 from PySide6.QtCore import QObject, Signal, QSettings
+from PySide6.QtWidgets import QApplication, QMessageBox
+
 from typing import Literal, Tuple, Optional, List
 import logging
 from weakref import WeakSet
@@ -65,6 +67,7 @@ class AppState(QObject):
         self._focused_component: Optional[NeuronComponent] = None
         self._highlighted_components: Optional[List[NeuronComponent]] = None
 
+        
         self.current_job = None
         self.tasks = TaskManager()
 
@@ -79,6 +82,7 @@ class AppState(QObject):
         self.time_ref = None
 
         self._current_request: Optional[RequestHandler] = None
+        self._request_focus_confirmation_open = False
 
         ## global parameters
         self._adjacency_radius = 15.0
@@ -143,6 +147,62 @@ class AppState(QObject):
     def notify_request_changed(self):
         self.request_status_changed.emit()
 
+    def _allow_focus_change(self, component):
+        if self._request_focus_confirmation_open:
+            return False
+
+        request = self.current_request
+        previous = self._focused_component
+
+        old_neuron = None if previous is None else previous.neuron_id
+        new_neuron = None if component is None else component.neuron_id
+
+        if request is None or old_neuron == new_neuron:
+            return True
+
+        version = self.data_version
+        self._request_focus_confirmation_open = True
+
+        try:
+            dialog = QMessageBox(QApplication.activeWindow())
+            dialog.setWindowTitle("Cancel current request?")
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            dialog.setText("Changing neurons cancels the current request.")
+
+            ok_button = dialog.addButton(QMessageBox.StandardButton.Ok)
+            stay_button = dialog.addButton(
+                (
+                    f"Stay at neuron {old_neuron}"
+                    if old_neuron is not None
+                    else "Keep current focus"
+                ),
+                QMessageBox.ButtonRole.RejectRole,
+            )
+            dialog.setDefaultButton(stay_button)
+            dialog.setEscapeButton(stay_button)
+
+            dialog.exec()
+            accepted = dialog.clickedButton() is ok_button
+            dialog.deleteLater()
+        finally:
+            self._request_focus_confirmation_open = False
+
+        if not accepted:
+            return False
+
+        # The dialog runs an event loop. Do not apply a navigation
+        # request whose underlying state changed in the meantime.
+        if (
+            self.current_request is not request
+            or self._focused_component != previous
+            or self.data_version != version
+        ):
+            return False
+
+        self.current_request = None
+        self.update_highlighted_components(None)
+        return True
+    
     @property
     def adjacency_radius(self) -> float:
         return self._adjacency_radius
@@ -264,20 +324,26 @@ class AppState(QObject):
         if isinstance(selected_components, list) and len(selected_components) == 0:
             selected_components = None
 
+        next_focus = self.focused_component
+
+        if selected_components is None:
+            next_focus = None
+        elif not self._component_in_components(
+            next_focus, selected_components
+        ):
+            next_focus = selected_components[-1]
+
+        # Ask before changing either selection or focus.
+        if not self._allow_focus_change(next_focus):
+            return
+
         self._selected_components = (
             sorted(selected_components, key=lambda c: c.neuron_id)
             if selected_components is not None
             else None
         )
-        if selected_components is not None and not self._component_in_components(
-            self.focused_component, selected_components
-        ):
-            self.focused_component = selected_components[-1]
-        elif selected_components is None:
-            self.focused_component = None
-        else:
-            self.focused_component = self.focused_component
 
+        self.focused_component = next_focus
         self.selected_components_changed.emit()
 
     @property
@@ -288,6 +354,9 @@ class AppState(QObject):
     def focused_component(self, component: Optional[NeuronComponent]):
 
         if component == self._focused_component:
+            return
+        
+        if not self._allow_focus_change(component):
             return
 
         self.logger.debug(f"Setting focused component to {component}")
@@ -439,12 +508,23 @@ class AppState(QObject):
         neuron_id_map: dict[int, int],
         *,
         from_session_id: int,
+        component_id_map=None,
     ):
         """Publish rebuilt assignments and remap surviving GUI selections."""
 
         def remap_component(component):
             if component is None:
                 return None
+
+            key = (component.neuron_id, component.session_id)
+            if component_id_map is not None and key in component_id_map:
+                target = component_id_map[key]
+                if target is None:
+                    return None
+                return NeuronComponent(
+                    neuron_id=target[0],
+                    session_id=target[1],
+                )
 
             # A session-specific selection in the rebuilt suffix may now
             # belong to a different neuron. Do not silently redirect it.
@@ -482,7 +562,15 @@ class AppState(QObject):
         self._focused_component = focused
         self._highlighted_components = highlighted
         self._hovered_components = None
-        self._current_request = None
+        request = self._current_request
+        if (
+            request is not None
+            and request.type == "neuron_merge"
+            and from_session_id >= assignments.shape[1]
+        ):
+            self._current_request = request.remap_rows(neuron_id_map)
+        else:
+            self._current_request = None
 
         self.selected_components_changed.emit()
         self.focused_component_changed.emit()

@@ -23,6 +23,30 @@
                     "attribute": "parameter_names"
                 }
             }
+        },
+        "persistence": {
+            "title": "Model state",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+                "metadata": {
+                    "path": "/model_metadata",
+                    "source": "field",
+                    "required": false
+                }
+            }
+        },
+        "count_arrays": {
+            "title": "Count records",
+            "type": "dynamic",
+            "enabled": true,
+            "fields": {
+                "arrays": {
+                    "path": "/counts/*",
+                    "source": "field",
+                    "required": false
+                }
+            }
         }
     },
     "native": true

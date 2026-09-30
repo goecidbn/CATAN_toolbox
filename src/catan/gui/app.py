@@ -77,12 +77,33 @@ def main() -> int:
 
         atexit.register(discard_fresh_settings)
 
+    # import faulthandler
+    # import tempfile
+    # from pathlib import Path
+
+    # traceback_path = Path(tempfile.gettempdir()) / "catan-loading-stacks.log"
+    # traceback_log = traceback_path.open("w", buffering=1)
+
+    # faulthandler.dump_traceback_later(
+    #     15,
+    #     repeat=True,
+    #     file=traceback_log,
+    # )
+    # print(f"Loading diagnostics: {traceback_path}", flush=True)
+
     window = MainWindow(settings=settings)
 
     if options.fresh:
         window.setWindowTitle(f"{window.windowTitle()} [fresh settings]")
 
     window.show()
+
+    # if owns_application:
+    #     try:
+    #         return app.exec()
+    #     finally:
+    #         faulthandler.cancel_dump_traceback_later()
+    #         traceback_log.close()
 
     if owns_application:
         return app.exec()

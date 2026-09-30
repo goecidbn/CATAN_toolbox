@@ -260,6 +260,7 @@ class FieldSelector(QWidget):
 
         self.fields_changed.connect(self._on_fields_changed)
 
+        self._compatibility_dirty = True
         self.update_source(source)
         # self.rebuild()
         # self.state.data_changed.connect(self._on_data_changed)
@@ -304,6 +305,10 @@ class FieldSelector(QWidget):
 
     def _on_fields_changed(self):
 
+        self._compatibility_dirty = True
+        if self._defer_compatibility_check():
+            return
+            
         if (
             self.source is None
             or not self.source.path
@@ -332,7 +337,8 @@ class FieldSelector(QWidget):
 
         # also, finally color current session properly!!
         self.source.status["loading_possible"] = loading_possible
-    
+        self._compatibility_dirty = False
+
     def _set_group_enabled(self, group_name: str, enabled: bool):
         if self.source is None or self.source.source_config is None:
             return
@@ -523,6 +529,18 @@ class FieldSelector(QWidget):
         self.field_options[group_name].refresh(field_name, field_path)
         self.fields_changed.emit()
 
+    def _defer_compatibility_check(self):
+        return (
+            isinstance(self.source, SessionData)
+            and getattr(self.source, "_restored_from_catan", False)
+            and not self.isVisible()
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+
+        if self._compatibility_dirty:
+            self._on_fields_changed()
 
 def checkbox_with_options(
     group_spec: FieldGroupSpec, opts_ref: QWidget, active: bool, callback: Callable

@@ -327,8 +327,6 @@ class Assignments:
 
     def register_data(self, **data):
 
-        # print("registering data:", data.keys())
-
         ids = data["assignments"].get("ids")
         assert ids is not None, "IDs must be provided in the data dictionary"
         assert isinstance(ids, np.ndarray), "IDs must be a numpy array"

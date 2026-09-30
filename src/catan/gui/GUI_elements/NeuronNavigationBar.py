@@ -51,6 +51,12 @@ class NeuronNavigationBar(QWidget):
         selector_layout.addWidget(self.only_open_checkbox)
 
         self.footprint_slider.sliderMoved.connect(self._on_slider_moved)
+        self.footprint_slider.sliderReleased.connect(
+            lambda: self._on_slider_moved(
+                self.footprint_slider.sliderPosition()
+            )
+        )
+
         self.footprint_id_prev.clicked.connect(self.on_prev_footprint)
         self.footprint_id_next.clicked.connect(self.on_next_footprint)
         self.footprint_edit.editingFinished.connect(self._on_neuron_edit_return)
@@ -181,6 +187,12 @@ class NeuronNavigationBar(QWidget):
         self,
         value: int,
     ):
+        # During a request, confirm only the final position on release.
+        if (
+            self.state.current_request is not None
+            and self.footprint_slider.isSliderDown()
+        ):
+            return
 
         selected = self.state.selected_components
 
@@ -202,6 +214,7 @@ class NeuronNavigationBar(QWidget):
             )
 
         self.state.focused_component = component
+        self.adjust_id()
 
     def adjust_id(
         self,
@@ -241,8 +254,12 @@ class NeuronNavigationBar(QWidget):
         else:
             slider_value = int(focused.neuron_id)
 
-        if self.footprint_slider.value() != slider_value:
+        was_blocked = self.footprint_slider.blockSignals(True)
+        try:
+            self.footprint_slider.setSliderPosition(slider_value)
             self.footprint_slider.setValue(slider_value)
+        finally:
+            self.footprint_slider.blockSignals(was_blocked)
 
     def _resolve_selected_component(
         self,
@@ -276,3 +293,4 @@ class NeuronNavigationBar(QWidget):
         )
 
         self.state.focused_component = component
+        self.adjust_id()

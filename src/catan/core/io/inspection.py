@@ -46,7 +46,7 @@ class FileInspector:
             return self._structure
 
         backend = get_backend(path)
-        structure = backend.inspect_file(path)
+        structure = backend.inspect_file(path, root=root)
         # with backend.open_read(path) as ref:
         #     structure = backend.inspect(ref, root=root)
 
@@ -138,10 +138,10 @@ def check_fields_compatibility(
 
             try:
                 if cache_key not in structures:
-                    backend = get_backend(source_path)
-
-                    structures[cache_key] = backend.inspect_file(
-                        source_path, root=source_root
+                    structures[cache_key] = _DEFAULT_INSPECTOR.inspect(
+                        source_path,
+                        root=source_root,
+                        refresh=refresh,
                     )
 
                 structure = structures[cache_key]

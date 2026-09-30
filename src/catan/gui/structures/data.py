@@ -3,6 +3,7 @@ from catan.tracking.structures.model import Model
 import numpy as np
 from pathlib import Path
 from functools import wraps
+from copy import copy, deepcopy
 
 from catan import Tracking
 from . import AppState, StatisticDisplayConfig
@@ -908,45 +909,76 @@ class Data(Tracking):
         with backend.open_read(from_file) as ref:
             object_type = backend.get_attribute(ref, "/", "object_type")
 
-        if object_type in {"SessionData", "SessionList"}:
+        restored_from_catan = object_type in {"SessionData", "SessionList"}
+        if restored_from_catan:
             sessions = super().load_session_data(from_file)
         else:
             sessions = [SessionData(path=str(Path(from_file).expanduser().resolve()))]
 
         registered_ids = []
 
-        for session in sessions:
-            session_id = super().register_session(
-                from_data=session,
-                **kwargs,
-            )
-            registered_ids.append(session_id)
+        try:
+            for session in sessions:
+                # Runtime marker for GUI validation; not persisted.
+                session._restored_from_catan = restored_from_catan
+                session_id = super().register_session(
+                    from_data=session,
+                    **kwargs,
+                )
+                registered_ids.append(session_id)
 
-            saved_state = session.__dict__.pop("_restored_processing", None)
-            if saved_state is not None:
-                processing = self._processing_state(session_id)
-                processing.geometry_revision = int(saved_state["geometry_revision"])
-                processing.alignment_stale = bool(saved_state["alignment_stale"])
+                saved_state = session.__dict__.pop("_restored_processing", None)
+                if saved_state is not None:
+                    processing = self._processing_state(session_id)
+                    processing.geometry_revision = int(
+                        saved_state["geometry_revision"]
+                    )
+                    processing.alignment_stale = bool(
+                        saved_state["alignment_stale"]
+                    )
 
-            # Preserve restored field mappings and source overrides.
-            if session.source_config is None:
-                session.source_config = self.state.config_manager.suggest_config_for(
-                    path=session.path,
-                    source_type="session",
+                # Preserve restored field mappings and source overrides.
+                if session.source_config is None:
+                    session.source_config = (
+                        self.state.config_manager.suggest_config_for(
+                            path=session.path,
+                            source_type="session",
+                        )
+                    )
+
+                if not session.name:
+                    session.name = Path(session.path).parent.name
+
+                self.state.session_color = (
+                    session_id,
+                    self.session_colors.next(),
                 )
 
-            if not session.name:
-                session.name = Path(session.path).parent.name
+        finally:
+            # Publish once, including sessions successfully added before
+            # an error interrupted registration.
+            if registered_ids:
+                # Padding replaces the underlying array. Publish its latest
+                # reference before notifying statistics and displays.
+                self.state.assignments = (
+                    None
+                    if self.assignments is None
+                    else self.assignments.ids
+                )
 
-            self.state.session_color = (
-                session_id,
-                self.session_colors.next(),
-            )
+                paths = {
+                    str(self.sessions[index].path)
+                    for index in registered_ids
+                    if self.sessions[index].path is not None
+                }
 
-            if self.state.current_session_id is None:
-                self.state.current_session_id = session_id
+                self.notify_change(
+                    C.SESSION_ADDED,
+                    session_paths=paths or None,
+                )
 
-            self.notify_change(C.SESSION_ADDED, session_id=session_id)
+                if self.state.current_session_id is None:
+                    self.state.current_session_id = registered_ids[0]
 
         return registered_ids
 
@@ -1056,7 +1088,6 @@ class Data(Tracking):
         self.restore_manipulations()
 
         self.rebuild_union()
-        self.rebuild_union_included()
 
         self.state.assignments = self.assignments.ids
 
@@ -1064,6 +1095,151 @@ class Data(Tracking):
             C.ASSIGNMENT_SET,
             C.FOOTPRINT_GEOMETRY,
             *ASSIGNMENT_CONTENT_CHANGES,
+        )
+
+    @after_display_tasks
+    def queue_load_assignments(self):
+        tasks = self.state.tasks
+
+        if tasks.processing_busy():
+            self.state.issue(
+                "warning",
+                "Assignment loading not started",
+                "Wait for existing processing tasks to finish.",
+            )
+            return
+
+        source = self.assignments
+        if source is None:
+            return
+
+        if source.source_config is None:
+            self.state.issue(
+                "warning",
+                "Assignment loading not started",
+                "Select a load configuration first.",
+            )
+            return
+
+        assignment_name = self.current_assignments
+        data_version = self.state.data_version
+        sessions = tuple(self.sessions)
+        source_path = source.path
+        source_fields = deepcopy(source.source_config.get_fields_to_load())
+
+        candidate = Assignments()
+        candidate.path = source_path
+        candidate.source_config = deepcopy(source.source_config)
+
+        # Borrow the tracking methods, but isolate everything this operation
+        # mutates. Large footprint/trace arrays are initially shared read-only.
+        worker = copy(self)
+        worker._assignments = {assignment_name: candidate}
+        worker._current_assignments = assignment_name
+        worker.sessions = []
+
+        for session in sessions:
+            staged = copy(session)
+
+            # Restoration changes inclusion in place.
+            staged.included = session.included.copy()
+
+            # Appending synthetic components replaces arrays, but writes
+            # their new references into these dictionaries.
+            staged._traces = dict(session._traces)
+            staged.quality = dict(session.quality)
+
+            worker.sessions.append(staged)
+
+        def run():
+            ctx = current_task_context()
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            candidate.load()
+            worker._ensure_assignment_session_count(candidate)
+
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            worker.restore_manipulations()
+
+            if candidate.ids.shape[0] > 0:
+                if not worker.check_assignments_compatibility(candidate):
+                    raise ValueError(
+                        "Assignments are incompatible with the loaded sessions."
+                    )
+
+            worker.rebuild_union(ctx=ctx)
+
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            return candidate
+
+        def publish(result):
+            if result is None:
+                return
+
+            sessions_unchanged = (
+                len(self.sessions) == len(sessions)
+                and all(
+                    current is original
+                    for current, original in zip(self.sessions, sessions)
+                )
+            )
+            config_unchanged = (
+                source.source_config is not None
+                and source.path == source_path
+                and source.source_config.get_fields_to_load() == source_fields
+            )
+
+            if (
+                self.state.data_version != data_version
+                or self.assignments is not source
+                or self.current_assignments != assignment_name
+                or not sessions_unchanged
+                or not config_unchanged
+            ):
+                self.state.issue(
+                    "warning",
+                    "Assignment loading discarded",
+                    "Data or the load configuration changed during loading. "
+                    "Please load the assignments again.",
+                )
+                return
+
+            # Publish restored manipulation effects, preserving session identity.
+            for original, staged in zip(sessions, worker.sessions):
+                original.included = staged.included
+
+                if staged.n_neurons != original.n_neurons:
+                    for field in (
+                        "footprints",
+                        "centroids",
+                        "n_neurons",
+                        "synthetic",
+                        "_traces",
+                        "quality",
+                    ):
+                        setattr(original, field, getattr(staged, field))
+
+            # Preserve references held by configuration widgets.
+            result.source_config = source.source_config
+            source.__dict__.update(result.__dict__)
+
+            self.state.assignments = source.ids
+            self.notify_change(
+                C.ASSIGNMENT_SET,
+                C.FOOTPRINT_GEOMETRY,
+                *ASSIGNMENT_CONTENT_CHANGES,
+            )
+
+        return tasks.start(
+            "loading",
+            "Load assignments and rebuild union",
+            run,
+            on_result=publish,
         )
 
     def add_assignments(
@@ -1383,7 +1559,7 @@ class Data(Tracking):
             )
 
             # The now-empty original slot gets a clean state.
-            values[retired_neuron_id, session_id, ...] = np.nan
+            values[neuron_id, session_id, ...] = np.nan
 
         # ---------------------------------------------
         # 3. Rebuild union representation.
@@ -1588,6 +1764,134 @@ class Data(Tracking):
             )
 
         return target_neuron
+
+    def neuron_merge_distance(self, source_id, target_id):
+        assignments = self.assignments
+        if assignments is None or assignments.union is None:
+            return np.inf
+
+        union = assignments.union
+        if (
+            source_id == target_id
+            or union.centroids is None
+            or not 0 <= source_id < len(union.centroids)
+            or not 0 <= target_id < len(union.centroids)
+        ):
+            return np.inf
+
+        # Union centroids use the pixel-to-micron conversion.
+        scale = float(union.params.get("pxtomu", 1.0))
+        if not np.isfinite(scale) or scale <= 0:
+            return np.inf
+
+        distance = (
+            np.linalg.norm(
+                union.centroids[source_id] - union.centroids[target_id]
+            )
+            / scale
+        )
+        return float(distance) if np.isfinite(distance) else np.inf
+
+    def merge_neuron_request(self, request):
+        assignments = self.assignments
+
+        if request.assignments is not assignments:
+            raise ValueError("The active assignments changed; start a new request.")
+
+        if (
+            self.state.tasks.processing_busy()
+            or self.state.tasks.processing_requested
+        ):
+            raise ValueError("Wait for assignment processing to finish.")
+
+        request.refresh()
+        if not request.is_complete:
+            raise ValueError(request.error)
+
+        source = request.source_id
+        target = request.target_id
+
+        if self.neuron_merge_distance(source, target) > 10.0:
+            raise ValueError("The union centroids are now more than 10 px apart.")
+
+        # Prepare changes separately. Publish only after union rebuilding
+        # and row compaction have succeeded.
+        candidate = copy(assignments)
+        candidate.ids = assignments.ids.copy()
+        candidate.stats = {
+            key: values.copy()
+            for key, values in assignments.stats.items()
+        }
+        candidate.review_status = assignments.review_status.copy()
+        candidate.manipulation_id = dict(assignments.manipulation_id)
+
+        candidate.union = copy(assignments.union)
+        union = candidate.union
+        union.centroids = union.centroids.copy()
+        union.included = union.included.copy()
+        union.synthetic = union.synthetic.copy()
+        if union.background is not None:
+            union.background = union.background.copy()
+
+        sessions = np.flatnonzero(candidate.ids[source] >= 0)
+        candidate.ids[target, sessions] = candidate.ids[source, sessions]
+        candidate.ids[source, :] = -1
+
+        # Existing matching scores no longer describe this combined neuron.
+        for values in candidate.stats.values():
+            values[target, ...] = np.nan
+            values[source, ...] = np.nan
+
+        candidate.review_status[target] = ReviewStatus.PENDING
+        union.synthetic[target] |= union.synthetic[source]
+
+        worker = copy(self)
+        worker._assignments = {self._current_assignments: candidate}
+        worker._current_assignments = self._current_assignments
+
+        worker.rebuild_union_neurons([source, target])
+        worker.rebuild_union_included()
+
+        # Remove the now-empty source row.
+        keep = np.delete(np.arange(len(candidate.ids)), source)
+        row_map = {
+            int(old): new
+            for new, old in enumerate(keep)
+        }
+
+        candidate.ids = candidate.ids[keep]
+        candidate.review_status = candidate.review_status[keep]
+        candidate.stats = {
+            key: values[keep]
+            for key, values in candidate.stats.items()
+        }
+        candidate.manipulation_id = {
+            row_map[old]: manipulation_id
+            for old, manipulation_id in candidate.manipulation_id.items()
+            if old in row_map
+        }
+        candidate.matched_status = np.any(candidate.ids >= 0, axis=0)
+
+        union.footprints = union.footprints[:, keep].tocsc()
+        union.centroids = union.centroids[keep]
+        union.included = union.included[keep]
+        union.synthetic = union.synthetic[keep]
+        union.n_neurons = len(keep)
+
+        # Preserve the Assignments object's identity.
+        assignments.__dict__.update(candidate.__dict__)
+
+        # Selections of moved components follow the destination neuron.
+        row_map[source] = row_map[target]
+        self.state.apply_assignment_rebuild(
+            assignments.ids,
+            row_map,
+            from_session_id=len(self.sessions),
+        )
+        self.notify_change(
+            *ASSIGNMENT_CONTENT_CHANGES,
+            C.REVIEW_STATUS,
+        )
 
     def change_review_status(self, neuron_id: int, status: ReviewStatus):
 
@@ -1868,3 +2172,152 @@ class Data(Tracking):
 
         self.assignments.review_status[neuron_ids] = int(status)
         self.notify_change(C.REVIEW_STATUS)
+
+    def curation_targets(self, components, *, whole_neurons=False, remove=False):
+        if self.assignments is None or self.assignments.union is None:
+            raise ValueError("Load or calculate assignments first.")
+
+        ids = self.assignments.ids
+        slots = set()
+
+        for component in components:
+            neuron_id = int(component.neuron_id)
+            if not 0 <= neuron_id < ids.shape[0]:
+                raise ValueError("The selection contains an outdated neuron.")
+
+            if whole_neurons:
+                slots.update(
+                    (neuron_id, int(session_id))
+                    for session_id in np.flatnonzero(ids[neuron_id] >= 0)
+                )
+            else:
+                session_id = component.session_id
+                if session_id is None:
+                    raise ValueError(
+                        "Select session-specific components for this operation."
+                    )
+                session_id = int(session_id)
+                if not 0 <= session_id < ids.shape[1]:
+                    raise ValueError("The selection contains an outdated session.")
+                slots.add((neuron_id, session_id))
+
+        targets = []
+        for neuron_id, session_id in sorted(slots):
+            footprint_id = int(ids[neuron_id, session_id])
+            if footprint_id < 0:
+                continue
+
+            session = self.sessions[session_id]
+            if not 0 <= footprint_id < len(session.included):
+                raise ValueError("An assigned footprint is missing from its session.")
+
+            # Exclusion is idempotent; removal also applies to excluded items.
+            if remove or session.included[footprint_id]:
+                targets.append((neuron_id, session_id, footprint_id))
+
+        return tuple(targets)
+
+    def apply_curation_targets(self, targets, *, remove=False, whole_neurons=False):
+        if not targets:
+            return
+
+        assignments = self.assignments
+        if assignments is None or assignments.union is None:
+            raise ValueError("No assignments are available.")
+
+        # Validate the entire target set before changing anything.
+        for neuron_id, session_id, footprint_id in targets:
+            if (
+                not 0 <= neuron_id < assignments.ids.shape[0]
+                or not 0 <= session_id < assignments.ids.shape[1]
+                or assignments.ids[neuron_id, session_id] != footprint_id
+                or not 0 <= footprint_id < len(self.sessions[session_id].included)
+            ):
+                raise ValueError("Assignments changed; select the components again.")
+
+        old_count = assignments.ids.shape[0]
+        affected = {neuron_id for neuron_id, _, _ in targets}
+        component_map = {}
+
+        # Component exclusion creates one excluded singleton per footprint.
+        detach = not remove and not whole_neurons
+        if detach:
+            assignments.pad_empty(n_neurons=len(targets), n_sessions=0)
+
+        for index, (neuron_id, session_id, footprint_id) in enumerate(targets):
+            self.sessions[session_id].included[footprint_id] = False
+
+            if remove or detach:
+                assignments.ids[neuron_id, session_id] = -1
+                for values in assignments.stats.values():
+                    values[neuron_id, session_id, ...] = np.nan
+
+            if detach:
+                new_id = old_count + index
+                assignments.ids[new_id, session_id] = footprint_id
+                for key, values in assignments.stats.items():
+                    values[new_id, session_id, ...] = (
+                        assignments.stats_default_value.get(key, np.nan)
+                    )
+                affected.add(new_id)
+                component_map[(neuron_id, session_id)] = (new_id, session_id)
+            elif remove:
+                component_map[(neuron_id, session_id)] = None
+
+        structural = remove or detach
+
+        if structural:
+            self.rebuild_union_neurons(sorted(affected))
+
+        self.rebuild_union_included()
+
+        # Compact once, after every target has been processed.
+        keep = np.flatnonzero(np.any(assignments.ids >= 0, axis=1))
+        row_map = {int(old): new for new, old in enumerate(keep)}
+
+        if structural and len(keep) != assignments.ids.shape[0]:
+            assignments.ids = assignments.ids[keep]
+            assignments.review_status = assignments.review_status[keep]
+            assignments.stats = {
+                key: values[keep]
+                for key, values in assignments.stats.items()
+            }
+            assignments.manipulation_id = {
+                row_map[old]: manipulation_id
+                for old, manipulation_id in assignments.manipulation_id.items()
+                if old in row_map
+            }
+
+            union = assignments.union
+            union.footprints = union.footprints[:, keep].tocsc()
+            if union.centroids is not None:
+                union.centroids = union.centroids[keep]
+            union.included = union.included[keep]
+            union.synthetic = union.synthetic[keep]
+            union.n_neurons = len(keep)
+        elif not structural:
+            row_map = {
+                index: index for index in range(assignments.ids.shape[0])
+            }
+
+        assignments.matched_status = np.any(assignments.ids >= 0, axis=0)
+
+        component_map = {
+            old: (
+                None if target is None
+                else (row_map[target[0]], target[1])
+            )
+            for old, target in component_map.items()
+        }
+
+        self.state.apply_assignment_rebuild(
+            assignments.ids,
+            row_map,
+            from_session_id=len(self.sessions),
+            component_id_map=component_map,
+        )
+
+        if structural:
+            self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
+        else:
+            self.notify_change(C.INCLUSION, neuron_ids=affected)

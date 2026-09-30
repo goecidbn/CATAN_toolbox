@@ -111,13 +111,11 @@ def make_engine_query_for_session_series(
         query.filters,
     )
 
-    # Used only for determining reduction order.
-    if "session" in session_dims:
-        keep_session_dim = "session"
-    elif "session_i" in session_dims:
-        keep_session_dim = "session_i"
-    else:
-        keep_session_dim = session_dims[0]
+    # Follow the actually retained axis (including a user-selected j axis).
+    keep_session_dim = next(
+        (d for d in session_dims if reductions.get(d, ReductionSpec("keep")).method == "keep"),
+        session_dims[0],
+    )
 
     reduction_order = _session_series_reduction_order(
         stat_def.dims,
@@ -173,7 +171,9 @@ def validate_session_series_engine_query(query: StatisticQuery, registry):
         spec = reductions.get(dim, ReductionSpec("keep"))
 
         if dim in NEURON_DIMS:
-            if spec.method in ("keep", "single"):
+            if spec.method == "keep" or (
+                spec.method == "single" and stat_def.key != "footprint_similarity"
+            ):
                 raise ValueError(
                     f"Session series cannot leave neuron dimension {dim!r} "
                     "unreduced."
@@ -260,7 +260,13 @@ def build_session_series_from_table(table: PickTable) -> SessionSeries:
 
     # Usually the table should already have one row per session after
     # session-series reductions. But this makes the function robust.
-    unique_sessions = np.asarray(sorted(np.unique(session_ids)))
+    # Sparse tables omit unobserved NaN rows. Keep the full session domain
+    # so missing sessions remain gaps rather than disappearing from a line.
+    from .sparse_values import SparseStatisticArray
+    if isinstance(table.stat, SparseStatisticArray):
+        unique_sessions = np.asarray(table.stat.dimensions[session_dim].coords)
+    else:
+        unique_sessions = np.asarray(sorted(np.unique(session_ids)))
 
     out_values = np.full(unique_sessions.shape, np.nan, dtype=float)
     out_err_low = None
@@ -276,6 +282,8 @@ def build_session_series_from_table(table: PickTable) -> SessionSeries:
 
     for i, sid in enumerate(unique_sessions):
         rows = np.flatnonzero(session_ids == sid)
+        if rows.size == 0:
+            continue
 
         # Expected case: one row per session.
         if rows.size == 1:

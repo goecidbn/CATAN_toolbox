@@ -65,6 +65,7 @@ class SessionData:
     ## to be calculated (with additional information)
     # idx_kde: np.ndarray
 
+
     HDF5_VERSION = 1
 
     def __init__(
@@ -76,6 +77,7 @@ class SessionData:
         """ """
         self.name = name
         self.path = kwargs.get("path", None)
+        self._restored_from_catan: bool = False
 
         self.status = {
             # load status flags

@@ -52,7 +52,7 @@ from catan.gui.data.statistics.dimensions import (
 )
 from catan.gui.utils.popups import constrain_popup
 
-MAX_PAIR_ROWS = 200
+MAX_TABLE_ROWS = 200
 MAX_STATISTIC_HEADER_LENGTH = 24
 
 EntityMode = Literal["footprint", "neuron"]
@@ -312,14 +312,11 @@ class Display(QWidget):
         ):
             self.update_display()
 
-    def _show_pair_warning(
-        self,
-        n_entities: int,
-        n_pairs: int,
-    ):
+    def _show_row_warning(self, total_rows: int):
         self.pair_warning_label.setText(
-            f"{n_entities} selected entities create {n_pairs} pairs. "
-            f"Showing the first {MAX_PAIR_ROWS}."
+            f"Showing the first {MAX_TABLE_ROWS} of {total_rows:,} rows. "
+            f"{total_rows - MAX_TABLE_ROWS:,} additional rows are hidden. "
+            "The full selection remains active."
         )
         self.pair_warning_label.setVisible(True)
 
@@ -374,37 +371,37 @@ class Display(QWidget):
 
         raise ValueError(self.entity_mode)
 
-    def _build_rows(
-        self,
-    ) -> list[SelectionTableRow]:
-
+    def _build_rows(self) -> list[SelectionTableRow]:
         entities = self._selected_entities()
 
         if self.row_mode == "single":
+            total_rows = len(entities)
+            rows = [
+                SelectionTableRow((entity,))
+                for entity in entities[:MAX_TABLE_ROWS]
+            ]
+
+        elif self.row_mode == "pair":
+            n = len(entities)
+            total_rows = n * (n - 1) // 2
+            rows = [
+                SelectionTableRow(pair)
+                for pair in islice(
+                    combinations(entities, 2),
+                    MAX_TABLE_ROWS,
+                )
+            ]
+
+        else:
+            raise ValueError(f"Unknown row mode: {self.row_mode!r}")
+
+        if total_rows > MAX_TABLE_ROWS:
+            self._show_row_warning(total_rows)
+        else:
             self._clear_pair_warning()
 
-            return [SelectionTableRow((entity,)) for entity in entities]
-
-        if self.row_mode == "pair":
-
-            n = len(entities)
-            n_pairs = n * (n - 1) // 2
-
-            pairs = islice(
-                combinations(entities, 2),
-                MAX_PAIR_ROWS,
-            )
-
-            if n_pairs > MAX_PAIR_ROWS:
-                self._show_pair_warning(
-                    n_entities=n,
-                    n_pairs=n_pairs,
-                )
-            else:
-                self._clear_pair_warning()
-
-            return [SelectionTableRow(pair) for pair in pairs]
-
+        return rows
+    
     def row_data(
         self,
         row: int,
@@ -1135,12 +1132,13 @@ class Controller(BasePlot.TableController):
 
         query = self._prepare_column_query(column.raw_query)
 
-        table = self.data.statistic_engine.evaluate_table(query)
-
-        return self._build_statistic_column_result(
+        return self._evaluate_rows_statistic_column(
             column=column,
             query=query,
-            table=table,
+            evaluation_rows=self._rows_for_evaluation(
+                tuple(self.table.rows)
+            ),
+            entity_mode=self.entity_mode,
         )
 
     def _failed_statistic_column_result(
@@ -1605,7 +1603,7 @@ class Controller(BasePlot.TableController):
             queries,
         )
 
-    def _pair_rows_for_evaluation(
+    def _rows_for_evaluation(
         self,
         rows: tuple[SelectionTableRow, ...],
     ):
@@ -1652,6 +1650,59 @@ class Controller(BasePlot.TableController):
 
         return tuple(resolved_rows)
 
+    def _bind_single_query_to_component(
+        self,
+        query: StatisticQuery,
+        component: NeuronComponent,
+        *,
+        entity_mode: EntityMode,
+    ) -> StatisticQuery | None:
+
+        stat_def = self.data.statistic_engine.registry[query.statistic_key]
+        reductions = query.reduction_dict()
+
+        neuron_dim = neuron_bound_dim(stat_def.dims)
+        if neuron_dim is None:
+            raise ValueError(
+                f"Statistic {query.statistic_key!r} has no neuron dimension."
+            )
+
+        reductions[neuron_dim] = ReductionSpec(
+            "single",
+            index=int(component.neuron_id),
+        )
+
+        if entity_mode == "footprint":
+            bound = component_bound_dims(stat_def.dims)
+            if bound is None:
+                raise ValueError(
+                    f"Statistic {query.statistic_key!r} "
+                    "has no component dimensions."
+                )
+
+            _, session_dim = bound
+
+            # Bind only a session axis that would remain in the output.
+            # Preserve explicit selections and reductions across sessions.
+            if (
+                session_dim is not None
+                and reductions.get(
+                    session_dim, ReductionSpec("keep")
+                ).method == "keep"
+            ):
+                if component.session_id is None:
+                    return None
+
+                reductions[session_dim] = ReductionSpec(
+                    "single",
+                    index=int(component.session_id),
+                )
+
+        return replace(
+            query,
+            reductions=tuple(sorted(reductions.items())),
+        )
+    
     def _bind_pair_query_to_components(
         self,
         query: StatisticQuery,
@@ -1780,36 +1831,47 @@ class Controller(BasePlot.TableController):
             reductions=tuple(sorted(reductions.items())),
         )
 
-    def _evaluate_pair_statistic_column(
+    def _evaluate_rows_statistic_column(
         self,
         *,
         column: StatisticColumn,
         query: StatisticQuery,
-        pair_rows,
+        evaluation_rows,
         entity_mode: EntityMode,
     ) -> StatisticColumnResult:
 
         stat_def = self.data.statistic_engine.registry[query.statistic_key]
 
         values = np.full(
-            len(pair_rows),
+            len(evaluation_rows),
             np.nan,
             dtype=float,
         )
 
         ctx = current_task_context()
-        for row_index, components in enumerate(pair_rows):
+        for row_index, components in enumerate(evaluation_rows):
             if ctx is not None:
                 ctx.check_cancelled()
 
             if components is None:
                 continue
 
-            bound_query = self._bind_pair_query_to_components(
-                query,
-                components,
-                entity_mode=entity_mode,
-            )
+            if len(components) == 1:
+                bound_query = self._bind_single_query_to_component(
+                    query,
+                    components[0],
+                    entity_mode=entity_mode,
+                )
+            elif len(components) == 2:
+                bound_query = self._bind_pair_query_to_components(
+                    query,
+                    components,
+                    entity_mode=entity_mode,
+                )
+            else:
+                raise ValueError(
+                    f"Unexpected number of row components: {len(components)}"
+                )
 
             if bound_query is None:
                 continue
@@ -1821,7 +1883,7 @@ class Controller(BasePlot.TableController):
 
             if table.n_rows != 1:
                 raise ValueError(
-                    f"Pair-bound query for {query.statistic_key!r} "
+                    f"Row-bound query for {query.statistic_key!r} "
                     f"produced {table.n_rows} rows instead of one."
                 )
 
@@ -1858,7 +1920,7 @@ class Controller(BasePlot.TableController):
 
         rows = tuple(self.table.rows)
 
-        pair_rows = self._pair_rows_for_evaluation(rows) if mode[1] == "pair" else None
+        evaluation_rows = self._rows_for_evaluation(rows)
 
         # Nothing to calculate.
         if not columns:
@@ -1893,27 +1955,22 @@ class Controller(BasePlot.TableController):
                     ctx.check_cancelled()
 
                 table = None
-                pair_result = None
+                row_result = None
 
                 try:
 
-                    if pair_rows is not None:
-                        pair_result = self._evaluate_pair_statistic_column(
-                            column=column,
-                            query=query,
-                            pair_rows=pair_rows,
-                            entity_mode=mode[0],
-                        )
-
-                    else:
-                        table = self.data.statistic_engine.evaluate_table(query)
-
+                    row_result = self._evaluate_rows_statistic_column(
+                        column=column,
+                        query=query,
+                        evaluation_rows=evaluation_rows,
+                        entity_mode=mode[0],
+                    )
                     error = None
                 except TaskCancelled:
                     raise
                 except Exception as exc:
                     table = None
-                    pair_result = None
+                    row_result = None
                     error = exc
 
                 evaluated.append(
@@ -1921,7 +1978,7 @@ class Controller(BasePlot.TableController):
                         column,
                         query,
                         table,
-                        pair_result,
+                        row_result,
                         error,
                     )
                 )
@@ -1977,12 +2034,12 @@ class Controller(BasePlot.TableController):
 
         results = []
 
-        for column, query, table, pair_result, error in evaluated:
+        for column, query, table, row_result, error in evaluated:
 
             if error is None:
 
-                if pair_result is not None:
-                    result = pair_result
+                if row_result is not None:
+                    result = row_result
 
                 else:
                     result = self._build_statistic_column_result(

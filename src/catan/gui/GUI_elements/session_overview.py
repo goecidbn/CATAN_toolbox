@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
+from shiboken6 import isValid
 import numpy as np
 from pathlib import Path
 
@@ -1240,7 +1241,16 @@ class LoadSessionRowWidget(QFrame):
             # First individually registered CATAN session:
             # always load data + register to model + track,
             # without changing the globally selected defaults.
-            if force_first_session and single_new_session and session_id == 0:
+            if (
+                force_first_session
+                and single_new_session
+                and session_id == 0
+                and not getattr(
+                    self.data.sessions[session_id],
+                    "_restored_from_catan",
+                    False
+                )
+            ):
                 effective_actions.update(
                     {"load_data", "register_model", "track_neurons"}
                 )
@@ -1489,9 +1499,26 @@ class SessionOverview(QWidget):
         item: QListWidgetItem,
         row: QWidget,
     ):
-        row.layout().activate()
+        # A list rebuild may have deleted these since this was queued.
+        if not isValid(self) or not isValid(item) or not isValid(row):
+            return
+
+        if not isValid(self.list_widget):
+            return
+
+        # Ignore rows that have been removed or replaced.
+        if self.list_widget.itemWidget(item) is not row:
+            return
+
+        layout = row.layout()
+        if layout is not None:
+            layout.activate()
+
         row.adjustSize()
-        item.setSizeHint(row.sizeHint())
+
+        # Layout changes can trigger further UI updates.
+        if isValid(item) and isValid(row):
+            item.setSizeHint(row.sizeHint())
 
     def _on_data_changed(self, event: DataChange):
         if event.has(*SESSION_STRUCTURE_CHANGES):

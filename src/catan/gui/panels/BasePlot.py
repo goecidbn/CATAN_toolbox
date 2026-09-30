@@ -2,10 +2,11 @@ from dataclasses import dataclass
 from typing import Generic, List, Optional, TypeVar, Tuple, Literal
 from collections.abc import Callable
 import numpy as np
+from time import perf_counter
 
 from vispy import scene
 from vispy.scene.visuals import Rectangle, Markers, Line
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, QTimer
 from PySide6.QtWidgets import QSizePolicy, QToolTip
 from PySide6.QtGui import QCursor
 
@@ -35,15 +36,18 @@ class TooltipStatisticResult:
     title: str
 
     def value_for_component(self, component: NeuronComponent):
-
         if self.session_dim is None:
             key = int(component.neuron_id)
-
         else:
             if component.session_id is None:
                 return np.nan
 
-        row = self.row_lookup.get(component.id)
+            key = (
+                int(component.neuron_id),
+                int(component.session_id),
+            )
+
+        row = self.row_lookup.get(key)
 
         if row is None:
             return np.nan
@@ -331,6 +335,7 @@ class BaseCanvas(scene.SceneCanvas):
             for visual in visuals:
                 if visual is not None:
                     visual.visible = False
+                    visual.parent = None
         self.plotting["overlays"] = {}
 
     def find_closest_component(
@@ -489,6 +494,17 @@ class BaseDisplayController(QObject):
         self._connections = []
         self._control_connections = []
 
+        self._pending_selection_events = set()
+
+        self._selection_update_timer = QTimer(self)
+        self._selection_update_timer.setSingleShot(True)
+        self._selection_update_timer.setInterval(0)
+
+        self.connect_signal(
+            self._selection_update_timer.timeout,
+            self._flush_selection_update,
+        )
+
         for signal, slot in (
             (self.state.hovered_components_changed, self._on_hover_changed),
             (self.state.selected_components_changed, self._on_selection_changed),
@@ -500,6 +516,7 @@ class BaseDisplayController(QObject):
             (self.state.data_changed, self._on_data_changed),
         ):
             self.connect_signal(signal, slot)
+
 
     def connect_signal(self, signal, slot, *, controls=False):
         connection = signal.connect(slot)
@@ -543,6 +560,8 @@ class BaseDisplayController(QObject):
             return
 
         self._deactivated = True
+        self._selection_update_timer.stop()
+        self._pending_selection_events.clear()
 
         self.disconnect_signals()
         self._cancel_background_tasks()
@@ -573,14 +592,8 @@ class BaseDisplayController(QObject):
         self.controls.clear()
 
     def disconnect_signals(self):
-        self.state.hovered_components_changed.disconnect(self._on_hover_changed)
-        self.state.selected_components_changed.disconnect(self._on_selection_changed)
-        self.state.focused_component_changed.disconnect(self._on_focus_changed)
-        self.state.highlighted_components_changed.disconnect(self._on_highlight_changed)
-
-        self.state.current_session_changed.disconnect(self._on_session_changed)
-        self.state.session_color_changed.disconnect(self._on_session_style_changed)
-
+        self._disconnect_connections(self._connections)
+    
     def get_config(self):
         return dict(self.config)
 
@@ -594,15 +607,26 @@ class BaseDisplayController(QObject):
         self.update_styles()
 
     def _on_selection_changed(self):
-        # self.state.logger.debug(
-        #     f"[BASEPLOT - {self.section.display_mode}] Neurons changed. Current selection: {self.state.selected_components}"
-        # )
-        self.update_neuron_selection()
+        self._queue_selection_update("selection")
 
     def _on_focus_changed(self):
-        self.state.logger.debug(
-            f"[BASEPLOT - {self.section.display_mode}] Focus changed. Current focus: {self.state.focused_component}"
-        )
+        self._queue_selection_update("focus")
+
+    def _queue_selection_update(self, event):
+        if self._deactivated:
+            return
+
+        self._pending_selection_events.add(event)
+
+        if not self._selection_update_timer.isActive():
+            self._selection_update_timer.start()
+
+    def _flush_selection_update(self):
+        self._pending_selection_events.clear()
+
+        if self._deactivated:
+            return
+
         self.update_neuron_selection()
 
     def _on_highlight_changed(self):

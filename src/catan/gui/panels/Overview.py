@@ -1089,6 +1089,7 @@ class Display(BasePlot.BaseCanvas):
             mask = self.state.assignments[:, self.state.current_session_id] >= 0
             distances[~mask] = np.inf
 
+        distances[~np.isfinite(distances)] = np.inf
         if not np.any(np.isfinite(distances)):
             return None
 

@@ -51,23 +51,17 @@ import catan.gui.data.curation_filter as curation_filter
 from catan.gui.panels.helper.Threshold import ThresholdSpec
 from catan.gui.GUI_elements.fragments.ResetViewButton import ResetViewButton
 
-# # importlib.reload(curation_filter)
-# importlib.reload(calculations)
-# # importlib.reload(stats)
-# importlib.reload(series_with_confidence)
-# # importlib.reload(plotdata_histogram)
-# importlib.reload(plotdata_series)
-# importlib.reload(StatisticsData)
-# importlib.reload(Threshold)
-
 STATUS_ROW_HEIGHT = 58
 STATUS_CARD_IDLE_HEIGHT = 30
 STATUS_CARD_BUSY_HEIGHT = 50
 STATUS_PROGRESS_HEIGHT = 6
 
+SERIES_PRIMARY_COLOR = (0.0, 0.0, 0.0, 1.0)
+SERIES_SECONDARY_COLOR = (0.0, 0.35, 0.65, 1.0)
+SERIES_BAND_ALPHA = 0.18
+
 SeriesPoint = tuple[str, int]
 VisualIndex = int | SeriesPoint
-
 
 @dataclass
 class RectangleData:
@@ -238,8 +232,8 @@ class Display(BasePlot.BaseCanvas):
             axis.axis.tick_width = 1
 
             if orientation in ["bottom", "top"]:
-                axis.height_min = 20
-                axis.height_max = 35
+                axis.height_min = 64
+                axis.height_max = 64
                 axis.stretch = (1.0, 0.15)  # don't take extra vertical space
             elif orientation in ["left", "right"]:
                 axis.width_min = 30
@@ -646,6 +640,15 @@ class Display(BasePlot.BaseCanvas):
 
         is_dual = second is not None
 
+        for key, color in (
+            ("y", SERIES_PRIMARY_COLOR),
+            ("y_2nd", SERIES_SECONDARY_COLOR),
+        ):
+            axis = self.axes[key].axis
+            axis.text_color = color
+            axis.tick_color = color
+            axis.axis_color = color
+
         if is_dual:
             # self._ensure_twin_y_view()
             self.right_view.visible = True
@@ -661,8 +664,8 @@ class Display(BasePlot.BaseCanvas):
 
         first_visual = series_with_confidence.SeriesVisual(
             parent=self.plot_root,
-            line_color=self.styles.get_color_array("selected"),
-            band_color=self.styles.get_color_array("default"),
+            line_color=SERIES_PRIMARY_COLOR,
+            band_color=(*SERIES_PRIMARY_COLOR[:3], SERIES_BAND_ALPHA),
             marker_size=7,
             order=0,
         )
@@ -684,8 +687,8 @@ class Display(BasePlot.BaseCanvas):
 
             second_visual = series_with_confidence.SeriesVisual(
                 parent=self.plot_root_right,
-                line_color=self.styles.get_color_array("highlighted"),
-                band_color=self.styles.get_color_array("default"),
+                line_color=SERIES_SECONDARY_COLOR,
+                band_color=(*SERIES_SECONDARY_COLOR[:3], SERIES_BAND_ALPHA),
                 marker_size=7,
                 order=0,
             )
@@ -941,9 +944,6 @@ class Display(BasePlot.BaseCanvas):
         if isinstance(self.plot_data, plotdata_histogram.PlotData):
             self.update_style(idx, "hovered")
 
-        elif isinstance(self.plot_data, plotdata_scatter.PlotData):
-            self.signals.marker_hovered.emit(idx)
-
         elif isinstance(self.plot_data, plotdata_series.PlotData):
             self.update_session_series_hover(idx)
 
@@ -1068,27 +1068,20 @@ class Display(BasePlot.BaseCanvas):
         return int(k)
 
     def find_marker_from_data(self, data_pos) -> Optional[int]:
-        """
-        Given data coords x_data, y_data, return marker index (int) or None.
-        We require (x,y) to be within pick_radius_scatter around marker.
-        """
-        assert isinstance(self.plot_data, plotdata_scatter.PlotData)
-        if self.plot_data is None:
+        if not isinstance(
+            self.plot_data,
+            plotdata_scatter.PlotData,
+        ):
             return None
 
-        cam_bounds = self.view.camera.rect
-        dx = (self.plot_data.x - data_pos[0]) / (cam_bounds.right - cam_bounds.left)
-        dy = (self.plot_data.y - data_pos[1]) / (cam_bounds.top - cam_bounds.bottom)
-        d2 = dx * dx + dy * dy
+        rect = self.view.camera.rect
 
-        idx = int(np.nanargmin(d2))
-
-        dist_px = float(np.sqrt(d2[idx]))
-
-        if dist_px > self.pick_radius_scatter:
-            return None
-
-        return idx
+        return self.plot_data.nearest_marker(
+            data_pos,
+            width=rect.right - rect.left,
+            height=rect.top - rect.bottom,
+            radius=self.pick_radius_scatter,
+        )
 
     def find_series_session_from_canvas(
         self,
@@ -1517,7 +1510,7 @@ class Display(BasePlot.BaseCanvas):
                     dtype=np.float32,
                 ),
                 size=12,
-                face_color=self.styles.get_color_array("selected"),
+                face_color=SERIES_PRIMARY_COLOR,
                 edge_width=0,
             )
 
@@ -1541,7 +1534,7 @@ class Display(BasePlot.BaseCanvas):
                         dtype=np.float32,
                     ),
                     size=12,
-                    face_color=self.styles.get_color_array("highlighted"),
+                    face_color=SERIES_SECONDARY_COLOR,
                     edge_width=0,
                 )
 
@@ -1636,6 +1629,9 @@ class Display(BasePlot.BaseCanvas):
 
         for axis in self.axes.values():
             axis.visible = False
+            axis.axis.text_color = "black"
+            axis.axis.tick_color = "black"
+            axis.axis.axis_color = "black"
 
         self.right_view.visible = False
 
@@ -1918,6 +1914,8 @@ class Controller(BasePlot.CanvasController):
                 if which == "y":
                     self.current_query["y_2nd"] = None
                     self.controls["y_selector_2nd"].set_query(None)
+
+                self.recalculate_statistics(which)
                 return
 
             prepared_query = plotdata_series.prepare_query(
@@ -1946,6 +1944,19 @@ class Controller(BasePlot.CanvasController):
         """
         wrapper around _recalculate_statistic for multiple slots.
         """
+
+        required = set(self._required_statistic_slots())
+
+        for slot in self.current_results:
+            if slot not in required:
+                self.current_results[slot] = None
+
+                task_id = self.statistic_tasks[slot]
+                self.statistic_tasks[slot] = None
+
+                if task_id is not None:
+                    self.state.tasks.cancel(task_id)
+        
         if which is None:
             slots = tuple(
                 slot for slot, query in self.current_query.items() if query is not None
@@ -1970,7 +1981,11 @@ class Controller(BasePlot.CanvasController):
         and cancels any obsolete tasks.
         """
 
-        query = self.current_query[which]
+        query = (
+            self.current_query[which]
+            if which in self._required_statistic_slots()
+            else None
+        )
 
         # Cancel obsolete task for THIS slot.
         old_task = self.statistic_tasks[which]
@@ -1981,6 +1996,7 @@ class Controller(BasePlot.CanvasController):
 
         if query is None:
             self.current_results[which] = None
+            self._release_plot_data()
             self.rebuild_plot()
             return
 
@@ -1994,6 +2010,10 @@ class Controller(BasePlot.CanvasController):
         ):
             self.rebuild_plot()
             return
+
+        self.current_results[which] = None
+        existing = None
+        self._release_plot_data()
 
         # Important: snapshot the query.
         requested_query = query
@@ -2077,6 +2097,8 @@ class Controller(BasePlot.CanvasController):
             return
         
         which = result.slot
+        if which not in self._required_statistic_slots():
+            return
 
         # A newer query has replaced this one.
         if result.query != self.current_query[which]:
@@ -2165,15 +2187,9 @@ class Controller(BasePlot.CanvasController):
         # ---------------------------------------------------------
         # Nothing requested.
         # ---------------------------------------------------------
-
         if not slots:
-
-            self.current_plot_data = None
-            self.displayed_results = {}
-
-            self.canvas.clear()
+            self._release_plot_data()
             self.canvas.hide_plot_error()
-
             self._update_statistics_status()
             return
 
@@ -2196,6 +2212,7 @@ class Controller(BasePlot.CanvasController):
 
         results = {slot: self.current_results[slot] for slot in slots}
 
+        self._release_plot_data()
         self.displayed_results = dict(results)
 
         try:
@@ -2285,9 +2302,7 @@ class Controller(BasePlot.CanvasController):
         message: str,
     ):
 
-        self.current_plot_data = None
-
-        self.canvas.clear()
+        self._release_plot_data()
 
         self.canvas.show_plot_error(
             "Cannot display requested statistics",
@@ -2741,6 +2756,26 @@ class Controller(BasePlot.CanvasController):
         if isinstance(self.current_plot_data, plotdata_scatter.PlotData):
             super().update_styles()
 
+    def _on_hover_changed(self):
+        if isinstance(
+            self.current_plot_data,
+            plotdata_scatter.PlotData,
+        ):
+            self.canvas.update_style(
+                self.state.hovered_components,
+                "hovered",
+            )
+
+    def _on_highlight_changed(self):
+        if isinstance(
+            self.current_plot_data,
+            plotdata_scatter.PlotData,
+        ):
+            self.canvas.update_style(
+                self.state.highlighted_components,
+                "highlighted",
+            )
+
     def _cancel_background_tasks(self):
         task_ids = tuple(
             task_id
@@ -2753,6 +2788,13 @@ class Controller(BasePlot.CanvasController):
 
         for task_id in task_ids:
             self.state.tasks.cancel(task_id)
+
+    def _release_plot_data(self):
+        self.canvas.clear_overlays()
+        self.canvas.clear()
+        self.canvas.plot_data = None
+        self.current_plot_data = None
+        self.displayed_results = {}
 
 
 class StatisticsControlPanel(ControlPanel.ControlPanel):

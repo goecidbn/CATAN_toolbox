@@ -1,8 +1,9 @@
 from dataclasses import dataclass, field
 import numpy as np
+from scipy.spatial import cKDTree
 
 from .dimensions import canonical_dims
-from .table import PickTable
+from .table import PickTable, refs_equal, ROW_BLOCK_SIZE
 from .errors import StatisticsPlotError
 
 
@@ -26,6 +27,16 @@ class PlotData:
 
     # matched row -> marker, -1 if not plotted
     row_to_marker: np.ndarray = field(init=False, repr=False)
+
+    _pick_tree: cKDTree | None = field(
+        init=False, default=None, repr=False
+    )
+    _pick_origin: np.ndarray = field(init=False, repr=False)
+    _pick_scale: np.ndarray = field(init=False, repr=False)
+
+    _neuron_index: dict = field(
+        init=False, default_factory=dict, repr=False
+    )
 
     def __post_init__(self):
 
@@ -52,6 +63,11 @@ class PlotData:
         self.row_to_marker = np.full(self.n_rows, -1, dtype=int)
 
         self.row_to_marker[self.marker_rows] = np.arange(self.marker_rows.size)
+        # Release construction temporaries before building the indexes.
+        del x_values, y_values, valid
+
+        self._build_interaction_indices()
+
 
     @property
     def n_rows(self) -> int:
@@ -148,34 +164,65 @@ class PlotData:
 
         return self.ref_sets_for_rows(rows)
 
-    def markers_matching_components(
-        self,
-        components,
-    ) -> np.ndarray:
-
-        matched = np.zeros(
-            self.n_rows,
-            dtype=bool,
+    def markers_matching_components(self, components):
+        components = (
+            [] if components is None else list(components)
         )
 
-        # x-side semantics
-        x_selected_rows = self.x_table.rows_matching_components(components)
+        if not components or not self.n_markers:
+            return np.empty(0, dtype=np.intp)
 
-        if x_selected_rows.size:
-            selected = np.zeros(self.x_table.n_rows, dtype=bool)
-            selected[x_selected_rows] = True
-            matched |= selected[self.x_rows]
+        neuron_ids = {
+            int(component.neuron_id)
+            for component in components
+        }
 
-        # y-side semantics
-        y_selected_rows = self.y_table.rows_matching_components(components)
+        matches = []
 
-        if y_selected_rows.size:
-            selected = np.zeros(self.y_table.n_rows, dtype=bool)
-            selected[y_selected_rows] = True
-            matched |= selected[self.y_rows]
+        for side, table, source_rows in (
+            ("x", self.x_table, self.x_rows),
+            ("y", self.y_table, self.y_rows),
+        ):
+            parts = []
 
-        return self.markers_for_rows(np.flatnonzero(matched))
+            for order, ranges in self._neuron_index.get(
+                side, ()
+            ):
+                for neuron_id in neuron_ids:
+                    bounds = ranges.get(neuron_id)
 
+                    if bounds is not None:
+                        start, stop = bounds
+                        parts.append(order[start:stop])
+
+            if not parts:
+                continue
+
+            candidates = np.unique(
+                np.concatenate(parts)
+            )
+
+            rows = source_rows[
+                self.marker_rows[candidates]
+            ]
+            candidate_table = table.subset_rows(rows)
+
+            # Keep the existing session, wildcard, and pair rules,
+            # but evaluate them only on candidate markers.
+            selected = (
+                candidate_table.rows_matching_components(
+                    components
+                )
+            )
+
+            if selected.size:
+                matches.append(candidates[selected])
+
+        if not matches:
+            return np.empty(0, dtype=np.intp)
+
+        return np.unique(np.concatenate(matches))
+    
     def tooltip_for_marker(
         self,
         marker_index: int,
@@ -214,6 +261,178 @@ class PlotData:
 
         return "\n".join(lines)
 
+    def _build_interaction_indices(self):
+        self._neuron_index = {}
+        self._pick_tree = None
+
+        if not self.n_markers:
+            return
+
+        # Spatial index for mouse picking.
+        self._pick_origin = np.array([
+            self.x.min(),
+            self.y.min(),
+        ])
+
+        self._pick_scale = np.array([
+            np.ptp(self.x),
+            np.ptp(self.y),
+        ])
+        self._pick_scale[self._pick_scale == 0] = 1.0
+
+        points = np.empty(
+            (self.n_markers, 2),
+            dtype=np.float64,
+        )
+        points[:, 0] = (
+            self.x - self._pick_origin[0]
+        ) / self._pick_scale[0]
+        points[:, 1] = (
+            self.y - self._pick_origin[1]
+        ) / self._pick_scale[1]
+
+        self._pick_tree = cKDTree(points, copy_data=False)
+
+        # Neuron -> candidate markers for linked highlighting.
+        index_dtype = (
+            np.int32
+            if self.n_markers <= np.iinfo(np.int32).max
+            else np.int64
+        )
+
+        for side, table, source_rows in (
+            ("x", self.x_table, self.x_rows),
+            ("y", self.y_table, self.y_rows),
+        ):
+            groups = []
+
+            for column in table._available_neuron_arrays():
+                neuron_ids = np.empty(
+                    self.n_markers,
+                    dtype=np.int64,
+                )
+
+                for start in range(
+                    0, self.n_markers, ROW_BLOCK_SIZE
+                ):
+                    markers = slice(
+                        start, start + ROW_BLOCK_SIZE
+                    )
+                    rows = source_rows[
+                        self.marker_rows[markers]
+                    ]
+                    neuron_ids[markers] = column[rows]
+
+                order = np.argsort(
+                    neuron_ids,
+                    kind="stable",
+                )
+                ordered_ids = neuron_ids[order]
+
+                starts = np.r_[
+                    0,
+                    np.flatnonzero(
+                        ordered_ids[1:] != ordered_ids[:-1]
+                    ) + 1,
+                ]
+                stops = np.r_[
+                    starts[1:],
+                    self.n_markers,
+                ]
+
+                ranges = {
+                    int(ordered_ids[start]): (
+                        int(start), int(stop)
+                    )
+                    for start, stop in zip(starts, stops)
+                }
+
+                groups.append((
+                    order.astype(index_dtype, copy=False),
+                    ranges,
+                ))
+
+                del neuron_ids, ordered_ids, order
+
+            self._neuron_index[side] = groups
+
+    def nearest_marker(
+        self,
+        data_pos,
+        width,
+        height,
+        radius,
+    ):
+        if self._pick_tree is None:
+            return None
+
+        width = abs(float(width))
+        height = abs(float(height))
+        pos = np.asarray(data_pos, dtype=float)[:2]
+
+        if (
+            not np.all(np.isfinite(pos))
+            or not np.isfinite(width + height)
+            or width == 0
+            or height == 0
+        ):
+            return None
+
+        query = (
+            pos - self._pick_origin
+        ) / self._pick_scale
+
+        # A nearby point provides an upper bound on the search.
+        _, seed = self._pick_tree.query(query)
+
+        seed_distance = np.hypot(
+            (self.x[seed] - pos[0]) / width,
+            (self.y[seed] - pos[1]) / height,
+        )
+
+        limit = min(
+            float(radius),
+            float(seed_distance),
+        )
+
+        # This circle encloses every point that could be closer
+        # under the current camera-normalized distance metric.
+        search_radius = limit * max(
+            width / self._pick_scale[0],
+            height / self._pick_scale[1],
+        )
+
+        search_radius += (
+            16 * np.finfo(float).eps
+            * (1 + np.linalg.norm(query))
+        )
+
+        candidates = np.asarray(
+            self._pick_tree.query_ball_point(
+                query,
+                search_radius,
+            ),
+            dtype=np.intp,
+        )
+
+        if not candidates.size:
+            return None
+
+        # Apply the original picking metric only to candidates.
+        dx = (self.x[candidates] - pos[0]) / width
+        dy = (self.y[candidates] - pos[1]) / height
+        distances = dx * dx + dy * dy
+
+        best = distances.min()
+
+        if np.sqrt(best) > radius:
+            return None
+
+        # Preserve the original first-marker behaviour for ties.
+        return int(
+            candidates[distances == best].min()
+        )
+
 
 def build_plot_data(
     x_table: PickTable,
@@ -224,46 +443,6 @@ def build_plot_data(
         x_table=x_table,
         y_table=y_table,
     )
-
-    # x_rows, y_rows = _matching_rows(x_table, y_table)
-
-    # # Semantic table corresponding exactly to the joined rows.
-    # matched_table = x_table.subset_rows(x_rows)
-
-    # x_values = x_table.values[x_rows]
-    # y_values = y_table.values[y_rows]
-
-    # # Not every matched coordinate necessarily has a finite
-    # # value in both statistics.
-    # valid = np.isfinite(x_values) & np.isfinite(y_values)
-
-    # marker_rows = np.flatnonzero(valid)
-
-    # x = x_values[valid]
-    # y = y_values[valid]
-
-    # row_to_marker = np.full(
-    #     matched_table.n_rows,
-    #     -1,
-    #     dtype=int,
-    # )
-
-    # row_to_marker[marker_rows] = np.arange(marker_rows.size)
-
-    # return PlotData(
-    #     title={
-    #         "x": x_table.stat.display_title,
-    #         "y": y_table.stat.display_title,
-    #     },
-    #     x_table=x_table,
-    #     y_table=y_table,
-    #     matched_table=matched_table,
-    #     x=x,
-    #     y=y,
-    #     marker_rows=marker_rows,
-    #     row_to_marker=row_to_marker,
-    # )
-
 
 def _matching_rows(
     x_table: PickTable,
@@ -305,6 +484,18 @@ def _matching_rows(
             np.asarray([0], dtype=int),
         )
 
+    if x_table.n_rows == y_table.n_rows and all(
+        refs_equal(x_table.refs[x_dim], y_table.refs[y_dim])
+        for x_dim, y_dim in zip(x_table.dims, y_table.dims)
+    ):
+        if not x_table.n_rows:
+            raise StatisticsPlotError(
+                "The selected statistics have no matching coordinates."
+            )
+
+        rows = np.arange(x_table.n_rows, dtype=np.intp)
+        return rows, rows
+
     # Build structured keys. Dimension correspondence is positional:
     #
     # x_table.dims[0] <-> y_table.dims[0]
@@ -331,8 +522,13 @@ def _matching_rows(
 
     for i, (x_dim, y_dim, dtype) in enumerate(zip(x_table.dims, y_table.dims, dtypes)):
         field = f"d{i}"
-        x_keys[field] = np.asarray(x_table.refs[x_dim], dtype=dtype)
-        y_keys[field] = np.asarray(y_table.refs[y_dim], dtype=dtype)
+        for table, keys, dim in (
+            (x_table, x_keys, x_dim),
+            (y_table, y_keys, y_dim),
+        ):
+            for start in range(0, table.n_rows, ROW_BLOCK_SIZE):
+                rows = slice(start, start + ROW_BLOCK_SIZE)
+                keys[field][rows] = table.refs[dim][rows]
 
     _, x_rows, y_rows = np.intersect1d(
         x_keys,

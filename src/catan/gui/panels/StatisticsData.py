@@ -1028,6 +1028,32 @@ class StatisticQuerySelector(QWidget):
 
         self.current_reductions[dim_name] = spec
 
+        if self.current_stat_key() == "footprint_similarity":
+            filters = {f.target: f for f in self.current_filters()}
+            target = dim_name.removesuffix("_i")
+            pair_filter = filters.get(target)
+            if (
+                dim_name.endswith("_i") and pair_filter is not None
+                and pair_filter.collapse_same
+                and (pair_filter.relation == "same" or (
+                    target == "session" and pair_filter.relation == "with previous"
+                ))
+            ):
+                self.current_reductions[target + "_j"] = spec
+
+        if (
+            self.current_stat_key() == "footprint_similarity"
+            and self.query_mode == "session_series"
+            and dim_name in ("session_i", "session_j")
+            and self.session_filter_button.current_relation() in ("all", "different")
+        ):
+            other = "session_j" if dim_name == "session_i" else "session_i"
+            other_spec = self.current_reductions.get(other, ReductionSpec("keep"))
+            if spec.method == "keep" and other_spec.method == "keep":
+                self.current_reductions[other] = ReductionSpec("single", index=0)
+            elif spec.method != "keep" and other_spec.method != "keep":
+                self.current_reductions[other] = ReductionSpec("keep")
+
         if self.query_mode == "session_series":
             self.current_reductions = normalize_session_series_reductions(
                 self.current_stat_def(),
@@ -1103,6 +1129,20 @@ class StatisticQuerySelector(QWidget):
         specific = stat_def.get_allowed_reductions(dim)
 
         methods = tuple(m for m in specific if m in general)
+
+        if stat_def.key == "footprint_similarity" and self.query_mode in ("generic", "session_series"):
+            relations = {f.target: f.relation for f in self.current_filters()}
+            collapsed = {f.target: f.collapse_same for f in self.current_filters()}
+            linked_n = relations.get("neuron") == "same" and collapsed.get("neuron", True)
+            linked_s = relations.get("session") in ("same", "with previous") and collapsed.get("session", True)
+            if (linked_n and dim == "neuron_j") or (linked_s and dim == "session_j"):
+                return ()
+            if self.query_mode == "session_series":
+                if dim in SESSION_DIMS:
+                    return () if linked_s else specific
+                if dim in NEURON_DIMS:
+                    return tuple(m for m in specific if m != "keep")
+            return specific
 
         # ------------------------------------------------
         # Bound entity contexts
@@ -1206,22 +1246,18 @@ class StatisticQuerySelector(QWidget):
         # Generic / histogram / scatter
         # ------------------------------------------------
         else:
-
-            # same / previous:
-            # user chooses session_i only;
-            # session_j is derived automatically
             if relation in ("same", "with previous"):
+                # Choose one session or retain all linked session pairs.
+                # The reference session follows from the relation.
                 if dim == "session_i":
-                    return ("single",)
+                    return tuple(
+                        method
+                        for method in methods
+                        if method in ("keep", "single")
+                    )
                 return ()
 
-            # different:
-            # both sessions must be independently selectable
-            if relation == "different":
-                return ("single",)
-
-            # all:
-            # no relation constraint
+            # "all" and "different" allow independent axis choices.
             return methods
 
         return methods
@@ -1245,6 +1281,14 @@ class StatisticQuerySelector(QWidget):
             method,
             context=self.query_mode,
         )
+
+        if self.current_stat_key() == "footprint_similarity":
+            methods = tuple(m for m in methods if m != "bootstrap")
+            if (
+                dim == "neuron_i"
+                and self.neuron_filter_button.current_relation() == "same"
+            ):
+                return methods
 
         if self.query_mode != "session_series":
             return methods

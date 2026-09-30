@@ -65,12 +65,13 @@ class MainWindow(QMainWindow):
 
         self._setup_navigation_shortcuts()
         self._setup_review_shortcuts()
+        self._setup_curation_shortcuts()
 
         # --- setting up reload logic ---
         reload_action = QAction("Reload plotting logic", self)
         reload_action.setShortcut("Ctrl+R")
         reload_action.triggered.connect(self.reload_logic)
-        # self.menuBar().addAction(reload_action)
+        self.menuBar().addAction(reload_action)
 
         # print_debug = QAction("Print debug info", self)
         # print_debug.setShortcut("Ctrl+D")
@@ -99,6 +100,7 @@ class MainWindow(QMainWindow):
 
     def reload_logic(self):
         tasks = self.state.tasks
+        # print(self.data.assignments.union.footprints)
 
         # Avoid reloading module globals while workers are using them.
         if (
@@ -118,6 +120,8 @@ class MainWindow(QMainWindow):
         if QApplication.activeModalWidget() is not None:
             return
 
+        self._reload_model_logic()
+
         display_area = self.gui_elements["display_area"]
 
         # Preserve the current panel configuration and splitter positions.
@@ -126,9 +130,44 @@ class MainWindow(QMainWindow):
 
         importlib.reload(click_events)
 
-        display_area.rebuild(reload_alignment=True)
+        display_area.rebuild(
+            reload_alignment=True,
+            reload_statistics=True,
+        )
         self.gui_elements["main_menu"].rebuild()
         self.reset_stylesheet()
+
+    def _reload_model_logic(self):
+        module = importlib.import_module(
+            "catan.tracking.structures.model"
+        )
+        existing_class = module.Model
+
+        importlib.invalidate_caches()
+        importlib.reload(module)
+        updated_class = module.Model
+
+        # Preserve class identity: existing instances and imported aliases
+        # continue to refer to this class, now with updated methods.
+        protected = {
+            "__dict__",
+            "__weakref__",
+            "__module__",
+            "__qualname__",
+        }
+
+        for name in tuple(vars(existing_class)):
+            if name not in protected and name not in vars(updated_class):
+                delattr(existing_class, name)
+
+        for name, value in vars(updated_class).items():
+            if name not in protected:
+                setattr(existing_class, name, value)
+
+        # Methods such as _from_dict() resolve Model through this module.
+        module.Model = existing_class
+
+        # print(f"Reloaded model logic from {module.__file__}")
 
     def reset_stylesheet(self):
 
@@ -144,7 +183,6 @@ class MainWindow(QMainWindow):
         app.setStyleSheet(style)
 
     def print_debug_info(self):
-
         click_events.print_debug(self.state, self.data)
 
     def closeEvent(self, event):
@@ -286,6 +324,142 @@ class MainWindow(QMainWindow):
                 )
             )
             self._review_shortcuts.append(batch_shortcut)
+    
+    def _setup_curation_shortcuts(self):
+        self._curation_shortcuts = []
+
+        bindings = (
+            ("X", False, False, False),
+            ("Del", True, False, False),
+            ("Shift+X", False, True, False),
+            ("Shift+Del", True, True, False),
+            ("Ctrl+Shift+X", False, True, True),
+            ("Ctrl+Shift+Del", True, True, True),
+        )
+
+        for sequence, remove, batch, whole_neurons in bindings:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(
+                lambda remove=remove, batch=batch, whole_neurons=whole_neurons:
+                self._curate_from_shortcut(
+                    remove=remove,
+                    batch=batch,
+                    whole_neurons=whole_neurons,
+                )
+            )
+            self._curation_shortcuts.append(shortcut)
+
+    def _curate_from_shortcut(self, *, remove, batch, whole_neurons):
+        if (
+            self._review_shortcut_blocked()
+            or QApplication.activeModalWidget() is not None
+        ):
+            return
+
+        tasks = self.state.tasks
+        if tasks.processing_busy() or tasks.processing_requested:
+            QMessageBox.information(
+                self,
+                "Curation unavailable",
+                "Wait for processing to finish before changing assignments.",
+            )
+            return
+
+        if batch:
+            components = list(self.state.selected_components or [])
+            target_label = "selected"
+        else:
+            components = list(self.state.highlighted_components or [])
+            target_label = "highlighted"
+
+            if not components:
+                focused = self.state.focused_component
+                components = [] if focused is None else [focused]
+                target_label = "focused"
+
+        if not components:
+            return
+
+        source = self.data.assignments
+        version = self.state.data_version
+
+        try:
+            targets = self.data.curation_targets(
+                components,
+                whole_neurons=whole_neurons,
+                remove=remove,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot curate selection", str(error))
+            return
+
+        if not targets:
+            QMessageBox.information(
+                self,
+                "Nothing to change",
+                "No eligible assigned components are selected.",
+            )
+            return
+
+        if batch or len(targets) > 1:
+            action = "Remove" if remove else "Exclude"
+            n_neurons = len({target[0] for target in targets})
+            n_sessions = len({target[1] for target in targets})
+
+            if whole_neurons:
+                scope = (
+                    f"{n_neurons} whole neurons represented by the selection"
+                    f"\n({len(targets)} components across {n_sessions} sessions)"
+                )
+            else:
+                scope = (
+                    f"{len(targets)} {target_label} components "
+                    f"across {n_sessions} sessions"
+                )
+
+            consequence = (
+                "Their assignment entries will be removed."
+                if remove
+                else "Their included flags will be set to false."
+            )
+
+            answer = QMessageBox.question(
+                self,
+                f"{action} selection",
+                f"{action} {scope}?\n\n"
+                f"{consequence}\nSource files are unchanged.",
+                QMessageBox.StandardButton.Ok
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+
+            if answer != QMessageBox.StandardButton.Ok:
+                return
+
+        # A confirmation dialog runs an event loop: recheck before applying.
+        if (
+            self.data.assignments is not source
+            or self.state.data_version != version
+            or tasks.processing_busy()
+            or tasks.processing_requested
+        ):
+            QMessageBox.information(
+                self,
+                "Selection changed",
+                "Data or processing state changed. Please retry the operation.",
+            )
+            return
+
+        try:
+            self.data.apply_curation_targets(
+                targets,
+                remove=remove,
+                whole_neurons=whole_neurons,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "Curation failed", str(error))
 
     def _set_review_status_from_shortcut(self, status: ReviewStatus, *, batch: bool):
 

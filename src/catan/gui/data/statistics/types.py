@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Any, Optional
 from collections.abc import Callable
 
@@ -37,6 +37,12 @@ class StatisticArray:
     errors_low: np.ndarray | None = None
     errors_high: np.ndarray | None = None
     n: np.ndarray | None = None
+
+    # Original query dimensions -> compact calculation dimensions.
+    reduction_aliases: dict[str, str] = field(default_factory=dict)
+
+    # Pair-filter targets already handled by the calculation.
+    applied_pair_filters: tuple[str, ...] = ()
 
     @property
     def dims(self) -> tuple[str, ...]:
@@ -414,6 +420,8 @@ class StatisticArray:
                 else np.array(self.errors_high, copy=True)
             ),
             n=None if self.n is None else np.array(self.n, copy=True),
+            reduction_aliases=dict(self.reduction_aliases),
+            applied_pair_filters=self.applied_pair_filters,
         )
 
 
@@ -497,6 +505,13 @@ class StatisticDefinition:
             indexers=indexers,
             filters=filters,
         )
+        # Some getters return an already compact, labelled result.
+        if isinstance(values, StatisticArray):
+            values.name = self.key
+            values.title = self.title
+            values.category = self.category
+            values.validate()
+            return values
 
         coords = self.coord_getter(state)
 

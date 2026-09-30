@@ -94,12 +94,8 @@ CALCULATED_STATISTICS = {
         dims=("neuron_i", "neuron_j", "session_i", "session_j"),
         category="pair",
         getter=calculations.calculate_footprint_similarity,
-        allowed_reductions={
-            "neuron_i": ("keep", "mean"),
-            "neuron_j": ("keep", "mean"),
-            "session_i": ("single", "mean", "median", "max", "min"),
-            "session_j": ("single", "mean", "median", "max", "min"),
-        },
+        # All implemented numeric reductions work on sparse pair values.
+        allowed_reductions=None,
         default_reductions={
             "neuron_i": ReductionSpec("keep"),
             "neuron_j": ReductionSpec("keep"),

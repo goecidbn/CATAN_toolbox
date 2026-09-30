@@ -3,6 +3,8 @@ from functools import partial
 from typing import Any, Literal
 from pathlib import Path
 import numpy as np
+import json
+
 from scipy.ndimage import gaussian_filter
 from scipy import interpolate
 
@@ -583,21 +585,145 @@ class Model:
         return model
 
     def register_data(self, **data):
-        names = data["parameters"]["names"]
-        values = data["parameters"]["values"]
+        raw_metadata = data.get("persistence", {}).get("metadata")
+        metadata = {}
 
-        parameters = {
+        if raw_metadata is not None:
+            if isinstance(raw_metadata, np.ndarray):
+                raw_metadata = raw_metadata.item()
+            if isinstance(raw_metadata, bytes):
+                raw_metadata = raw_metadata.decode("utf-8")
+
+            metadata = json.loads(raw_metadata)
+
+            if metadata.get("version") != 1:
+                raise ValueError("Unsupported model metadata version.")
+
+        # Saved settings define how both parameters and counts are interpreted.
+        # Older files retain the settings provided when constructing the model.
+        self.params.update(metadata.get("params", {}))
+        self.reset()
+        self.clear_counts()
+
+        names = np.asarray(data["parameters"]["names"]).reshape(-1)
+        values = np.asarray(data["parameters"]["values"]).reshape(-1)
+
+        if len(names) != len(values):
+            raise ValueError("Model parameter names and values differ in length.")
+
+        self.parameters = {
             (name.decode("utf-8") if isinstance(name, bytes) else str(name)): value
             for name, value in zip(names, values)
         }
-        self.parameters = parameters
-        self.loaded = True
-        self.build_from_parameters(use_cdf=True)
 
+        arrays = data.get("count_arrays", {})
+        seen = set()
+
+        for record in metadata.get("records", []):
+            kind = record["kind"]
+            paths = record["paths"]
+            revision = record["revision"]
+            counts = arrays[record["array"]]
+
+            if kind == "same" and len(paths) == 1:
+                key = paths[0]
+            elif kind == "cross" and len(paths) == 2:
+                key = tuple(paths)
+            else:
+                raise ValueError("Invalid model count record.")
+
+            identity = (kind, key)
+            if identity in seen:
+                raise ValueError(f"Duplicate model count record: {identity!r}")
+            seen.add(identity)
+
+            if kind == "same":
+                self.set_same_counts(
+                    key,
+                    counts,
+                    source_revision=revision,
+                )
+            else:
+                if revision is not None and len(revision) != 2:
+                    raise ValueError("Cross-count revisions must contain two entries.")
+
+                self.set_cross_counts(
+                    *key,
+                    counts,
+                    source_revisions=(
+                        None if revision is None else tuple(revision)
+                    ),
+                )
+
+            if record["stale"]:
+                self.stale_counts[kind].add(key)
+
+        # Counts can also be saved before a fit has been produced.
+        if self.parameters:
+            self.build_from_parameters(use_cdf=True)
+
+        self.fit_stale = bool(metadata.get("fit_stale", False))
+        self.fit_used_fallback = bool(
+            metadata.get("fit_used_fallback", False)
+        )
+        self.loaded = True
+
+    def _count_save_data(self, *, include_counts: bool):
+        arrays = {}
+        records = []
+
+        if include_counts:
+            for kind in ("same", "cross"):
+                for key, counts in self.counts[kind].items():
+                    name = f"record_{len(records):06d}"
+                    arrays[name] = counts
+
+                    records.append(
+                        {
+                            "array": name,
+                            "kind": kind,
+                            "paths": [key] if kind == "same" else list(key),
+                            "revision": self.count_revisions[kind].get(key),
+                            "stale": key in self.stale_counts[kind],
+                        }
+                    )
+
+        metadata = {
+            "version": 1,
+            "params": self.params,
+            "fit_stale": bool(self.fit_stale),
+            "fit_used_fallback": bool(self.fit_used_fallback),
+            "counts_included": bool(include_counts),
+            "records": records,
+        }
+
+        def json_default(value):
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, Path):
+                return str(value)
+            raise TypeError(
+                f"Cannot serialize {type(value).__name__} in model metadata."
+            )
+        
+        return {
+            "persistence": {
+                "metadata": json.dumps(
+                    metadata,
+                    # Handle NumPy scalar parameters/revision numbers.
+                    default=json_default,
+                )
+            },
+            "count_arrays": arrays,
+        }
+    
     def save(
         self,
         path: str | Path,
         *,
+        include_counts: bool = True,
         mat_version: Literal["pre73", "7.3"] = "7.3",
     ) -> None:
 
@@ -616,12 +742,15 @@ class Model:
                 "values": parameter_values,
             }
         }
+        save_data.update(
+            self._count_save_data(include_counts=include_counts)
+        )
 
         save_file(
             path,
             save_data,
             fields_to_save,
             mat_version=mat_version,
-            root_attributes={"object_type": "ModelData", "format_version": 1},
+            root_attributes={"object_type": "ModelData", "format_version": 2},
             root="/",
         )

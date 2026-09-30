@@ -73,6 +73,17 @@ class FieldConfigConstructor(QObject):
         self.rebuild_config_selector()
         self.refresh()
 
+        if (
+            isinstance(self.source, SessionData)
+            and not getattr(self.source, "_restored_from_catan", False)
+            and (
+                self.source.source_config is None
+                or self.source.status.get("loading_possible") is False
+            )
+        ):
+            self.toggle_config_options.set_expanded(True)
+            self.expanded_changed.emit()
+
     def build_toggle_config_options(self):
         ## define and set toggle
         self.toggle_config_options = ToggleOption(

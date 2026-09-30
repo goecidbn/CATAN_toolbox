@@ -7,7 +7,7 @@ from vispy.scene import visuals, cameras
 from vispy.color import Colormap
 from vispy.scene.visuals import Mesh
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent
 
 from PySide6.QtGui import (
     QCursor,
@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QFrame,
     QSlider,
+    QComboBox,
+    QStyle,
 )
 
 import importlib
@@ -53,6 +55,13 @@ from catan.core.image_correlation import calculate_img_correlation
 importlib.reload(request_handler)
 
 CAMERA_PADDING_PX = 25.0
+
+# Good → intermediate → bad; bright throughout for dark menus.
+MATCH_QUALITY_CMAP = Colormap([
+    "#72E6A1",  # mint green
+    "#FFE08A",  # pale yellow
+    "#FF8585",  # coral red
+])
 
 
 @dataclass
@@ -222,21 +231,8 @@ class Display(BasePlot.BaseCanvas):
         palette.raise_()
 
     def _position_request_display(self):
-
-        if self.request_display is None:
-            return
-
-        margin = 8
-
-        display = self.request_display
-        display.adjustSize()
-
-        x = margin
-        y = self.native.height() - display.height() - margin
-
-        display.move(x, max(margin, y))
-
-        display.raise_()
+        if self.request_display is not None:
+            self.request_display.reposition()
 
     def attach_parameter_overlay(self):
         """
@@ -321,6 +317,11 @@ class Display(BasePlot.BaseCanvas):
         ## identify the neurons thata should be plotted
         this_neuron = self.state.focused_component.neuron_id
 
+        selected_neurons = {
+            int(component.neuron_id)
+            for component in (self.state.selected_components or [])
+        }
+
         display_scope = self.controls["parameter"].display_scope
         if display_scope == "adjacent":
 
@@ -332,7 +333,7 @@ class Display(BasePlot.BaseCanvas):
             to_plot_neurons = np.where(distances <= self.state.adjacency_radius)[0]
 
         elif display_scope == "selection":
-            to_plot_neurons = [c.neuron_id for c in self.state.selected_components]
+            to_plot_neurons = sorted(selected_neurons)
         else:
             raise ValueError(f"Unknown footprint display scope: " f"{display_scope!r}")
 
@@ -364,11 +365,6 @@ class Display(BasePlot.BaseCanvas):
         ## iterate through each neuron that should be plotted
         for neuron in to_plot_neurons:
             included = bool(self.data.assignments.union.included[neuron])
-
-            selected_neurons = {
-                component.neuron_id
-                for component in (self.state.selected_components or [])
-            }
 
             if not included:
                 key = "default"
@@ -598,11 +594,35 @@ class Display(BasePlot.BaseCanvas):
         center_radius_px = 80
         point_radius_px = 10
 
+        parameters = self.controls["parameter"]
+        session_filter = parameters.checkbox_session_only.isChecked()
+        filter_focused = parameters.checkbox_filter_focused.isChecked()
+        session_id = int(self.controls["session_filter"].slider.value())
+
+        focused = self.state.focused_component
+        focused_neuron = (
+            None if focused is None else focused.neuron_id
+        )
+
         keys = [
             key
-            for key in self.plotting["data"].keys()
-            if isinstance(key, tuple) and key[0] in self.plotting["visuals"]
+            for key in self.plotting["data"]
+            if (
+                isinstance(key, tuple)
+                and key[0] in self.plotting["visuals"]
+                and (
+                    not session_filter
+                    or key[1] == session_id
+                    or (
+                        key[0] == focused_neuron
+                        and not filter_focused
+                    )
+                )
+            )
         ]
+
+        if not keys:
+            return None
         centers = np.asarray(
             [self.plotting["data"][key].center_xyz for key in keys],
             dtype=np.float32,
@@ -650,7 +670,8 @@ class Display(BasePlot.BaseCanvas):
         neuron_id = component.neuron_id
         d = np.linalg.norm(union_centroids - union_centroids[neuron_id], axis=1)
 
-        neuron_ids = np.where(d <= self.state.adjacency_radius)[0]
+        radius = min(10,self.state.adjacency_radius)
+        neuron_ids = np.where(d <= radius)[0]
         neuron_ids = [n for n in neuron_ids if n != neuron_id]
 
         self.state.logger.debug(
@@ -668,20 +689,34 @@ class Display(BasePlot.BaseCanvas):
         return {"vertices": verts, "faces": faces, "vertex_colors": cols}
 
     def on_mouse_release(self, event):
+        request = self.state.current_request
 
-        if self.state.current_request is not None:
-
-            if event.button == 1 and event.pos is not None:
-                self._on_request_interaction(event)
+        # Allow inspection and conflict resolution during neuron merging.
+        if (
+            event.button == 2
+            and event.pos is not None
+            and (request is None or request.type == "neuron_merge")
+        ):
+            component = self.find_closest_component(event.pos)
+            if component is not None:
+                self.open_footprint_context_menu(component)
 
             event.handled = True
             return
 
-        if event.button == 2:  # right click in VisPy
-            key = self.find_closest_component(event.pos)
-            if key is not None:
-                self.open_footprint_context_menu(key)
+        if request is not None:
+            if (
+                request.type != "neuron_merge"
+                and event.button == 1
+                and event.pos is not None
+                and not self.is_drag(event.pos)
+            ):
+                self._on_request_interaction(event)
+
+            # The request continues to own the highlighted components.
             event.handled = True
+            return
+
         super().on_mouse_release(event)
 
     def calculate_tracking_statistics(
@@ -763,7 +798,7 @@ class Display(BasePlot.BaseCanvas):
         this_component: NeuronComponent,
         candidate: int,
         which: str = "previous",
-        cmap=Colormap(["green", "black", "red"]),
+        cmap=MATCH_QUALITY_CMAP,
     ):
 
         similarity, shift, p_same, session_id = self.calculate_tracking_statistics(
@@ -782,7 +817,7 @@ class Display(BasePlot.BaseCanvas):
         arrow = "\u25bc" if which == "previous" else "\u25b2"
         html_session = (
             f"\u0394s="
-            + get_colored_label(f"{ds}", ds / 10.0, cmap)
+            + get_colored_label(f"{ds}", float(np.clip(ds / 10.0, 0.0, 1.0)), cmap)
             + f"({session_id})"
         )
         html_probability = ""
@@ -790,17 +825,17 @@ class Display(BasePlot.BaseCanvas):
         html_shift = ""
         if p_same is not None:
             html_probability = get_colored_label(
-                f"p={p_same:.2f}", 1 - p_same, cmap, ["b"]
+                f"p={p_same:.2f}", float(np.clip(1 - p_same, 0.0, 1.0)), cmap, ["b"]
             )
 
         if similarity is not None:
             html_similarity = "c=" + get_colored_label(
-                f"{similarity:.2f}", (1 - similarity) / 2.0, cmap
+                f"{similarity:.2f}", float(np.clip((1 - similarity) / 2.0, 0.0, 1.0)), cmap
             )
 
         if shift is not None:
             html_shift = "shift=" + get_colored_label(
-                f"{shift:.2f}px", shift / 10.0, cmap
+                f"{shift:.2f}px", float(np.clip(shift / 10.0, 0.0, 1.0)), cmap
             )
 
         add_label_to_menu(
@@ -870,6 +905,24 @@ class Display(BasePlot.BaseCanvas):
             submenu_change.addAction(act_candidate)
             menu.addMenu(submenu_change)
             menu.addSeparator()
+
+        focused = self.state.focused_component
+        if focused is not None:
+            source_id = int(this_component.neuron_id)
+            target_id = int(focused.neuron_id)
+
+            if (
+                source_id != target_id
+                and self.data.neuron_merge_distance(source_id, target_id) <= 10.0
+            ):
+                action = menu.addAction("Merge with selected neuron")
+                action.setEnabled(self.state.current_request is None)
+                action.triggered.connect(
+                    lambda checked=False, source=source_id, target=target_id:
+                    self.start_neuron_merge(source, target)
+                )
+
+        menu.addSeparator()
 
         ## === flag submenus ===
         submenu_neuron = self.build_neuron_tag_menu(this_component.neuron_id, menu)
@@ -961,6 +1014,10 @@ class Display(BasePlot.BaseCanvas):
             lambda: self.remove_component(component)
         )
 
+        can_start_request = self.state.current_request is None
+        self.register_actions["merge"].setEnabled(can_start_request)
+        self.register_actions["split"].setEnabled(can_start_request)
+
         return submenu
 
     def _on_request_status_changed(self):
@@ -971,6 +1028,11 @@ class Display(BasePlot.BaseCanvas):
     def sync_request_display(self):
 
         request = self.state.current_request
+        if request is not None and request.type == "neuron_merge":
+            if request.assignments is not self.data.assignments:
+                self.cancel_request()
+                return
+            request.refresh()
 
         self.request_display.set_request(request)
 
@@ -978,6 +1040,25 @@ class Display(BasePlot.BaseCanvas):
             self.state.update_highlighted_components(request.components)
 
         self._position_request_display()
+
+    def start_neuron_merge(self, source_id, target_id):
+        if self.state.current_request is not None:
+            return
+
+        self.state.current_request = request_handler.NeuronMergeRequest(
+            self.data.assignments,
+            source_id,
+            target_id,
+        )
+        self.plot_neurons(reset=True)
+
+    def change_request_highlight(self, mode):
+        request = self.state.current_request
+        if request is None or request.type != "neuron_merge":
+            return
+
+        request.highlight_mode = mode
+        self.state.notify_request_changed()
 
     def start_merge(self, component: NeuronComponent):
         self.state.current_request = request_handler.RequestHandler("merge", component)
@@ -996,6 +1077,17 @@ class Display(BasePlot.BaseCanvas):
         request = self.state.current_request
 
         if request is None:
+            return
+
+        if request.type == "neuron_merge":
+            try:
+                self.data.merge_neuron_request(request)
+            except Exception as exc:
+                self.sync_request_display()
+                self.request_display.set_error(str(exc))
+                return
+
+            self.cancel_request()
             return
 
         # ---------------------------------------------
@@ -1033,7 +1125,7 @@ class Display(BasePlot.BaseCanvas):
 
         request = self.state.current_request
 
-        if request is None:
+        if request is None or request.type == "neuron_merge":
             return
 
         component = self.find_closest_component(event.pos)
@@ -1099,6 +1191,7 @@ class Display(BasePlot.BaseCanvas):
                 f"Creating new neuron {new_neuron} for footprint {fp_id} in session {session_id}"
             )
             self.data.assignments.pad_empty(n_neurons=1, n_sessions=0)
+            self.state.assignments = self.data.assignments.ids
 
         ## change assignments array
         self.state.assignments[new_neuron, session_id] = fp_id
@@ -1106,11 +1199,23 @@ class Display(BasePlot.BaseCanvas):
 
         self.data.rebuild_union_neurons([new_neuron, component.neuron_id])
 
-        if np.all(self.state.assignments[component.neuron_id, :] < 0):
-            print(f"Neuron {component.neuron_id} is now empty and will be removed.")
-            print(
-                f"CAREFUL!! all references are f**cked up now, need to update all neurons"
-            )
+        for values in self.data.assignments.stats.values():
+            values[new_neuron, ...] = np.nan
+            values[component.neuron_id, ...] = np.nan
+
+        self.data.assignments.review_status[new_neuron] = ReviewStatus.PENDING
+        self.data.assignments.review_status[
+            component.neuron_id
+        ] = ReviewStatus.PENDING
+
+        self.data.rebuild_union_included()
+        self.data.assignments.updating_neuron_presence()
+        self.data.notify_change(
+            C.ASSIGNMENT_MAPPING,
+            C.UNION_GEOMETRY,
+            C.INCLUSION,
+            C.REVIEW_STATUS,
+        )
 
         self.plot_neurons(reset=True)
 
@@ -1160,7 +1265,11 @@ class Controller(BasePlot.CanvasController):
         self.connect_signal(self.state.request_status_changed, self._on_request_status_changed,controls=True)
         self.connect_signal(self.canvas.request_display.cancel_requested, self.canvas.cancel_request,controls=True)
         self.connect_signal(self.canvas.request_display.confirm_requested, self.canvas.advance_or_confirm_request,controls=True)
-
+        self.connect_signal(
+            self.canvas.request_display.highlight_changed,
+            self.canvas.change_request_highlight,
+            controls=True,
+        )
         self._on_request_status_changed()
 
     def _on_data_changed(self, event: DataChange):
@@ -1183,6 +1292,12 @@ class Controller(BasePlot.CanvasController):
             C.ASSIGNMENT_MAPPING,
         ):
             self.canvas.update_review_status_tag()
+
+        if (
+            self.state.current_request is not None
+            and self.state.current_request.type == "neuron_merge"
+        ):
+            self.canvas.sync_request_display()
 
     def initialize_display(self):
         self._setup_session_filter()
@@ -1310,10 +1425,18 @@ class RequestDisplay(QFrame):
     cancel_requested = Signal()
     confirm_requested = Signal()
 
+    highlight_changed = Signal(str)
+
     def __init__(self, parent):
         super().__init__(parent)
 
-        self.setMaximumWidth(parent.width() / 2)
+        self._position_timer = QTimer(self)
+        self._position_timer.setSingleShot(True)
+        self._position_timer.setInterval(0)
+        self._position_timer.timeout.connect(self.reposition)
+        parent.installEventFilter(self)
+
+        self.setMaximumWidth(max(1, parent.width() // 2))
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 8, 10, 8)
@@ -1338,7 +1461,34 @@ class RequestDisplay(QFrame):
         self.error_label.setObjectName("requestError")
         self.error_label.setWordWrap(True)
         self.error_label.hide()
-        root_layout.addWidget(self.error_label)
+        self.error_icon = QLabel(self)
+        self.error_icon.setPixmap(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_MessageBoxWarning
+            ).pixmap(22, 22)
+        )
+        self.error_icon.setFixedSize(24, 24)
+        self.error_icon.hide()
+
+        error_layout = QHBoxLayout()
+        error_layout.setSpacing(7)
+        error_layout.addWidget(
+            self.error_icon,
+            0,
+            Qt.AlignmentFlag.AlignTop,
+        )
+        error_layout.addWidget(self.error_label, 1)
+        root_layout.addLayout(error_layout)
+
+        self.highlight_selector = QComboBox(self)
+        self.highlight_selector.hide()
+        root_layout.addWidget(self.highlight_selector)
+
+        self.highlight_selector.currentIndexChanged.connect(
+            lambda _: self.highlight_changed.emit(
+                self.highlight_selector.currentData()
+            )
+        )
 
         button_layout = QHBoxLayout()
 
@@ -1368,6 +1518,10 @@ class RequestDisplay(QFrame):
                 border-radius: 7px;
             }
 
+            QFrame#RequestDisplayOverlay[needsAttention="true"] {
+                border: 2px solid #c87920;
+            }
+
             QFrame#RequestDisplayOverlay QLabel {
                 background: transparent;
                 border: none;
@@ -1388,9 +1542,9 @@ class RequestDisplay(QFrame):
             }
 
             QLabel#requestError {
-                color: #ff8a8a;
-                font-size: 11px;
-                font-weight: 500;
+                color: #ffd28a;
+                font-size: 13px;
+                font-weight: 600;
                 padding: 3px 2px;
             }
 
@@ -1433,13 +1587,101 @@ class RequestDisplay(QFrame):
 
         self.setVisible(False)
 
+    def event(self, event):
+        result = super().event(event)
+
+        if (
+            event.type() in (
+                QEvent.Type.LayoutRequest,
+                QEvent.Type.Resize,
+                QEvent.Type.Show,
+            )
+            and hasattr(self, "_position_timer")
+        ):
+            self._position_timer.start()
+
+        return result
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is self.parentWidget()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._position_timer.start()
+
+        return super().eventFilter(watched, event)
+
+    def reposition(self):
+        parent = self.parentWidget()
+        if parent is None or not self.isVisible():
+            return
+
+        margin = 8
+        available_width = max(1, parent.width() - 2 * margin)
+        self.setMaximumWidth(
+            min(available_width, max(280, parent.width() // 2))
+        )
+        self.adjustSize()
+        self.move(
+            margin,
+            max(margin, parent.height() - self.height() - margin),
+        )
+        self.raise_()
+
     def set_request(
         self,
         request_handler: request_handler.RequestHandler | None,
     ):
 
+        self.highlight_selector.hide()
         if request_handler is None:
             self.clear_request()
+            return
+
+        if request_handler.type == "neuron_merge":
+            request = request_handler
+
+            self.title.setText("Merge neurons")
+            self.origin_label.setText(
+                f"Move neuron {request.source_id} "
+                f"({len(request.origin)} footprints)"
+            )
+            self.destination_label.setText(
+                f"Into neuron {request.target_id}"
+            )
+
+            self.highlight_selector.blockSignals(True)
+            try:
+                self.highlight_selector.clear()
+                self.highlight_selector.addItem(
+                    "Highlight footprints", "footprints"
+                )
+                if request.conflicts:
+                    self.highlight_selector.addItem(
+                        "Highlight conflicts", "conflicts"
+                    )
+                self.highlight_selector.setCurrentIndex(
+                    max(
+                        0,
+                        self.highlight_selector.findData(
+                            request.highlight_mode
+                        ),
+                    )
+                )
+            finally:
+                self.highlight_selector.blockSignals(False)
+
+            self.highlight_selector.show()
+            self.confirm_button.setText("Apply")
+            self.confirm_button.setEnabled(request.is_complete)
+
+            if request.error:
+                self.set_error(request.error)
+            else:
+                self.clear_error()
+
+            self.show()
+            self._position_timer.start()
             return
 
         self.setVisible(True)
@@ -1458,14 +1700,28 @@ class RequestDisplay(QFrame):
 
         self.clear_error()
 
+    def _set_attention(self, active):
+        if self.property("needsAttention") == active:
+            return
+
+        self.setProperty("needsAttention", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
     def set_error(self, message: str):
         self.error_label.setText(message)
         self.error_label.show()
-        self.adjustSize()
+        self.error_icon.show()
+        self._set_attention(True)
+        self._position_timer.start()
 
     def clear_error(self):
         self.error_label.clear()
         self.error_label.hide()
+        self.error_icon.hide()
+        self._set_attention(False)
+        self._position_timer.start()
 
     def clear_request(self):
 
