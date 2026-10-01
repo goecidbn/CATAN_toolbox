@@ -35,13 +35,24 @@ from .main_menu import MainMenu
 
 class MainWindow(QMainWindow):
 
-    settings = QSettings()
-
     def __init__(self, *, settings=None):
         super().__init__()
 
-        if settings is not None:
-            self.settings = settings
+        self.setWindowTitle("CATAN - Curating and Tracking Neurons")
+
+        QCoreApplication.setOrganizationName("WolfLabs")
+        QCoreApplication.setApplicationName("CATAN")
+
+        self.settings = (
+            settings
+            if settings is not None
+            else QSettings(
+                QSettings.Format.NativeFormat,
+                QSettings.Scope.UserScope,
+                "WolfLabs",
+                "CATAN",
+            )
+        )
 
         self.state = AppState(settings=self.settings)
         
@@ -51,10 +62,6 @@ class MainWindow(QMainWindow):
         # self.settings = QSettings()
         self._restore_settings()
 
-        self.setWindowTitle("CATAN - Curating and Tracking Neurons")
-
-        QCoreApplication.setOrganizationName("WolfLabs")
-        QCoreApplication.setApplicationName("CATAN")
 
         # --- UI setup ---
         self._init_ui()
@@ -191,11 +198,24 @@ class MainWindow(QMainWindow):
         for gui in self.gui_elements.values():
             if hasattr(gui, "_save_settings"):
                 gui._save_settings()
-        # self.gui_elements._save_settings()
+        
+        # Flush after every panel has written its settings.
+        self.settings.sync()
+
+        status = self.settings.status()
+        if status != QSettings.Status.NoError:
+            QMessageBox.warning(
+                self,
+                "Could not save settings",
+                "CATAN could not save its preferences.\n\n"
+                f"Location: {self.settings.fileName()}\n"
+                f"Status: {status.name}",
+            )
+        
         super().closeEvent(event)
         # print("MainWindow closeEvent finished")
 
-        app = QApplication.instance()
+        # app = QApplication.instance()
         # print("quitOnLastWindowClosed:", app.quitOnLastWindowClosed())
 
         # print("top-level widgets:")
