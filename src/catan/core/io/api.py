@@ -161,6 +161,104 @@ def load_fields_from_sources(
     return result
 
 
+def read_assignments_source(
+    path,
+    fields_to_load,
+    *,
+    load_data=False,
+):
+    from copy import deepcopy
+    from dataclasses import replace
+
+    import numpy as np
+
+    from .inspection import check_fields_compatibility
+
+    backend = get_backend(path)
+    with backend.open_read(path) as ref:
+        object_type = backend.get_attribute(ref, "/", "object_type", default=None)
+
+    if object_type is not None:
+        value = np.asarray(object_type)
+        if value.size == 1:
+            object_type = value.item()
+
+        if isinstance(object_type, bytes):
+            object_type = object_type.decode("utf-8", errors="replace")
+
+        object_type = str(object_type).strip()
+
+    if object_type in {"SessionData", "SessionList", "ModelData"}:
+        raise ValueError(
+            f"The selected file is a CATAN {object_type} file, "
+            "not an assignments file. Select an assignments file "
+            "or an external file containing a neuron-by-session IDs array."
+        )
+
+    fields = deepcopy(fields_to_load or {})
+
+    # Never use editable/preset mappings for CATAN's internal metadata.
+    fields.pop("curation", None)
+
+    ids_spec = fields.get("assignments", {}).get("ids")
+    if ids_spec is None:
+        return {
+            "problems": [
+                "No enabled field is configured for assignments.ids. "
+                "Select a preset or enable and configure that field."
+            ],
+            "data": None,
+        }
+
+    required = {}
+    for group, specs in fields.items():
+        selected = {
+            label: spec
+            for label, spec in specs.items()
+            if spec.required or (group == "assignments" and label == "ids")
+        }
+        if selected:
+            required[group] = selected
+
+    report = check_fields_compatibility(
+        path,
+        required,
+        refresh=True,
+        raise_source_errors=True,
+    )
+
+    problems = [
+        (
+            f"{field.group}.{field.label}: {field.spec.path}\n"
+            f"Source: {resolve_source_path(path, field.spec.source_path)}\n"
+            f"{field.reason or 'Configured field is unavailable.'}"
+        )
+        for field in report.fields
+        if not field.available
+    ]
+
+    if problems or not load_data:
+        return {"problems": problems, "data": None}
+
+    # Metadata belongs to the native IDs stored in this file.
+    # Do not attach it to IDs selected from a different physical source.
+    ids_source = resolve_source_path(path, ids_spec.source_path)
+    if object_type == "AssignmentsData" and ids_source == Path(path):
+        native = LoadConfig.fields_from_resource(
+            NATIVE_ASSIGNMENTS_CONFIG,
+            enabled_only=False,
+        )
+        fields["curation"] = {
+            label: replace(spec, required=False, source_path=None)
+            for label, spec in native.get("curation", {}).items()
+        }
+
+    return {
+        "problems": [],
+        "data": load_fields_from_sources(path, fields),
+    }
+
+
 def save_file(
     path: str | Path,
     data: Any,

@@ -23,6 +23,15 @@ def main() -> int:
     )
     options, qt_arguments = parser.parse_known_args(sys.argv[1:])
 
+    if sys.argv[1:2] == ["--catan-read-worker"]:
+        if len(sys.argv) != 3:
+            raise SystemExit("Internal reader mode requires a request directory.")
+
+        from catan.core.io.isolated_read import _child_main
+
+        _child_main(sys.argv[2])
+        return 0
+
     configure_graphics_backend()
 
     try:

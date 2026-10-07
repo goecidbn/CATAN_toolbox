@@ -21,9 +21,9 @@ def _build_remap(dims, shifts, flow=None):
         np.arange(0.0, dims[0]).astype(np.float32),
     )
 
-    if not (flow is None):
-        y_remap = (y_grid - shifts[0] + flow[..., 0]).astype(np.float32)
-        x_remap = (x_grid - shifts[1] + flow[..., 1]).astype(np.float32)
+    if flow is not None:
+        y_remap = (y_grid - shifts[0] + flow[..., 1]).astype(np.float32)
+        x_remap = (x_grid - shifts[1] + flow[..., 0]).astype(np.float32)
     else:
         y_remap = (y_grid - shifts[0]).astype(np.float32)
         x_remap = (x_grid - shifts[1]).astype(np.float32)
@@ -158,15 +158,60 @@ def get_session_remap(
 
     if not use_optical_flow:
         return shift, None, c, c_zscored
-    
+
     y_remap, x_remap = _build_remap(dims, shift)
 
     A2 = cv2.remap(A2, x_remap, y_remap, interpolation=cv2.INTER_CUBIC)
     A2 = normalize_array(A2, "uint", 8)
     # A2 = normalize_array(A2,'uint',8)
 
-    flow = cv2.calcOpticalFlowFarneback(
-        A1, A2, np.array([], dtype=np.float32), 0.5, 5, 128, 3, 7, 1.5, 0
-    )
+    flow = calculate_residual_flow(A1, A2)
+    # flow = cv2.calcOpticalFlowFarneback(
+    #     A1, A2, np.array([], dtype=np.float32), 0.5, 5, 128, 3, 7, 1.5, 0
+    # )
 
     return shift, flow, c, c_zscored
+
+
+def calculate_residual_flow(reference, moving):
+    """Return reference-to-moving flow, with components (dx, dy).
+
+    Both images must already be in the same coordinate system.
+    No additional shift or rotation is estimated here.
+    """
+    reference = np.asarray(reference)
+    moving = np.asarray(moving)
+
+    if reference.ndim != 2 or moving.shape != reference.shape:
+        raise ValueError("Flow requires two equally sized 2D backgrounds.")
+
+    for image in (reference, moving):
+        if not np.isfinite(image).all():
+            raise ValueError("Background contains NaN or infinite values.")
+        if np.ptp(image) == 0:
+            raise ValueError("Background contains no intensity variation.")
+
+    # Suppress fine image detail before estimating deformation.
+    template_sigma = 4.0  # pixels
+
+    reference = cv2.GaussianBlur(
+        reference.astype(np.float32),
+        (0, 0),
+        sigmaX=template_sigma,
+        sigmaY=template_sigma,
+        borderType=cv2.BORDER_REFLECT_101,
+    )
+    moving = cv2.GaussianBlur(
+        moving.astype(np.float32),
+        (0, 0),
+        sigmaX=template_sigma,
+        sigmaY=template_sigma,
+        borderType=cv2.BORDER_REFLECT_101,
+    )
+
+    reference = normalize_array(reference, "uint", 8)
+    moving = normalize_array(moving, "uint", 8)
+
+    return cv2.calcOpticalFlowFarneback(
+        reference, moving, None, 0.5, 5, 128, 3, 7, 1.5, 0
+    )

@@ -14,6 +14,12 @@ from catan.core.io import (
 )
 from catan.core.structures.load_config import LoadConfig, FieldSpec
 from catan.core.data import center_of_mass
+from catan.core.io.isolated_read import read_fields
+
+from catan.core.spatial_geometry import (
+    check_shapes,
+    background_transpose,
+)
 
 sessiondata_type = Literal["spatial", "traces", "quality"]
 
@@ -64,7 +70,6 @@ class SessionData:
     centroids: Optional[np.ndarray] = None  #
     ## to be calculated (with additional information)
     # idx_kde: np.ndarray
-
 
     HDF5_VERSION = 1
 
@@ -194,17 +199,50 @@ class SessionData:
         fields_to_load: dict[str, dict[str, FieldSpec]] | None = None,
         **kwargs,
     ) -> None:
-        if self.path is None or not Path(self.path).exists():
-            raise ValueError("No (valid) path provided for session, cannot load data.")
+        if not self.path:
+            raise ValueError("No source path is configured for this session.")
 
         if fields_to_load is None:
             fields_to_load = LoadConfig.fields_from_resource(
                 NATIVE_SESSION_CONFIG, enabled_only=False
             )
 
-        data = load_fields_from_sources(self.path, fields_to_load)
+        ctx = kwargs.get("ctx")
+
+        spatial = "footprints" in fields_to_load.get("spatial", {})
+        config = getattr(self, "source_config", None)
+
+        if config is not None:
+            dimensions = config.dimensions
+        elif fields_to_load.get("spatial", {}).get("background") is not None:
+            dimensions = {"mode": "image", "field": None}
+        else:
+            dimensions = {
+                "mode": "manual",
+                "height": self.dims[0],
+                "width": self.dims[1],
+            }
+
+        data = read_fields(
+            self.path,
+            fields_to_load,
+            ctx=ctx,
+            operation="session_fields" if spatial else "fields",
+            parameters={
+                "dimensions": dimensions,
+                "orientation": kwargs.get("background_orientation", "auto"),
+                "expected_dims": kwargs.get("expected_dims"),
+            },
+        )
+
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.message("Applying loaded session data…")
+
         self.register_data(
-            alignment_references=kwargs.get("alignment_references", None), **data
+            alignment_references=kwargs.get("alignment_references"),
+            background_orientation=kwargs.get("background_orientation", "auto"),
+            **data,
         )
 
     def save(
@@ -233,7 +271,13 @@ class SessionData:
     ### ================= REGISTRATION METHODS ================== ###
     ### ========================================================= ###
 
-    def register_data(self, alignment_references: Optional[np.ndarray] = None, **data):
+    def register_data(
+        self,
+        alignment_references: Optional[np.ndarray] = None,
+        *,
+        background_orientation="auto",
+        **data,
+    ):
         """
         Registers data from kwargs 'data' input to SessionData object. Requires 'data' to contain the keys 'spatial', 'traces', and 'quality' with the corresponding data keys to be registered.
 
@@ -241,7 +285,9 @@ class SessionData:
         """
 
         self.register_spatial(
-            alignment_references=alignment_references, **data.get("spatial", {})
+            alignment_references=alignment_references,
+            background_orientation=background_orientation,
+            **data.get("spatial", {}),
         )
         self.register_traces(**data.get("traces", {}))
         self.register_quality(**data.get("quality", {}))
@@ -380,150 +426,148 @@ class SessionData:
     ### ===================== SPATIAL METHODS ==================== ###
     ### ========================================================== ###
 
-    def register_spatial(self, alignment_references=None, **data):
-
+    def register_spatial(
+        self,
+        alignment_references=None,
+        *,
+        background_orientation="auto",
+        **data,
+    ):
         if "footprints" not in data or data["footprints"] is None:
             return
 
-        self.footprints = data["footprints"]
+        if background_orientation not in {
+            "auto",
+            "as_stored",
+            "transpose",
+        }:
+            raise ValueError(
+                f"Unknown background orientation: " f"{background_orientation!r}"
+            )
+
+        footprints = data["footprints"]
+
+        if not sparse.issparse(footprints):
+            raise ValueError(
+                "Footprints must be sparse, with shape " "(height * width, neurons)."
+            )
+
+        footprints = sparse.csc_matrix(footprints)
 
         loaded_background = data.get("background")
+        if loaded_background is not None:
+            loaded_background = self._prepare_background(loaded_background)
+
+        dims = data.get("dims")
+
+        if dims is None and loaded_background is not None:
+            dims = loaded_background.shape
+            if background_orientation == "transpose":
+                dims = dims[::-1]
+
+        if dims is None:
+            raise ValueError(
+                "Specify image dimensions when loading "
+                "footprints without a background."
+            )
+
+        dims = check_shapes(
+            dims,
+            footprints.shape,
+            (None if loaded_background is None else loaded_background.shape),
+            background_orientation,
+        )
+
+        for reference in (alignment_references or {}).values():
+            shape = np.asarray(reference["template"]).shape
+            if tuple(shape) != dims:
+                raise ValueError(
+                    f"Alignment reference shape {shape} " f"does not match {dims}."
+                )
+
+        footprints_proj = np.asarray(
+            footprints.sum(axis=1),
+            dtype=np.float32,
+        ).reshape(dims)
+
+        if loaded_background is None:
+            origin = "footprints"
+            template = footprints_proj
+
+        else:
+            origin = "loaded"
+            transpose = background_transpose(
+                loaded_background.shape,
+                dims,
+                background_orientation,
+            )
+            template = loaded_background.T if transpose else loaded_background
+
+            if background_orientation == "auto" and dims[0] == dims[1]:
+                orientation = Remapping(evaluate=False)
+                orientation.test_transpose(
+                    footprints_proj,
+                    template,
+                )
+                template = orientation.fix_transpose(template)
+
+        # Validate geometry before modifying the session.
+        self.dims = dims
+        self.footprints = footprints
+        self.background_origin = origin
+
+        # Never alter this copy through cross-session alignment.
+        self.background_template = np.asarray(
+            template,
+            dtype=np.float32,
+        ).copy()
+        self.background = self.background_template.copy()
 
         self.status["spatial_loaded"] = True
 
-        self.dims = (
-            data.get("dims", self.dims)
-            if loaded_background is None
-            else loaded_background.shape
-        )
-
-        footprints_proj = self.footprints.sum(axis=1).reshape(self.dims)
-
-        if loaded_background is None:
-            self.background_origin = "footprints"
-
-            template = np.asarray(footprints_proj, dtype=np.float32)
-
-        else:
-            self.background_origin = "loaded"
-
-            template = self._prepare_background(loaded_background)
-
-            # Source-orientation correction only.
-            orientation = Remapping(evaluate=False)
-
-            orientation.test_transpose(footprints_proj, template)
-
-            template = orientation.fix_transpose(template)
-
-        # THIS COPY MUST NEVER BE ALTERED BY CROSS-SESSION ALIGNMENT.
-        self.background_template = np.asarray(template, dtype=np.float32).copy()
-
-        self.background = self.background_template.copy()
-
         if alignment_references:
-            self.align_to_reference(alignment_references, use_optical_flow=False)
-
+            self.align_to_reference(
+                alignment_references,
+                use_optical_flow=True,
+            )
         else:
             self.remap = Remapping.identity(self.dims)
-
             self.postprocess_spatial_data()
 
         self.evaluate_alignment_status()
 
-    # def register_spatial(self, alignment_references: Optional[np.ndarray] = None, **data):
-
-    #     if "footprints" not in data or data["footprints"] is None:
-    #         # print("No footprints provided, skipping spatial registration.")
-    #         return
-
-    #     self.footprints = data.get("footprints", sparse.csc_matrix((0, 0)))
-    #     background = data.get("background", None)
-
-    #     if background is not None and background.ndim != 2:
-    #         raise ValueError(
-    #             "Spatial background must be a 2D array. "
-    #             f"Loaded shape: {background.shape}. "
-    #             "Select or preprocess a single image plane/channel."
-    #         )
-
-    #     self.background = (
-    #         None if background is None else self._prepare_background(background)
-    #     )
-
-    #     if self.footprints is None:
-    #         return
-
-    #     self.status["spatial_loaded"] = True
-
-    #     self.dims = (
-    #         data.get("dims", self.dims)
-    #         if self.background is None
-    #         else self.background.shape
-    #     )  # assert dims is not None, "Either background or dims must be provided to prepare_background"
-
-    #     footprints_proj = self.footprints.sum(axis=1).reshape(self.dims)
-    #     if self.background is None:
-    #         ## return projection image if no background available
-    #         self.background_origin = "footprints"
-    #         # self.background = np.array(footprints_proj).astype(np.float32)
-    #         self.background = self._prepare_background(np.asarray(footprints_proj))
-    #     else:
-    #         ## check if footprints and background are consistent (e.g. transposition) and adjust if needed
-    #         # print("testing for transpose of background relative to footprints...")
-    #         self.background_origin = "loaded"
-    #         remap = Remapping(
-    #             template=footprints_proj,
-    #             template_reference=self.background,
-    #             use_optical_flow=False,
-    #             evaluate=False,
-    #         )
-    #         remap.test_transpose(footprints_proj, self.background)
-    #         self.background = remap.fix_transpose(self.background)
-
-    #     if alignment_references is not None:
-    #         # print("align to reference template")
-    #         self.align_to_reference(
-    #             alignment_references, use_optical_flow=False
-    #         )  # includes a call to postprocess_spatial_data()
-    #     else:
-    #         self.postprocess_spatial_data()
-
-    #     # self._ensure_component_flags(
-    #     #     included=data.get("included"),
-    #     #     synthetic=data.get("synthetic"),
-    #     # )
-
-    #     self.evaluate_alignment_status()
-
     @staticmethod
-    def _prepare_background(
-        background: np.ndarray,
-    ) -> np.ndarray:
-
-        background = np.asarray(background, dtype=np.float32)
-
-        if background.ndim != 2:
-            raise ValueError(
-                "Spatial background must be a 2D array; "
-                f"got shape {background.shape}."
-            )
-
-        if not np.all(np.isfinite(background)):
-            raise ValueError("Spatial background contains NaN or Inf values.")
+    def _prepare_background(background: np.ndarray) -> np.ndarray:
+        background = SessionData._background_as_grayscale(background)
 
         lo = float(background.min())
         hi = float(background.max())
 
         if hi > lo:
-            background = (background - lo) / (hi - lo)
+            return (background - lo) / (hi - lo)
 
-        else:
-            # Constant image: valid array, but carries no
-            # useful intensity information for alignment.
-            background = np.zeros_like(background, dtype=np.float32)
+        return np.zeros_like(background, dtype=np.float32)
 
-        return background
+    @staticmethod
+    def _background_as_grayscale(background: np.ndarray) -> np.ndarray:
+        image = np.asarray(background, dtype=np.float32)
+
+        if image.size == 0:
+            raise ValueError("Spatial background is empty.")
+
+        if not np.all(np.isfinite(image)):
+            raise ValueError("Spatial background contains NaN or Inf values.")
+
+        if image.ndim == 2:
+            return image
+
+        if image.ndim == 3 and image.shape[-1] == 3:
+            return image.mean(axis=-1, dtype=np.float32)
+
+        raise ValueError(
+            "Spatial background must be a 2D grayscale image "
+            f"or an (H, W, 3) RGB image; got shape {image.shape}."
+        )
 
     def update_footprints(
         self,
@@ -623,7 +667,6 @@ class SessionData:
         self.included &= self.footprints.getnnz(axis=0) > footprints_thr
 
     def _clean_spatial(self):
-        self.dims = (512, 512)
         self.footprints = sparse.csc_matrix((0, 0))
         self.background = None
         self.background_origin = None
@@ -711,50 +754,58 @@ class SessionData:
     ### ==================== ALIGNMENT METHODS ================== ###
     ### ========================================================= ###
 
-    def prepare_background_template(self, background: np.ndarray) -> np.ndarray:
-        """
-        Prepare a newly loaded background for use as an
-        unaligned session background template.
+    def prepare_background_template(
+        self,
+        background: np.ndarray,
+        *,
+        background_orientation="auto",
+    ) -> np.ndarray:
+        """Prepare a source background without modifying this session."""
 
-        This does not modify SessionData.
-        """
-
-        template = np.asarray(background, dtype=np.float32)
-        if template.ndim != 2:
+        if background_orientation not in {"auto", "as_stored", "transpose"}:
             raise ValueError(
-                f"Background must be a 2D image, got shape {template.shape}."
+                f"Unknown background orientation: {background_orientation!r}"
             )
 
+        template = self._background_as_grayscale(background)
         dims = tuple(self.dims)
 
-        # Non-square data allow us to determine the
-        # orientation directly from the shape.
+        if background_orientation == "transpose":
+            template = template.T
+
+        orientation = Remapping(evaluate=False)
+        orientation.test_transpose(self.background_template, template)
+
+        if background_orientation == "auto":
+            if template.shape != dims:
+                if template.T.shape == dims:
+                    template = template.T
+                else:
+                    raise ValueError(
+                        f"Background has incompatible shape {template.shape}; "
+                        f"expected {dims}."
+                    )
+
+            elif dims[0] == dims[1] and self.background_template is not None:
+                # orientation = Remapping(evaluate=False)
+                # orientation.test_transpose(self.background_template, template)
+                template = orientation.fix_transpose(template)
+
         if template.shape != dims:
+            raise ValueError(
+                f"Background orientation {background_orientation!r} produces "
+                f"shape {template.shape}, but the session requires {dims}. "
+                "Choose another background orientation and load again."
+            )
 
-            if template.T.shape == dims:
-                template = template.T
-            else:
-                raise ValueError(
-                    f"Background has incompatible shape {template.shape}; expected {dims}."
-                )
-
-        # For square images, shape cannot tell us whether
-        # the image is transposed. The current unaligned
-        # template provides the orientation reference.
-        elif dims[0] == dims[1] and self.background_template is not None:
-            orientation = Remapping(evaluate=False)
-            orientation.test_transpose(self.background_template, template)
-
-            template = orientation.fix_transpose(template)
-
-        return template.copy()
+        return np.asarray(template, dtype=np.float32).copy()
 
     def propose_remapping(
         self,
         alignment_references,
         *,
         background_template=None,
-        use_optical_flow=False,
+        use_optical_flow=True,
         correct_rotation: bool | None = None,
     ) -> Remapping:
         """
@@ -802,7 +853,7 @@ class SessionData:
             rotation_refine_step=self.params["rotation_refine_step"],
         )
 
-    def align_to_reference(self, alignment_references, use_optical_flow=False):
+    def align_to_reference(self, alignment_references, use_optical_flow=True):
 
         if (
             not self.status["spatial_loaded"]

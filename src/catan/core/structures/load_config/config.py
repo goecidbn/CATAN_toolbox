@@ -48,6 +48,15 @@ class LoadConfig:
 
     subconfigs: dict[str, SubConfigSpec] = field(default_factory=dict)
 
+    dimensions: dict = field(
+        default_factory=lambda: {
+            "mode": "manual",
+            "height": 512,
+            "width": 512,
+            "field": None,
+        }
+    )
+
     FORMAT_VERSION = 1
 
     def get_group(self, group: str) -> FieldGroupSpec:
@@ -92,7 +101,14 @@ class LoadConfig:
 
     def update_field(self, group: str, field_name: str, **changes) -> None:
         spec = self.get_group(group).fields[field_name]
-        valid = {"path", "source", "attribute", "required", "source_path"}
+        valid = {
+            "path",
+            "source",
+            "attribute",
+            "required",
+            "source_path",
+            "exposed",
+        }
         unknown = set(changes) - valid
         if unknown:
             raise ValueError(f"Unknown FieldSpec properties: {sorted(unknown)}")
@@ -157,6 +173,7 @@ class LoadConfig:
             "subconfigs": {
                 name: spec.to_dict() for name, spec in self.subconfigs.items()
             },
+            "dimensions": deepcopy(self.dimensions),
         }
 
         if for_compare:
@@ -213,6 +230,17 @@ class LoadConfig:
                 name: SubConfigSpec.from_dict(spec)
                 for name, spec in data.get("subconfigs", {}).items()
             },
+            dimensions=deepcopy(
+                data.get(
+                    "dimensions",
+                    {
+                        "mode": "manual",
+                        "height": 512,
+                        "width": 512,
+                        "field": None,
+                    },
+                )
+            ),
         )
 
     @classmethod

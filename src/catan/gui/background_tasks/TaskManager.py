@@ -10,6 +10,11 @@ from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
 from .Worker import Worker
 
 
+@dataclass(eq=False)
+class TaskBatch:
+    cancelled: bool = False
+
+
 @dataclass
 class QueuedTask:
     id: str
@@ -20,6 +25,7 @@ class QueuedTask:
     on_result: Callable | None = None
     ready: Callable[[], bool] | None = None
     background: bool = False
+    batch: TaskBatch | None = None
 
 
 class TaskManager(QObject):
@@ -42,6 +48,7 @@ class TaskManager(QObject):
         "loading",
         "model update",
         "calculating",
+        "saving",
     )
 
     def __init__(self):
@@ -70,6 +77,8 @@ class TaskManager(QObject):
         self._finishing_depth = 0
         self._processing_queues = False
 
+        self._processing_holds = {}
+
     # ------------------------------------------------------------------
     # Timer
     # ------------------------------------------------------------------
@@ -84,22 +93,58 @@ class TaskManager(QObject):
     # ------------------------------------------------------------------
     # Status inquiries
     # ------------------------------------------------------------------
-    
+
     @property
     def processing_requested(self):
         return self._pending_processing is not None
 
+    @property
+    def processing_paused(self):
+        return bool(self._processing_holds)
+
     def processing_busy(self):
-        """Registered processing work; excludes display-only calculations."""
-        return any(
-            not task.background
-            for task in self.tasks.values()
+        """Processing tasks or an outstanding interactive loading check."""
+        return bool(self._processing_holds) or any(
+            not task.background for task in self.tasks.values()
         )
+
+    def pause_processing(self, group, *, batch, on_cancel):
+        """Prevent new workers from starting while a GUI check is pending."""
+        if group not in self.queues:
+            raise ValueError(f"Unknown task group {group!r}")
+
+        if batch.cancelled:
+            return None
+
+        token = object()
+        self._processing_holds[token] = (group, batch, on_cancel)
+        self.queue_changed.emit(group)
+        return token
+
+    def resume_processing(self, token):
+        hold = self._processing_holds.pop(token, None)
+        if hold is None:
+            return
+
+        group, _, _ = hold
+        self.queue_changed.emit(group)
+        self.process_queues()
+        self.scheduling_settled.emit()
+
+    def _cancel_processing_holds(self, batch):
+        for token, (group, held_batch, callback) in list(
+            self._processing_holds.items()
+        ):
+            if held_batch is not batch:
+                continue
+
+            self._processing_holds.pop(token, None)
+            callback()
+            self.queue_changed.emit(group)
 
     def _background_running(self):
         return any(
-            task is not None and task.background
-            for task in self.current.values()
+            task is not None and task.background for task in self.current.values()
         )
 
     def defer_for_background(self, callback):
@@ -119,7 +164,7 @@ class TaskManager(QObject):
                 self.cancel(task.id)
 
         return True
-    
+
     # ------------------------------------------------------------------
     # Task creation
     # ------------------------------------------------------------------
@@ -138,8 +183,13 @@ class TaskManager(QObject):
         ready=None,
         unique=False,
         background=False,
+        batch=None,
+        prepend=False,
         **kwargs,
-    ) -> str:
+    ) -> str | None:
+
+        if batch is not None and batch.cancelled:
+            return None
 
         if group not in self.queues:
             raise ValueError(
@@ -166,10 +216,15 @@ class TaskManager(QObject):
             on_result=on_result,
             ready=ready,
             background=background,
+            batch=batch,
         )
 
         self.tasks[task.id] = task
-        self.queues[group].append(task)
+
+        if prepend:
+            self.queues[group].appendleft(task)
+        else:
+            self.queues[group].append(task)
 
         self.task_added.emit(
             group,
@@ -211,6 +266,9 @@ class TaskManager(QObject):
         task: QueuedTask,
     ) -> bool:
 
+        if task.batch is not None and task.batch.cancelled:
+            return False
+
         if task.ready is None:
             return True
 
@@ -236,6 +294,10 @@ class TaskManager(QObject):
         group: str,
     ) -> None:
 
+        # Completion callbacks may show a modal selection dialog.
+        # Do not promote further work until those callbacks finish.
+        if self._finishing_depth or self._processing_holds:
+            return
         # Only one task per group at once.
         if self.current[group] is not None:
             return
@@ -355,7 +417,7 @@ class TaskManager(QObject):
         worker = task.worker
 
         self._finishing_depth += 1
-        
+
         # Remove from active task lookup.
         self.tasks.pop(
             task.id,
@@ -365,7 +427,9 @@ class TaskManager(QObject):
         if self.current[group] is task:
             self.current[group] = None
 
-        cancelled = worker.is_cancelled()
+        cancelled = worker.is_cancelled() or (
+            task.batch is not None and task.batch.cancelled
+        )
         failed = worker.is_failed()
 
         try:
@@ -391,8 +455,10 @@ class TaskManager(QObject):
                 if task.on_result is not None:
                     task.on_result(result)
 
-                # Only successful tasks execute their completion callback.
-                if task.finished is not None:
+                # on_result may have opened a prompt and cancelled the batch.
+                if task.finished is not None and not (
+                    task.batch is not None and task.batch.cancelled
+                ):
                     task.finished()
 
         finally:
@@ -451,33 +517,73 @@ class TaskManager(QObject):
         self._start_next(group)
         self.scheduling_settled.emit()
 
-    def cancel_group(
-        self,
-        group: str,
-    ) -> None:
-
+    def cancel_group(self, group):
         if group not in self.queues:
             raise ValueError(f"Unknown task group {group!r}")
 
-        current = self.current[group]
+        self._finishing_depth += 1
+        try:
+            held_batches = {
+                batch
+                for held_group, batch, _ in self._processing_holds.values()
+                if held_group == group
+            }
 
-        if current is not None:
-            self.cancel(current.id)
+            for batch in held_batches:
+                self.cancel_batch(batch)
 
-        # Copy because cancel() mutates self.tasks.
-        for task in list(self.queued_tasks(group)):
-            self.cancel(task.id)
+            for task in list(self.tasks.values()):
+                if task.group == group:
+                    self.cancel(task.id)
 
-        # Remove cancelled stale entries from physical queue.
-        self.queues[group] = deque(
-            task for task in self.queues[group] if task.id in self.tasks
-        )
+            self.queues[group] = deque(
+                task for task in self.queues[group] if task.id in self.tasks
+            )
+        finally:
+            self._finishing_depth -= 1
 
         self.queue_changed.emit(group)
+        self.process_queues()
+        self.scheduling_settled.emit()
 
-    def cancel_all(self) -> None:
-        for group in self.GROUPS:
-            self.cancel_group(group)
+    def cancel_all(self):
+        self._finishing_depth += 1
+        try:
+            self._pending_processing = None
+            for group in self.GROUPS:
+                self.cancel_group(group)
+        finally:
+            self._finishing_depth -= 1
+
+        self.process_queues()
+        self.scheduling_settled.emit()
+
+    def cancel_batch(self, batch: TaskBatch) -> None:
+        """Cancel this batch without touching unrelated work."""
+        if batch.cancelled:
+            return
+
+        # Set this before emitting signals or cancelling individual tasks:
+        # callbacks must not be able to schedule more batch work.
+        batch.cancelled = True
+
+        self._finishing_depth += 1
+        try:
+            self._cancel_processing_holds(batch)
+
+            for task in list(self.tasks.values()):
+                if task.batch is batch:
+                    self.cancel(task.id)
+
+            for group, queue in self.queues.items():
+                self.queues[group] = deque(
+                    task for task in queue if task.id in self.tasks
+                )
+        finally:
+            self._finishing_depth -= 1
+
+        self.process_queues()
+        self.scheduling_settled.emit()
 
     # ------------------------------------------------------------------
     # Queue inspection
@@ -566,13 +672,9 @@ class TaskManager(QObject):
         for group in self.GROUPS:
             current = self.current_task(group)
             if current is not None:
-                lines.append(
-                    f"{group}: current {current.id} — {current.name}"
-                )
+                lines.append(f"{group}: current {current.id} — {current.name}")
 
             for task in self.queued_tasks(group):
-                lines.append(
-                    f"{group}: queued {task.id} — {task.name}"
-                )
+                lines.append(f"{group}: queued {task.id} — {task.name}")
 
         return "\n".join(lines) or "No current or queued tasks found."

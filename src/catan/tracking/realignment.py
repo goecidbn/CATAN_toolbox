@@ -6,7 +6,7 @@ import numpy as np
 from scipy import sparse
 
 from catan.core.data import center_of_mass
-from catan.core.io import load_fields_from_sources
+from catan.core.io.isolated_read import read_fields
 
 
 def _build_comparison_updates(tracking, sessions, session_id, template, remap):
@@ -47,6 +47,37 @@ def _build_comparison_updates(tracking, sessions, session_id, template, remap):
 
         for path, reference in references.items():
             record = cached.get(path)
+
+            if record is not None and record.get("kind") == "flow_rigid":
+                fresh_flow_records = (
+                    sid == session_id
+                    and target_remap.method == "automatic_flow"
+                    and bool(target_remap.remap_data)
+                )
+
+                # An earlier reference changed: its old flow-derived
+                # comparison is no longer current. A later alignment rerun
+                # will generate a new candidate.
+                if sid != session_id and path == changed_path:
+                    continue
+
+                # A changed target background invalidates old comparisons.
+                # Keep candidates freshly calculated for that background.
+                if template_changed and sid == session_id and not fresh_flow_records:
+                    continue
+
+                updated = deepcopy(record)
+                global_matrix = np.asarray(updated["global_matrix"], dtype=np.float64)
+                reference_matrix = np.asarray(reference["matrix"], dtype=np.float64)
+                local_matrix = np.linalg.solve(reference_matrix, global_matrix)
+
+                updated["matrix"] = local_matrix
+                updated["shift"], updated["rotation"] = target_remap._rigid_parameters(
+                    target_remap.dims, local_matrix
+                )
+                records[path] = updated
+                continue
+
             must_recalculate = (
                 record is None
                 or (template_changed and (sid == session_id or path == changed_path))
@@ -86,7 +117,13 @@ def _build_comparison_updates(tracking, sessions, session_id, template, remap):
 
 
 def build_realignment_update(
-    tracking, session_id, *, background_template, remap, background_spec
+    tracking,
+    session_id,
+    *,
+    background_template,
+    remap,
+    background_spec,
+    ctx=None,
 ):
     sessions = tuple(tracking.sessions)
     session = sessions[session_id]
@@ -120,8 +157,10 @@ def build_realignment_update(
         raise ValueError("Original footprint IDs are not a contiguous prefix.")
 
     # Read ONLY original footprints. No traces, backgrounds or postprocessing.
-    loaded = load_fields_from_sources(
-        session.path, {"spatial": {"footprints": group.fields["footprints"]}}
+    loaded = read_fields(
+        session.path,
+        {"spatial": {"footprints": group.fields["footprints"]}},
+        ctx=ctx,
     )
     raw = sparse.csc_matrix(loaded["spatial"]["footprints"])
     if raw.shape != (int(np.prod(dims)), n_raw):
@@ -131,7 +170,7 @@ def build_realignment_update(
         )
 
     remap = deepcopy(remap)
-    aligned = remap.apply_remap(raw, use_optical_flow=False)
+    aligned = remap.apply_remap(raw, use_optical_flow=True)
     footprints = sparse.hstack([aligned, session.footprints[:, n_raw:]], format="csc")
     if background_spec is not None:
         group.fields["background"] = deepcopy(background_spec)
@@ -233,7 +272,7 @@ def build_realignment_update(
 
     updates[session_id].update(
         background_template=template,
-        background=remap.apply_remap(template, use_optical_flow=False),
+        background=remap.apply_remap(template, use_optical_flow=True),
         background_origin=(
             "loaded" if background_spec is not None else session.background_origin
         ),

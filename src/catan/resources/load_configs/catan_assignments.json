@@ -35,6 +35,7 @@
             "title": "Curation metadata",
             "type": "static",
             "enabled": true,
+            "exposed": false,
             "fields": {
                 "review_status": {
                     "path": "/curation/review_status",

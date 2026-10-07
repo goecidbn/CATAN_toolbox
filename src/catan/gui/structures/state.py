@@ -1,7 +1,14 @@
 from dataclasses import dataclass
 from time import time
 import numpy as np
-from PySide6.QtCore import QObject, Signal, QSettings
+from PySide6.QtCore import (
+    QObject,
+    Signal,
+    Slot,
+    QSettings,
+    QThread,
+    Qt,
+)
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from typing import Literal, Tuple, Optional, List
@@ -51,8 +58,15 @@ class AppState(QObject):
     alignment_review_changed = Signal()
     alignment_review_finished = Signal(object)
 
+    _issue_requested = Signal(str, str, str, object)
+
     def __init__(self, settings: QSettings):
         super().__init__()
+
+        self._issue_requested.connect(
+            self._show_issue,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         self.settings = settings
 
@@ -67,7 +81,6 @@ class AppState(QObject):
         self._focused_component: Optional[NeuronComponent] = None
         self._highlighted_components: Optional[List[NeuronComponent]] = None
 
-        
         self.current_job = None
         self.tasks = TaskManager()
 
@@ -91,17 +104,39 @@ class AppState(QObject):
         self.alignment_panels = WeakSet()
         self.alignment_review = None
 
-    def issue(self, level, title, message):
-        from PySide6.QtWidgets import QMessageBox
+    def issue(self, level, title, message, *, parent=None):
+        if level not in {"info", "warning", "error"}:
+            raise ValueError(f"Unknown issue level: {level}")
+
+        title = str(title)
+        message = str(message)
+
+        if QThread.currentThread() == self.thread():
+            self._show_issue(level, title, message, parent)
+        else:
+            self._issue_requested.emit(level, title, message, parent)
+
+    @Slot(str, str, str, object)
+    def _show_issue(self, level, title, message, parent):
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        from shiboken6 import isValid
+
+        # A queued notification may outlive its original parent.
+        if parent is not None and not isValid(parent):
+            parent = None
+
+        if parent is None:
+            parent = QApplication.activeWindow()
+
+        if parent is not None:
+            parent = parent.window()
 
         if level == "info":
-            QMessageBox.information(None, title, message)
+            QMessageBox.information(parent, title, message)
         elif level == "warning":
-            QMessageBox.warning(None, title, message)
-        elif level == "error":
-            QMessageBox.critical(None, title, message)
+            QMessageBox.warning(parent, title, message)
         else:
-            raise ValueError(f"Unknown issue level: {level}")
+            QMessageBox.critical(parent, title, message)
 
     def set_logging_level(self, level: str):
         self.logging_level = level
@@ -202,7 +237,7 @@ class AppState(QObject):
         self.current_request = None
         self.update_highlighted_components(None)
         return True
-    
+
     @property
     def adjacency_radius(self) -> float:
         return self._adjacency_radius
@@ -328,9 +363,7 @@ class AppState(QObject):
 
         if selected_components is None:
             next_focus = None
-        elif not self._component_in_components(
-            next_focus, selected_components
-        ):
+        elif not self._component_in_components(next_focus, selected_components):
             next_focus = selected_components[-1]
 
         # Ask before changing either selection or focus.
@@ -355,7 +388,7 @@ class AppState(QObject):
 
         if component == self._focused_component:
             return
-        
+
         if not self._allow_focus_change(component):
             return
 

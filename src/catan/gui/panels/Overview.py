@@ -73,11 +73,25 @@ class Display(BasePlot.BaseCanvas):
         super().__init__(parent, controls, config)
 
         self.unfreeze()
-        self.grid = self.central_widget.add_grid(spacing=0)
-        self.view = self.grid.add_view(row=0, col=0)
-        self.view.stretch = (1, 1)  # expand a lot
+
+        self.central_widget.bgcolor = "#f5f6f7"
+        self.central_widget.margin = 0
+        self.central_widget.padding = 0
+        self.central_widget.border_width = 0
+
+        self.view = scene.widgets.ViewBox(
+            parent=self.central_widget,
+            bgcolor="#20252b",
+            border_width=0,
+        )
+        self.view.margin = 0
+        self.view.padding = 0
+
+        self.central_widget.events.resize.connect(self._layout_overview_view)
+        self._layout_overview_view()
+
         ## set camera
-        self.view.camera = scene.PanZoomCamera(aspect=None)
+        self.view.camera = scene.PanZoomCamera(aspect=1)
         self.view.camera.interactive = False
 
         self.plot_root = scene.Node(parent=self.view.scene)
@@ -263,6 +277,16 @@ class Display(BasePlot.BaseCanvas):
 
         self._position_overlay_controls()
 
+    def _layout_overview_view(self, event=None):
+        margin = 4.0
+        width, height = self.central_widget.size
+
+        self.view.pos = (margin, margin)
+        self.view.size = (
+            max(1.0, width - 2 * margin),
+            max(1.0, height - 2 * margin),
+        )
+
     def _position_overlay_controls(self):
 
         if self.control_overlay is None:
@@ -322,7 +346,9 @@ class Display(BasePlot.BaseCanvas):
             return
 
         roi_pos, neuron_ids, roi_vals = sparse_A_to_points(
-            self.data.assignments.union.footprints, self.data.sessions[0].dims, thr=0.5
+            self.data.assignments.union.footprints,
+            self.data.assignments.union.dims,
+            thr=0.5,
         )
 
         self.plotting["data"]["union"] = OverviewRecord(

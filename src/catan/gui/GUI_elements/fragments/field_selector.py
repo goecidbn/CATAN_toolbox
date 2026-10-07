@@ -1,7 +1,7 @@
 from typing import Callable, Optional
 from pathlib import Path, PurePosixPath
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QSizePolicy,
     QWidget,
@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QCheckBox,
     QHBoxLayout,
+    QComboBox,
+    QSpinBox,
 )
 
 from catan.core.io.inspection import check_fields_compatibility
@@ -23,11 +25,13 @@ from catan.gui.GUI_elements.utils.FlowLayout import FlowLayout, QSizePolicy
 
 from .field_chip import FieldChip
 from .dialog_load_field import FieldSelectDialog
+from .file_inspection import FileInspection
 
 COMPAT_COLORS = {
     "available": "#4F7F5A",  # muted green
     "optional_missing": "#8A7040",  # muted amber
     "required_missing": "#8A4F52",  # muted red
+    "unknown": "#555B66",
 }
 # green  = "#3F6548"
 # amber  = "#6F5B35"
@@ -36,6 +40,7 @@ COMPAT_BORDERS = {
     "available": "#6A9A74",
     "optional_missing": "#A88A52",
     "required_missing": "#A8676B",
+    "unknown": "#89909C",
 }
 TEXT_COLOR = "#E8E8E8"
 
@@ -86,9 +91,7 @@ class OptionList(QWidget):
         callback: Callable,
         enabled: bool = True,
     ):
-        # container = QWidget()
-        # structure_path = QLineEdit("/estimates")
-        # layout.addWidget(structure_path)
+
         super().__init__()
 
         self.group_name = group_name
@@ -142,7 +145,11 @@ class OptionList(QWidget):
 
         self.clear_options()
 
-        for row, (name, spec) in enumerate(group_spec.fields.items()):
+        visible_fields = (
+            (name, spec) for name, spec in group_spec.fields.items() if spec.exposed
+        )
+
+        for row, (name, spec) in enumerate(visible_fields):
             self.add_editor(row, name, spec, enabled=enabled)
 
         self.list_layout.setColumnStretch(1, 1)
@@ -185,7 +192,8 @@ class OptionList(QWidget):
         self.clear_options()
 
         for name, spec in group_spec.fields.items():
-            self.add_chip(name, spec, enabled)
+            if spec.exposed:
+                self.add_chip(name, spec, enabled)
 
         add_button = QToolButton()
         add_button.setText("+")
@@ -254,9 +262,28 @@ class FieldSelector(QWidget):
         self.data: data.Data = parent.data
 
         self.field_options: dict[str, OptionList] = {}
-        self.opts_layout = QVBoxLayout(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._build_dimension_controls(layout)
+        self._inspection = FileInspection(self)
+        layout.addWidget(self._inspection)
+
+        self.opts_layout = QVBoxLayout()
         self.opts_layout.setContentsMargins(6, 6, 6, 6)
         self.opts_layout.setSpacing(3)
+        layout.addLayout(self.opts_layout)
+
+        self._inspection.result.connect(self._apply_compatibility)
+        self._inspection.failed.connect(self._set_compatibility_unknown)
+        self._inspection.cancelled.connect(self._set_compatibility_unknown)
+        self._inspection.busy_changed.connect(self._on_compatibility_busy)
+
+        self._check_timer = QTimer(self)
+        self._check_timer.setSingleShot(True)
+        self._check_timer.setInterval(250)
+        self._check_timer.timeout.connect(self._start_compatibility_check)
 
         self.fields_changed.connect(self._on_fields_changed)
 
@@ -273,10 +300,22 @@ class FieldSelector(QWidget):
 
         self.clear()
 
+        self._sync_dimension_controls()
+
         if self.source is None or self.source.source_config is None:
             return
         ## loading options
         for group_name, group_spec in self.source.source_config.groups.items():
+            if not group_spec.exposed:
+                continue
+
+            # Avoid an empty static group when all its fields are hidden.
+            # Dynamic groups can remain empty because users may add fields.
+            if group_spec.type == "static" and not any(
+                spec.exposed for spec in group_spec.fields.values()
+            ):
+                continue
+
             self.field_options[group_name] = OptionList(
                 group_name,
                 group_spec,
@@ -298,17 +337,194 @@ class FieldSelector(QWidget):
         self._on_fields_changed()
 
     def clear(self):
+        self._check_timer.stop()
+        self._inspection.invalidate()
+
         while (child := self.opts_layout.takeAt(0)) is not None:
             if child.widget() is not None:
                 child.widget().deleteLater()
         self.field_options.clear()
 
-    def _on_fields_changed(self):
+    def _build_dimension_controls(self, layout):
+        self.dimension_box = QWidget(self)
+        box = QVBoxLayout(self.dimension_box)
+        box.setContentsMargins(6, 6, 6, 6)
 
-        self._compatibility_dirty = True
+        box.addWidget(QLabel("Image dimensions (height × width)"))
+
+        self.dimension_mode = QComboBox()
+        for title, mode in (
+            ("Manual", "manual"),
+            ("Read field values", "values"),
+            ("Use image shape", "image"),
+        ):
+            self.dimension_mode.addItem(title, mode)
+
+        box.addWidget(self.dimension_mode)
+
+        row = QHBoxLayout()
+        self.dimension_height = QSpinBox()
+        self.dimension_width = QSpinBox()
+
+        for label, spin in (
+            ("Height", self.dimension_height),
+            ("Width", self.dimension_width),
+        ):
+            spin.setRange(1, 1000000)
+            row.addWidget(QLabel(label))
+            row.addWidget(spin)
+
+        box.addLayout(row)
+
+        self.dimension_source = QLabel()
+        self.dimension_source.setWordWrap(True)
+        box.addWidget(self.dimension_source)
+
+        self.dimension_browse = QToolButton()
+        self.dimension_browse.setText("Browse dimension source…")
+        box.addWidget(self.dimension_browse)
+
+        self.dimension_status = QLabel()
+        self.dimension_status.setWordWrap(True)
+        box.addWidget(self.dimension_status)
+
+        layout.addWidget(self.dimension_box)
+
+        self._syncing_dimensions = False
+
+        self.dimension_mode.currentIndexChanged.connect(self._dimensions_changed)
+        self.dimension_height.valueChanged.connect(self._dimensions_changed)
+        self.dimension_width.valueChanged.connect(self._dimensions_changed)
+        self.dimension_browse.clicked.connect(self._browse_dimensions)
+
+    def _sync_dimension_controls(self):
+        source = self.source
+        visible = isinstance(source, SessionData) and source.source_config is not None
+        self.dimension_box.setVisible(visible)
+
+        if not visible:
+            return
+
+        spec = source.source_config.dimensions
+        self._syncing_dimensions = True
+
+        try:
+            mode = spec.get("mode", "manual")
+            self.dimension_mode.setCurrentIndex(self.dimension_mode.findData(mode))
+            self.dimension_height.setValue(spec.get("height", 512))
+            self.dimension_width.setValue(spec.get("width", 512))
+
+            manual = mode == "manual"
+            self.dimension_height.setEnabled(manual)
+            self.dimension_width.setEnabled(manual)
+            self.dimension_browse.setEnabled(not manual)
+
+            field = spec.get("field")
+            self.dimension_source.setText(
+                (f"{field.get('source_path') or source.path}: " f"{field['path']}")
+                if field
+                else (
+                    "No source selected; image mode uses " "the configured background."
+                )
+            )
+            self.dimension_source.setVisible(not manual)
+
+        finally:
+            self._syncing_dimensions = False
+
+    def _dimensions_changed(self, *_):
+        if self._syncing_dimensions or not isinstance(self.source, SessionData):
+            return
+
+        config = self.source.source_config
+        if config is None:
+            return
+
+        config.dimensions.update(
+            mode=self.dimension_mode.currentData(),
+            height=self.dimension_height.value(),
+            width=self.dimension_width.value(),
+        )
+
+        self._sync_dimension_controls()
+        self.fields_changed.emit()
+
+    def _browse_dimensions(self):
+        source = self.source
+        config = source.source_config
+        raw = config.dimensions.get("field")
+
+        selection = FieldSelectDialog.get_field(
+            path=source.path,
+            key="dimensions",
+            parent=self,
+            spec=FieldSpec.from_dict(raw) if raw else None,
+        )
+
+        if (
+            selection is None
+            or self.source is not source
+            or source.source_config is not config
+        ):
+            return
+
+        config.dimensions["field"] = FieldSpec(
+            path=selection.path,
+            source=selection.source,
+            attribute=selection.attribute,
+            source_path=selection.source_path,
+            required=True,
+        ).to_dict()
+
+        self._sync_dimension_controls()
+        self.fields_changed.emit()
+
+    def _dimension_parameters(self):
+        source = self.source
+
+        orientation = getattr(source, "_recipe_options", {}).get(
+            "background_orientation",
+            getattr(self.data, "background_orientation", "auto"),
+        )
+
+        expected = next(
+            (
+                tuple(other.dims)
+                for other in self.data.sessions
+                if other is not source and other.status["spatial_loaded"]
+            ),
+            None,
+        )
+
+        return {
+            "dimensions": source.source_config.dimensions,
+            "orientation": orientation,
+            "expected_dims": expected,
+        }
+
+    def _show_dimension_status(self, ok, message):
+        key = "unknown" if ok is None else "available" if ok else "required_missing"
+
+        self.dimension_status.setText(message)
+
+        for widget in (
+            self.dimension_height,
+            self.dimension_width,
+            self.dimension_source,
+        ):
+            widget.setStyleSheet(
+                f"background-color: {COMPAT_COLORS[key]}; " f"color: {TEXT_COLOR};"
+            )
+            widget.setToolTip(message)
+
+    def _on_fields_changed(self):
+        self._check_timer.stop()
+        self._inspection.invalidate()
+        self._set_compatibility_unknown()
+
         if self._defer_compatibility_check():
             return
-            
+
         if (
             self.source is None
             or not self.source.path
@@ -316,26 +532,80 @@ class FieldSelector(QWidget):
         ):
             return
 
-        report = check_fields_compatibility(
-            self.source.path,
-            self.source.source_config.get_fields_to_load(
-                list(self.source.source_config.groups.keys())
-            ),
+        self._check_timer.start()
+
+    def _on_compatibility_busy(self, busy):
+        if busy:
+            self._set_compatibility_unknown()
+
+    def _set_compatibility_unknown(self):
+        self._compatibility_dirty = True
+        self._show_dimension_status(
+            None,
+            "Dimensions have not been verified.",
         )
 
-        loading_possible = True
+        if self.source is not None:
+            self.source.status["loading_possible"] = False
+
+        for options in self.field_options.values():
+            for name, widget in options.option.items():
+                options.update_style(name, "unknown")
+                widget.setToolTip("Source compatibility has not been verified.")
+
+    def _start_compatibility_check(self):
+        if (
+            self.source is None
+            or not self.source.path
+            or self.source.source_config is None
+        ):
+            return
+
+        config = self.source.source_config
+
+        fields = config.get_fields_to_load(list(config.groups.keys()))
+        spatial = isinstance(self.source, SessionData) and "footprints" in fields.get(
+            "spatial", {}
+        )
+
+        self._inspection.start(
+            "session_compatibility" if spatial else "compatibility",
+            self.source.path,
+            fields_to_load=fields,
+            **(self._dimension_parameters() if spatial else {}),
+        )
+
+    def _apply_compatibility(self, report):
+        if self.source is None:
+            return
+
+        geometry = report.get("geometry") if isinstance(report, dict) else None
+
+        if geometry is not None:
+            report = report["fields"]
+            self._show_dimension_status(
+                geometry["ok"],
+                geometry["message"],
+            )
+
+        loading_possible = geometry is None or geometry["ok"]
+
         for field in report.fields:
-            if not field.available and field.spec.required:
-                loading_possible &= False
-                status = "required_missing"
-            elif not field.available and not field.spec.required:
-                status = "optional_missing"
-            else:
+            if field.available:
                 status = "available"
+            elif field.spec.required:
+                status = "required_missing"
+                loading_possible = False
+            else:
+                status = "optional_missing"
 
-            self.field_options[field.group].update_style(field.label, status)
+            options = self.field_options.get(field.group)
+            if options is None or field.label not in options.option:
+                continue
 
-        # also, finally color current session properly!!
+            options.update_style(field.label, status)
+            options.option[field.label].setToolTip(field.reason or field.spec.path)
+
         self.source.status["loading_possible"] = loading_possible
         self._compatibility_dirty = False
 
@@ -541,6 +811,7 @@ class FieldSelector(QWidget):
 
         if self._compatibility_dirty:
             self._on_fields_changed()
+
 
 def checkbox_with_options(
     group_spec: FieldGroupSpec, opts_ref: QWidget, active: bool, callback: Callable

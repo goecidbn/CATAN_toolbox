@@ -31,6 +31,8 @@ class Worker(QRunnable):
         self._cancelled = False
         self._failed = False
 
+        self.failure_info = None
+
         self.signals = WorkerSignals()
 
     def cancel(self) -> None:
@@ -74,8 +76,13 @@ class Worker(QRunnable):
         except TaskCancelled:
             self._cancelled = True
 
-        except Exception:
+        except Exception as exc:
             self._failed = True
+
+            # Retain only plain error information, not the exception object
+            # and its traceback references to potentially large arrays.
+            self.failure_info = getattr(exc, "failure_info", None)
+
             self.signals.error.emit(traceback.format_exc())
 
         finally:

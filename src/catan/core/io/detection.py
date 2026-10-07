@@ -43,7 +43,7 @@ def detect_file_format(
         return FileFormat.MAT73 if is_mat73(path) else FileFormat.MAT_PRE73
     if suffix == ".npz":
         return FileFormat.NPZ
-    if suffix == ".zarr" or (path.is_dir() and path.name.lower().endswith(".zarr")):
+    if suffix == ".zarr":
         return FileFormat.ZARR
     if suffix in IMAGE_SUFFIXES:
         return FileFormat.IMAGE

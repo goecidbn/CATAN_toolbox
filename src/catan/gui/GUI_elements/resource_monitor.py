@@ -2,7 +2,7 @@ import os, psutil, sys
 
 from scipy import sparse
 import numpy as np
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, Slot, QTimer
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QProgressBar, QMessageBox
 
 
@@ -24,26 +24,106 @@ class ResourceMonitor(QWidget):
         self.status_label = QLabel()
         layout.addWidget(self.status_label)
 
+        self._active_tasks = {}
+        self._task_messages = {}
+        self._error_dialogs = set()
+
         tasks = self.state.tasks
 
-        # tasks.task_progress.connect(self.progress_bar.setValue)
+        tasks.task_started.connect(self._on_task_started)
+        tasks.task_progress.connect(self._on_task_progress)
+        tasks.task_message.connect(self._on_task_message)
 
-        tasks.task_message.connect(self.status_label.setText)
+        tasks.task_finished.connect(self._on_task_ended)
+        tasks.task_failed.connect(self._on_task_ended)
+        tasks.task_cancelled.connect(self._on_task_ended)
 
-        tasks.task_started.connect(lambda n: self.progress_bar.show())
-
-        tasks.task_finished.connect(
-            ## should additionally connect hiding message!
-            lambda n: (self.progress_bar.hide(), self.status_label.clear())
-        )
-
-        tasks.task_error.connect(
-            lambda err: QMessageBox.critical(self, "Worker Error", err)
-        )
+        tasks.task_error.connect(self._on_task_error)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_display)
         self.timer.start(2000)  # every 2 seconds
+
+    @Slot(str, str)
+    def _on_task_started(self, group, task_id):
+        task = self.state.tasks.tasks.get(task_id)
+        self._active_tasks[task_id] = task.name if task is not None else group
+
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.show()
+        self.status_label.setText(self._active_tasks[task_id])
+
+    @Slot(str, str, int)
+    def _on_task_progress(self, group, task_id, value):
+        if task_id not in self._active_tasks:
+            return
+
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(value)
+
+    @Slot(str, str, str)
+    def _on_task_message(self, group, task_id, message):
+        self._task_messages[task_id] = message
+        self.status_label.setText(message)
+        self.status_label.setWordWrap(True)
+        self.status_label.setToolTip(message)
+
+    @Slot(str, str)
+    def _on_task_ended(self, group, task_id):
+        self._active_tasks.pop(task_id, None)
+        self._task_messages.pop(task_id, None)
+
+        if not self._active_tasks:
+            self.progress_bar.hide()
+            self.status_label.clear()
+            self.status_label.setToolTip("")
+            return
+
+        remaining_id = next(reversed(self._active_tasks))
+        self.status_label.setText(
+            self._task_messages.get(
+                remaining_id,
+                self._active_tasks[remaining_id],
+            )
+        )
+
+    @Slot(str, str, str)
+    def _on_task_error(self, group, task_id, traceback_text):
+        task = self.state.tasks.tasks.get(task_id)
+
+        name = task.name if task is not None else group
+        failure = (
+            getattr(task.worker, "failure_info", None) if task is not None else None
+        )
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Task failed")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+
+        if failure is not None:
+            box.setText(failure["summary"])
+            box.setInformativeText(failure["recovery"])
+        else:
+            box.setText(f"{name} failed.")
+            box.setInformativeText(
+                "Open Details for the underlying error.\n\n"
+                "This task may have made partial changes before it failed. "
+                "Automatic retry is therefore not offered."
+            )
+
+        box.setDetailedText(traceback_text)
+        box.setStandardButtons(QMessageBox.StandardButton.Close)
+
+        # Keep the dialog alive without blocking the task-completion handler.
+        self._error_dialogs.add(box)
+
+        def release_dialog(_result):
+            self._error_dialogs.discard(box)
+            box.deleteLater()
+
+        box.finished.connect(release_dialog)
+        box.open()
 
     def update_display(self):
         import time

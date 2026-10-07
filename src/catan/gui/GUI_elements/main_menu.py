@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
     QCheckBox,
 )
-from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal
+from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal, QSignalBlocker, QSize
 from PySide6.QtGui import QAction
 from shiboken6 import isValid
 
@@ -27,6 +27,8 @@ from pathlib import Path
 
 from catan.core.changes import DataChange
 from catan.gui.structures import data, state
+from catan.gui.background_tasks.TaskManager import TaskBatch
+from catan.gui.resources.get_icon import get_fa_icon
 
 from .resource_monitor import ResourceMonitor
 from .fragments import (
@@ -102,7 +104,6 @@ class MainMenu(QFrame):
         self.session_list.load_requested.connect(self.process_data_from_session)
 
         self.state.data_changed.connect(self._on_data_changed)
-        self.state.busy_changed.connect(self.toggle_busy)
 
     def rebuild(self):
         # importlib.reload(session_overview)
@@ -118,18 +119,18 @@ class MainMenu(QFrame):
         self.button_process.setEnabled(not busy)
         # self.button_cancel.setVisible(busy)
 
-    def on_process_all(self):
-        row = self.session_list.load_row
-        row._on_sessions_registered(
-            [session.id for session in self.data.sessions],
-            actions=row.registration_action_selector.actions(),
-        )
-
     def process_data_from_session(self, session_id: int):
         row = self.session_list.load_row
+
+        # The folder button must actually request loading, independently
+        # of whether automatic loading is enabled globally.
+        actions = set(row.registration_action_selector.actions)
+        actions.add("load_data")
+
         row._on_sessions_registered(
             [session_id],
-            actions=row.registration_action_selector.actions(),
+            actions=actions,
+            batch=TaskBatch(),
         )
 
     def _on_data_changed(self, event: DataChange):
@@ -162,102 +163,57 @@ class MainMenu(QFrame):
         self.loader["assignments"]["button_save"].setEnabled(any_assigned)
         self.update_buttons()
 
-    def build_app_mode_menu(self) -> QWidget:
-        """
-        Here, rather build the whole menu inside a subspace of layout and only delete this
-        (as right now, deleting the options shifts up th path list)
-        """
-        ## first, disband previous menu
-        # while (child := self.paths_layout.takeAt(0)) is not None:
-        #     if child.widget() is not None:
-        #         child.widget().deleteLater()
-
-        ## then, build new menu
-
-        # File paths & fields
+    def build_app_mode_menu(self):
         paths_menu = QWidget()
         self.paths_layout = QVBoxLayout(paths_menu)
+        self.paths_layout.setContentsMargins(0, 0, 0, 0)
 
-        formFrame = QFrame()
-        formFrame.setFrameShape(QFrame.Shape.StyledPanel)
+        frame = QFrame()
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
 
-        form = QFormLayout(formFrame)
+        form = QFormLayout(frame)
+        form.setContentsMargins(8, 8, 8, 8)
+        form.setHorizontalSpacing(6)
+        form.setVerticalSpacing(5)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.form = form
 
-        ## add connected path loading and editing option for root path
-
-        form.addRow(QLabel("Data paths:"), QLabel(""))
+        def source_icon(icon_name, tooltip):
+            label = QLabel()
+            label.setFixedSize(24, 26)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setPixmap(get_fa_icon(icon_name).pixmap(QSize(17, 17)))
+            label.setToolTip(tooltip)
+            return label
 
         self.loader = {}
-        ## model data loading options
+
         form.addRow(
-            QLabel("Model"),
+            source_icon("chart-column", "Model"),
             self.build_load_options(
                 "model",
-                self.data.available_models,
+                list(self.data.available_models),
                 add_options=selector_options["model"],
             ),
         )
 
-        ### assignment data loading options
         self.config_constructor = FieldConfigConstructor(self, self.data.assignments)
+
         form.addRow(
-            QLabel("Assignments"),
+            source_icon("layer-group", "Assignments"),
             self.build_load_options(
                 "assignments",
-                self.data.available_assignments,
+                list(self.data.available_assignments),
                 add_options=selector_options["assignments"],
                 add_widgets=[self.config_constructor.toggle_config_options],
             ),
         )
-        form.addRow(self.config_constructor.config_options)
 
-        self.checkbox_correct_rotation = QCheckBox("Correct session rotation")
-        self.checkbox_correct_rotation.setChecked(self.data.correct_rotation)
-        self.checkbox_correct_rotation.setToolTip(
-            "Search for rotation as well as translation during new "
-            "alignment calculations. Slower; existing alignments "
-            "are unchanged."
-        )
-
-        def set_rotation_correction(enabled):
-            self.data.correct_rotation = bool(enabled)
-            self.settings.setValue("alignment/correct_rotation", bool(enabled))
-
-        self.checkbox_correct_rotation.toggled.connect(set_rotation_correction)
-        form.addRow(self.checkbox_correct_rotation)
-
-        self.paths_layout.addWidget(formFrame, alignment=Qt.AlignmentFlag.AlignTop)
-
-        ### triggering processing
-        ## default processing
-        self.button_process = QToolButton(self)
-        self.button_process.setText("Process data")
-        self.button_process.setPopupMode(
-            QToolButton.ToolButtonPopupMode.MenuButtonPopup
-        )
-        self.button_process.clicked.connect(self.on_process_all)
-
-        ## alternative processing
-        menu = QMenu(self.button_process)
-        menu.addAction(QAction("Complete loading", menu))
-        menu.addAction(QAction("Complete model registration", menu))
-        menu.addAction(QAction("Complete registration", menu))
-        self.button_process.setMenu(menu)
-
-        self.paths_layout.addWidget(self.button_process)
-
-        self.button_save = QPushButton("Save results")
-        self.paths_layout.addWidget(self.button_save)
-
+        # Configuration content belongs to its popup, not this form.
+        self.paths_layout.addWidget(frame)
         self.update_buttons()
-
         return paths_menu
-
-        # self.checkbox_auto_advance = QCheckBox("Auto-advance to next cluster")
-        # self.checkbox_skip_processed_side = QCheckBox("Skip processed in navigation")
-        # self.paths_layout.addWidget(self.checkbox_auto_advance)
-        # self.paths_layout.addWidget(self.checkbox_skip_processed_side)
 
     def build_root_selector(self) -> QWidget:
 
@@ -385,115 +341,122 @@ class MainMenu(QFrame):
         self,
         key,
         options,
-        add_options: Optional[list[str]] = None,
-        add_widgets: List[QWidget] = [],
-    ) -> QHBoxLayout:
+        add_options=None,
+        add_widgets=None,
+    ):
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
-        entry_layout = QHBoxLayout()
+        self.loader[key] = {"options": list(options)}
 
-        self.loader[key] = {}
-        self.loader[key]["options"] = options
-
-        ## option selection
-        self.loader[key]["selector"] = QComboBox()
-        self.loader[key]["selector"].setFixedWidth(90)
-        self.loader[key]["selector"].currentTextChanged.connect(
-            lambda text, key=key: self._on_load_option_changed(key, text)
+        selector = QComboBox()
+        selector.setMinimumWidth(40)
+        selector.setMinimumContentsLength(1)
+        selector.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        selector.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
         )
 
-        self.rebuild_selector(key, options=options, add_options=add_options)
-        entry_layout.addWidget(self.loader[key]["selector"])
-
-        ## load / execute button
-        if key in ("model", "assignments"):
-            button = QToolButton(self)
-            button.setFixedSize(46, 28)
-            button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-            set_button_icon(
-                button,
-                "folder-open",
-                tooltip=f"Load {key} data",
-            )
-            self._add_process_menu(button, key)
-        else:
-            button = make_icon_button(
-                "folder-open",
-                tooltip=f"Load {key} data",
-                size=28,
-                icon_size=22,
-            )
-            button.setFixedWidth(25)
-
-        self.loader[key]["button_execute"] = button
-        entry_layout.addWidget(self.loader[key]["button_execute"])
-
-        ## save button
-        self.loader[key]["button_save"] = make_icon_button(
-            "floppy-disk", tooltip=f"Save {key} data", size=28, icon_size=22
-        )
-        self.loader[key]["button_save"].setFixedWidth(35)
-        self.loader[key]["button_save"].setEnabled(False)
-        entry_layout.addWidget(self.loader[key]["button_save"])
-
-        self.loader[key]["button_save"].clicked.connect(
-            lambda method=key: self.save_data(key)
+        self.loader[key]["selector"] = selector
+        self.rebuild_selector(
+            key,
+            options=list(options),
+            add_options=add_options,
         )
 
-        def on_button_click():
-            pass
+        selector.currentTextChanged.connect(
+            lambda text: self._on_load_option_changed(key, text)
+        )
+        selector.currentTextChanged.connect(selector.setToolTip)
+        selector.setToolTip(selector.currentText())
 
-        if key == "model":
-            set_button_icon(
-                self.loader["model"]["button_execute"],
-                "play",
-                tooltip="Process pending model counts and fit",
-            )
+        layout.addWidget(selector, 1)
 
-            def on_button_click():
+        execute = QToolButton(self)
+        execute.setAutoRaise(True)
+        execute.setFixedSize(36, 26)
+        execute.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        set_button_icon(
+            execute,
+            "play" if key == "model" else "folder-open",
+            tooltip=(
+                "Process pending model counts and fit"
+                if key == "model"
+                else "Load assignments"
+            ),
+        )
+        execute.setIconSize(QSize(16, 16))
+        self._add_process_menu(execute, key)
+        self.loader[key]["button_execute"] = execute
+        layout.addWidget(execute)
+
+        save = QToolButton(self)
+        save.setAutoRaise(True)
+        save.setFixedSize(26, 26)
+        set_button_icon(save, "floppy-disk", tooltip=f"Save {key} data")
+        save.setIconSize(QSize(16, 16))
+        save.setEnabled(False)
+        save.clicked.connect(lambda checked=False: self.save_data(key))
+        self.loader[key]["button_save"] = save
+        layout.addWidget(save)
+
+        # Both rows reserve exactly the same configuration-button space.
+        config_slot = QWidget()
+        config_slot.setFixedSize(28, 26)
+        config_layout = QHBoxLayout(config_slot)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+
+        for widget in add_widgets or ():
+            widget.setFixedSize(28, 26)
+            widget.setIconSize(QSize(16, 16))
+            config_layout.addWidget(widget)
+
+        layout.addWidget(config_slot)
+
+        def execute_clicked():
+            if key == "model":
                 self.data.queue_process_model(mode="pending")
+                return
 
-        if key == "assignments":
+            assignments = self.data.assignments
+            if assignments is None:
+                return
 
-            def on_button_click():
-                if self.data.assignments is None:
-                    return
+            if assignments.path and not assignments.status["loaded"]:
+                self._load_assignments_from_source()
+            else:
+                self.data.queue_process_assignments(mode="pending")
 
-                if (
-                    self.data.assignments
-                    and self.data.assignments.path
-                    and not self.data.assignments.status["loaded"]
-                ):
-                    self.data.queue_load_assignments()
-                else:
-                    self.data.queue_process_assignments(mode="pending")
+        execute.clicked.connect(execute_clicked)
+        execute.setEnabled(False)
 
-        self.loader[key]["button_execute"].clicked.connect(on_button_click)
-        self.loader[key]["button_execute"].setEnabled(False)
-
-        for widget in add_widgets:
-            entry_layout.addWidget(widget)
-        return entry_layout
+        return layout
 
     def save_data(self, key):
+        if key not in {"model", "assignments"}:
+            raise ValueError(f"Unsupported result type: {key}")
 
         save_path = choose_path(
             self,
-            pick_dir=False,
-            init_path=str(Path(self.data.root) / f"catan_{key}.hdf5"),
-            display_text=f"Select folder to save {key} file to",
+            init_path=str(self.data.root),
+            display_text=f"Save {key}",
             only_existing=False,
+            default_suffix="hdf5",
+            file_filters=[
+                ("HDF5 file", ("*.hdf5", "*.h5")),
+                ("MATLAB file", ("*.mat",)),
+                ("NumPy file", ("*.npz",)),
+            ],
+            state=self.state,
+            default_filename=f"catan_{key}.hdf5",
         )
-        if save_path is None:
-            return
 
-        # if key == "sessions":
-        #     self.data.save_sessions(save_path)
-
-        if key == "model":
-            self.data.save_model(save_path)
-
-        if key == "assignments":
-            self.data.save_assignments(save_path)
+        if save_path is not None:
+            self.data.queue_save_result(key, save_path)
 
     def _on_load_option_changed(self, key, opt: str):
 
@@ -513,7 +476,7 @@ class MainMenu(QFrame):
                     only_existing=True,
                 )
                 if not load_path:
-                    self.loader[key]["selector"].setCurrentIndex(0)
+                    self._refresh_source_selector(key)
                     return
 
             name, ok = QInputDialog.getText(
@@ -528,6 +491,27 @@ class MainMenu(QFrame):
             elif key == "assignments":
                 self.data.change_assignments(opt)
 
+            return
+
+        if not ok:
+            self._refresh_source_selector(key)
+            return
+
+        if isinstance(name, str) and load_path is not None:
+            name = name.strip()
+
+            # Keep showing the currently active source while loading.
+            self._refresh_source_selector(key)
+
+            if not name:
+                return
+
+            self.data.queue_import_source(
+                key,
+                load_path,
+                name,
+                on_loaded=lambda: self._on_source_registered(key),
+            )
             return
 
         if ok:
@@ -562,6 +546,43 @@ class MainMenu(QFrame):
 
         self.update_buttons()
 
+    def _show_assignments_configuration(self):
+        constructor = self.config_constructor
+        constructor.update_source(self.data.assignments)
+        constructor.toggle_config_options.set_expanded(True)
+        constructor.expanded_changed.emit()
+        self.update_buttons()
+
+    def _load_assignments_from_source(self):
+        self.data.queue_load_assignments(
+            on_config_required=self._show_assignments_configuration,
+        )
+
+    def _on_source_registered(self, key):
+        self._refresh_source_selector(key)
+
+        if key != "assignments":
+            return
+
+        source = self.data.assignments
+        problems = getattr(source, "_load_config_problems", [])
+
+        if problems:
+            source.status["loading_possible"] = False
+            self._show_assignments_configuration()
+
+            self.state.issue(
+                "info",
+                "Choose or repair the assignments configuration",
+                "\n\n".join(problems)
+                + "\n\nSelect a matching preset or configure the IDs field. "
+                "Then click the assignments open-folder button to load.",
+                parent=self.window(),
+            )
+            return
+
+        self._load_assignments_from_source()
+
     def update_buttons(self):
 
         ## update of assignments button
@@ -588,17 +609,9 @@ class MainMenu(QFrame):
             self.data.assignments is not None and (loading or bool(self.data.sessions))
         )
 
-        # if self.data.assignments is None:
-        #     enable_button = False
-        # else:
-        #     enable_button = loading
-        #     enable_button |= not all(
-        #         [
-        #             not self.data.session_assigned(s.id) and s.status["spatial_loaded"]
-        #             for s in self.data.sessions
-        #         ]
-        #     )
-        # self.loader["assignments"]["button_execute"].setEnabled(enable_button)
+        for controls in self.loader.values():
+            controls["button_execute"].setIconSize(QSize(16, 16))
+            controls["button_save"].setIconSize(QSize(16, 16))
 
     def rebuild_selector(
         self, key: str, options: list[str], add_options: Optional[list[str]] = None
@@ -614,6 +627,34 @@ class MainMenu(QFrame):
 
         selector.addItems([opt for opt in options])
         selector.blockSignals(False)
+
+    def _refresh_source_selector(self, key):
+        if not isValid(self):
+            return
+
+        if key == "model":
+            names = list(self.data.available_models)
+            current = self.data.current_model_name
+        else:
+            names = list(self.data.available_assignments)
+            current = self.data.current_assignments
+
+        self.rebuild_selector(
+            key,
+            names,
+            add_options=selector_options[key],
+        )
+
+        selector = self.loader[key]["selector"]
+
+        with QSignalBlocker(selector):
+            index = selector.findText(current) if current is not None else -1
+            selector.setCurrentIndex(index)
+
+        if key == "assignments":
+            self.config_constructor.update_source(self.data.assignments)
+
+        self.update_buttons()
 
     ### ------------------------------------------###
     ###    Logic for saving/restoring settings    ###

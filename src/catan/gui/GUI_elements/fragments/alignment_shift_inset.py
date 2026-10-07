@@ -38,7 +38,7 @@ class AlignmentShiftInset(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
 
-        title = QLabel("Shifts · dx → / dy ↓ · pixels", self)
+        title = QLabel("Shifts · dx → / dy ↑ · pixels", self)
         layout.addWidget(title)
 
         self.canvas = scene.SceneCanvas(bgcolor="#20252b")
@@ -61,7 +61,7 @@ class AlignmentShiftInset(QWidget):
 
         self.view = grid.add_view(row=0, col=1)
         self.view.camera = scene.PanZoomCamera(aspect=1)
-        self.view.camera.flip = (False, True, False)
+        self.view.camera.flip = (False, False, False)
         self.view.camera.interactive = True
 
         self.x_axis = scene.AxisWidget(orientation="bottom")

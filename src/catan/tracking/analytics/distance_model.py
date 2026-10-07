@@ -71,6 +71,40 @@ def Abar_squared_window(r, L: float, mode: str = "exact"):
     evaluates the average overlap area Abar(r) in a squared imaging window of side L x L
     """
 
+    # L may also be (height, width), in the distance model's units.
+    # if this is too costly, rather ignore it and assume a square window of side L
+    if np.ndim(L) != 0:
+        height, width = np.asarray(L, dtype=float)
+
+        if height <= 0 or width <= 0:
+            raise ValueError("Window dimensions must be positive.")
+
+        r = np.asarray(r, dtype=float)
+        safe = np.where(r > 0, r, 1.0)
+
+        lower = np.arccos(np.clip(width / safe, 0, 1))
+        upper = np.arcsin(np.clip(height / safe, 0, 1))
+
+        def primitive(theta):
+            return (
+                height * width * theta
+                + width * r * np.cos(theta)
+                - height * r * np.sin(theta)
+                + 0.5 * r**2 * np.sin(theta) ** 2
+            )
+
+        area = (2 / np.pi) * (primitive(upper) - primitive(lower))
+
+        return np.where(
+            r == 0,
+            height * width,
+            np.where(
+                (r > 0) & (upper > lower),
+                np.maximum(area, 0),
+                0,
+            ),
+        )
+
     if mode == "exact":
 
         r = np.asarray(r, dtype=float)

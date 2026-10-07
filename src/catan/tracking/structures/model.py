@@ -4,6 +4,7 @@ from typing import Any, Literal
 from pathlib import Path
 import numpy as np
 import json
+from copy import deepcopy
 
 from scipy.ndimage import gaussian_filter
 from scipy import interpolate
@@ -329,8 +330,11 @@ class Model:
         p_init, bounds = self.get_parameter_estimates(counts)
         # print("Fitting model to data with initial parameters:", p_init)
 
-        lambda_ = (
-            300 / self.params["L"] ** 2
+        lambda_ = 300 / np.prod(
+            self.params.get(
+                "window_dims",
+                (self.params["L"], self.params["L"]),
+            )
         )  # initial guess for neuron density - result should be kinda independent
 
         match_function = partial(
@@ -338,7 +342,7 @@ class Model:
             lambda_=lambda_,
             R_cut=self.params["neighbor_distance"],
             nbins=self.params["bins"],
-            L=self.params["L"],
+            L=self.params.get("window_dims", self.params["L"]),
         )
 
         opts = dict(
@@ -403,7 +407,12 @@ class Model:
             "c_same_sd": (1e-3, 0.5),
         }
 
-        lambda_ = 300 / self.params["L"] ** 2
+        lambda_ = 300 / np.prod(
+            self.params.get(
+                "window_dims",
+                (self.params["L"], self.params["L"]),
+            )
+        )
 
         # Same feasibility condition as check_matern_feasible():
         # lambda_ * pi * h**2 <= 1/e.
@@ -474,10 +483,16 @@ class Model:
 
         self.distributions["pdf"] = match_model(
             list(p_fit.values()),
-            lambda_=300 / self.params["L"] ** 2,
+            lambda_=300
+            / np.prod(
+                self.params.get(
+                    "window_dims",
+                    (self.params["L"], self.params["L"]),
+                )
+            ),
             R_cut=self.params["neighbor_distance"],
             nbins=self.params["bins"],
-            L=self.params["L"],
+            L=self.params.get("window_dims", self.params["L"]),
             return_1D=True,
         )
 
@@ -650,9 +665,7 @@ class Model:
                 self.set_cross_counts(
                     *key,
                     counts,
-                    source_revisions=(
-                        None if revision is None else tuple(revision)
-                    ),
+                    source_revisions=(None if revision is None else tuple(revision)),
                 )
 
             if record["stale"]:
@@ -663,9 +676,7 @@ class Model:
             self.build_from_parameters(use_cdf=True)
 
         self.fit_stale = bool(metadata.get("fit_stale", False))
-        self.fit_used_fallback = bool(
-            metadata.get("fit_used_fallback", False)
-        )
+        self.fit_used_fallback = bool(metadata.get("fit_used_fallback", False))
         self.loaded = True
 
     def _count_save_data(self, *, include_counts: bool):
@@ -707,7 +718,7 @@ class Model:
             raise TypeError(
                 f"Cannot serialize {type(value).__name__} in model metadata."
             )
-        
+
         return {
             "persistence": {
                 "metadata": json.dumps(
@@ -718,14 +729,8 @@ class Model:
             },
             "count_arrays": arrays,
         }
-    
-    def save(
-        self,
-        path: str | Path,
-        *,
-        include_counts: bool = True,
-        mat_version: Literal["pre73", "7.3"] = "7.3",
-    ) -> None:
+
+    def prepare_save(self):
 
         fields_to_save = LoadConfig.fields_from_resource(
             NATIVE_MODEL_CONFIG,
@@ -742,15 +747,26 @@ class Model:
                 "values": parameter_values,
             }
         }
-        save_data.update(
-            self._count_save_data(include_counts=include_counts)
+        save_data.update(self._count_save_data(include_counts=True))
+
+        return deepcopy(
+            {
+                "data": save_data,
+                "fields": fields_to_save,
+                "attributes": {
+                    "object_type": "ModelData",
+                    "format_version": 1,
+                },
+            }
         )
 
+    def save(self, path, *, mat_version="7.3"):
+        prepared = self.prepare_save()
         save_file(
             path,
-            save_data,
-            fields_to_save,
+            prepared["data"],
+            prepared["fields"],
             mat_version=mat_version,
-            root_attributes={"object_type": "ModelData", "format_version": 2},
+            root_attributes=prepared["attributes"],
             root="/",
         )

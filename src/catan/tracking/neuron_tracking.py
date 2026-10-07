@@ -530,49 +530,55 @@ class Tracking:
         return this_data.id
 
     def alignment_references_for_session(self, session_id: int | None = None):
+        stop = len(self.sessions) if session_id is None else session_id
+        if not 0 <= stop <= len(self.sessions):
+            raise IndexError(f"Invalid session_id {session_id}.")
 
-        if session_id is None:
-            candidate_sessions = self.sessions
+        # Exactly the previous five positions in the session sequence.
+        flow_start = max(0, stop - 5)
 
-        else:
-            if not (0 <= session_id <= len(self.sessions)):
-                raise IndexError(f"Invalid session_id {session_id}.")
-
-            # Alignment of a session is defined
-            # relative to earlier sessions only.
-            candidate_sessions = self.sessions[:session_id]
-
-        aligned_sessions = [
-            session
-            for session in candidate_sessions
+        eligible = [
+            (sid, session)
+            for sid, session in enumerate(self.sessions[:stop])
             if (
                 session.status["aligned"]
+                and not self.alignment_is_stale(sid)
                 and session.path is not None
                 and session.background_template is not None
             )
         ]
 
-        if not aligned_sessions:
+        if not eligible:
             return None
-
-        alignment_window = min(len(aligned_sessions), 10)
 
         references = {}
 
-        for session in aligned_sessions[-alignment_window:]:
+        # Retain the existing up-to-ten-reference rigid consensus.
+        for sid, session in eligible[-10:]:
+            remap = session.remap
+            matrix = np.eye(3) if remap is None else remap.matrix
 
-            assert session.path is not None
-
-            matrix = (
-                np.eye(3, dtype=float)
-                if session.remap is None
-                else session.remap.matrix
-            )
-
-            references[str(session.path)] = {
-                "template": (session.background_template.copy()),
-                "matrix": (np.asarray(matrix, dtype=float).copy()),
+            entry = {
+                "template": session.background_template.copy(),
+                "matrix": np.asarray(matrix, dtype=float).copy(),
+                "flow_candidate": sid >= flow_start,
             }
+
+            if entry["flow_candidate"]:
+                if remap is None:
+                    aligned = session.background_template.copy()
+                    valid = np.ones(session.dims, dtype=bool)
+                else:
+                    aligned = remap.apply_remap(
+                        session.background_template,
+                        use_optical_flow=True,
+                    )
+                    valid = remap.valid_mask(use_optical_flow=True)
+
+                entry["aligned_template"] = np.asarray(aligned, dtype=np.float32)
+                entry["valid_mask"] = valid
+
+            references[str(session.path)] = entry
 
         return references
 
@@ -1127,6 +1133,20 @@ class Tracking:
 
         if self.model is None:
             raise ValueError("No model available to fit.")
+
+        grids = {
+            tuple(session.dims) for session in self.sessions if session.n_neurons > 0
+        }
+
+        if len(grids) > 1:
+            raise ValueError(
+                "Model fitting requires sessions on one common image grid."
+            )
+
+        if grids and not self.model.loaded:
+            self.model.params["window_dims"] = tuple(
+                value * self.params.get("pxtomu", 1.0) for value in grids.pop()
+            )
 
         # Current session order is deliberately supplied here,
         # rather than stored inside Model.
@@ -1688,6 +1708,22 @@ class Tracking:
         if self.assignments.union is None:
             self.assignments.union = SessionData()
 
+        loaded_dims = {
+            tuple(session.dims)
+            for session in self.sessions
+            if session.status["spatial_loaded"]
+        }
+
+        if len(loaded_dims) != 1:
+            raise ValueError(
+                "Union construction requires one common loaded image grid."
+            )
+
+        self.assignments.union.dims = loaded_dims.pop()
+
+        if footprints_new.shape[0] != np.prod(self.assignments.union.dims):
+            raise ValueError("Union input has an incompatible pixel count.")
+
         ### =================================================== ###
         ### ========= update reference data structure ========= ###
         ### =================================================== ###
@@ -1716,9 +1752,7 @@ class Tracking:
         fp_updated: List[sparse.csc_matrix] = []
         for n_idx, fp_idx in enumerate(assignments_new):
 
-            footprint_existed = (
-                n_idx < nA_prev and previous_mass[n_idx] > 0
-            )
+            footprint_existed = n_idx < nA_prev and previous_mass[n_idx] > 0
 
             if fp_idx < 0 and footprint_existed:
                 # print(f"Neuron {n_idx} not present in session, retaining existing footprint.")
@@ -1916,7 +1950,7 @@ class Tracking:
             shape=matrix.shape,
         )
 
-    def rebuild_union(self,*,ctx=None):
+    def rebuild_union(self, *, ctx=None):
 
         if self.assignments is None:
             return
@@ -2092,34 +2126,117 @@ class Tracking:
             delta = new_block.sum(axis=1) - old_block.sum(axis=1)
             union.background += np.asarray(delta).reshape(union.dims)
 
-    def check_assignments_compatibility(self, assignments):
-
+    def check_assignments_compatibility(
+        self,
+        assignments,
+        *,
+        check_footprints=True,
+        raise_on_error=False,
+    ):
         if not isinstance(assignments, Assignments):
-            raise ValueError("assignments must be an instance of Assignments class.")
+            raise ValueError("assignments must be an Assignments instance.")
 
-        n_sessions = len(self.sessions)
-        if assignments.ids.shape[1] > n_sessions:
-            raise ValueError(
-                "The assignments contain more sessions than the current tracking object."
-            )
+        ids = assignments.ids
+        problems = []
 
-        ## check neuron numbers
-        for session_id in range(assignments.ids.shape[1]):
-            session = self.sessions[session_id]
-            n_neurons_session = session.n_neurons
-            n_neurons_assignments = np.max(assignments.ids[:, session_id]) + 1
+        if ids.ndim != 2:
+            problems.append(f"IDs have shape {ids.shape}; expected neurons × sessions.")
+        else:
+            n_columns = ids.shape[1]
+            n_sessions = len(self.sessions)
 
-            # print(f"Session {session_id}: {n_neurons_assignments} neurons in assignments, {n_neurons_session} neurons in session data.")
-            if n_neurons_assignments > n_neurons_session:
-                warnings.warn(
-                    f"Session {session_id} has more neurons in assignments ({n_neurons_assignments}) than in the session data ({n_neurons_session})."
+            if n_columns > n_sessions:
+                problems.append(
+                    f"The assignments contain {n_columns} session columns, "
+                    f"but CATAN has only {n_sessions} registered sessions."
                 )
-                return False
 
-        ## check session vs union centroids
-        # warnings.warn("to be implemented: check if union centroids match session centroids (after alignment)")
+            if check_footprints:
+                for session_index in range(min(n_columns, n_sessions)):
+                    session = self.sessions[session_index]
+                    column = ids[:, session_index]
+                    referenced = column[column >= 0]
 
-        return True
+                    if not referenced.size:
+                        continue
+
+                    count = int(session.n_neurons or 0)
+                    invalid = referenced[referenced >= count]
+
+                    if not invalid.size:
+                        continue
+
+                    name = getattr(session, "name", str(session_index))
+                    maximum = int(referenced.max())
+                    valid_range = f"0–{count - 1}" if count else "none"
+                    examples = ", ".join(
+                        str(int(value)) for value in np.unique(invalid)[:8]
+                    )
+
+                    problems.append(
+                        f"Session {session_index}: {name}\n"
+                        f"Available footprints: {count}; "
+                        f"valid IDs: {valid_range}.\n"
+                        f"Highest referenced footprint ID: {maximum}.\n"
+                        f"Invalid assignment entries: {invalid.size}; "
+                        f"example IDs: {examples}."
+                    )
+
+        if not problems:
+            return True
+
+        recovery = (
+            "Check that the loaded sessions are the correct source files "
+            "and appear in the same order as the assignments columns. "
+            "Ensure their spatial data is loaded. CATAN uses zero-based "
+            "footprint IDs; external one-based IDs require an explicit "
+            "conversion. IDs have not been changed automatically."
+        )
+
+        message = (
+            "Assignments are incompatible with the loaded sessions.\n\n"
+            + "\n\n".join(problems)
+        )
+
+        if raise_on_error:
+            error = ValueError(message)
+            error.failure_info = {
+                "summary": message,
+                "recovery": recovery,
+            }
+            raise error
+
+        warnings.warn(f"{message}\n\n{recovery}")
+        return False
+
+    # def check_assignments_compatibility(self, assignments):
+
+    #     if not isinstance(assignments, Assignments):
+    #         raise ValueError("assignments must be an instance of Assignments class.")
+
+    #     n_sessions = len(self.sessions)
+    #     if assignments.ids.shape[1] > n_sessions:
+    #         raise ValueError(
+    #             "The assignments contain more sessions than the current tracking object."
+    #         )
+
+    #     ## check neuron numbers
+    #     for session_id in range(assignments.ids.shape[1]):
+    #         session = self.sessions[session_id]
+    #         n_neurons_session = session.n_neurons
+    #         n_neurons_assignments = np.max(assignments.ids[:, session_id]) + 1
+
+    #         # print(f"Session {session_id}: {n_neurons_assignments} neurons in assignments, {n_neurons_session} neurons in session data.")
+    #         if n_neurons_assignments > n_neurons_session:
+    #             warnings.warn(
+    #                 f"Session {session_id} has more neurons in assignments ({n_neurons_assignments}) than in the session data ({n_neurons_session})."
+    #             )
+    #             return False
+
+    #     ## check session vs union centroids
+    #     # warnings.warn("to be implemented: check if union centroids match session centroids (after alignment)")
+
+    #     return True
 
     def move_session(self, session_id: int, new_session_id: int):
         """
@@ -2499,7 +2616,7 @@ class Tracking:
         if np.all(np.isfinite(alignment["shift"][s, :].max())):
             dataIn_silent = apply_remap(
                 dataIn_silent,
-                dims=(512, 512),
+                dims=dims,
                 shift=-alignment["shift"][s, :],
             )
 

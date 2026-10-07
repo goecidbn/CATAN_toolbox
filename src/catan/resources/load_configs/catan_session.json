@@ -4,6 +4,12 @@
     "name": "CATAN session",
     "source_type": "session",
     "public": false,
+    "dimensions": {
+        "mode": "image",
+        "height": 512,
+        "width": 512,
+        "field": null
+    },
     "groups": {
         "metadata": {
             "title": "Metadata",
@@ -23,6 +29,11 @@
             "type": "static",
             "enabled": true,
             "fields": {
+                "dims": {
+                    "path": "/dims",
+                    "required": false,
+                    "exposed": false
+                },
                 "footprints": {
                     "path": "/footprints",
                     "required": true,

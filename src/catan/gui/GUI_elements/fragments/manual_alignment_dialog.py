@@ -1,4 +1,6 @@
 import numpy as np
+from copy import deepcopy
+
 from vispy import scene
 from vispy.visuals.transforms import STTransform
 from vispy.scene.visuals import Markers, Line, Image
@@ -27,6 +29,8 @@ from PySide6.QtWidgets import (
 
 from catan.core.image_correlation import calculate_shift_score_map
 from catan.core.structures.remap import Remapping
+from catan.core.spatial_geometry import bounded_view
+
 from catan.gui.structures.alignment_draft import AlignmentDraft
 from catan.gui.panels.helper.ControlPanel import ControlPanel
 from catan.gui.background_tasks.runtime import (
@@ -36,6 +40,7 @@ from catan.gui.background_tasks.runtime import (
 from catan.gui.GUI_elements.fragments.alignment_shift_inset import (
     AlignmentShiftInset,
 )
+from catan.core.alignment import calculate_residual_flow
 
 
 class AlignmentCamera(scene.PanZoomCamera):
@@ -57,31 +62,20 @@ class AlignmentCamera(scene.PanZoomCamera):
         vw, vh = self._viewbox.size
 
         if bounds is not None and vw > 0 and vh > 0:
-            x0, y0, x1, y1 = bounds
-            ratio = float(vw / vh)
             rect = self.rect
-            cx, cy = rect.center
 
-            width = max(
-                abs(rect.width),
-                abs(rect.height) * ratio,
-                1e-6,
+            self._rect = Rect(
+                *bounded_view(
+                    bounds,
+                    (
+                        rect.left,
+                        rect.bottom,
+                        rect.width,
+                        rect.height,
+                    ),
+                    (vw, vh),
+                )
             )
-            height = width / ratio
-
-            scale = min(
-                1.0,
-                (x1 - x0) / width,
-                (y1 - y0) / height,
-            )
-            width *= scale
-            height *= scale
-
-            left = float(np.clip(cx - width / 2, x0, x1 - width))
-            bottom = float(np.clip(cy - height / 2, y0, y1 - height))
-
-            # Avoid recursively invoking rect.setter / view_changed.
-            self._rect = Rect(left, bottom, width, height)
 
         super()._update_transform()
 
@@ -105,6 +99,8 @@ class ManualAlignmentEditor(QWidget):
         self._score_key = None
         self._score_result = None
         self._displayed_score_key = None
+        self._estimate_task_id = None
+        self._estimate_generation = 0
 
         self._fit_next_score = True
 
@@ -139,6 +135,18 @@ class ManualAlignmentEditor(QWidget):
         self.options.toggle_button.setToolTip("Alignment settings")
 
         form = self.options.form
+        self.deformation_status = QLabel(self.options)
+        self.deformation_status.setWordWrap(True)
+        form.addRow(self.deformation_status)
+
+        self.transpose_background = QCheckBox("Transpose background", self.options)
+        self.transpose_background.setToolTip(
+            "Swap the background image's rows and columns before alignment. "
+            "Footprints retain their existing orientation. "
+            "This correction currently requires a square background."
+        )
+        self.transpose_background.toggled.connect(self._set_background_transposed)
+        form.addRow(self.transpose_background)
 
         self.legend = QLabel(
             "Reference: green · This session: magenta\n"
@@ -150,6 +158,7 @@ class ManualAlignmentEditor(QWidget):
         self.view_mode = QComboBox(self)
         self.view_mode.addItem("Background overlay", "overlay")
         self.view_mode.addItem("Correlation surface", "correlation")
+        self.view_mode.addItem("Estimated flow", "flow")
 
         self.correlation_method = QComboBox(self)
         for label, method in (
@@ -178,6 +187,27 @@ class ManualAlignmentEditor(QWidget):
         )
 
         form.addRow("Display", self.view_mode)
+        self.flow_scale = QDoubleSpinBox(self.options)
+        self.flow_scale.setRange(0.1, 1000.0)
+        self.flow_scale.setDecimals(1)
+        self.flow_scale.setSingleStep(5.0)
+        self.flow_scale.setValue(20.0)
+        self.flow_scale.setSuffix("×")
+        self.flow_scale.setToolTip(
+            "Magnifies arrows only. Reported displacements remain in pixels."
+        )
+        form.addRow("Flow arrow scale", self.flow_scale)
+
+        self.flow_status = QLabel(self.options)
+        self.flow_status.setWordWrap(True)
+        form.addRow(self.flow_status)
+
+        self.flow_scale.hide()
+        form.labelForField(self.flow_scale).hide()
+        self.flow_status.hide()
+
+        self.flow_scale.valueChanged.connect(lambda _value: self._draw_flow())
+
         form.addRow("Method", self.correlation_method)
 
         self.correlation_method.hide()
@@ -260,17 +290,68 @@ class ManualAlignmentEditor(QWidget):
             }
         """)
 
-        self.edit_rotation = QCheckBox("Edit rotation", self)
-        self.edit_rotation.setChecked(data.correct_rotation)
+        self.edit_rotation = QToolButton(self.shift_controls)
+        self.edit_rotation.setText("↻")
+        self.edit_rotation.setCheckable(True)
+        self.edit_rotation.setChecked(True)
+        self.edit_rotation.setFixedWidth(24)
         self.edit_rotation.setToolTip(
-            "Enables rotation editing. Disabling it retains the current angle."
+            "Enable rotation editing. Turning this off retains " "the current angle."
         )
-        self.angle.setEnabled(self.edit_rotation.isChecked())
-        self.edit_rotation.toggled.connect(self.angle.setEnabled)
 
-        # Preserve the angle and existing synchronization, but hide editing.
-        self.edit_rotation.hide()
-        self.angle.hide()
+        self.angle.setSuffix("°")
+        self.angle.setFixedWidth(self.dx.width())
+        self.angle.setToolTip("Session rotation")
+
+        coordinates.addWidget(self.angle, 2, 0)
+        coordinates.addWidget(self.edit_rotation, 2, 1)
+
+        self.edit_rotation.toggled.connect(lambda _checked: self._update_availability())
+
+        estimate_row = QWidget(self.options)
+        estimate_layout = QHBoxLayout(estimate_row)
+        estimate_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.estimate_rotation_button = QPushButton("Estimate rotation")
+        self.estimate_shift_button = QPushButton("Estimate shift")
+
+        self.estimate_rotation_button.setToolTip(
+            "Estimate rotation near the current angle, keeping dx and dy fixed. "
+            "Uses whole-image cosine similarity."
+        )
+        self.estimate_shift_button.setToolTip(
+            "Estimate dx and dy, keeping the current rotation fixed. "
+            "Uses whole-image cosine similarity."
+        )
+
+        self.estimate_rotation_button.setText("Auto ↻")
+        self.estimate_rotation_button.setFixedWidth(58)
+        coordinates.addWidget(self.estimate_rotation_button, 2, 2)
+        estimate_layout.addWidget(self.estimate_shift_button)
+        form.addRow(estimate_row)
+
+        self.estimate_status = QLabel(self.options)
+        self.estimate_status.setWordWrap(True)
+        form.addRow(self.estimate_status)
+
+        self.estimate_rotation_button.clicked.connect(
+            lambda: self._estimate_alignment("rotation")
+        )
+        self.estimate_shift_button.clicked.connect(
+            lambda: self._estimate_alignment("shift")
+        )
+
+        self.refine_flow_button = QPushButton("Refine flow", self.shift_controls)
+        self.refine_flow_button.setToolTip(
+            "Calculate optical-flow correction from the current shift "
+            "and rotation against the selected reference session. "
+            "Preview the result, then Apply changes."
+        )
+        coordinates.addWidget(self.refine_flow_button, 3, 0, 1, 3)
+
+        self.refine_flow_button.clicked.connect(
+            lambda: self._estimate_alignment("flow")
+        )
 
         grid = self.canvas.central_widget.add_grid(spacing=0)
 
@@ -280,7 +361,7 @@ class ManualAlignmentEditor(QWidget):
 
         self.view = grid.add_view(row=0, col=1)
         self.view.camera = AlignmentCamera()
-        self.view.camera.flip = (False, True, False)
+        self.view.camera.flip = (False, False, False)
 
         self.x_axis = scene.AxisWidget(orientation="bottom")
         self.x_axis.height_min = self.x_axis.height_max = 50
@@ -294,6 +375,17 @@ class ManualAlignmentEditor(QWidget):
 
         self.x_axis.axis.axis_label = "x (px)"
         self.y_axis.axis.axis_label = "y (px)"
+
+        self._flow_key = None
+        self._flow_result = None
+        self._flow_pending = None
+        self._flow_task_id = None
+        self._flow_generation = 0
+
+        self._flow_timer = QTimer(self)
+        self._flow_timer.setSingleShot(True)
+        self._flow_timer.setInterval(200)
+        self._flow_timer.timeout.connect(self._start_flow)
 
         self.image = Image(
             np.zeros(self.dims + (3,), dtype=np.float32),
@@ -310,6 +402,17 @@ class ManualAlignmentEditor(QWidget):
         self.score_image.order = 0
         self.score_image.visible = False
         self.score_image.set_gl_state("translucent", depth_test=False)
+
+        self.flow_arrows = Line(
+            pos=np.zeros((2, 2), dtype=np.float32),
+            connect="segments",
+            color="#ffe066",
+            width=2,
+            parent=self.view.scene,
+        )
+        self.flow_arrows.order = 5
+        self.flow_arrows.visible = False
+        self.flow_arrows.set_gl_state("translucent", depth_test=False)
 
         self._color_window = None
         self.canvas.events.draw.connect(self._update_visible_clim, position="first")
@@ -503,6 +606,10 @@ class ManualAlignmentEditor(QWidget):
                 self.state.alignment_review_changed,
                 self._update_availability,
             ),
+            (self.state.tasks.task_cancelled, self._on_flow_task_stopped),
+            (self.state.tasks.task_failed, self._on_flow_task_stopped),
+            (self.state.tasks.task_cancelled, self._on_estimate_stopped),
+            (self.state.tasks.task_failed, self._on_estimate_stopped),
         )
         for signal, slot in self._connections:
             signal.connect(slot)
@@ -540,6 +647,18 @@ class ManualAlignmentEditor(QWidget):
 
         self.options.show()
         self._position_options()
+
+    def _set_background_transposed(self, checked):
+        if not self.can_apply() or not self.draft.can_transpose_background:
+            return
+
+        checked = bool(checked)
+        if checked == self.draft.background_transposed:
+            return
+
+        self._cancel_score_task()
+        self.draft.background_transposed = checked
+        self.state.alignment_draft_changed.emit()
 
     def _position_options(self, *_):
         if self._disposed:
@@ -602,7 +721,11 @@ class ManualAlignmentEditor(QWidget):
             reference = f"S{reference_id}"
 
         suffix = " · unapplied" if draft is self.draft and draft.dirty else ""
-        self.status_label.setText(f"S{draft.session_id} ↔ {reference}{suffix}")
+        deformation = " · ∿ flow" if draft.effective_flow is not None else " · rigid"
+
+        self.status_label.setText(
+            f"S{draft.session_id} ↔ {reference}" f"{deformation}{suffix}"
+        )
         self._position_options()
 
     def _populate_references(self, preferred_id=-1):
@@ -765,7 +888,16 @@ class ManualAlignmentEditor(QWidget):
         ]
 
         if kind == "session":
-            reference_id = available[-1] if available else None
+            if draft is self.draft:
+                index = self.reference.currentIndex()
+                reference_id = (
+                    self._reference_session_ids[index]
+                    if 0 <= index < len(self._reference_session_ids)
+                    else None
+                )
+            else:
+                reference_id = available[-1] if available else None
+
         elif reference_id not in available:
             return
 
@@ -823,29 +955,50 @@ class ManualAlignmentEditor(QWidget):
             else "Green: reference; magenta: current session; white: overlap."
         )
 
+        flow_mode = self.view_mode.currentData() == "flow"
+        self.flow_scale.setVisible(flow_mode)
+        self.options.form.labelForField(self.flow_scale).setVisible(flow_mode)
+        self.flow_status.setVisible(flow_mode)
+
         self._render_preview()
         self._fit_view()
         self._position_options()
 
     @staticmethod
-    def _warp_template(template, dims, transpose, dx, dy, angle):
-        moving = template.T if transpose else template
-        matrix = Remapping._rigid_matrix(
-            dims,
-            np.array([dy, dx], dtype=float),
-            float(angle),
-        )
-        return Remapping._warp_dense(moving, matrix)
+    def _warp_template(template, dims, transpose, dx, dy, angle, flow=None):
+        remap = Remapping.identity(dims)
+        remap.transpose = transpose
+        remap.shift = np.array([dy, dx], dtype=float)
+        remap.rotation = float(angle)
+        remap.matrix = Remapping._rigid_matrix(dims, remap.shift, remap.rotation)
+        remap.flow = flow
+
+        return remap.apply_remap(template, use_optical_flow=True)
 
     def _render_preview(self, *_):
         if self._disposed:
             return
+
+        flow_mode = self.view_mode.currentData() == "flow"
+        if not flow_mode:
+            self._clear_flow()
 
         reference_index = self.reference.currentIndex()
         if reference_index < 0:
             return
 
         draft, reference, reference_id = self._comparison_context()
+        applied_flow = draft.effective_flow
+
+        self.deformation_status.setText(
+            draft.flow_message
+            + (
+                "\nCorrelation shows residual translation after the "
+                "complete correction; zero is the current alignment."
+                if applied_flow is not None
+                else "\nCorrelation shows translation at the current rotation."
+            )
+        )
         dx, dy, angle = map(float, draft.values)
         correlation = self.view_mode.currentData() == "correlation"
 
@@ -877,6 +1030,7 @@ class ManualAlignmentEditor(QWidget):
                     dx,
                     dy,
                     angle,
+                    flow=draft.effective_flow,
                 )
             )
 
@@ -892,6 +1046,10 @@ class ManualAlignmentEditor(QWidget):
             self.shift_tip.visible = False
             self.pair_arrow.visible = False
             self.pair_tip.visible = False
+
+            if flow_mode:
+                self._queue_flow(draft, reference, reference_id)
+
             self.canvas.update()
             return
 
@@ -901,6 +1059,15 @@ class ManualAlignmentEditor(QWidget):
             self.correlation_method.currentData(),
             angle,
             bool(draft.transpose),
+            bool(draft.background_transposed),
+            (
+                (
+                    tuple(map(float, draft.values[:2])),
+                    id(applied_flow),
+                )
+                if applied_flow is not None
+                else None
+            ),
         )
 
         if self._requested_score_key is not None and self._requested_score_key != key:
@@ -954,7 +1121,10 @@ class ManualAlignmentEditor(QWidget):
 
             self._update_visible_clim()
 
-            self._update_shift_marker(dx, dy)
+            self._update_shift_marker(
+                0.0 if applied_flow is not None else dx,
+                0.0 if applied_flow is not None else dy,
+            )
             if fit_needed and self._fit_next_score:
                 self._fit_view()
                 self._fit_next_score = False
@@ -1040,11 +1210,17 @@ class ManualAlignmentEditor(QWidget):
         self._requested_score_key = key
         generation = self._score_generation
 
-        _, method, angle, transpose = key
+        _, method, angle, transpose, _background_transposed = key[:5]
 
         reference = reference.copy()
         template = draft.template.copy()
         dims = draft.dims
+
+        flow = draft.effective_flow
+        flow = None if flow is None else flow.copy()
+
+        dx, dy = map(float, draft.values[:2])
+        residual_surface = flow is not None
 
         self.score_status.setText("Calculating correlation surface…")
 
@@ -1055,11 +1231,15 @@ class ManualAlignmentEditor(QWidget):
                 if ctx is not None:
                     ctx.check_cancelled()
 
-                # Translation is deliberately zero here: the surface explores
-                # every translation at the chosen rotation.
                 moving = ManualAlignmentEditor._normalize(
                     ManualAlignmentEditor._warp_template(
-                        template, dims, transpose, 0.0, 0.0, angle
+                        template,
+                        dims,
+                        transpose,
+                        dx if residual_surface else 0.0,
+                        dy if residual_surface else 0.0,
+                        angle,
+                        flow=flow,
                     )
                 )
 
@@ -1100,8 +1280,14 @@ class ManualAlignmentEditor(QWidget):
                     "moving_shape": moving.shape,
                     "peak": (float(peak_dx), float(peak_dy)),
                     "message": (
-                        f"Global score range: {low:.3g} to {high:.3g}\n"
-                        f"Grid peak: dx={peak_dx}, dy={peak_dy} px"
+                        (
+                            "Residual translation after flow correction; "
+                            "(0, 0) is the current alignment.\n"
+                            if residual_surface
+                            else "Translation at the current rotation.\n"
+                        )
+                        + f"Global score range: {low:.3g} to {high:.3g}\n"
+                        + f"Grid peak: dx={peak_dx}, dy={peak_dy} px"
                     ),
                 }
 
@@ -1153,6 +1339,244 @@ class ManualAlignmentEditor(QWidget):
         self._requested_score_key = None
         self.score_status.setText(
             "Calculation stopped. Change the method or display mode to retry."
+        )
+
+    def _clear_flow(self):
+        self._flow_timer.stop()
+        self._flow_generation += 1
+        self._flow_pending = None
+        self._flow_key = None
+        self._flow_result = None
+        self.flow_arrows.visible = False
+
+        task_id = self._flow_task_id
+        self._flow_task_id = None
+        if task_id is not None:
+            self.state.tasks.cancel(task_id)
+
+    def _queue_flow(self, draft, reference, reference_id):
+        key = (
+            draft,
+            reference_id,
+            self.state.data_version,
+            tuple(map(float, draft.values)),
+            bool(draft.transpose),
+            bool(draft.background_transposed),
+            id(draft.effective_flow),
+        )
+
+        if key == self._flow_key:
+            self._draw_flow()
+            return
+
+        self._clear_flow()
+        self._flow_key = key
+
+        # Snapshot inputs on the GUI thread.
+        self._flow_pending = (
+            reference.copy(),
+            draft.template.copy(),
+            tuple(draft.dims),
+            bool(draft.transpose),
+            tuple(map(float, draft.values)),
+            None if draft.effective_flow is None else draft.effective_flow.copy(),
+        )
+        self.flow_status.setText("Waiting for alignment changes to settle…")
+        self._flow_timer.start()
+
+    def _start_flow(self):
+        pending = self._flow_pending
+        if self._disposed or pending is None:
+            return
+
+        self._flow_pending = None
+        generation = self._flow_generation
+        reference, template, dims, transpose, values, applied_flow = pending
+        dx, dy, angle = values
+
+        self.flow_status.setText("Estimating residual flow…")
+
+        def calculate():
+            ctx = current_task_context()
+
+            try:
+                if ctx is not None:
+                    ctx.check_cancelled()
+
+                moving = ManualAlignmentEditor._warp_template(
+                    template,
+                    dims,
+                    transpose,
+                    dx,
+                    dy,
+                    angle,
+                    flow=applied_flow,
+                )
+
+                # Identify actual overlap, excluding warp padding.
+                coverage = ManualAlignmentEditor._warp_template(
+                    np.ones_like(template, dtype=np.float32),
+                    dims,
+                    transpose,
+                    dx,
+                    dy,
+                    angle,
+                    flow=applied_flow,
+                )
+
+                flow = calculate_residual_flow(reference, moving)
+
+                if ctx is not None:
+                    ctx.check_cancelled()
+
+                # Sampling validity uses the real flow, never its display scale.
+                yy, xx = np.indices(dims, dtype=np.float32)
+                destination_x = xx + flow[..., 0]
+                destination_y = yy + flow[..., 1]
+
+                valid = (
+                    (coverage > 0.999)
+                    & np.isfinite(flow).all(axis=-1)
+                    & (destination_x >= 0)
+                    & (destination_x <= dims[1] - 1)
+                    & (destination_y >= 0)
+                    & (destination_y <= dims[0] - 1)
+                )
+
+                # Check coverage at the corresponding moving-image location.
+                ix = np.clip(
+                    np.rint(np.nan_to_num(destination_x)),
+                    0,
+                    dims[1] - 1,
+                ).astype(np.intp)
+                iy = np.clip(
+                    np.rint(np.nan_to_num(destination_y)),
+                    0,
+                    dims[0] - 1,
+                ).astype(np.intp)
+                valid &= coverage[iy, ix] > 0.999
+
+                flow = np.asarray(flow, dtype=np.float32)
+                flow[~valid] = np.nan
+
+                magnitude = np.linalg.norm(flow[valid], axis=-1)
+                if magnitude.size == 0:
+                    raise ValueError("No valid overlapping region for flow.")
+
+                return {
+                    "flow": flow,
+                    "median": float(np.median(magnitude)),
+                    "p95": float(np.percentile(magnitude, 95)),
+                }
+
+            except TaskCancelled:
+                raise
+            except Exception as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
+
+        self._flow_task_id = self.state.tasks.start(
+            "calculating",
+            "Estimating comparison flow",
+            calculate,
+            on_result=lambda result: self._on_flow_ready(generation, result),
+            background=True,
+        )
+
+    def _on_flow_ready(self, generation, result):
+        if self._disposed or generation != self._flow_generation:
+            return
+
+        self._flow_task_id = None
+        self._flow_result = result
+        self._draw_flow()
+
+    def _draw_flow(self):
+        if self._disposed:
+            return
+
+        self.flow_arrows.visible = False
+        result = self._flow_result
+
+        if self.view_mode.currentData() != "flow" or result is None:
+            return
+
+        if "error" in result:
+            self.flow_status.setText(
+                f"Flow unavailable: {result['error']}\n"
+                "Check the backgrounds or adjust the alignment. "
+                "Switch display modes to retry."
+            )
+            self.canvas.update()
+            return
+
+        flow = result["flow"]
+        height, width = flow.shape[:2]
+
+        # Roughly 32 arrows across a 512-pixel image.
+        spacing = max(8, int(round(min(height, width) / 32)))
+        yy, xx = np.mgrid[
+            spacing // 2 : height : spacing,
+            spacing // 2 : width : spacing,
+        ]
+
+        vectors = flow[yy, xx].reshape(-1, 2)
+        starts = np.column_stack((xx.ravel(), yy.ravel())).astype(np.float32)
+        valid = np.isfinite(vectors).all(axis=1)
+        vectors = vectors[valid]
+        starts = starts[valid]
+
+        delta = vectors * float(self.flow_scale.value())
+        lengths = np.linalg.norm(delta, axis=1)
+
+        # Avoid tiny, directionless arrowheads.
+        visible = lengths >= 0.5
+        starts = starts[visible]
+        delta = delta[visible]
+        lengths = lengths[visible]
+
+        if lengths.size:
+            ends = starts + delta
+            direction = delta / lengths[:, None]
+            perpendicular = np.column_stack((-direction[:, 1], direction[:, 0]))
+
+            head_length = np.minimum(5.0, lengths * 0.35)
+            back = ends - direction * head_length[:, None]
+            wing = perpendicular * (head_length * 0.5)[:, None]
+
+            segments = np.stack(
+                (
+                    starts,
+                    ends,
+                    ends,
+                    back + wing,
+                    ends,
+                    back - wing,
+                ),
+                axis=1,
+            ).reshape(-1, 2)
+
+            self.flow_arrows.set_data(
+                pos=segments.astype(np.float32),
+                connect="segments",
+            )
+            self.flow_arrows.visible = True
+
+        self.flow_status.setText(
+            "Residual flow: reference → current session\n"
+            f"Median: {result['median']:.3f} px · "
+            f"95th percentile: {result['p95']:.3f} px\n"
+            f"Arrows magnified {self.flow_scale.value():g}×; "
+            "flow is not applied."
+        )
+        self.canvas.update()
+
+    def _on_flow_task_stopped(self, group, task_id, *_):
+        if self._disposed or task_id != self._flow_task_id:
+            return
+
+        self._flow_task_id = None
+        self.flow_status.setText(
+            "Flow calculation stopped. Switch display modes to retry."
         )
 
     @staticmethod
@@ -1211,10 +1635,10 @@ class ManualAlignmentEditor(QWidget):
         draft, _, _ = self._comparison_context()
 
         if self.view_mode.currentData() == "correlation":
-            points = [
-                (0.0, 0.0),
-                tuple(map(float, draft.values[:2])),
-            ]
+            points = [(0.0, 0.0)]
+
+            if draft.effective_flow is None:
+                points.append(tuple(map(float, draft.values[:2])))
 
             result = self._score_result
             if (
@@ -1263,6 +1687,17 @@ class ManualAlignmentEditor(QWidget):
         self.shift_inset.editable = self.can_apply()
         available = self.can_apply() and not previewing_other
 
+        can_estimate = available and self._estimate_task_id is None
+        self.estimate_rotation_button.setEnabled(can_estimate)
+        self.estimate_shift_button.setEnabled(can_estimate)
+
+        _, _, reference_id = self._comparison_context()
+        self.refine_flow_button.setEnabled(
+            can_estimate
+            and reference_id is not None
+            and not self.data.alignment_is_stale(reference_id)
+        )
+
         for widget in (
             self.dx,
             self.dy,
@@ -1271,6 +1706,10 @@ class ManualAlignmentEditor(QWidget):
             self.apply_button,
         ):
             widget.setEnabled(available)
+
+        self.transpose_background.setEnabled(
+            available and self.draft.can_transpose_background
+        )
 
         self.angle.setEnabled(available and self.edit_rotation.isChecked())
 
@@ -1291,7 +1730,18 @@ class ManualAlignmentEditor(QWidget):
                 f"{self.draft.session.name}"
             )
 
-        self.status_label.setToolTip(message)
+        displayed_draft, _, _ = self._comparison_context()
+
+        self.status_label.setToolTip(
+            message
+            + (
+                "\nOptical-flow deformation is included in the preview. "
+                "Main session arrows show the rigid component; "
+                "comparison arrows summarize relative mean displacement."
+                if displayed_draft.effective_flow is not None
+                else "\nThe preview currently uses rigid geometry."
+            )
+        )
         self.apply_button.setToolTip(message)
 
         tasks = self.state.tasks
@@ -1399,6 +1849,12 @@ class ManualAlignmentEditor(QWidget):
                 widget.setValue(float(value))
                 widget.blockSignals(previous)
 
+            self.template = self.draft.template
+
+            previous = self.transpose_background.blockSignals(True)
+            self.transpose_background.setChecked(self.draft.background_transposed)
+            self.transpose_background.blockSignals(previous)
+
             self._render_preview()
             self._refresh_shift_inset()
 
@@ -1413,9 +1869,17 @@ class ManualAlignmentEditor(QWidget):
         ):
             return
 
+        self.draft.clear_refined_flow()
+
         self._end_correlation_drag()
         self.shift_inset.release_focus()
         self._clear_hover(render=False)
+
+        if self.can_apply():
+            self._cancel_score_task()
+            self.draft.values[:] = self.draft.initial
+            self.draft.background_transposed = False
+            self.state.alignment_draft_changed.emit()
 
         if self.draft.is_current(self.data):
             self.draft.values[:] = self.draft.initial
@@ -1438,6 +1902,12 @@ class ManualAlignmentEditor(QWidget):
             return
 
         self._disposed = True
+        self._estimate_generation += 1
+        task_id = self._estimate_task_id
+        self._estimate_task_id = None
+        if task_id is not None:
+            self.state.tasks.cancel(task_id)
+        self._clear_flow()
 
         self._hover_timer.stop()
         self._hover_context = self._hover_draft = None
@@ -1463,6 +1933,88 @@ class ManualAlignmentEditor(QWidget):
         self.canvas.events.draw.disconnect(self._update_visible_clim)
 
         self.canvas.close()
+
+    def _session_mean_displacement(self, session_id):
+        """Mean (dx, dy) of the complete stored or draft transformation."""
+        session = self.data.sessions[session_id]
+        active = session is self.draft.session
+
+        revision = self.data.state.data_version
+        if getattr(self, "_shift_mean_revision", None) != revision:
+            self._shift_mean_revision = revision
+            self._shift_mean_cache = {}
+
+        key = (
+            session_id,
+            id(session),
+            id(session.remap),
+            tuple(session.dims),
+            (
+                (
+                    id(self.draft),
+                    tuple(float(v) for v in self.draft.values),
+                    bool(self.draft.background_transposed),
+                )
+                if active
+                else None
+            ),
+            id(self.draft.effective_flow) if active else None,
+        )
+
+        if key in self._shift_mean_cache:
+            return self._shift_mean_cache[key]
+
+        remap = self.draft.make_remap() if active else session.remap
+
+        if remap is None or not remap.success:
+            return None
+
+        source_x, source_y = remap.sampling_maps()
+        height, width = session.dims
+
+        valid = (
+            np.isfinite(source_x)
+            & np.isfinite(source_y)
+            & (source_x >= 0)
+            & (source_x <= width - 1)
+            & (source_y >= 0)
+            & (source_y <= height - 1)
+        )
+
+        if not valid.any():
+            return None
+
+        yy, xx = np.indices(
+            (height, width),
+            dtype=np.float32,
+        )
+
+        # sampling_maps maps output coordinates back to source coordinates.
+        # Reverse that displacement to retain the UI's correction direction.
+        displacement = np.array(
+            [
+                np.mean(
+                    xx[valid] - source_x[valid],
+                    dtype=np.float64,
+                ),
+                np.mean(
+                    yy[valid] - source_y[valid],
+                    dtype=np.float64,
+                ),
+            ],
+            dtype=float,
+        )
+
+        # Retain only the current summary for this session.
+        # Never cache the full sampling maps here.
+        self._shift_mean_cache = {
+            old_key: value
+            for old_key, value in self._shift_mean_cache.items()
+            if old_key[0] != session_id
+        }
+        self._shift_mean_cache[key] = displacement
+
+        return displacement
 
     def _refresh_shift_inset(self, *, fit=False):
         items = []
@@ -1521,49 +2073,57 @@ class ManualAlignmentEditor(QWidget):
             self.shift_inset.set_items(items, fit=fit)
             return
 
-        session = self.data.sessions[self._inset_session_id]
+        owner_id = self._inset_session_id
+        session = self.data.sessions[owner_id]
         dims = tuple(session.dims)
-        remap = session.remap
-        records = {} if remap is None else remap.remap_data
 
-        for reference_id, reference in enumerate(
-            self.data.sessions[: self._inset_session_id]
-        ):
-            if (
-                not reference.status["aligned"]
-                or reference.background is None
-                or tuple(reference.background.shape) != dims
-            ):
-                continue
-            record = records.get(str(reference.path))
-            if not record or not record.get("success"):
-                continue
+        moving_mean = self._session_mean_displacement(owner_id)
 
-            matrix = record.get("global_matrix")
-            if matrix is None:
-                continue
+        if moving_mean is not None:
+            for reference_id, reference in enumerate(self.data.sessions[:owner_id]):
+                if (
+                    not reference.status["aligned"]
+                    or reference.background is None
+                    or tuple(reference.background.shape) != dims
+                ):
+                    continue
 
-            shift, _ = Remapping._rigid_parameters(
-                dims, np.asarray(matrix, dtype=float)
-            )
-            xy = np.asarray(shift)[::-1].copy()
-            if not np.isfinite(xy).all():
-                continue
+                reference_mean = self._session_mean_displacement(reference_id)
 
-            items.append(
-                {
-                    "kind": "reference",
-                    "id": reference_id,
-                    "xy": xy,
-                    "label": (
-                        f"S{self._inset_session_id} via S{reference_id} (stored)"
-                    ),
-                    "active": False,
-                    "owner": self._inset_session_id,
-                    "start": focus["xy"].copy(),
-                    "focused": True,
-                }
-            )
+                if reference_mean is None:
+                    continue
+
+                relative = moving_mean - reference_mean
+
+                if not np.isfinite(relative).all():
+                    continue
+
+                start = focus["xy"].copy()
+
+                label = (
+                    f"S{owner_id} → S{reference_id}: "
+                    f"mean dx={relative[0]:+.2f}, "
+                    f"dy={relative[1]:+.2f} px "
+                    "(from stored transformations)"
+                )
+
+                if self.data.alignment_is_stale(
+                    owner_id
+                ) or self.data.alignment_is_stale(reference_id):
+                    label += " (outdated)"
+
+                items.append(
+                    {
+                        "kind": "reference",
+                        "id": reference_id,
+                        "xy": start + relative,
+                        "label": label,
+                        "active": False,
+                        "owner": owner_id,
+                        "start": start,
+                        "focused": True,
+                    }
+                )
 
         self.shift_inset.set_items(items, fit=fit)
 
@@ -1574,9 +2134,20 @@ class ManualAlignmentEditor(QWidget):
             return
 
         target_id = session_id if kind == "session" else self._inset_session_id
-        reference_id = session_id if kind == "reference" else -1
 
-        if kind == "session" and self._hover_context is not None:
+        index = self.reference.currentIndex()
+        selected_reference = (
+            self._reference_session_ids[index]
+            if 0 <= index < len(self._reference_session_ids)
+            else None
+        )
+
+        reference_id = selected_reference
+
+        if kind == "reference":
+            reference_id = session_id
+
+        elif target_id != self.draft.session_id and self._hover_context is not None:
             preview, _, preview_reference = self._hover_context
             if preview.session_id == target_id:
                 reference_id = preview_reference
@@ -1625,6 +2196,10 @@ class ManualAlignmentEditor(QWidget):
         displayed_draft, _, _ = self._comparison_context()
         if displayed_draft is not self.draft:
             # Hover previews of other sessions remain read-only.
+            return
+        if displayed_draft.effective_flow is not None:
+            # This surface describes residual displacement, not the
+            # absolute rigid coordinates edited by this drag handler.
             return
 
         transform = self.view.scene.node_transform(self.canvas.scene)
@@ -1704,6 +2279,314 @@ class ManualAlignmentEditor(QWidget):
         draft = select_alignment_draft(self.data, sid, self)
         if draft is not None:
             self.set_draft(draft)
+
+    def _estimate_context(self):
+        draft, _, reference_id = self._comparison_context()
+        return (
+            draft,
+            reference_id,
+            self.state.data_version,
+            tuple(map(float, draft.values)),
+            bool(draft.transpose),
+            bool(draft.background_transposed),
+        )
+
+    def _estimate_alignment(self, kind):
+        if not self.can_apply() or self._estimate_task_id is not None:
+            return
+
+        draft, reference, reference_id = self._comparison_context()
+        if draft is not self.draft:
+            return
+
+        context = self._estimate_context()
+        reference = np.asarray(reference, dtype=np.float64).copy()
+        template = self._normalize(draft.template).copy()
+        dims = tuple(draft.dims)
+        transpose = bool(draft.transpose)
+        dx, dy, angle = map(float, draft.values)
+
+        candidate = None
+        reference_remap = None
+        reference_path = None
+
+        if kind == "flow":
+            if reference_id is None or self.data.alignment_is_stale(reference_id):
+                return
+
+            reference_session = self.data.sessions[reference_id]
+            reference_path = str(reference_session.path)
+            reference_remap = deepcopy(reference_session.remap)
+
+            candidate = draft.make_remap()
+
+            # Re-estimate the complete residual correction at the
+            # current rigid geometry; do not stack it onto old flow.
+            candidate.flow = None
+            candidate.flow_info = {}
+
+        radius = float(draft.session.params.get("max_session_rotation", 10.0))
+        coarse_step = float(draft.session.params.get("rotation_step", 1.0))
+        fine_step = float(draft.session.params.get("rotation_refine_step", 0.1))
+
+        angle_limits = (self.angle.minimum(), self.angle.maximum())
+        x_limits = (self.dx.minimum(), self.dx.maximum())
+        y_limits = (self.dy.minimum(), self.dy.maximum())
+
+        self._estimate_generation += 1
+        generation = self._estimate_generation
+        self.estimate_status.setText(f"Estimating {kind}…")
+
+        def calculate():
+            ctx = current_task_context()
+
+            def check_cancelled():
+                if ctx is not None:
+                    ctx.check_cancelled()
+
+            try:
+                check_cancelled()
+
+                if (
+                    not np.isfinite(reference).all()
+                    or not np.isfinite(template).all()
+                    or np.ptp(reference) == 0
+                    or np.ptp(template) == 0
+                ):
+                    raise ValueError(
+                        "Both backgrounds need finite, nonconstant image data."
+                    )
+
+                if kind == "flow":
+                    valid_mask = (
+                        np.ones(dims, dtype=bool)
+                        if reference_remap is None
+                        else reference_remap.valid_mask()
+                    )
+
+                    candidate.estimate_flow(
+                        template,
+                        {
+                            reference_path: {
+                                "aligned_template": reference,
+                                "valid_mask": valid_mask,
+                                "flow_candidate": True,
+                            }
+                        },
+                        residual=True,
+                    )
+
+                    check_cancelled()
+
+                    if candidate.flow is None:
+                        raise ValueError(
+                            candidate.flow_info.get("reason")
+                            or "No acceptable flow correction was found."
+                        )
+
+                    return {
+                        "kind": "flow",
+                        "remap": candidate,
+                        "message": (
+                            "Flow refinement is ready for inspection. "
+                            "Apply changes to commit it."
+                        ),
+                    }
+
+                if kind == "shift":
+                    # Keep rotation; search translations from zero shift.
+                    moving = ManualAlignmentEditor._warp_template(
+                        template, dims, transpose, 0.0, 0.0, angle
+                    )
+
+                    scores = calculate_shift_score_map(
+                        reference,
+                        moving,
+                        mode="cosine",
+                        min_overlap=0.25,
+                    )
+                    check_cancelled()
+
+                    xs = np.arange(scores.shape[1]) - (moving.shape[1] - 1)
+                    ys = np.arange(scores.shape[0]) - (moving.shape[0] - 1)
+
+                    valid = (
+                        np.isfinite(scores)
+                        & (xs[None, :] >= x_limits[0])
+                        & (xs[None, :] <= x_limits[1])
+                        & (ys[:, None] >= y_limits[0])
+                        & (ys[:, None] <= y_limits[1])
+                    )
+                    if not valid.any():
+                        raise ValueError("No valid translation could be estimated.")
+
+                    best = float(np.max(scores[valid]))
+
+                    # Resolve numerically equivalent peaks toward the current shift.
+                    candidates = np.argwhere(
+                        valid & np.isclose(scores, best, rtol=0, atol=1e-10)
+                    )
+                    distance = (xs[candidates[:, 1]] - dx) ** 2 + (
+                        ys[candidates[:, 0]] - dy
+                    ) ** 2
+                    iy, ix = candidates[np.argmin(distance)]
+
+                    return {
+                        "kind": kind,
+                        "values": (float(xs[ix]), float(ys[iy])),
+                        "message": (
+                            f"Estimated shift: dx={xs[ix]:g}, dy={ys[iy]:g} px. "
+                            "Rotation retained; preview only."
+                        ),
+                    }
+
+                if radius <= 0 or coarse_step <= 0 or fine_step <= 0:
+                    raise ValueError(
+                        "Rotation search range and steps must be positive."
+                    )
+
+                lo = max(angle_limits[0], angle - radius)
+                hi = min(angle_limits[1], angle + radius)
+                reference_norm = np.linalg.norm(reference)
+                scores = {}
+
+                def score_rotation(candidate):
+                    candidate = float(candidate)
+                    if candidate in scores:
+                        return scores[candidate]
+
+                    check_cancelled()
+
+                    rotated = ManualAlignmentEditor._warp_template(
+                        template, dims, transpose, 0.0, 0.0, candidate
+                    )
+                    moving = ManualAlignmentEditor._warp_template(
+                        template, dims, transpose, dx, dy, candidate
+                    )
+                    coverage = ManualAlignmentEditor._warp_template(
+                        np.ones_like(template),
+                        dims,
+                        transpose,
+                        dx,
+                        dy,
+                        candidate,
+                    )
+
+                    # Reject candidates with too little usable overlap.
+                    if np.count_nonzero(coverage > 0.999) < 0.25 * reference.size:
+                        value = -np.inf
+                    else:
+                        # Use the pre-translation norm so losing image content
+                        # at the boundary does not improve normalization.
+                        denominator = reference_norm * np.linalg.norm(rotated)
+                        value = (
+                            float(np.sum(reference * moving) / denominator)
+                            if denominator > 0
+                            else -np.inf
+                        )
+
+                    scores[candidate] = value
+                    return value
+
+                def grid(start, stop, step):
+                    count = max(1, int(np.ceil((stop - start) / step)))
+                    return np.linspace(start, stop, count + 1)
+
+                best_angle = angle
+                best_score = score_rotation(angle)
+
+                for candidate in grid(lo, hi, coarse_step):
+                    value = score_rotation(candidate)
+                    if value > best_score + 1e-10:
+                        best_angle, best_score = float(candidate), value
+
+                fine_lo = max(lo, best_angle - coarse_step)
+                fine_hi = min(hi, best_angle + coarse_step)
+
+                for candidate in grid(fine_lo, fine_hi, fine_step):
+                    value = score_rotation(candidate)
+                    if value > best_score + 1e-10:
+                        best_angle, best_score = float(candidate), value
+
+                if not np.isfinite(best_score):
+                    raise ValueError(
+                        "Insufficient overlap to estimate rotation at this shift."
+                    )
+
+                boundary = (
+                    abs(best_angle - lo) <= fine_step
+                    or abs(best_angle - hi) <= fine_step
+                )
+                return {
+                    "kind": kind,
+                    "values": (best_angle,),
+                    "message": (
+                        f"Estimated rotation: {best_angle:.2f}°. "
+                        "Shift retained; preview only."
+                        + (
+                            " Best angle is near the search boundary; "
+                            "another estimate can search farther."
+                            if boundary
+                            else ""
+                        )
+                    ),
+                }
+
+            except TaskCancelled:
+                raise
+            except Exception as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
+
+        self._estimate_task_id = self.state.tasks.start(
+            "calculating",
+            f"Estimating alignment {kind}",
+            calculate,
+            on_result=lambda result: self._on_estimate_ready(
+                generation, context, result
+            ),
+            background=True,
+        )
+        self._update_availability()
+
+    def _on_estimate_ready(self, generation, context, result):
+        if self._disposed or generation != self._estimate_generation:
+            return
+
+        self._estimate_task_id = None
+
+        if not self.can_apply() or self._estimate_context() != context:
+            self.estimate_status.setText(
+                "Estimate discarded because the alignment or comparison changed. "
+                "Click Estimate again."
+            )
+        elif "error" in result:
+            self.estimate_status.setText(f"Estimation failed: {result['error']}")
+            self.state.issue(
+                "warning",
+                "Alignment estimation",
+                result["error"],
+                parent=self.window(),
+            )
+        else:
+            if result["kind"] == "flow":
+                self.draft.accept_refined_flow(result["remap"])
+            elif result["kind"] == "shift":
+                self.draft.values[:2] = result["values"]
+            else:
+                self.draft.values[2] = result["values"][0]
+
+            self.estimate_status.setText(result["message"])
+            self.state.alignment_draft_changed.emit()
+
+        self._update_availability()
+
+    def _on_estimate_stopped(self, group, task_id, *_):
+        if self._disposed or task_id != self._estimate_task_id:
+            return
+
+        self._estimate_task_id = None
+        self.estimate_status.setText("Estimation stopped. Click Estimate to retry.")
+        self._update_availability()
 
 
 def select_alignment_draft(data, session_id, parent=None, *, proposal=None):

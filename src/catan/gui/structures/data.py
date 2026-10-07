@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 from functools import wraps
 from copy import copy, deepcopy
+import json, os, tempfile
 
 from catan import Tracking
 from . import AppState, StatisticDisplayConfig
@@ -21,15 +22,24 @@ from catan.core.io import (
     get_backend,
 )
 from catan.core.structures import NeuronComponent, SessionData, sessiondata_type
-from catan.core.structures.load_config import FieldSpec
+from catan.core.structures.load_config import FieldSpec, LoadConfig
+from catan.core.structures.session_snapshot import (
+    prepare_session_snapshot,
+)
+from catan.core.io.isolated_read import read_fields, read_operation
+
 from catan.tracking.structures import Assignments, ReviewStatus
 from catan.tracking.realignment import build_realignment_update
-from catan.gui.panels.colors import CyclicColorMap
 
+from catan.gui.panels.colors import CyclicColorMap
 from catan.gui.data.statistics.engine import StatisticEngine
 from catan.gui.data.statistics.registry import build_statistics_registry
-
 from catan.gui.background_tasks.runtime import current_task_context
+from catan.gui.background_tasks.file_writes import (
+    save_bytes_task,
+    save_session_snapshots_task,
+    save_prepared_file_task,
+)
 
 
 def after_display_tasks(method):
@@ -72,6 +82,7 @@ class Data(Tracking):
         self.state.current_session_changed.connect(self._on_current_session_changed)
 
         self._model_fit_requested = False
+        self._model_fit_batches = []
         self.state.tasks.scheduling_settled.connect(self._try_fit_after_loading)
 
     def is_available(self, what: List[str] | None = None) -> bool:
@@ -251,14 +262,43 @@ class Data(Tracking):
         if not fields_to_load:
             return
 
+        recipe_options = getattr(session, "_recipe_options", {})
+
+        orientation = recipe_options.get(
+            "background_orientation",
+            getattr(self, "background_orientation", "auto"),
+        )
+        correct_rotation = recipe_options.get(
+            "correct_rotation", bool(self.correct_rotation)
+        )
+
         if "spatial" in fields_to_load:
-            session.params["correct_rotation"] = self.correct_rotation
+            session.params["correct_rotation"] = correct_rotation
 
         session.load_data(
             fields_to_load,
-            alignment_references=(self.alignment_references_for_session(session_id)),
+            alignment_references=self.alignment_references_for_session(session_id),
+            background_orientation=orientation,
+            expected_dims=next(
+                (
+                    tuple(other.dims)
+                    for other in self.sessions
+                    if other is not session and other.status["spatial_loaded"]
+                ),
+                None,
+            ),
             ctx=current_task_context(),
         )
+
+        if "spatial" in fields_to_load:
+            self._report_flow_fallback(session)
+            session._last_load_options = {
+                "background_orientation": orientation,
+                "correct_rotation": correct_rotation,
+                "background_mode": getattr(
+                    session, "_load_background_mode", "configured"
+                ),
+            }
 
         self.notify_change(
             C.DATA_AVAILABILITY,
@@ -302,7 +342,11 @@ class Data(Tracking):
 
         self._load_session_fields(session_id, fields_to_load)
 
-    def queue_load_data(self, session_id: int, *, fields_to_load=None, finished=None):
+    def queue_load_data(
+        self, session_id: int, *, fields_to_load=None, finished=None, batch=None
+    ):
+        if batch is not None and batch.cancelled:
+            return
 
         session = self.sessions[session_id]
         if session.source_config is None:
@@ -318,6 +362,8 @@ class Data(Tracking):
             session_id=session_id,
             fields_to_load=fields_to_load,
             finished=finished,
+            batch=batch,
+            prepend=True,
         )
 
     def queue_registration_actions(
@@ -327,7 +373,11 @@ class Data(Tracking):
         *,
         background_mode: str = "configured",
         on_alignment_error=None,
+        batch=None,
     ):
+        if batch is not None and batch.cancelled:
+            return
+
         session = self.sessions[session_id]
 
         actions = set(actions)
@@ -341,6 +391,7 @@ class Data(Tracking):
         # Data loading
         # ==================================================
         if load_requested:
+            session._load_background_mode = background_mode
             if session.source_config is None:
                 self.state.issue(
                     "warning",
@@ -364,35 +415,33 @@ class Data(Tracking):
 
             if not fields_to_load:
                 self._continue_registration_actions(
-                    session_id, actions, on_alignment_error=on_alignment_error
+                    session_id,
+                    actions,
+                    on_alignment_error=on_alignment_error,
+                    batch=batch,
                 )
                 return
 
             if background_mode == "footprints":
                 fields_to_load.get("spatial", {}).pop("background", None)
 
-            if not evaluate_fields_compatibility(session.path, fields_to_load):
-                self.state.issue(
-                    "warning",
-                    "Session data incompatible",
-                    (
-                        "The fields selected for loading "
-                        "are not compatible with their "
-                        "configured sources."
-                    ),
-                )
-                return
-
             self.queue_load_data(
                 session_id,
                 fields_to_load=fields_to_load,
                 finished=lambda: self._continue_registration_actions(
-                    session_id, actions, on_alignment_error=on_alignment_error
+                    session_id,
+                    actions,
+                    on_alignment_error=on_alignment_error,
+                    batch=batch,
                 ),
+                batch=batch,
             )
         else:
             self._continue_registration_actions(
-                session_id, actions, on_alignment_error=on_alignment_error
+                session_id,
+                actions,
+                on_alignment_error=on_alignment_error,
+                batch=batch,
             )
 
     def _continue_registration_actions(
@@ -401,7 +450,10 @@ class Data(Tracking):
         actions: set[str],
         *,
         on_alignment_error=None,
+        batch=None,
     ):
+        if batch is not None and batch.cancelled:
+            return
 
         session = self.sessions[session_id]
 
@@ -438,18 +490,19 @@ class Data(Tracking):
         # Normal processing
         # --------------------------------------------------
         if register_model:
-
             callback = None
-
             if track_neurons:
-                callback = lambda: self.queue_assign_neurons(session_id)
+                callback = lambda: self.queue_assign_neurons(session_id, batch=batch)
 
-            self.queue_update_model(session_id, callback=callback)
-
+            self.queue_update_model(
+                session_id,
+                callback=callback,
+                batch=batch,
+            )
             return
 
         if track_neurons:
-            self.queue_assign_neurons(session_id)
+            self.queue_assign_neurons(session_id, batch=batch)
 
     @after_display_tasks
     def queue_process_alignments(self, *, session_ids, finished=None):
@@ -532,8 +585,7 @@ class Data(Tracking):
                     )
                 }
 
-            return build_realignment_update(
-                self,
+            return self._build_realignment_update(
                 session_id,
                 background_template=template,
                 remap=remap,
@@ -650,8 +702,11 @@ class Data(Tracking):
         )
 
     def queue_update_model(
-        self, session_id: int, to_present: bool = True, callback=None
+        self, session_id: int, to_present: bool = True, callback=None, *, batch=None
     ):
+        if batch is not None and batch.cancelled:
+            return
+
         if self.model is not None and self.model.loaded:
             self.state.issue(
                 "warning",
@@ -662,7 +717,11 @@ class Data(Tracking):
         session = self.sessions[session_id]
 
         def when_finished():
-            self.fit_after_loading()
+            if batch is not None and batch.cancelled:
+                return
+
+            self.fit_after_loading(batch=batch)
+
             if callback is not None:
                 callback()
 
@@ -673,6 +732,7 @@ class Data(Tracking):
             session_id=session_id,
             finished=when_finished,
             ready=lambda session=session: session.status["aligned"],
+            batch=batch,
         )
 
     def update_counts(
@@ -691,12 +751,27 @@ class Data(Tracking):
             session_id=session_id,
         )
 
-    def fit_after_loading(self, key: str = "model update"):
-        # Called by the model-count completion callback.
-        # TaskManager checks the request after callbacks finish.
+    def fit_after_loading(self, key: str = "model update", *, batch=None):
+        if batch is not None and batch.cancelled:
+            return
+
+        if not any(item is batch for item in self._model_fit_batches):
+            self._model_fit_batches.append(batch)
+
         self._model_fit_requested = True
 
     def _try_fit_after_loading(self):
+
+        if self._model_fit_batches:
+            self._model_fit_batches = [
+                batch
+                for batch in self._model_fit_batches
+                if batch is None or not batch.cancelled
+            ]
+            if not self._model_fit_batches:
+                self._model_fit_requested = False
+                return
+
         if not self._model_fit_requested:
             return
 
@@ -708,6 +783,9 @@ class Data(Tracking):
         ):
             return
 
+        requests = self._model_fit_batches
+        fit_batch = requests[0] if len(requests) == 1 else None
+        self._model_fit_batches = []
         self._model_fit_requested = False
 
         if self.model is None or self.model.loaded:
@@ -730,6 +808,7 @@ class Data(Tracking):
             "model update",
             "Fit model to data",
             self.fit_model,
+            batch=fit_batch,
         )
 
     def fit_model(self, **kwargs):
@@ -744,6 +823,110 @@ class Data(Tracking):
         )
         return counts
 
+    @after_display_tasks
+    def queue_import_source(self, key, path, name, *, on_loaded=None):
+        if key not in {"model", "assignments"}:
+            raise ValueError(f"Unsupported source type: {key}")
+
+        tasks = self.state.tasks
+
+        if tasks.processing_busy():
+            self.state.issue(
+                "info",
+                "Loading not started",
+                "Finish or cancel the current processing tasks, "
+                "then select the file again.",
+            )
+            return
+
+        path = os.path.abspath(os.path.expanduser(os.fspath(path)))
+        params = deepcopy(self.params)
+        data_version = self.state.data_version
+
+        previous_source = getattr(self, key)
+        previous_name = (
+            self.current_model_name if key == "model" else self.current_assignments
+        )
+
+        def run():
+            ctx = current_task_context()
+
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            if key == "model":
+                data = read_operation(
+                    "model",
+                    path,
+                    ctx=ctx,
+                    timeout=300.0,
+                )
+
+                # Build and validate a separate candidate. Its settings
+                # must not mutate the live Tracking.params dictionary.
+                candidate = Model._from_dict(data, params=params)
+
+            else:
+                config = self.state.config_manager.suggest_config_for(
+                    path=path,
+                    source_type="assignments",
+                    ctx=ctx,
+                )
+
+                check = read_operation(
+                    "assignments_preflight",
+                    path,
+                    fields_to_load=(
+                        config.get_fields_to_load() if config is not None else {}
+                    ),
+                    ctx=ctx,
+                )
+
+                candidate = Assignments()
+                candidate.path = path
+                candidate.source_config = config
+                candidate._load_config_problems = check["problems"]
+
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            return candidate
+
+        def publish(candidate):
+            current_name = (
+                self.current_model_name if key == "model" else self.current_assignments
+            )
+
+            if (
+                self.state.data_version != data_version
+                or getattr(self, key) is not previous_source
+                or current_name != previous_name
+            ):
+                self.state.issue(
+                    "warning",
+                    "Loaded source was not applied",
+                    "The active data changed while loading. "
+                    "Select the file again to load it into the current state.",
+                )
+                return
+
+            if key == "model":
+                # Passing an object avoids the synchronous file-loading path.
+                self.add_model(name, candidate)
+            else:
+                self._assignments[name] = candidate
+                self._current_assignments = name
+
+            if on_loaded is not None:
+                on_loaded()
+
+        return tasks.start(
+            "loading",
+            f"Loading {key}: {Path(path).name}",
+            run,
+            on_result=publish,
+        )
+
     def propose_session_remapping(self, session_id: int, *, background_template=None):
 
         session = self.sessions[session_id]
@@ -755,7 +938,7 @@ class Data(Tracking):
         return session.propose_remapping(
             references,
             background_template=(background_template),
-            use_optical_flow=False,
+            use_optical_flow=True,
             correct_rotation=self.correct_rotation,
         )
 
@@ -775,17 +958,53 @@ class Data(Tracking):
             path=field_path, source=source, attribute=attribute, required=True
         )
 
-        data = load_file(source_path, {"spatial": {"background": spec}})
+        data = read_fields(
+            source_path,
+            {"spatial": {"background": spec}},
+            ctx=current_task_context(),
+        )
 
         background = data["spatial"]["background"]
 
-        candidate_template = session.prepare_background_template(background)
-
+        candidate_template = session.prepare_background_template(
+            background,
+            background_orientation=getattr(self, "background_orientation", "auto"),
+        )
         candidate_remap = self.propose_session_remapping(
             session_id, background_template=(candidate_template)
         )
 
         return (candidate_template, candidate_remap)
+
+    def _report_flow_fallback(self, session):
+        remap = session.remap
+        if remap is None:
+            return
+
+        info = remap.flow_info or {}
+        if info.get("status") != "skipped":
+            return
+
+        if info.get("mode") == "flow_only":
+            title = f"Alignment failed: {session.name}"
+            recovery = (
+                "Inspect the background and its orientation in Session "
+                "Alignment. Correct them if needed, then rerun alignment "
+                "or apply a manual alignment."
+            )
+        else:
+            title = f"Flow correction skipped: {session.name}"
+            recovery = (
+                "The rigid alignment remains usable. Inspect it in "
+                "Session Alignment; adjust the geometry or background "
+                "if necessary, then rerun alignment."
+            )
+
+        self.state.issue(
+            "warning",
+            title,
+            remap.flow_message + "\n" + recovery,
+        )
 
     @after_display_tasks
     def queue_commit_session_realignment(
@@ -830,8 +1049,7 @@ class Data(Tracking):
         tasks.start(
             "loading",
             f"Commit alignment for {self.sessions[session_id].name}",
-            build_realignment_update,
-            self,
+            self._build_realignment_update,
             session_id,
             background_template=background_template,
             remap=remap,
@@ -900,25 +1118,80 @@ class Data(Tracking):
             ),
             Change(C.PROCESSING_STATUS),
         )
+        self._report_flow_fallback(self.sessions[result["session_id"]])
         self.state.alignment_review_finished.emit(self.sessions[result["session_id"]])
         return True
 
-    def register_session(self, from_file: str | Path, **kwargs) -> list[int]:
-        backend = get_backend(from_file)
+    def _build_realignment_update(self, session_id, **kwargs):
+        return build_realignment_update(
+            self,
+            session_id,
+            ctx=current_task_context(),
+            **kwargs,
+        )
 
-        with backend.open_read(from_file) as ref:
-            object_type = backend.get_attribute(ref, "/", "object_type")
-
-        restored_from_catan = object_type in {"SessionData", "SessionList"}
-        if restored_from_catan:
-            sessions = super().load_session_data(from_file)
+    def register_session(
+        self,
+        from_file: str | Path | None = None,
+        *,
+        prepared_sessions=None,
+        **kwargs,
+    ) -> list[int]:
+        if prepared_sessions is not None:
+            sessions = list(prepared_sessions)
+            restored_from_catan = False
+        elif Path(from_file).suffix.lower() == ".json":
+            sessions = self._read_loading_recipe(from_file)
+            restored_from_catan = False
         else:
-            sessions = [SessionData(path=str(Path(from_file).expanduser().resolve()))]
+            source_path = os.path.abspath(os.path.expanduser(os.fspath(from_file)))
+
+            result = read_operation(
+                "registration",
+                source_path,
+                ctx=current_task_context(),
+                timeout=300.0,
+                retry_hint=(
+                    "Registration could not complete. Restore access to "
+                    "the source, then select this file again. If this was "
+                    "part of a batch, check the session list before "
+                    "resubmitting files already registered."
+                ),
+            )
+
+            restored_from_catan = result["restored_from_catan"]
+
+            if restored_from_catan:
+                sessions = result["sessions"]
+            else:
+                sessions = [SessionData(path=source_path)]
 
         registered_ids = []
+        added_ids = []
 
         try:
             for session in sessions:
+
+                ctx = current_task_context()
+                if ctx is not None:
+                    ctx.check_cancelled()
+
+                # Reopening a recipe can resume an existing session.
+                # Preserve its current configuration and already-loaded data.
+                if hasattr(session, "_recipe_options"):
+                    key = self.session_source_key(session.path)
+                    existing_id = next(
+                        (
+                            index
+                            for index, existing in enumerate(self.sessions)
+                            if self.session_source_key(existing.path) == key
+                        ),
+                        None,
+                    )
+                    if existing_id is not None:
+                        registered_ids.append(existing_id)
+                        continue
+
                 # Runtime marker for GUI validation; not persisted.
                 session._restored_from_catan = restored_from_catan
                 session_id = super().register_session(
@@ -926,16 +1199,13 @@ class Data(Tracking):
                     **kwargs,
                 )
                 registered_ids.append(session_id)
+                added_ids.append(session_id)
 
                 saved_state = session.__dict__.pop("_restored_processing", None)
                 if saved_state is not None:
                     processing = self._processing_state(session_id)
-                    processing.geometry_revision = int(
-                        saved_state["geometry_revision"]
-                    )
-                    processing.alignment_stale = bool(
-                        saved_state["alignment_stale"]
-                    )
+                    processing.geometry_revision = int(saved_state["geometry_revision"])
+                    processing.alignment_stale = bool(saved_state["alignment_stale"])
 
                 # Preserve restored field mappings and source overrides.
                 if session.source_config is None:
@@ -943,6 +1213,7 @@ class Data(Tracking):
                         self.state.config_manager.suggest_config_for(
                             path=session.path,
                             source_type="session",
+                            ctx=current_task_context(),
                         )
                     )
 
@@ -957,18 +1228,16 @@ class Data(Tracking):
         finally:
             # Publish once, including sessions successfully added before
             # an error interrupted registration.
-            if registered_ids:
+            if added_ids:
                 # Padding replaces the underlying array. Publish its latest
                 # reference before notifying statistics and displays.
                 self.state.assignments = (
-                    None
-                    if self.assignments is None
-                    else self.assignments.ids
+                    None if self.assignments is None else self.assignments.ids
                 )
 
                 paths = {
                     str(self.sessions[index].path)
-                    for index in registered_ids
+                    for index in added_ids
                     if self.sessions[index].path is not None
                 }
 
@@ -978,9 +1247,113 @@ class Data(Tracking):
                 )
 
                 if self.state.current_session_id is None:
-                    self.state.current_session_id = registered_ids[0]
+                    self.state.current_session_id = added_ids[0]
 
         return registered_ids
+
+    @after_display_tasks
+    def queue_save_sessions(self, path, *, mat_version="7.3"):
+        tasks = self.state.tasks
+
+        if tasks.processing_busy():
+            self.state.issue(
+                "info",
+                "Session save is waiting",
+                "Finish or cancel the current processing tasks, "
+                "then click Save again.",
+            )
+            return
+
+        if not self.sessions:
+            self.state.issue(
+                "info",
+                "No sessions to save",
+                "Register a session before saving.",
+            )
+            return
+
+        try:
+            snapshots = []
+
+            for session_id, session in enumerate(self.sessions):
+                processing = self._processing_state(session_id)
+
+                snapshots.append(
+                    prepare_session_snapshot(
+                        session,
+                        processing={
+                            "geometry_revision": processing.geometry_revision,
+                            "alignment_stale": processing.alignment_stale,
+                        },
+                        copy_arrays=True,
+                    )
+                )
+        except Exception as exc:
+            self.state.issue(
+                "warning",
+                "Could not prepare session save",
+                str(exc),
+            )
+            return
+
+        return tasks.start(
+            "saving",
+            f"Saving sessions: {Path(path).name}",
+            save_session_snapshots_task,
+            self.state,
+            str(path),
+            snapshots,
+            mat_version=mat_version,
+        )
+
+    @after_display_tasks
+    def queue_save_result(self, key, path):
+        if key not in {"model", "assignments"}:
+            raise ValueError(f"Unsupported result type: {key}")
+
+        tasks = self.state.tasks
+
+        if tasks.processing_busy():
+            self.state.issue(
+                "info",
+                "Cannot save while processing",
+                "Finish or cancel the current processing tasks, "
+                "then click Save again.",
+            )
+            return
+
+        source = getattr(self, key)
+
+        if source is None:
+            self.state.issue(
+                "info",
+                "Nothing to save",
+                (
+                    f"No {key} are available."
+                    if key == "assignments"
+                    else "No model is available."
+                ),
+            )
+            return
+
+        try:
+            prepared = source.prepare_save()
+        except Exception as exc:
+            self.state.issue(
+                "warning",
+                f"Could not prepare {key} save",
+                str(exc),
+            )
+            return
+
+        return tasks.start(
+            "saving",
+            f"Saving {key}: {Path(path).name}",
+            save_prepared_file_task,
+            self.state,
+            str(path),
+            prepared,
+        )
 
     def remove_session(self, session_id: int):
 
@@ -1071,7 +1444,9 @@ class Data(Tracking):
         assignments = Assignments()
         assignments.path = path
         assignments.source_config = self.state.config_manager.suggest_config_for(
-            path=path, source_type="assignments"
+            path=path,
+            source_type="assignments",
+            ctx=current_task_context(),
         )
         assert (
             assignments.source_config is not None
@@ -1098,7 +1473,7 @@ class Data(Tracking):
         )
 
     @after_display_tasks
-    def queue_load_assignments(self):
+    def queue_load_assignments(self, *, on_config_required=None):
         tasks = self.state.tasks
 
         if tasks.processing_busy():
@@ -1114,6 +1489,8 @@ class Data(Tracking):
             return
 
         if source.source_config is None:
+            if on_config_required is not None:
+                on_config_required()
             self.state.issue(
                 "warning",
                 "Assignment loading not started",
@@ -1156,7 +1533,26 @@ class Data(Tracking):
             if ctx is not None:
                 ctx.check_cancelled()
 
-            candidate.load()
+            result = read_operation(
+                "assignments_fields",
+                source_path,
+                fields_to_load=source_fields,
+                ctx=ctx,
+                timeout=300.0,
+            )
+
+            if result["problems"]:
+                return {"config_problems": result["problems"]}
+
+            candidate.register_data(**result["data"])
+
+            # Check column count before padding or restoring manipulations.
+            worker.check_assignments_compatibility(
+                candidate,
+                check_footprints=False,
+                raise_on_error=True,
+            )
+
             worker._ensure_assignment_session_count(candidate)
 
             if ctx is not None:
@@ -1164,11 +1560,10 @@ class Data(Tracking):
 
             worker.restore_manipulations()
 
-            if candidate.ids.shape[0] > 0:
-                if not worker.check_assignments_compatibility(candidate):
-                    raise ValueError(
-                        "Assignments are incompatible with the loaded sessions."
-                    )
+            worker.check_assignments_compatibility(
+                candidate,
+                raise_on_error=True,
+            )
 
             worker.rebuild_union(ctx=ctx)
 
@@ -1181,12 +1576,9 @@ class Data(Tracking):
             if result is None:
                 return
 
-            sessions_unchanged = (
-                len(self.sessions) == len(sessions)
-                and all(
-                    current is original
-                    for current, original in zip(self.sessions, sessions)
-                )
+            sessions_unchanged = len(self.sessions) == len(sessions) and all(
+                current is original
+                for current, original in zip(self.sessions, sessions)
             )
             config_unchanged = (
                 source.source_config is not None
@@ -1206,6 +1598,21 @@ class Data(Tracking):
                     "Assignment loading discarded",
                     "Data or the load configuration changed during loading. "
                     "Please load the assignments again.",
+                )
+                return
+
+            if isinstance(result, dict) and "config_problems" in result:
+                source.status["loading_possible"] = False
+
+                if on_config_required is not None:
+                    on_config_required()
+
+                self.state.issue(
+                    "info",
+                    "Repair the assignments load configuration",
+                    "\n\n".join(result["config_problems"])
+                    + "\n\nSelect a matching preset or correct the IDs field, "
+                    "then click the assignments open-folder button to load again.",
                 )
                 return
 
@@ -1261,7 +1668,9 @@ class Data(Tracking):
             return
 
         self.assignments.source_config = self.state.config_manager.suggest_config_for(
-            path=self.assignments.path, source_type="assignments"
+            path=self.assignments.path,
+            source_type="assignments",
+            ctx=current_task_context(),
         )
 
         if self.assignments is None:
@@ -1411,7 +1820,157 @@ class Data(Tracking):
             on_result=publish,
         )
 
-    def queue_assign_neurons(self, session_id: int, to_present=True, callback=None):
+    @staticmethod
+    def session_source_key(path):
+        """Lexical comparison: avoid resolving or probing remote paths."""
+        if path is None:
+            return None
+        return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+    def loading_recipe_snapshot(self):
+        """Create a plain-data snapshot on the GUI thread."""
+        entries = []
+
+        for session in self.sessions:
+            if not session.path or session.source_config is None:
+                raise ValueError(
+                    f"Session {session.name!r} has no source path or load configuration."
+                )
+
+            options = dict(
+                getattr(
+                    session,
+                    "_last_load_options",
+                    getattr(session, "_recipe_options", {}),
+                )
+            )
+            options.setdefault(
+                "background_orientation",
+                getattr(self, "background_orientation", "auto"),
+            )
+            options.setdefault("correct_rotation", bool(self.correct_rotation))
+            options.setdefault(
+                "background_mode",
+                getattr(session, "_load_background_mode", "configured"),
+            )
+
+            # The displayed background may have been constructed from footprints.
+            if session.background_origin == "footprints":
+                options["background_mode"] = "footprints"
+
+            entries.append(
+                {
+                    "path": os.path.abspath(os.path.expanduser(str(session.path))),
+                    "name": session.name,
+                    "load_config": deepcopy(session.source_config.to_dict()),
+                    "load_options": options,
+                }
+            )
+
+        if not entries:
+            raise ValueError("There are no sessions to save.")
+
+        return {
+            "type": "catan-loading-recipe",
+            "version": 1,
+            "sessions": entries,
+        }
+
+    def save_loading_recipe(self, path, document):
+        payload = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+
+        return save_bytes_task(self.state, path, payload)
+
+    @staticmethod
+    def _read_loading_recipe(path):
+        """Parse all entries before registering any session."""
+        path = Path(os.path.abspath(os.path.expanduser(str(path))))
+
+        document = read_operation(
+            "json",
+            path,
+            ctx=current_task_context(),
+            timeout=60.0,
+            retry_hint=(
+                "Restore access to the recipe file, then reopen it. "
+                "You can select the remaining sessions in the recipe chooser."
+            ),
+        )
+
+        if (
+            not isinstance(document, dict)
+            or document.get("type") != "catan-loading-recipe"
+            or document.get("version") != 1
+        ):
+            raise ValueError("This JSON is not a supported CATAN loading recipe.")
+
+        entries = document.get("sessions")
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("The loading recipe contains no sessions.")
+
+        sessions = []
+        ctx = current_task_context()
+
+        for index, entry in enumerate(entries, start=1):
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            try:
+                source = entry["path"]
+                if not isinstance(source, str) or not source.strip():
+                    raise ValueError("Missing session source path.")
+
+                source = Path(source).expanduser()
+                if not source.is_absolute():
+                    source = path.parent / source
+
+                # Lexical normalization, without inspecting remote sources.
+                source = os.path.abspath(str(source))
+
+                config = LoadConfig.from_dict(entry["load_config"])
+                if config.source_type != "session":
+                    raise ValueError("Expected a session load configuration.")
+
+                options = dict(entry.get("load_options", {}))
+                options.setdefault("background_orientation", "auto")
+                options.setdefault("background_mode", "configured")
+                options.setdefault("correct_rotation", False)
+
+                if options["background_orientation"] not in {
+                    "auto",
+                    "as_stored",
+                    "transpose",
+                }:
+                    raise ValueError("Invalid background orientation.")
+
+                if options["background_mode"] not in {"configured", "footprints"}:
+                    raise ValueError("Invalid background mode.")
+
+                if not isinstance(options["correct_rotation"], bool):
+                    raise ValueError("correct_rotation must be true or false.")
+
+                session = SessionData(
+                    path=source,
+                    name=entry.get("name"),
+                )
+                session.source_config = config
+                session._recipe_options = options
+                sessions.append(session)
+
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                raise ValueError(
+                    f"Invalid loading recipe, session entry {index}: {exc}"
+                ) from exc
+
+        return sessions
+
+    def queue_assign_neurons(
+        self, session_id: int, to_present=True, callback=None, *, batch=None
+    ):
+        if batch is not None and batch.cancelled:
+            return
         session = self.sessions[session_id]
 
         if to_present:
@@ -1445,6 +2004,7 @@ class Data(Tracking):
                 )
             ),
             finished=callback,
+            batch=batch,
         )
 
     def assign_neurons(
@@ -1785,9 +2345,7 @@ class Data(Tracking):
             return np.inf
 
         distance = (
-            np.linalg.norm(
-                union.centroids[source_id] - union.centroids[target_id]
-            )
+            np.linalg.norm(union.centroids[source_id] - union.centroids[target_id])
             / scale
         )
         return float(distance) if np.isfinite(distance) else np.inf
@@ -1798,10 +2356,7 @@ class Data(Tracking):
         if request.assignments is not assignments:
             raise ValueError("The active assignments changed; start a new request.")
 
-        if (
-            self.state.tasks.processing_busy()
-            or self.state.tasks.processing_requested
-        ):
+        if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
             raise ValueError("Wait for assignment processing to finish.")
 
         request.refresh()
@@ -1819,8 +2374,7 @@ class Data(Tracking):
         candidate = copy(assignments)
         candidate.ids = assignments.ids.copy()
         candidate.stats = {
-            key: values.copy()
-            for key, values in assignments.stats.items()
+            key: values.copy() for key, values in assignments.stats.items()
         }
         candidate.review_status = assignments.review_status.copy()
         candidate.manipulation_id = dict(assignments.manipulation_id)
@@ -1854,17 +2408,11 @@ class Data(Tracking):
 
         # Remove the now-empty source row.
         keep = np.delete(np.arange(len(candidate.ids)), source)
-        row_map = {
-            int(old): new
-            for new, old in enumerate(keep)
-        }
+        row_map = {int(old): new for new, old in enumerate(keep)}
 
         candidate.ids = candidate.ids[keep]
         candidate.review_status = candidate.review_status[keep]
-        candidate.stats = {
-            key: values[keep]
-            for key, values in candidate.stats.items()
-        }
+        candidate.stats = {key: values[keep] for key, values in candidate.stats.items()}
         candidate.manipulation_id = {
             row_map[old]: manipulation_id
             for old, manipulation_id in candidate.manipulation_id.items()
@@ -2279,8 +2827,7 @@ class Data(Tracking):
             assignments.ids = assignments.ids[keep]
             assignments.review_status = assignments.review_status[keep]
             assignments.stats = {
-                key: values[keep]
-                for key, values in assignments.stats.items()
+                key: values[keep] for key, values in assignments.stats.items()
             }
             assignments.manipulation_id = {
                 row_map[old]: manipulation_id
@@ -2296,17 +2843,12 @@ class Data(Tracking):
             union.synthetic = union.synthetic[keep]
             union.n_neurons = len(keep)
         elif not structural:
-            row_map = {
-                index: index for index in range(assignments.ids.shape[0])
-            }
+            row_map = {index: index for index in range(assignments.ids.shape[0])}
 
         assignments.matched_status = np.any(assignments.ids >= 0, axis=0)
 
         component_map = {
-            old: (
-                None if target is None
-                else (row_map[target[0]], target[1])
-            )
+            old: (None if target is None else (row_map[target[0]], target[1]))
             for old, target in component_map.items()
         }
 

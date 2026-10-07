@@ -319,51 +319,113 @@ class Assignments:
         return assignments
 
     def load(self):
+        from catan.core.io.api import read_assignments_source
+
         if self.source_config is None:
             raise ValueError("Source config is not set.")
-        fields_to_load = self.source_config.get_fields_to_load()
-        data = load_file(self.path, fields_to_load)
-        self.register_data(**data)
 
-    def register_data(self, **data):
-
-        ids = data["assignments"].get("ids")
-        assert ids is not None, "IDs must be provided in the data dictionary"
-        assert isinstance(ids, np.ndarray), "IDs must be a numpy array"
-
-        n_neurons, n_sessions = ids.shape
-
-        mask = np.isfinite(ids)
-        if not mask.all():
-            ids[~mask] = -1  # replace with placeholder for invalid IDs / non-matched
-        self.ids = ids.astype(int)
-
-        stats = data["stats"]
-        assert isinstance(stats, dict) and all(
-            isinstance(v, np.ndarray) for v in stats.values()
-        ), "Stats must be a dictionary of numpy arrays"
-        # assert stats is not None, "Stats must be provided in the data dictionary"
-        self.stats = stats
-
-        ## reset status values
-        self.matched_status = np.any(self.ids >= 0, axis=0)
-
-        self.review_status = data["curation"].get(
-            "review_status", np.full(n_neurons, ReviewStatus.PENDING, dtype=np.uint8)
+        result = read_assignments_source(
+            self.path,
+            self.source_config.get_fields_to_load(),
+            load_data=True,
         )
 
-        self._deserialize_manipulation_ids(data["curation"].get("manipulation_id"))
-        self._deserialize_manipulations(data["curation"].get("manipulations", {}))
+        if result["problems"]:
+            raise ValueError("\n\n".join(result["problems"]))
+
+        self.register_data(**result["data"])
+
+    def register_data(self, **data):
+        ids = data.get("assignments", {}).get("ids")
+
+        if ids is None:
+            raise ValueError("The required assignments.ids field was not loaded.")
+
+        ids = np.asarray(ids)
+
+        if ids.ndim != 2:
+            raise ValueError(
+                "Assignments IDs must be a two-dimensional array "
+                f"(neurons × sessions); received shape {ids.shape}."
+            )
+
+        if ids.dtype.kind not in "iuf":
+            raise ValueError(
+                f"Assignments IDs must be numeric; received dtype {ids.dtype}."
+            )
+
+        if np.isinf(ids).any():
+            raise ValueError(
+                "Assignments IDs contain infinite values. "
+                "Use NaN or -1 for unmatched entries."
+            )
+
+        finite = np.isfinite(ids)
+        values = ids[finite]
+
+        if np.any(values != np.floor(values)) or np.any(values < -1):
+            raise ValueError(
+                "Assignments IDs must be non-negative integers. "
+                "Use NaN or -1 for unmatched entries. "
+                "Check the selected field and its indexing convention."
+            )
+
+        # CATAN stores IDs as signed integers; reserve -1 for unmatched entries.
+        if values.size and np.any(values >= float(2**63)):
+            raise ValueError("Assignments IDs exceed the supported integer range.")
+
+        self.ids = np.where(finite, ids, -1).astype(np.int64)
+        n_neurons, n_sessions = self.ids.shape
+
+        stats = data.get("stats") or {}
+        if not isinstance(stats, dict):
+            raise ValueError("Assignment statistics must be a dictionary.")
+
+        # Supply the normal defaults when an external file contains only IDs.
+        self.stats = {
+            "p_matched": np.broadcast_to(
+                np.array([1.0, np.nan]),
+                (n_neurons, n_sessions, 2),
+            ).copy(),
+            "shifts": np.zeros((n_neurons, n_sessions, 2), dtype=float),
+            "fp_corr": np.ones((n_neurons, n_sessions), dtype=float),
+        }
+
+        for name, values in stats.items():
+            if values is None:
+                continue
+
+            values = np.asarray(values)
+            if values.ndim < 2 or values.shape[:2] != self.ids.shape:
+                raise ValueError(
+                    f"Statistic {name!r} has shape {values.shape}; "
+                    f"its first two dimensions must match IDs {self.ids.shape}."
+                )
+
+            self.stats[name] = values
+
+        self.matched_status = np.any(self.ids >= 0, axis=0)
+
+        curation = data.get("curation") or {}
+        review_status = curation.get("review_status")
+
+        if review_status is None:
+            review_status = np.full(n_neurons, ReviewStatus.PENDING, dtype=np.uint8)
+        else:
+            review_status = np.asarray(review_status)
+            if review_status.shape != (n_neurons,):
+                raise ValueError(
+                    "Saved review status does not match the assignments: "
+                    f"shape {review_status.shape}, expected {(n_neurons,)}."
+                )
+
+        self.review_status = review_status
+        self._deserialize_manipulation_ids(curation.get("manipulation_id"))
+        self._deserialize_manipulations(curation.get("manipulations") or {})
 
         self.status["loaded"] = True
 
-    def save(
-        self,
-        path: str | Path,
-        fields_to_save: dict[str, dict[str, FieldSpec]] | None = None,
-        *,
-        mat_version: Literal["pre73", "7.3"] = "7.3",
-    ) -> None:
+    def prepare_save(self, fields_to_save=None):
 
         fields_to_save = fields_to_save or LoadConfig.fields_from_resource(
             NATIVE_ASSIGNMENTS_CONFIG,
@@ -382,12 +444,25 @@ class Assignments:
             },
         }
 
+        return deepcopy(
+            {
+                "data": save_data,
+                "fields": fields_to_save,
+                "attributes": {
+                    "object_type": "AssignmentsData",
+                    "format_version": 1,
+                },
+            }
+        )
+
+    def save(self, path, fields_to_save=None, *, mat_version="7.3"):
+        prepared = self.prepare_save(fields_to_save)
         save_file(
             path,
-            save_data,
-            fields_to_save,
+            prepared["data"],
+            prepared["fields"],
             mat_version=mat_version,
-            root_attributes={"object_type": "AssignmentsData", "format_version": 1},
+            root_attributes=prepared["attributes"],
             root="/",
         )
 

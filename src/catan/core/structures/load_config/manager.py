@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from importlib.resources import files
 from pathlib import Path
-import json
+import json, os
 from typing import Literal, Tuple
 
 from .config import LoadConfig
 from catan.core.io.types import FileFormat, SourceTypes
 from catan.core.io.detection import detect_file_format
+from catan.core.io.isolated_read import read_operation
 
 
 class LoadConfigManager:
@@ -41,6 +42,7 @@ class LoadConfigManager:
         self.config_paths: dict[str, Path] = {}
         self._packaged_configs: dict[str, LoadConfig] = {}
         self._hidden_builtins: set[str] = self._load_hidden_builtins()
+        self._file_formats = {}
 
         self._inspector = None
 
@@ -194,9 +196,11 @@ class LoadConfigManager:
         self,
         path: str | Path,
         source_type: SourceTypes,
+        *,
+        ctx=None,
     ) -> LoadConfig | None:
 
-        fmt = detect_file_format(path)
+        fmt = self.resolve_file_format(path, ctx=ctx)
 
         # 1. Previous config for this format
         previous = self.last_used_configs.get((source_type, fmt))
@@ -211,15 +215,6 @@ class LoadConfigManager:
             return default.copy_for_session()
 
         return None
-
-    # def get_default(self,
-    #     file_format: FileFormat,
-    #     source_type: SourceTypes
-    # ) -> LoadConfig | None:
-    #     return self.default_for(
-    #         file_format=file_format,
-    #         source_type=source_type,
-    #     )
 
     def default_for(
         self, file_format: FileFormat, source_type: SourceTypes
@@ -339,6 +334,47 @@ class LoadConfigManager:
 
         self.default_configs = defaults
 
+    @staticmethod
+    def _format_cache_key(path):
+        # Pure path manipulation: no access to the source filesystem.
+        return os.path.normcase(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+    def remember_file_format(self, path, file_format):
+        self._file_formats[self._format_cache_key(path)] = file_format
+
+    def known_file_format(self, path):
+        """Return a format without opening or inspecting the source."""
+        if path is None:
+            return None
+
+        if Path(path).suffix.lower() != ".mat":
+            # Safe after the redundant Zarr directory check was removed.
+            return detect_file_format(path)
+
+        return self._file_formats.get(self._format_cache_key(path))
+
+    def resolve_file_format(self, path, *, ctx=None):
+        """Inspect only formats whose subtype cannot be inferred from the suffix."""
+        file_format = self.known_file_format(path)
+
+        if file_format is not None:
+            return file_format
+
+        # None means "use the source-type fallback" for unsaved objects,
+        # directory placeholders, and unsupported extensions.
+        # Only .mat needs file access to distinguish its two formats.
+        if path is None or Path(path).suffix.lower() != ".mat":
+            return None
+
+        file_format = read_operation(
+            "format",
+            path,
+            ctx=ctx,
+            timeout=60.0,
+        )
+        self.remember_file_format(path, file_format)
+        return file_format
+
     def is_registered(
         self,
         config: LoadConfig | str,
@@ -357,10 +393,10 @@ class LoadConfigManager:
         path: str,  # | Path | FileFormat,
         config: LoadConfig,
     ) -> bool:
-        # if isinstance(path, (str, Path)):
-        file_format = detect_file_format(path)
-        # else:
-        #     file_format = path
+
+        file_format = self.known_file_format(path)
+        if file_format is None:
+            return False
 
         uid = config.preset_uid if isinstance(config, LoadConfig) else config
 

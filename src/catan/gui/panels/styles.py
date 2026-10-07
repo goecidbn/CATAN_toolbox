@@ -88,46 +88,56 @@ class Styles:
         values: np.ndarray | float = 0.7,
         **kwargs,
     ):
-        if not isinstance(values, np.ndarray):
-            values = np.asarray(values, dtype=np.float32)
-
-        colors = kwargs.get("colors", None)
-        alpha = kwargs.get("alpha", None)
+        colors = kwargs.get("colors")
+        alpha = kwargs.get("alpha")
+        style_alpha = self.opts[style]["alpha"] if alpha is None else alpha
 
         if colors is None:
-            cmap_name = kwargs.get(
-                "cmap_name",
-                self.opts[style]["cmap"],
+            values = np.asarray(values, dtype=np.float32)
+            cmap = color.get_colormap(
+                kwargs.get("cmap_name", self.opts[style]["cmap"])
             )
-            cmap = color.get_colormap(cmap_name)
-
             color_array = np.asarray(
-                cmap.map(values),
-                dtype=np.float32,
+                cmap.map(values), dtype=np.float32
             ).copy()
-
-            color_array[..., 3] = self.opts[style]["alpha"] if alpha is None else alpha
+            color_array[..., 3] = style_alpha
 
         else:
+            # Determine whether the caller supplied per-item RGBA before
+            # ColorArray converts everything into an (N, 4) array.
+            raw = np.asarray(
+                colors.rgba if hasattr(colors, "rgba") else colors
+            )
+            per_item_rgba = (
+                raw.ndim == 2
+                and raw.shape[-1] == 4
+                and raw.dtype.kind in "fiu"
+            )
+
+            if raw.ndim == 2 and raw.shape[0] == 0:
+                return np.empty((0, 4), dtype=np.float32)
+
+            # Supports "white", hex strings, RGB, RGBA, and color arrays.
             color_array = np.asarray(
-                colors,
+                color.ColorArray(colors).rgba,
                 dtype=np.float32,
             ).copy()
 
-            # Preserve alpha only for per-item RGBA.
-            per_item_rgba = color_array.ndim == 2 and color_array.shape[-1] == 4
+            if not per_item_rgba or alpha is not None:
+                color_array[..., 3] = style_alpha
 
-            if not per_item_rgba:
-                # Single color -> stylesheet still controls alpha.
-                color_array[..., 3] = (
-                    self.opts[style]["alpha"] if alpha is None else alpha
-                )
+            # Preserve the previous single-numeric-color return shape.
+            if isinstance(colors, str) or (
+                raw.ndim == 1 and raw.dtype.kind in "fiu"
+            ):
+                color_array = color_array[0]
 
-            elif alpha is not None:
-                # Explicit alpha always wins.
-                color_array[..., 3] = alpha
-
-        return color_array.astype(np.float32)
+        color_array[..., 3] = np.clip(
+            color_array[..., 3] * kwargs.get("alpha_scale", 1.0),
+            0.0,
+            1.0,
+        )
+        return color_array
 
     def get_plot_options(
         self,

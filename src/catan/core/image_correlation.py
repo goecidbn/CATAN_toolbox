@@ -1,7 +1,7 @@
 from typing import Tuple
 import numpy as np
 
-from scipy import signal
+from scipy import signal, sparse
 from scipy.signal import fftconvolve
 
 from .utils import crop_to_common_bbox
@@ -18,6 +18,8 @@ def calculate_img_correlation(
     mode="cosine_union",
     **kwargs,
 ):
+    A1 = _as_dense_image(A1, dims)
+    A2 = _as_dense_image(A2, dims)
 
     if shift:
         ## try with binary and continuous
@@ -32,8 +34,8 @@ def calculate_img_correlation(
                 A2 = A2 > np.median(A2_nnz)
 
         # t_start = time.time()
-        A1 = A1.reshape(dims) if not np.all(A1.shape == dims) else A1
-        A2 = A2.reshape(dims) if not np.all(A2.shape == dims) else A2
+        # A1 = A1.reshape(dims) if not np.all(A1.shape == dims) else A1
+        # A2 = A2.reshape(dims) if not np.all(A2.shape == dims) else A2
         # t_end = time.time()
         # print('reshaping --- time taken: %5.3g'%(t_end-t_start))
 
@@ -49,10 +51,9 @@ def calculate_img_correlation(
             C_max, C_zscored, img_shift = _from_correlation(A1, A2)
 
         elif mode == "cosine_union":
-            C_max, C_zscored, img_shift = _from_cosine_union(
-                A1, A2, **kwargs
-            )
-
+            C_max, C_zscored, img_shift = _from_cosine_union(A1, A2, **kwargs)
+        elif mode == "cosine_weighted":
+            C_max, C_zscored, img_shift = _from_weighted_cosine(A1, A2, **kwargs)
         elif mode in ("cosine", "pearson"):
             score_map = calculate_shift_score_map(
                 A1,
@@ -88,11 +89,51 @@ def calculate_img_correlation(
             A2 = A2.reshape(dims)[
                 extent[0, 0] : extent[1, 0], extent[0, 1] : extent[1, 1]
             ]
-        return (
-            (A1 * A2).sum() / np.sqrt((A1**2).sum() * (A2**2).sum()),
-            None,
-            None,
-        )
+
+        if A1.shape != A2.shape:
+            raise ValueError(
+                f"Images must have identical shapes; got {A1.shape} and {A2.shape}."
+            )
+
+        if A1.size == 0:
+            return np.nan, None, None
+
+        if not (np.all(np.isfinite(A1)) and np.all(np.isfinite(A2))):
+            raise ValueError("Images contain NaN or Inf values.")
+
+        if mode == "cosine_union":
+            options = dict(kwargs)
+            options["shift_optimized"] = False
+            return _from_cosine_union(A1, A2, **options)
+
+        elif mode == "cosine_weighted":
+            return _from_weighted_cosine(A1, A2, **kwargs)
+
+        elif mode in ("pearson", "correlation"):
+            x = A1.ravel() - A1.mean()
+            y = A2.ravel() - A2.mean()
+
+        elif mode == "cosine":
+            x = A1.ravel()
+            y = A2.ravel()
+
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+
+        nx = np.linalg.norm(x)
+        ny = np.linalg.norm(y)
+
+        if nx == 0.0 or ny == 0.0:
+            return np.nan, None, None
+
+        score = float(np.dot(x / nx, y / ny))
+        return score, None, None
+        # return float(np.clip(score, -1.0, 1.0)), None, None
+        # return (
+        #     (A1 * A2).sum() / np.sqrt((A1**2).sum() * (A2**2).sum()),
+        #     None,
+        #     None,
+        # )
 
 
 def _from_correlation(A1, A2, *, return_score_map=False):
@@ -150,7 +191,7 @@ def _from_cosine_union(
         robust_map = overlap_cosine_map * np.power(overlap_coeff_map, gamma)
         if return_score_map:
             return robust_map
-        
+
         return subpixel_shift_from_score_map(
             robust_map, A2.shape, window_radius=3, threshold_rel=0.1
         )
@@ -186,6 +227,48 @@ def _from_cosine_union(
             np.nan,
             (0.0, 0.0),
         )  # no shift optimization in this branch
+
+
+def _from_weighted_cosine(
+    A1,
+    A2,
+    *,
+    outside_weight=0.1,
+    reference_threshold=0.1,
+    reference_percentile=99.0,
+):
+    if not np.isfinite(outside_weight) or not 0 <= outside_weight <= 1:
+        raise ValueError("outside_weight must be between 0 and 1.")
+
+    if not np.isfinite(reference_threshold) or not 0 <= reference_threshold <= 1:
+        raise ValueError("reference_threshold must be between 0 and 1.")
+
+    if not np.isfinite(reference_percentile) or not 0 < reference_percentile <= 100:
+        raise ValueError("reference_percentile must be in (0, 100].")
+
+    # Use positive pixels: a sparse projection can have a whole-image
+    # 95th percentile of zero.
+    positive = A1[A1 > 0]
+    if positive.size == 0:
+        return np.nan, np.nan, (0.0, 0.0)
+
+    reference_scale = np.percentile(positive, reference_percentile)
+    threshold = reference_threshold * reference_scale
+    mask = (A1 > 0) & (A1 >= threshold)
+
+    sqrt_w = np.sqrt(np.where(mask, 1.0, outside_weight))
+    x = (A1 * sqrt_w).ravel()
+    y = (A2 * sqrt_w).ravel()
+
+    nx = np.linalg.norm(x)
+    ny = np.linalg.norm(y)
+
+    if nx == 0 or ny == 0:
+        return np.nan, np.nan, (0.0, 0.0)
+
+    score = float(np.dot(x / nx, y / ny))
+    return float(np.clip(score, -1.0, 1.0)), np.nan, (0.0, 0.0)
+
 
 def calculate_shift_score_map(
     A1,
@@ -253,9 +336,7 @@ def _additional_score_map(A, B, *, mode, min_overlap):
         denominator = np.sqrt(np.sum(A * A) * np.sum(B * B))
 
         if denominator > 0:
-            result[valid] = np.clip(
-                numerator[valid] / denominator, -1, 1
-            )
+            result[valid] = np.clip(numerator[valid] / denominator, -1, 1)
 
         return result
 
@@ -284,6 +365,7 @@ def _additional_score_map(A, B, *, mode, min_overlap):
     )
 
     return result
+
 
 def subpixel_shift_from_score_map(
     score_map, shape2, window_radius=2, threshold_rel=0.5
@@ -361,3 +443,26 @@ def subpixel_shift_from_score_map(
     )
 
     return score_max, score_zscored, shift
+
+
+def _as_dense_image(value, dims):
+    if sparse.issparse(value):
+        value = value.toarray()
+
+    image = np.asarray(value, dtype=np.float64)
+
+    # Individual footprints may arrive as flattened sparse columns.
+    if image.ndim == 1 or (
+        image.ndim == 2 and 1 in image.shape and image.shape != tuple(dims)
+    ):
+        if image.size != int(np.prod(dims)):
+            raise ValueError(
+                f"Flattened image has {image.size} pixels; "
+                f"expected {int(np.prod(dims))} for dims={dims}."
+            )
+        image = image.reshape(dims)
+
+    if image.ndim != 2:
+        raise ValueError(f"Expected a 2D image, got {image.shape}.")
+
+    return image

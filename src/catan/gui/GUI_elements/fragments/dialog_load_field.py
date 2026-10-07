@@ -25,8 +25,10 @@ from PySide6.QtCore import Qt
 
 from catan.core.io import resolve_source_path
 from catan.core.io.types import FieldSource
-from catan.core.io.inspection import browse_file_fields
 from catan.core.structures.load_config import FieldSpec
+
+from .file_inspection import FileInspection
+from .path_selector import choose_path
 
 
 @dataclass(frozen=True)
@@ -133,18 +135,9 @@ class FieldSelectDialog(QDialog):
 
         header = self.tree_widget.header()
 
-        header.setSectionResizeMode(
-            0,
-            QHeaderView.ResizeMode.Stretch,
-        )
-        header.setSectionResizeMode(
-            1,
-            QHeaderView.ResizeMode.ResizeToContents,
-        )
-        header.setSectionResizeMode(
-            2,
-            QHeaderView.ResizeMode.ResizeToContents,
-        )
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
 
         # self.list_widget = QListWidget()
         # self.list_widget.setSelectionMode(
@@ -165,6 +158,21 @@ class FieldSelectDialog(QDialog):
 
         self.tree_widget.itemDoubleClicked.connect(self._item_double_clicked)
 
+        self._structure = None
+        self._structure_path = None
+
+        self._ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+
+        self._inspection = FileInspection(self)
+        layout.insertWidget(layout.indexOf(self.tree_widget), self._inspection)
+
+        self._inspection.result.connect(self._on_structure_ready)
+        self._inspection.failed.connect(self._on_inspection_failed)
+        self._inspection.cancelled.connect(self._on_inspection_failed)
+        self._inspection.busy_changed.connect(self._on_inspection_busy)
+
+        self.finished.connect(lambda _result: self._inspection.invalidate())
+
         self._populate()
 
     @staticmethod
@@ -176,18 +184,13 @@ class FieldSelectDialog(QDialog):
 
         return path if path != "" else "/"
 
-    def _populate(self):
-
-        self.tree_widget.clear()
-        self.path_label.setText(f"Path: {self.current_path}")
-        fields = browse_file_fields(self.path, subpath=self.current_path)
+    def _render_fields(self, fields):
 
         selected_item = None
 
         # ---------------------------------------------------------
         # Parent directory entry
         # ---------------------------------------------------------
-
         if self.current_path != "/":
 
             item = QTreeWidgetItem(["📁  ..", "", ""])
@@ -272,6 +275,47 @@ class FieldSelectDialog(QDialog):
             self.tree_widget.setCurrentItem(selected_item)
             selected_item.setSelected(True)
             self.tree_widget.scrollToItem(selected_item)
+
+    def _populate(self):
+        self.tree_widget.clear()
+        self.path_label.setText(f"Path: {self.current_path}")
+
+        if self._structure is not None and self._structure_path == self.path:
+            self._render_fields(self._structure.children(self.current_path))
+            self.tree_widget.setEnabled(True)
+            self._ok_button.setEnabled(True)
+            return
+
+        self.tree_widget.setEnabled(False)
+        self._ok_button.setEnabled(False)
+        self._inspection.start("inspect", self.path)
+
+    def _on_structure_ready(self, structure):
+        self._structure = structure
+        self._structure_path = self.path
+
+        self.tree_widget.clear()
+        self._render_fields(structure.children(self.current_path))
+
+        self.tree_widget.setEnabled(True)
+        self._ok_button.setEnabled(True)
+
+    def _on_inspection_busy(self, busy):
+        ready = (
+            not busy
+            and self._structure is not None
+            and self._structure_path == self.path
+        )
+        self.tree_widget.setEnabled(ready)
+        self._ok_button.setEnabled(ready)
+
+    def _on_inspection_failed(self):
+        self._structure = None
+        self._structure_path = None
+
+        self.tree_widget.clear()
+        self.tree_widget.setEnabled(False)
+        self._ok_button.setEnabled(False)
 
     def _item_double_clicked(
         self,
@@ -375,11 +419,12 @@ class FieldSelectDialog(QDialog):
 
         result = dlg.exec()
 
-        if result == QDialog.DialogCode.Accepted:
-            # return dlg.current_path, dlg.selected_field
-            return dlg.selected_field
+        selection = (
+            dlg.selected_field if result == QDialog.DialogCode.Accepted else None
+        )
 
-        return None
+        dlg.deleteLater()
+        return selection
 
     def _update_source_display(self):
 
@@ -407,28 +452,43 @@ class FieldSelectDialog(QDialog):
         self._populate()
 
     def _choose_source_file(self):
-
-        start = str(Path(self.path).parent)
-
-        path, _ = QFileDialog.getOpenFileName(self, "Select field source", start)
-
-        if not path:
-            return
-
-        self._set_source(path)
-
-    def _choose_source_directory(self):
-
-        start = str(Path(self.path).parent)
-
-        path = QFileDialog.getExistingDirectory(
-            self, "Select field source directory", start
+        path = choose_path(
+            self,
+            init_path=str(Path(self.path).parent),
+            display_text="Select field source",
+            file_filters=[
+                (
+                    "Data and images",
+                    (
+                        "*.hdf5",
+                        "*.h5",
+                        "*.mat",
+                        "*.npz",
+                        "*.png",
+                        "*.jpg",
+                        "*.jpeg",
+                        "*.tif",
+                        "*.tiff",
+                        "*.bmp",
+                    ),
+                ),
+                ("All files", ("*",)),
+            ],
         )
 
-        if not path:
-            return
+        if path is not None:
+            self._set_source(path)
 
-        self._set_source(path)
+    def _choose_source_directory(self):
+        path = choose_path(
+            self,
+            pick_dir=True,
+            init_path=str(Path(self.path).parent),
+            display_text="Select field source directory",
+        )
+
+        if path is not None:
+            self._set_source(path)
 
     def _revert_source(self):
         self._set_source(None)

@@ -1,9 +1,19 @@
 from pathlib import Path
 from typing import Optional
-from PySide6.QtWidgets import (
-    QLineEdit,
-    QFileDialog,
-)
+
+from PySide6.QtWidgets import QLineEdit
+
+from .guarded_path_dialog import GuardedPathDialog
+
+
+def _find_state(parent):
+    widget = parent
+    while widget is not None:
+        state = getattr(widget, "state", None)
+        if state is not None and callable(getattr(state, "issue", None)):
+            return state
+        widget = widget.parentWidget()
+    return None
 
 
 def choose_path(
@@ -14,31 +24,62 @@ def choose_path(
     edit_line: Optional[QLineEdit] = None,
     display_text: str = "Select file",
     only_existing: bool = True,
+    *,
+    state=None,
+    file_filters=None,
+    default_suffix="",
+    default_filename="",
 ) -> Optional[str]:
-    if pick_dir:
-        path = QFileDialog.getExistingDirectory(
-            parent=parent,
-            caption=display_text,
-            dir=init_path,  # initial directory ("" = current)
-            options=QFileDialog.Option.DontUseNativeDialog,
-        )
-    else:
-        opts = dict(
-            parent=parent,
-            caption=display_text,
-            dir=init_path,  # initial directory ("" = current)
-            filter="HDF5 files (*.hdf5 *.h5);;MATLAB files (*.mat);;All files (*)",
-            options=QFileDialog.Option.DontUseNativeDialog,
-        )
-        if only_existing:
-            path, _ = QFileDialog.getOpenFileName(**opts)
-        else:
-            path, _ = QFileDialog.getSaveFileName(**opts)
-    if not path:
-        return
+    if file_filters is None:
+        file_filters = [
+            (
+                "Supported files",
+                (
+                    "*.hdf5",
+                    "*.h5",
+                    "*.mat",
+                    "*.npz",
+                    "*.json",
+                    "*.png",
+                    "*.jpg",
+                    "*.jpeg",
+                    "*.tif",
+                    "*.tiff",
+                    "*.bmp",
+                ),
+            ),
+            ("HDF5 files", ("*.hdf5", "*.h5")),
+            ("MATLAB files", ("*.mat",)),
+            ("CATAN loading recipe", ("*.json",)),
+            ("All files", ("*",)),
+        ]
 
-    if path and edit_line is not None:
-        relative_path = str(Path(path).relative_to(init_path)) if only_tail else path
-        edit_line.setText(relative_path)
-    elif path:
-        return path
+    path = GuardedPathDialog.get_path(
+        parent,
+        title=display_text,
+        initial_path=init_path,
+        pick_dir=pick_dir,
+        only_existing=only_existing,
+        file_filters=file_filters,
+        state=state if state is not None else _find_state(parent),
+        default_suffix=default_suffix,
+        default_filename=default_filename,
+    )
+
+    if path is None:
+        return None
+
+    if edit_line is not None:
+        if only_tail:
+            try:
+                displayed = str(Path(path).relative_to(init_path))
+            except ValueError:
+                # Selection outside the initial folder remains valid.
+                displayed = path
+        else:
+            displayed = path
+
+        edit_line.setText(displayed)
+        return None
+
+    return path

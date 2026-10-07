@@ -2,21 +2,22 @@ from pathlib import Path
 
 import numpy as np
 
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QImage, QImageWriter
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QLabel,
-    QMessageBox,
     QSpinBox,
     QStyle,
     QToolButton,
     QCheckBox,
 )
+
+from catan.gui.background_tasks.file_writes import save_bytes_task
+from .path_selector import choose_path
 
 from .ResetViewButton import OVERLAY_BUTTON_STYLE
 
@@ -128,65 +129,40 @@ class SaveDisplayButton(QToolButton):
             return
 
         width_mm, dpi, transparent = options
+        state = self.canvas.state
 
         last_directory = self.settings.value("export/last_directory", "", type=str)
         directory = Path(
             last_directory or self.get_directory() or Path.home()
         ).expanduser()
 
-        if not directory.is_dir():
-            directory = Path(self.get_directory() or Path.home()).expanduser()
-
-        if not directory.is_dir():
-            directory = Path.home()
-
-        dialog = QFileDialog(self.canvas.native, "Save plot image")
-        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        # Confirm explicitly below, using the final selected filename.
-        dialog.setOption(QFileDialog.Option.DontConfirmOverwrite, True)
-        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
-        dialog.setDirectory(str(directory))
-
-        filters = ["PNG image (*.png)"]
+        filters = [("PNG image", ("*.png",))]
         if not transparent:
-            filters.append("JPEG image (*.jpg *.jpeg)")
-        dialog.setNameFilters(filters)
+            filters.append(("JPEG image", ("*.jpg", "*.jpeg")))
 
-        dialog.setDefaultSuffix("png")
-        dialog.selectFile(self.filename)
-
-        dialog.filterSelected.connect(
-            lambda selected: dialog.setDefaultSuffix(
-                "jpg" if selected.startswith("JPEG") else "png"
-            )
+        filename = choose_path(
+            self,
+            init_path=str(directory),
+            display_text="Save plot image",
+            only_existing=False,
+            default_suffix="png",
+            file_filters=filters,
+            state=state,
+            default_filename=self.filename,
         )
-
-        accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        filename = dialog.selectedFiles()[0] if accepted else None
-        dialog.deleteLater()
-
         if filename is None:
             return
 
         path = Path(filename)
 
         try:
-            if path.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+            suffix = path.suffix.lower()
+
+            if suffix not in (".png", ".jpg", ".jpeg"):
                 raise ValueError("Use a .png, .jpg, or .jpeg filename.")
 
-            if transparent and path.suffix.lower() != ".png":
+            if transparent and suffix != ".png":
                 raise ValueError("Transparent export requires a .png filename.")
-
-            if path.exists():
-                answer = QMessageBox.question(
-                    self.canvas.native,
-                    "Replace existing image?",
-                    f"The file already exists:\n{path}\n\nReplace it?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
 
             canvas_width, canvas_height = self.canvas.size
             if canvas_width <= 0 or canvas_height <= 0:
@@ -201,7 +177,8 @@ class SaveDisplayButton(QToolButton):
                     "Reduce the print width or DPI."
                 )
 
-            # Render the VisPy scene, excluding all Qt overlay widgets.
+            # Rendering stays on the GUI thread, using the existing
+            # VisPy/OpenGL context.
             pixels = np.ascontiguousarray(
                 self.canvas.render(
                     size=(pixels_x, pixels_y),
@@ -230,22 +207,51 @@ class SaveDisplayButton(QToolButton):
             image.setDotsPerMeterX(dots_per_meter)
             image.setDotsPerMeterY(dots_per_meter)
 
-            writer = QImageWriter(str(path))
-            if path.suffix.lower() in (".jpg", ".jpeg"):
-                writer.setQuality(95)
+            # Encode in memory: QImageWriter never opens the destination.
+            encoded = QByteArray()
+            buffer = QBuffer(encoded)
 
-            if not writer.write(image):
-                raise OSError(writer.errorString())
+            if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError("Could not allocate the image export buffer.")
 
-            self.settings.setValue("export/last_directory", str(path.parent.resolve()))
+            try:
+                image_type = b"png" if suffix == ".png" else b"jpg"
+                writer = QImageWriter(buffer, image_type)
 
-            self.settings.setValue("export/width_mm", width_mm)
-            self.settings.setValue("export/dpi", dpi)
-            self.settings.setValue("export/transparent", transparent)
+                if image_type == b"jpg":
+                    writer.setQuality(95)
+
+                if not writer.write(image):
+                    raise OSError(writer.errorString())
+
+                payload = bytes(encoded)
+            finally:
+                buffer.close()
 
         except Exception as exc:
-            QMessageBox.warning(
-                self.canvas.native,
+            state.issue(
+                "warning",
                 "Plot export failed",
                 str(exc),
+                parent=self.window(),
             )
+            return
+
+        # Capture the settings object rather than the button in the callback.
+        settings = self.settings
+
+        def saved(_result):
+            settings.setValue("export/last_directory", str(path.parent))
+            settings.setValue("export/width_mm", width_mm)
+            settings.setValue("export/dpi", dpi)
+            settings.setValue("export/transparent", transparent)
+
+        state.tasks.start(
+            "saving",
+            f"Saving plot image: {path.name}",
+            save_bytes_task,
+            state,
+            str(path),
+            payload,
+            on_result=saved,
+        )

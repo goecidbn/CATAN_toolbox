@@ -38,6 +38,7 @@ class FieldSpec:
     # Relative path:    resolve relative to the primary source directory.
     # Absolute path:    use exactly this source.
     source_path: str | None = None
+    exposed: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -46,6 +47,7 @@ class FieldSpec:
             "attribute": self.attribute,
             "required": self.required,
             "source_path": self.source_path,
+            "exposed": self.exposed,
         }
 
     @classmethod
@@ -56,6 +58,7 @@ class FieldSpec:
             attribute=data.get("attribute"),
             required=data.get("required", False),
             source_path=data.get("source_path"),
+            exposed=data.get("exposed", True),
         )
 
 
@@ -65,6 +68,7 @@ class FieldGroupSpec:
     type: GroupType
     fields: dict[str, FieldSpec] = field(default_factory=dict)
     enabled: bool = True
+    exposed: bool = True
 
     def add_field(self, name: str, spec: FieldSpec) -> None:
         if self.type != "dynamic":
@@ -102,6 +106,7 @@ class FieldGroupSpec:
             "title": self.title,
             "type": self.type,
             "enabled": self.enabled,
+            "exposed": self.exposed,
             "fields": {name: spec.to_dict() for name, spec in self.fields.items()},
         }
 
@@ -111,6 +116,7 @@ class FieldGroupSpec:
             title=data["title"],
             type=data["type"],
             enabled=data.get("enabled", True),
+            exposed=data.get("exposed", True),
             fields={
                 name: FieldSpec.from_dict(spec)
                 for name, spec in data.get("fields", {}).items()

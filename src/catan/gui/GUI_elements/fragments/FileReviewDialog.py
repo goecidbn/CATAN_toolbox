@@ -52,6 +52,7 @@ class SessionListWidget(QListWidget):
 
         super().keyPressEvent(event)
 
+
 class GlobReviewDialog(QDialog):
     def __init__(
         self,
@@ -74,14 +75,12 @@ class GlobReviewDialog(QDialog):
         self.list_widget = SessionListWidget()
 
         # Enable manual drag-and-drop reordering
-        self.list_widget.setDragDropMode(
-            QAbstractItemView.DragDropMode.InternalMove
-        )
-        self.list_widget.setDefaultDropAction(
-            Qt.DropAction.MoveAction
-        )
+        self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
 
-        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_widget.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
 
         for path in self._original_paths:
             self._add_path(path)
@@ -111,8 +110,7 @@ class GlobReviewDialog(QDialog):
         controls.addWidget(remove_button)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
 
         buttons.accepted.connect(self.accept)
@@ -138,9 +136,7 @@ class GlobReviewDialog(QDialog):
 
     def paths(self) -> list[Path]:
         return [
-            self.common_path / self.list_widget.item(i).data(
-                Qt.ItemDataRole.UserRole
-            )
+            self.common_path / self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(self.list_widget.count())
         ]
 
@@ -160,7 +156,7 @@ class GlobReviewDialog(QDialog):
 
     def reset_order(self) -> None:
         self._replace_paths(self._original_paths)
-    
+
     def move_item(self, from_row: int, to_row: int) -> None:
 
         if from_row < 0 or from_row >= self.list_widget.count():
@@ -188,6 +184,65 @@ class GlobReviewDialog(QDialog):
         self._update_info()
 
     def _update_info(self) -> None:
-        self.info_label.setText(
-            f"{self.list_widget.count()} files selected."
+        self.info_label.setText(f"{self.list_widget.count()} files selected.")
+
+
+class RecipeReviewDialog(QDialog):
+    """Select recipe entries while preserving their original order."""
+
+    def __init__(self, rows, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select sessions from loading recipe")
+        self.resize(850, 500)
+
+        layout = QVBoxLayout(self)
+
+        explanation = QLabel(
+            "Choose sessions to load. Existing sessions are reused, "
+            "with their current configuration and loaded data retained."
         )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget)
+
+        for index, row in enumerate(rows):
+            item = QListWidgetItem(f"{row['name']} — {row['status']}\n{row['path']}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if row["checked"] else Qt.CheckState.Unchecked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setToolTip(row["path"])
+            self.list_widget.addItem(item)
+
+        controls = QHBoxLayout()
+        select_all = QPushButton("Select all")
+        select_none = QPushButton("Select none")
+        select_all.clicked.connect(lambda: self._set_all(True))
+        select_none.clicked.connect(lambda: self._set_all(False))
+        controls.addWidget(select_all)
+        controls.addWidget(select_none)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Load selected")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_all(self, checked):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for index in range(self.list_widget.count()):
+            self.list_widget.item(index).setCheckState(state)
+
+    def selected_indices(self):
+        return [
+            self.list_widget.item(index).data(Qt.ItemDataRole.UserRole)
+            for index in range(self.list_widget.count())
+            if self.list_widget.item(index).checkState() == Qt.CheckState.Checked
+        ]

@@ -120,6 +120,7 @@ def check_fields_compatibility(
     *,
     root: str = "/",
     refresh: bool = False,
+    raise_source_errors: bool = False,
 ) -> MultiSourceCompatibilityReport:
 
     primary_path = Path(primary_path)
@@ -150,6 +151,8 @@ def check_fields_compatibility(
                 reason = None if available else "Configured path is not available"
 
             except Exception as exc:
+                if raise_source_errors:
+                    raise
 
                 available = False
                 reason = f"{type(exc).__name__}: {exc}"

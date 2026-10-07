@@ -20,12 +20,20 @@ def center_of_mass(
         A = sparse.csc_matrix(A)
 
     if d3 is None:
+        if A.shape[0] != d1 * d2:
+            raise ValueError(
+                f"Footprints have {A.shape[0]} pixels; " f"expected {d1 * d2}."
+            )
+
+        if A.shape[1] == 0:
+            return np.empty((0, 2), dtype=float)
+
         Coor = np.matrix(
             [
-                np.outer(np.ones(d2), np.arange(d1)).ravel(),
-                np.outer(np.arange(d2), np.ones(d1)).ravel(),
+                np.tile(np.arange(d2), d1),  # x
+                np.repeat(np.arange(d1), d2),  # y
             ],
-            dtype=A.dtype,
+            dtype=np.float64,
         )
     else:
         Coor = np.matrix(

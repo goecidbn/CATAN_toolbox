@@ -1,8 +1,16 @@
 from typing import Optional
 from unicodedata import name
 
+import pickle
+import traceback
+import os, re
+from copy import deepcopy
+from shiboken6 import isValid
+import numpy as np
+from pathlib import Path
+
 from PySide6.QtCore import QSize, QTimer, Qt, Signal, QPoint
-from PySide6.QtGui import QColor, QAction
+from PySide6.QtGui import QColor, QAction, QActionGroup, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -25,22 +33,26 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QWidgetAction,
     QSizePolicy,
+    QFileDialog,
 )
 
-from shiboken6 import isValid
-import numpy as np
-from pathlib import Path
 
 from catan.core.changes import (
     ChangeKind as C,
     DataChange,
     SESSION_STRUCTURE_CHANGES,
 )
-from catan.gui.structures import AppState, Data, SessionData
 from catan.core.structures import sessiondata_type
 from catan.core.structures.load_config import FieldSpec
 from catan.core.io import resolve_source_path
+from catan.core.io.isolated_read import read_operation
 
+from catan.gui.structures import AppState, Data, SessionData
+from catan.gui.background_tasks.TaskManager import TaskBatch
+from catan.gui.background_tasks.runtime import current_task_context
+
+
+from .fragments.FileReviewDialog import RecipeReviewDialog
 from .fragments import (
     FieldConfigConstructor,
     GlobReviewDialog,
@@ -48,7 +60,6 @@ from .fragments import (
     set_button_icon,
     choose_path,
 )
-
 from .fragments.dialog_load_field import (
     FieldSelectDialog,
     FieldSelection,
@@ -57,6 +68,7 @@ from .fragments.manual_alignment_dialog import (
     open_manual_alignment,
     select_alignment_draft,
 )
+from .fragments.file_inspection import FileInspection
 
 
 class SessionRowWidget(QFrame):
@@ -232,7 +244,6 @@ class SessionRowWidget(QFrame):
 
         layout.addWidget(self.config_constructor.toggle_config_options)
         stacked_layout.addLayout(layout)
-        stacked_layout.addWidget(self.config_constructor.config_options)
 
         self.refresh(current=current)
 
@@ -665,11 +676,18 @@ class SessionRowWidget(QFrame):
             "Change color…", lambda: self.changeColorRequested.emit(self.index)
         )
 
-        if self.session.status["spatial_loaded"]:
-            menu.addAction(
-                "Change background…",
-                lambda: (self.backgroundRequested.emit(self.index)),
-            )
+        spatial_loaded = self.session.status["spatial_loaded"]
+
+        menu.addAction(
+            (
+                "Change background…"
+                if spatial_loaded
+                else "Select background and load spatial data…"
+            ),
+            lambda: self.backgroundRequested.emit(self.index),
+        )
+
+        if spatial_loaded:
             menu.addAction(
                 "Adjust alignment…",
                 lambda: self.manualAlignmentRequested.emit(self.index),
@@ -711,6 +729,9 @@ class RegistrationActionMenu(QMenu):
 class RegistrationActionSelector(QToolButton):
 
     actionsChanged = Signal(object)
+    backgroundOrientationChanged = Signal(str)
+
+    BACKGROUND_ORIENTATION_KEY = "session_registration/background_orientation"
 
     SETTINGS_KEY = "session_registration/actions"
 
@@ -744,6 +765,33 @@ class RegistrationActionSelector(QToolButton):
 
             self.menu.addAction(action)
             self._actions[key] = action
+
+        self.menu.addSeparator()
+        orientation_menu = self.menu.addMenu("Background orientation")
+
+        self._orientation_group = QActionGroup(self)
+        self._orientation_group.setExclusive(True)
+        self._orientation_actions = {}
+
+        saved = self.settings.value(self.BACKGROUND_ORIENTATION_KEY, "auto")
+        if saved not in {"auto", "as_stored", "transpose"}:
+            saved = "auto"
+
+        for value, label in (
+            ("auto", "Automatic"),
+            ("as_stored", "As stored — skip detection"),
+            ("transpose", "Transpose — skip detection"),
+        ):
+            action = orientation_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(value)
+            self._orientation_group.addAction(action)
+            self._orientation_actions[value] = action
+            action.setChecked(value == saved)
+
+        self._orientation_group.triggered.connect(
+            self._on_background_orientation_changed
+        )
 
         self._restore()
         self._update_text()
@@ -787,6 +835,16 @@ class RegistrationActionSelector(QToolButton):
         self._save()
 
         self.actionsChanged.emit(self.actions)
+
+    @property
+    def background_orientation(self):
+        action = self._orientation_group.checkedAction()
+        return action.data() if action is not None else "auto"
+
+    def _on_background_orientation_changed(self, action):
+        value = action.data()
+        self.settings.setValue(self.BACKGROUND_ORIENTATION_KEY, value)
+        self.backgroundOrientationChanged.emit(value)
 
     def _set_checked_silent(self, key, checked):
 
@@ -853,6 +911,7 @@ class RegistrationActionSelector(QToolButton):
 
 class LoadSessionRowWidget(QFrame):
     loadRequested = Signal()
+    loadConfigRequired = Signal(int)
 
     def __init__(self, parent: "SessionOverview"):
         super().__init__(parent)
@@ -871,6 +930,51 @@ class LoadSessionRowWidget(QFrame):
         layout.setSpacing(3)
 
         root_layout.addLayout(layout)
+
+        self._loading_check = None
+        self._loading_status_batch = None
+        self._loading_had_error = False
+        self._loading_status_task_ids = set()
+
+        self.loading_status = QWidget(self)
+        status_layout = QVBoxLayout(self.loading_status)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(3)
+
+        self.loading_status_title = QLabel()
+        self.loading_status_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.loading_status_title.setWordWrap(True)
+        status_layout.addWidget(self.loading_status_title)
+
+        self.loading_inspection = FileInspection(self.loading_status)
+        self.loading_inspection.message_formatter = self._format_loading_message
+        status_layout.addWidget(self.loading_inspection)
+
+        self.loading_status_title.setText("Ready for loading further session data")
+        self.loading_inspection.hide()
+        self.loading_status.show()
+        root_layout.addWidget(self.loading_status)
+
+        self.loading_inspection.result.connect(self._on_loading_inspected)
+        self.loading_inspection.failed.connect(self._on_loading_inspection_failed)
+        self.loading_inspection.cancelled.connect(self._cancel_inline_loading)
+
+        tasks = self.state.tasks
+        tasks.task_started.connect(self._on_loading_task_started)
+        tasks.task_message.connect(self._on_loading_task_message)
+        tasks.task_failed.connect(self._on_loading_task_failed)
+        tasks.scheduling_settled.connect(self._refresh_loading_status)
+
+        # Do not leave a queue hold behind if this widget is destroyed.
+        self._loading_lifetime = {"batch": None}
+        lifetime = self._loading_lifetime
+        self.destroyed.connect(
+            lambda *_: (
+                tasks.cancel_batch(lifetime["batch"])
+                if lifetime["batch"] is not None
+                else None
+            )
+        )
 
         load_button = make_icon_button(
             "plus", tooltip="Register new session data…", icon_size=30
@@ -892,9 +996,32 @@ class LoadSessionRowWidget(QFrame):
         )
 
         self.edit_load_glob = QLineEdit(
-            "Session0*/neuron*", placeholderText="Enter glob pattern"
+            str(
+                parent.settings.value(
+                    "session_registration/glob_pattern",
+                    "Session0*/neuron*",
+                )
+                or ""
+            ),
+            placeholderText="Enter glob pattern",
+        )
+
+        self.edit_load_glob.textChanged.connect(
+            lambda text: parent.settings.setValue(
+                "session_registration/glob_pattern", text
+            )
         )
         self.edit_load_glob.setTextMargins(6, 6, 6, 6)
+
+        self._load_shortcuts = []
+
+        for widget in (self.selector_load_mode, self.edit_load_glob):
+            for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                shortcut = QShortcut(QKeySequence(key), widget)
+                shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+                shortcut.setAutoRepeat(False)
+                shortcut.activated.connect(load_button.click)
+                self._load_shortcuts.append(shortcut)
 
         layout.addWidget(self.edit_load_glob, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addStretch()
@@ -907,15 +1034,30 @@ class LoadSessionRowWidget(QFrame):
         self.button_save_sessions = make_icon_button(
             "floppy-disk", tooltip=f"Save sessions data", size=28, icon_size=22
         )
-        self.button_save_sessions.setFixedWidth(35)
+        self.button_save_sessions.setFixedWidth(48)
         self.button_save_sessions.setEnabled(False)
         layout.addWidget(
             self.button_save_sessions, alignment=Qt.AlignmentFlag.AlignRight
         )
         self.button_save_sessions.clicked.connect(lambda: self.save_data("sessions"))
+        save_menu = QMenu(self.button_save_sessions)
+        save_recipe_action = save_menu.addAction("Save loading recipe (.json)…")
+        save_recipe_action.triggered.connect(self.save_loading_recipe)
+
+        self.button_save_sessions.setMenu(save_menu)
+        self.button_save_sessions.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup
+        )
 
         self.registration_action_selector = RegistrationActionSelector(
             parent.settings, parent=self
+        )
+        self.data.background_orientation = (
+            self.registration_action_selector.background_orientation
+        )
+
+        self.registration_action_selector.backgroundOrientationChanged.connect(
+            lambda value: setattr(self.data, "background_orientation", value)
         )
         root_layout.addWidget(self.registration_action_selector)
         self._remembered_background_choice = None
@@ -936,15 +1078,58 @@ class LoadSessionRowWidget(QFrame):
         save_path = choose_path(
             self,
             pick_dir=False,
-            init_path=str(Path(self.data.root) / f"catan_{key}.hdf5"),
+            init_path=str(self.data.root),
             display_text=f"Select folder to save {key} file to",
             only_existing=False,
+            default_suffix="hdf5",
+            file_filters=[
+                ("HDF5 session file", ("*.hdf5", "*.h5")),
+                ("MATLAB session file", ("*.mat",)),
+                ("NumPy session file", ("*.npz",)),
+            ],
+            state=self.state,
+            default_filename=f"catan_{key}.hdf5",
         )
         if save_path is None:
             return
 
-        # if key == "sessions":
-        self.data.save_sessions(save_path)
+        self.data.queue_save_sessions(save_path)
+
+    def save_loading_recipe(self):
+        try:
+            document = self.data.loading_recipe_snapshot()
+        except Exception as exc:
+            self.state.issue(
+                "warning",
+                "Cannot save loading recipe",
+                str(exc),
+                parent=self.window(),
+            )
+            return
+
+        path = choose_path(
+            self,
+            init_path=str(self.data.root),
+            display_text="Save loading recipe",
+            only_existing=False,
+            default_suffix="json",
+            file_filters=[
+                ("CATAN loading recipe", ("*.json",)),
+            ],
+            state=self.state,
+            default_filename="catan_loading_recipe.json",
+        )
+
+        if path is None:
+            return
+
+        self.state.tasks.start(
+            "saving",
+            "Saving loading recipe…",
+            self.data.save_loading_recipe,
+            path=path,
+            document=document,
+        )
 
     def _update_background(self):
 
@@ -959,64 +1144,84 @@ class LoadSessionRowWidget(QFrame):
             }}
             """)
 
-    def on_register_session(self):
-
-        opt = self.selector_load_mode.currentText()
-
-        if opt.lower() == "from file":
-            ## chooses automatically between loading from single detection session or from list of sessions (from hdf5 attribute)
-            path = choose_path(
-                self,
-                pick_dir=False,
-                init_path=self.data.root,
-                display_text="Select session file",
-                only_existing=True,
-            )
-            if path is None:
-                return
-            self.state.tasks.start(
-                "loading",
-                "Loading session data from file...",
-                lambda: self.data.register_session(from_file=path),
-            )
-
-        elif opt == ".* (glob)":
-            self.choose_sessions_from_glob()
-        else:
-            raise ValueError(f"Unknown option selected: {opt}")
-
     def choose_sessions_from_glob(self):
-        root = Path(self.data.root)
         pattern = self.edit_load_glob.text()
-        paths = list(root.glob(pattern))
+        if not pattern.strip():
+            self.state.issue(
+                "info",
+                "No file pattern",
+                "Enter a file pattern before searching.",
+                parent=self.window(),
+            )
+            return
 
-        # show warning / empty result dialog
+        batch = TaskBatch()
+        actions = set(self.registration_action_selector.actions)
+
+        self.state.tasks.start(
+            "loading",
+            "Searching for session files…",
+            self._discover_session_paths,
+            str(self.data.root),
+            pattern,
+            batch=batch,
+            on_result=lambda paths: self._review_glob_matches(
+                paths,
+                batch=batch,
+                actions=actions,
+            ),
+        )
+
+    @staticmethod
+    def _discover_session_paths(root, pattern):
+        return read_operation(
+            "glob",
+            root,
+            pattern=pattern,
+            ctx=current_task_context(),
+            timeout=120.0,
+            retry_hint=(
+                "No sessions were registered by this search. Restore "
+                "access to the root folder, or narrow the pattern, "
+                "then run the glob search again."
+            ),
+        )
+
+    def _review_glob_matches(self, paths, *, batch, actions):
+        if batch.cancelled:
+            return
+
         if not paths:
+            self.state.issue(
+                "info",
+                "No matching session files",
+                "No files matched the pattern. Check the root folder "
+                "and pattern, then search again.",
+                parent=self.window(),
+            )
             return
 
         dialog = GlobReviewDialog(
-            paths,
+            [Path(path) for path in paths],
             parent=self,
         )
-
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        paths = dialog.paths()
-        if paths is None:
+            self._cancel_registration_batch(batch)
             return
 
-        actions = set(self.registration_action_selector.actions)
+        if batch.cancelled:
+            return
 
-        for path in paths:
+        for path in dialog.paths():
+            if batch.cancelled:
+                break
 
-            session_ids = self.data.register_session(from_file=path)
-
-            self._on_sessions_registered(
-                session_ids,
+            self._queue_registration_path(
+                path,
+                batch=batch,
                 actions=actions,
                 force_first_session=False,
             )
-        return
 
     def _background_spec(self, session):
 
@@ -1033,50 +1238,78 @@ class LoadSessionRowWidget(QFrame):
         return spatial.fields.get("background")
 
     def _ask_background_choice(self, *, configured_available: bool):
-
-        dialog = QMessageBox(self)
-
+        dialog = QDialog(self.window())
         dialog.setWindowTitle("Background source")
 
-        if configured_available:
-            dialog.setText("Choose which background to use for this session.")
-        else:
-            dialog.setText("No configured background could be loaded for this session.")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
 
-        configured_button = None
-
-        if configured_available:
-            configured_button = dialog.addButton(
-                "Use configured background", QMessageBox.ButtonRole.AcceptRole
-            )
-
-        select_button = dialog.addButton(
-            "Select background…", QMessageBox.ButtonRole.AcceptRole
+        description = QLabel(
+            "Choose which background to use for this session."
+            if configured_available
+            else "The configured background is unavailable. "
+            "Choose another source or construct it from footprints."
         )
-
-        footprints_button = dialog.addButton(
-            "Construct from footprints", QMessageBox.ButtonRole.ActionRole
-        )
-
-        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        description.setWordWrap(True)
+        layout.addWidget(description)
 
         remember = QCheckBox("Remember choice for following sessions")
+        layout.addWidget(remember)
 
-        dialog.setCheckBox(remember)
-        dialog.exec()
+        result = {"mode": "cancel"}
+        choice_buttons = []
 
-        clicked = dialog.clickedButton()
+        def choose(mode):
+            result["mode"] = mode
+            dialog.accept()
 
-        if configured_button is not None and clicked is configured_button:
-            mode = "configured"
-        elif clicked is select_button:
-            mode = "select"
-        elif clicked is footprints_button:
-            mode = "footprints"
-        else:
-            mode = "cancel"
+        choices = []
+        if configured_available:
+            choices.append(("Use configured background", "configured"))
 
-        return mode, remember.isChecked()
+        choices.extend(
+            [
+                ("Select background…", "select"),
+                ("Construct from footprints", "footprints"),
+            ]
+        )
+
+        for text, mode in choices:
+            button = QPushButton(text)
+            button.setAutoDefault(False)
+            button.setMinimumHeight(button.fontMetrics().height() + 20)
+            button.clicked.connect(lambda _checked=False, value=mode: choose(value))
+            layout.addWidget(button)
+            choice_buttons.append(button)
+
+        cancel_row = QHBoxLayout()
+        cancel_row.addStretch()
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setAutoDefault(False)
+        cancel_button.clicked.connect(dialog.reject)
+        cancel_row.addWidget(cancel_button)
+        layout.addLayout(cancel_row)
+
+        # Account for both font scaling and the longest control label.
+        dialog.setMinimumWidth(
+            max(
+                460,
+                remember.sizeHint().width() + 40,
+                max(button.sizeHint().width() for button in choice_buttons) + 40,
+            )
+        )
+        dialog.adjustSize()
+
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            return (
+                result["mode"] if accepted else "cancel",
+                remember.isChecked() if accepted else False,
+            )
+        finally:
+            dialog.deleteLater()
 
     def _apply_background_selection(self, session, selection: FieldSelection):
 
@@ -1136,6 +1369,7 @@ class LoadSessionRowWidget(QFrame):
         *,
         load_requested: bool,
         force_prompt: bool,
+        configured_available: bool,
     ) -> str | None:
         """
         Returns
@@ -1155,9 +1389,8 @@ class LoadSessionRowWidget(QFrame):
         if session.source_config is None:
             return "configured"
 
-        configured_available = self.data.session_field_available(
-            session.id, "spatial", "background"
-        )
+        if not load_requested and not force_prompt:
+            return "configured"
 
         needs_prompt = force_prompt or (load_requested and not configured_available)
 
@@ -1225,54 +1458,399 @@ class LoadSessionRowWidget(QFrame):
         raise ValueError(f"Unknown background mode: {mode!r}")
 
     def _on_sessions_registered(
-        self, session_ids, *, actions, force_first_session=False
+        self,
+        session_ids,
+        *,
+        actions,
+        batch,
+        force_first_session=False,
     ):
-
-        if session_ids is None:
+        if batch.cancelled or session_ids is None:
             return
 
         session_ids = list(session_ids)
-        single_new_session = len(session_ids) == 1
+        if not session_ids:
+            return
 
-        for session_id in session_ids:
+        # Normally prevented by the queue hold. This also protects against
+        # another explicit load request while an inspection is pending.
+        if self._loading_check is not None:
+            self.state.tasks.start(
+                "loading",
+                "Continue session registration",
+                lambda ids=tuple(session_ids): ids,
+                on_result=lambda ids: self._on_sessions_registered(
+                    ids,
+                    actions=actions,
+                    batch=batch,
+                    force_first_session=force_first_session,
+                ),
+                batch=batch,
+            )
+            return
 
-            effective_actions = set(actions)
+        session_id = session_ids[0]
+        session = self.data.sessions[session_id]
+        effective_actions = set(actions)
+        recipe_options = deepcopy(getattr(session, "_recipe_options", None))
 
-            # First individually registered CATAN session:
-            # always load data + register to model + track,
-            # without changing the globally selected defaults.
-            if (
-                force_first_session
-                and single_new_session
-                and session_id == 0
-                and not getattr(
-                    self.data.sessions[session_id],
-                    "_restored_from_catan",
-                    False
+        if recipe_options is not None:
+            effective_actions.discard("load_all")
+            effective_actions.discard("prompt_background")
+            effective_actions.add("load_data")
+
+        elif (
+            force_first_session
+            and len(session_ids) == 1
+            and session_id == 0
+            and not getattr(session, "_restored_from_catan", False)
+        ):
+            effective_actions.update({"load_data", "register_model", "track_neurons"})
+
+        check = {
+            "session": session,
+            "remaining": session_ids[1:],
+            "original_actions": set(actions),
+            "actions": effective_actions,
+            "recipe_options": recipe_options,
+            "batch": batch,
+            "token": None,
+        }
+
+        self._loading_check = check
+        self._set_loading_status_batch(batch)
+
+        check["token"] = self.state.tasks.pause_processing(
+            "loading",
+            batch=batch,
+            on_cancel=lambda: self._discard_loading_check(check),
+        )
+
+        if self._loading_check is check:
+            self._run_loading_step(self._begin_loading_check)
+
+    def _run_loading_step(self, callback, *args):
+        """Release the queue cleanly if a GUI continuation itself fails."""
+        check = self._loading_check
+        if check is None or check["batch"].cancelled:
+            return
+
+        try:
+            callback(*args)
+        except Exception as exc:
+            details = traceback.format_exc()
+            self.state.tasks.cancel_batch(check["batch"])
+            self._remembered_background_choice = None
+
+            self.state.issue(
+                "error",
+                "Session loading stopped",
+                (
+                    f"{exc}\n\n"
+                    "Previously completed sessions have been retained. "
+                    "Check this session's load configuration and source access, "
+                    "then use its open-folder button to try again.\n\n"
+                    f"{details}"
+                ),
+                parent=self.window(),
+            )
+
+    def _loading_config_signature(self, session):
+        config = session.source_config
+        fields = (
+            config.get_fields_to_load(enabled_only=False)
+            if config is not None
+            else None
+        )
+        return pickle.dumps(
+            (
+                str(session.path),
+                fields,
+                None if config is None else config.dimensions,
+            ),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    def _begin_loading_check(self):
+        check = self._loading_check
+        session = check["session"]
+        actions = check["actions"]
+
+        load_requested = bool({"load_data", "load_all"} & actions)
+        check["load_requested"] = load_requested
+
+        if not load_requested:
+            self._begin_background_check()
+            return
+
+        if session.source_config is None:
+            self._request_load_configuration(
+                session,
+                check["batch"],
+                "No load configuration is selected.",
+            )
+            return
+
+        fields = session.source_config.get_fields_to_load(
+            enabled_only="load_all" not in actions
+        )
+        fields = self.data._missing_session_fields(session, fields)
+
+        recipe = check["recipe_options"]
+        skip_background = recipe is None or recipe["background_mode"] == "footprints"
+
+        required = {}
+        for group, specs in fields.items():
+            selected = {
+                name: spec
+                for name, spec in specs.items()
+                if spec.required
+                and not (
+                    skip_background and group == "spatial" and name == "background"
                 )
-            ):
-                effective_actions.update(
-                    {"load_data", "register_model", "track_neurons"}
+            }
+            if selected:
+                required[group] = selected
+
+        if not required:
+            self._begin_background_check()
+            return
+
+        self._start_loading_inspection(
+            "required",
+            required,
+            f"Checking required fields — {session.name}",
+        )
+
+    def _begin_background_check(self):
+        check = self._loading_check
+        session = check["session"]
+
+        # Recipes already specify how the background should be obtained.
+        if check["recipe_options"] is not None:
+            self._complete_loading_check(False)
+            return
+
+        force_prompt = "prompt_background" in check["actions"]
+
+        if (
+            session.status["spatial_loaded"]
+            or session.source_config is None
+            or not (check["load_requested"] or force_prompt)
+        ):
+            self._complete_loading_check(False)
+            return
+
+        spec = self._background_spec(session)
+
+        if session.path is None or spec is None:
+            self._complete_loading_check(False)
+            return
+
+        self._start_loading_inspection(
+            "background",
+            {"spatial": {"background": spec}},
+            f"Checking background source — {session.name}",
+        )
+
+    def _start_loading_inspection(self, stage, fields, title):
+        check = self._loading_check
+        check["stage"] = stage
+        check["signature"] = self._loading_config_signature(check["session"])
+
+        self.loading_status_title.setText(title)
+        self.loading_status.show()
+        self.loading_inspection.start(
+            "compatibility",
+            check["session"].path,
+            fields_to_load=fields,
+        )
+
+    def _on_loading_inspected(self, report):
+        self._run_loading_step(self._handle_loading_report, report)
+
+    def _handle_loading_report(self, report):
+        check = self._loading_check
+        session = check["session"]
+
+        # A user may have edited the configuration during the inspection.
+        # Never apply a report produced for an older configuration.
+        if check["signature"] != self._loading_config_signature(session):
+            self._begin_loading_check()
+            return
+
+        if check["stage"] == "dimensions":
+            if not report["ok"]:
+                self._request_load_configuration(
+                    session,
+                    check["batch"],
+                    report["message"],
                 )
+            else:
+                self._queue_dimension_checked_session()
+            return
 
-            session = self.data.sessions[session_id]
-            load_requested = bool(effective_actions & {"load_data", "load_all"})
+        if check["stage"] == "background":
+            available = bool(report.fields) and all(
+                field.available for field in report.fields
+            )
+            self._complete_loading_check(available)
+            return
 
+        missing = [field for field in report.fields if not field.available]
+
+        if missing:
+            details = "\n".join(
+                f"• {field.group}.{field.label}: {field.spec.path}"
+                + (
+                    f" (source: {field.spec.source_path})"
+                    if field.spec.source_path
+                    else ""
+                )
+                for field in missing
+            )
+
+            self._request_load_configuration(
+                session,
+                check["batch"],
+                "The selected configuration refers to required fields "
+                f"that are absent from the source:\n\n{details}",
+            )
+            return
+
+        self._begin_background_check()
+
+    def _on_loading_inspection_failed(self):
+        if self._loading_check is None:
+            return
+
+        # Keep the queue paused. FileInspection already supplies Retry,
+        # Details, and the source-specific recovery explanation.
+        self.loading_inspection.cancel_button.setEnabled(True)
+        self.loading_status_title.setText(
+            "Loading paused — restore source access and Retry, " "or Cancel this batch."
+        )
+
+    def _complete_loading_check(self, configured_available):
+        check = self._loading_check
+        session = check["session"]
+        batch = check["batch"]
+        recipe = check["recipe_options"]
+
+        if recipe is not None:
+            background_mode = recipe["background_mode"]
+        else:
             background_mode = self._prepare_background_for_registration(
                 session,
-                load_requested=load_requested,
-                force_prompt=("prompt_background" in effective_actions),
+                load_requested=check["load_requested"],
+                force_prompt=("prompt_background" in check["actions"]),
+                configured_available=configured_available,
             )
 
-            if background_mode is None:
-                continue
+        # A genuine selection dialog may have run a nested event loop.
+        if batch.cancelled or self._loading_check is not check:
+            return
 
-            self.data.queue_registration_actions(
-                session_id,
-                effective_actions,
-                background_mode=background_mode,
-                on_alignment_error=self._show_alignment_error,
+        if background_mode is None:
+            self._cancel_registration_batch(batch)
+            return
+
+        check["background_mode"] = background_mode
+
+        fields = (
+            session.source_config.get_fields_to_load(
+                enabled_only="load_all" not in check["actions"]
             )
+            if session.source_config is not None
+            else {}
+        )
+        fields = self.data._missing_session_fields(session, fields)
+
+        if check["load_requested"] and "footprints" in fields.get("spatial", {}):
+            if background_mode == "footprints":
+                fields["spatial"].pop("background", None)
+
+            check["stage"] = "dimensions"
+            check["signature"] = self._loading_config_signature(session)
+
+            self.loading_status_title.setText(
+                f"Checking image dimensions — {session.name}"
+            )
+
+            self.loading_inspection.start(
+                "dimensions",
+                session.path,
+                fields_to_load=fields,
+                dimensions=session.source_config.dimensions,
+                orientation=getattr(session, "_recipe_options", {}).get(
+                    "background_orientation",
+                    self.data.background_orientation,
+                ),
+                expected_dims=next(
+                    (
+                        tuple(other.dims)
+                        for other in self.data.sessions
+                        if other is not session and other.status["spatial_loaded"]
+                    ),
+                    None,
+                ),
+            )
+            return
+
+        self._queue_dimension_checked_session()
+
+    def _queue_dimension_checked_session(self):
+        check = self._loading_check
+        session = check["session"]
+        batch = check["batch"]
+        background_mode = check["background_mode"]
+
+        # Queue the remaining sessions first. queue_registration_actions()
+        # then prepends the current session's data load ahead of them.
+        # This preserves completed loads when a later session is cancelled.
+        remaining = tuple(check["remaining"])
+        original_actions = set(check["original_actions"])
+
+        if remaining:
+            self.state.tasks.start(
+                "loading",
+                "Continue session registration",
+                lambda ids=remaining: ids,
+                on_result=lambda ids: self._on_sessions_registered(
+                    ids,
+                    actions=original_actions,
+                    batch=batch,
+                    force_first_session=False,
+                ),
+                batch=batch,
+                prepend=True,
+            )
+
+        self.data.queue_registration_actions(
+            session.id,
+            check["actions"],
+            background_mode=background_mode,
+            on_alignment_error=self._show_alignment_error,
+            batch=batch,
+        )
+
+        token = check["token"]
+        self._discard_loading_check(check)
+        self.state.tasks.resume_processing(token)
+
+    def _discard_loading_check(self, check):
+        if self._loading_check is not check:
+            return
+
+        self._loading_check = None
+
+        if isValid(self.loading_inspection):
+            self.loading_inspection.invalidate()
+
+    def _cancel_inline_loading(self):
+        batch = self._loading_status_batch
+        if batch is not None and not batch.cancelled:
+            self._cancel_registration_batch(batch)
 
     def _show_alignment_error(self, session_id: int, report):
 
@@ -1300,45 +1878,296 @@ class LoadSessionRowWidget(QFrame):
         self.state.alignment_failed.emit(session, text, session.remap)
 
     def on_register_session(self):
-
         opt = self.selector_load_mode.currentText()
 
-        actions = set(self.registration_action_selector.actions)
+        if opt == ".* (glob)":
+            self.choose_sessions_from_glob()
+            return
 
-        if opt.lower() == "from file":
+        if opt.lower() != "from file":
+            raise ValueError(f"Unknown option selected: {opt}")
 
-            path = choose_path(
-                self,
-                pick_dir=False,
-                init_path=self.data.root,
-                display_text="Select session file",
-                only_existing=True,
+        path = choose_path(
+            self,
+            pick_dir=False,
+            init_path=self.data.root,
+            display_text="Select session file or loading recipe",
+            only_existing=True,
+        )
+        if path is None:
+            return
+
+        self._queue_registration_path(
+            Path(path),
+            batch=TaskBatch(),
+            actions=set(self.registration_action_selector.actions),
+            force_first_session=not self.data.sessions,
+        )
+
+    def _cancel_registration_batch(self, batch):
+        if batch.cancelled:
+            return
+
+        self._remembered_background_choice = None
+        self.state.tasks.cancel_batch(batch)
+        self._refresh_loading_status()
+
+    def _queue_registration_path(
+        self, path, *, batch, actions, force_first_session=False
+    ):
+        if batch.cancelled:
+            return
+
+        path = Path(path)
+
+        if path.suffix.lower() == ".json":
+            self.state.tasks.start(
+                "loading",
+                f"Reading loading recipe: {path.name}",
+                self.data._read_loading_recipe,
+                path,
+                batch=batch,
+                on_result=lambda sessions: self._review_recipe(
+                    sessions,
+                    batch=batch,
+                    actions=actions,
+                ),
+            )
+            return
+
+        self.state.tasks.start(
+            "loading",
+            f"Registering session: {path.name}",
+            self.data.register_session,
+            from_file=path,
+            batch=batch,
+            on_result=lambda session_ids: self._on_sessions_registered(
+                session_ids,
+                actions=actions,
+                force_first_session=force_first_session,
+                batch=batch,
+            ),
+        )
+
+    def _review_recipe(self, sessions, *, batch, actions):
+        if batch.cancelled:
+            return
+
+        existing_by_path = {
+            self.data.session_source_key(session.path): session
+            for session in self.data.sessions
+            if session.path is not None
+        }
+
+        rows = []
+        for proposed in sessions:
+            existing = existing_by_path.get(self.data.session_source_key(proposed.path))
+
+            if existing is None:
+                status = "Not registered"
+                checked = True
+            elif existing.source_config is None:
+                status = "Registered; configuration required"
+                checked = True
+            else:
+                fields = existing.source_config.get_fields_to_load()
+                missing = self.data._missing_session_fields(existing, fields)
+
+                if missing:
+                    status = "Registered; data loading incomplete"
+                    checked = True
+                else:
+                    status = "Configured data already loaded"
+                    checked = False
+                    if (
+                        existing.status["spatial_loaded"]
+                        and not existing.status["aligned"]
+                    ):
+                        status += "; alignment needs review"
+
+            rows.append(
+                {
+                    "name": proposed.name or Path(proposed.path).parent.name,
+                    "path": str(proposed.path),
+                    "status": status,
+                    "checked": checked,
+                }
             )
 
-            if path is None:
-                return
+        dialog = RecipeReviewDialog(rows, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._cancel_registration_batch(batch)
+            return
 
-            first_session = len(self.data.sessions) == 0
+        if batch.cancelled:
+            return
+
+        # Avoid duplicate source entries within this recipe selection.
+        seen = set()
+        for index in dialog.selected_indices():
+            session = sessions[index]
+            key = self.data.session_source_key(session.path)
+            if key in seen:
+                continue
+            seen.add(key)
 
             self.state.tasks.start(
                 "loading",
-                "Registering session from file...",
+                f"Registering recipe session: {session.name or session.path}",
                 self.data.register_session,
-                from_file=path,
-                on_result=lambda session_ids: (
-                    self._on_sessions_registered(
-                        session_ids,
-                        actions=actions,
-                        force_first_session=first_session,
-                    )
+                prepared_sessions=[session],
+                batch=batch,
+                on_result=lambda session_ids: self._on_sessions_registered(
+                    session_ids,
+                    actions=actions,
+                    batch=batch,
                 ),
             )
 
-        elif opt == ".* (glob)":
-            self.choose_sessions_from_glob()
+    def _request_load_configuration(self, session, batch, explanation):
+        # Stop downstream registration without discarding completed sessions.
+        self.state.tasks.cancel_batch(batch)
+        self._remembered_background_choice = None
 
+        session.status["loading_possible"] = False
+        self.loadConfigRequired.emit(session.id)
+
+        self.state.issue(
+            "info",
+            "Choose or repair the load configuration",
+            (
+                f"Session: {session.name}\n\n"
+                f"{explanation}\n\n"
+                "Loading has stopped before reading the session data. "
+                "Previously loaded sessions are retained.\n\n"
+                "Choose a matching preset or correct the required field "
+                "paths in the expanded configuration. Then click this "
+                "session's open-folder button to load it.\n\n"
+                "To resume the remaining batch, reopen the JSON recipe "
+                "or glob selection and select the unfinished sessions."
+            ),
+            parent=self.window(),
+        )
+
+    def _set_loading_status_batch(self, batch):
+        if self._loading_status_batch is not batch:
+            self._loading_had_error = False
+            self._loading_status_task_ids.clear()
+
+        self._loading_status_batch = batch
+        self._loading_lifetime["batch"] = batch
+        self.loading_status.show()
+
+        self.loading_inspection.show()
+
+        for button in (
+            self.loading_inspection.retry_button,
+            self.loading_inspection.cancel_button,
+            self.loading_inspection.details_button,
+        ):
+            button.show()
+
+    def _on_loading_task_started(self, group, task_id):
+        if group != "loading":
+            return
+
+        task = self.state.tasks.get_task(task_id)
+        if task is None or task.batch is None:
+            return
+
+        self._set_loading_status_batch(task.batch)
+        self._loading_status_task_ids.add(task_id)
+
+        self.loading_status_title.setText(task.name)
+        self.loading_inspection.label.setText("Loading…")
+        self.loading_inspection.retry_button.setEnabled(False)
+        self.loading_inspection.details_button.setEnabled(False)
+        self.loading_inspection.cancel_button.setEnabled(True)
+
+    def _on_loading_task_message(self, group, task_id, message):
+        if group != "loading" or self._loading_check is not None:
+            return
+
+        task = self.state.tasks.get_task(task_id)
+        if task is not None and task.batch is self._loading_status_batch:
+            self.loading_inspection.set_message(message)
+
+    def _on_loading_task_failed(self, group, task_id):
+        if group == "loading" and task_id in self._loading_status_task_ids:
+            self._loading_had_error = True
+
+    def _refresh_loading_status(self):
+        if self._loading_check is not None:
+            return
+
+        batch = self._loading_status_batch
+        if batch is None:
+            return
+
+        pending = any(task.batch is batch for task in self.state.tasks.tasks.values())
+
+        self.loading_inspection.retry_button.setEnabled(False)
+        self.loading_inspection.cancel_button.setEnabled(
+            pending and not batch.cancelled
+        )
+
+        if batch.cancelled:
+            self.loading_status_title.setText("Loading stopped")
+            self.loading_inspection.label.setText(
+                "Previously completed sessions are retained. "
+                "Select unfinished sessions again to continue."
+            )
+        elif pending:
+            self.loading_status_title.setText("Loading and registration")
+        elif self._loading_had_error:
+            self.loading_status_title.setText("Loading finished with an error")
+            self.loading_inspection.label.setText(
+                "Review the reported issue. After correcting the source or "
+                "configuration, use the session's open-folder button to retry."
+            )
         else:
-            raise ValueError(f"Unknown option selected: {opt}")
+            self.loading_status_title.setText("Ready for loading further data")
+            self.loading_inspection.label.clear()
+            self.loading_inspection.hide()
+
+        if not pending:
+            self._loading_lifetime["batch"] = None
+
+            for button in (
+                self.loading_inspection.retry_button,
+                self.loading_inspection.cancel_button,
+                self.loading_inspection.details_button,
+            ):
+                button.hide()
+
+    def _format_loading_message(self, message):
+        root = self.data.root
+        if root is None or not str(root).strip():
+            return message
+
+        # Purely lexical: do not resolve/stat a potentially remote path.
+        root = os.path.abspath(os.path.normpath(os.fspath(root)))
+
+        # Accept either separator on Windows.
+        separator = r"[\\/]" if os.name == "nt" else "/"
+        root_text = root.rstrip("\\/") if os.name == "nt" else root.rstrip("/")
+
+        if os.name == "nt":
+            root_pattern = re.escape(root_text.replace("\\", "/"))
+            root_pattern = root_pattern.replace("/", r"[\\/]")
+        else:
+            root_pattern = re.escape(root_text)
+
+        # Match the root only at the beginning of a path and require
+        # a separator afterwards: /data must not match /database.
+        pattern = r"(?<![\w./\\-])" + root_pattern + separator
+
+        return re.sub(
+            pattern,
+            "",
+            str(message),
+            flags=re.IGNORECASE if os.name == "nt" else 0,
+        )
 
 
 class SessionList(QListWidget):
@@ -1415,6 +2244,8 @@ class SessionOverview(QWidget):
         self.load_row = LoadSessionRowWidget(self)
         layout.addWidget(self.load_row)
 
+        self.load_row.loadConfigRequired.connect(self._show_load_configuration)
+
         self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
 
@@ -1483,9 +2314,6 @@ class SessionOverview(QWidget):
         row.assignmentRequested.connect(self.toggle_assignments)
         row.removeRequested.connect(self.remove_session)
 
-        row.config_constructor.expanded_changed.connect(
-            lambda: QTimer.singleShot(0, lambda: self.update_row_height(item, row))
-        )
         item.setSizeHint(row.sizeHint())
 
         # self.list_widget.addItem(item)
@@ -1570,6 +2398,29 @@ class SessionOverview(QWidget):
         session_id = item.data(Qt.ItemDataRole.UserRole)
         self.set_current_session(session_id)
 
+    def _show_load_configuration(self, session_id):
+        row = self._row_widgets.get(session_id)
+
+        if row is None:
+            self.rebuild()
+            row = self._row_widgets.get(session_id)
+
+        if row is None:
+            return
+
+        for index in range(self.list_widget.count()):
+            item = self.list_widget.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == session_id:
+                self.list_widget.setCurrentItem(item)
+                self.list_widget.scrollToItem(item)
+                break
+
+        def open_config():
+            if isValid(row):
+                row.config_constructor.toggle_config_options.set_expanded(True)
+
+        QTimer.singleShot(0, open_config)
+
     def set_current_session(self, session_id: int):
         self.state.current_session_id = session_id
 
@@ -1628,6 +2479,54 @@ class SessionOverview(QWidget):
     def change_session_background(self, session_id: int):
 
         session = self.data.sessions[session_id]
+
+        if not session.status["spatial_loaded"]:
+            config = session.source_config
+
+            if config is None or "spatial" not in config.groups:
+                self.state.issue(
+                    "warning",
+                    "Spatial configuration required",
+                    "Choose a load configuration containing the spatial "
+                    "footprint fields in this session's options, then "
+                    "select the background again.",
+                )
+                return
+
+            selection = FieldSelectDialog.get_field(
+                path=session.path,
+                key="background",
+                spec=self.load_row._background_spec(session),
+                title="Select background and load spatial data",
+                context=f"Session: {session.name}",
+                parent=self,
+            )
+            if selection is None:
+                return
+
+            self.load_row._apply_background_selection(session, selection)
+
+            # Explicit recovery choice supersedes an earlier recipe choice
+            # to construct the background from footprints.
+            recipe_options = getattr(session, "_recipe_options", None)
+            if recipe_options is not None:
+                session._recipe_options = {
+                    **recipe_options,
+                    "background_mode": "configured",
+                }
+
+            session._load_background_mode = "configured"
+
+            fields_to_load = config.get_fields_to_load(["spatial"])
+
+            self.data.queue_load_data(
+                session_id,
+                fields_to_load=fields_to_load,
+                finished=self.refresh_rows,
+                batch=TaskBatch(),
+            )
+            return
+
         expected_version = self.state.data_version
 
         spec = None
@@ -1936,7 +2835,7 @@ class SessionOverview(QWidget):
             path=selection.path,
             source=selection.source,
             attribute=selection.attribute,
-            source_path=str(source_path.expanduser().resolve()),
+            source_path=os.path.abspath(os.path.expanduser(os.fspath(source_path))),
             required=True,
         )
 

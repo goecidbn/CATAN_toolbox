@@ -1,4 +1,4 @@
-import json
+import json, os
 from pathlib import Path
 
 import numpy as np
@@ -49,10 +49,16 @@ REMAP_FIELDS = (
     "c_max",
     "c_zscored",
     "method",
+    "flow_info",
 )
 
 
-def write_session_snapshot(backend, ref, session, *, root="/", processing=None):
+def prepare_session_snapshot(
+    session,
+    *,
+    processing=None,
+    copy_arrays=False,
+):
     if session.path is None:
         raise ValueError("Cannot save a session without its original source path.")
 
@@ -61,7 +67,7 @@ def write_session_snapshot(backend, ref, session, *, root="/", processing=None):
     def encode(value):
         if isinstance(value, np.ndarray) or sparse.issparse(value):
             key = f"a{len(arrays):04d}"
-            arrays[key] = value
+            arrays[key] = value.copy() if copy_arrays else value
             return {"__array__": key}
         if isinstance(value, np.generic):
             return value.item()
@@ -70,7 +76,7 @@ def write_session_snapshot(backend, ref, session, *, root="/", processing=None):
         raise TypeError(f"Cannot serialize {type(value).__name__}.")
 
     values = {key: getattr(session, key) for key in SESSION_FIELDS}
-    values["path"] = str(Path(session.path).expanduser().resolve())
+    values["path"] = os.path.abspath(os.path.expanduser(os.fspath(session.path)))
     payload = {
         "version": 2,
         "session": values,
@@ -89,19 +95,52 @@ def write_session_snapshot(backend, ref, session, *, root="/", processing=None):
         },
     }
     document = json.dumps(payload, default=encode)
+    return {
+        "document": document,
+        "arrays": arrays,
+    }
+
+
+def write_prepared_session_snapshot(backend, ref, snapshot, *, root="/"):
+    arrays = snapshot["arrays"]
+
     fields = {
         "arrays": {
-            key: FieldSpec(path=f"/snapshot_arrays/{key}", required=True)
+            key: FieldSpec(
+                path=f"/snapshot_arrays/{key}",
+                required=True,
+            )
             for key in arrays
-        }
+        },
+        "snapshot": {
+            "document": FieldSpec(
+                path="/snapshot_json",
+                required=True,
+            ),
+        },
     }
-    fields["snapshot"] = {
-        "document": FieldSpec(path="/snapshot_json", required=True),
-    }
+
     backend.write(
         ref,
-        {"arrays": arrays, "snapshot": {"document": document}},
+        {
+            "arrays": arrays,
+            "snapshot": {"document": snapshot["document"]},
+        },
         fields,
+        root=root,
+    )
+
+
+def write_session_snapshot(backend, ref, session, *, root="/", processing=None):
+    # Preserve the existing API for other callers.
+    snapshot = prepare_session_snapshot(
+        session,
+        processing=processing,
+    )
+    write_prepared_session_snapshot(
+        backend,
+        ref,
+        snapshot,
         root=root,
     )
 
@@ -146,7 +185,7 @@ def read_session_snapshot(backend, ref, *, root="/"):
     if payload["remap"] is not None:
         session.remap = Remapping(evaluate=False)
         for key in REMAP_FIELDS:
-            if key == "method" and key not in payload["remap"]:
+            if key in {"method", "flow_info"} and key not in payload["remap"]:
                 continue  # Older snapshots retain the constructor default.
             setattr(session.remap, key, payload["remap"][key])
         if session.remap.dims is not None:
@@ -161,6 +200,20 @@ def read_session_snapshot(backend, ref, *, root="/"):
                 raise ValueError(f"Saved {key} flags have inconsistent dimensions.")
         if session.background_template is None:
             raise ValueError("Saved spatial data lack the original template.")
+
+        from catan.core.spatial_geometry import check_shapes
+
+        for image in (
+            session.background_template,
+            session.background,
+        ):
+            if image is not None:
+                check_shapes(
+                    session.dims,
+                    session.footprints.shape,
+                    image.shape,
+                    "as_stored",
+                )
 
     session.evaluate_alignment_status()
     # Counts and assignments are separate files, not restored here.

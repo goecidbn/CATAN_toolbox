@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from . import FieldSelector, ToggleOption
+from .file_inspection import FileInspection
+
 from catan.core.structures import SessionData
 from catan.tracking.structures import Assignments
 
@@ -57,15 +59,11 @@ class FieldConfigConstructor(QObject):
         self.update_source(source)
 
     def update_source(self, source: SessionData | Assignments | None):
-        self.source = source
-        self.toggle_config_options.setEnabled(self.source is not None)
+        expanded = self.toggle_config_options.isChecked()
 
-        expanded = (
-            self.toggle_config_options.container is not None
-            and self.toggle_config_options.container.isVisible()
-            and (self.source is not None)
-        )
-        self.toggle_config_options.set_expanded(expanded)
+        self.source = source
+        self.toggle_config_options.setEnabled(source is not None)
+        self.toggle_config_options.set_expanded(expanded and source is not None)
         self.source_changed.emit()
 
     def _on_source_changed(self):
@@ -73,21 +71,15 @@ class FieldConfigConstructor(QObject):
         self.rebuild_config_selector()
         self.refresh()
 
-        if (
-            isinstance(self.source, SessionData)
-            and not getattr(self.source, "_restored_from_catan", False)
-            and (
-                self.source.source_config is None
-                or self.source.status.get("loading_possible") is False
-            )
-        ):
-            self.toggle_config_options.set_expanded(True)
-            self.expanded_changed.emit()
-
     def build_toggle_config_options(self):
         ## define and set toggle
         self.toggle_config_options = ToggleOption(
-            icon_name="cog", tooltip="Select fields to load", expanded=False
+            icon_name="cog",
+            tooltip="Configure fields to load",
+            expanded=False,
+            popup=True,
+            popup_size=(480, 600),
+            parent=self._parent,
         )
 
         def on_toggle_config_fields():
@@ -133,6 +125,7 @@ class FieldConfigConstructor(QObject):
             name = names[idx]
 
             self.source.source_config = self.state.config_manager.select(name)
+            self._remember_selected_config()
 
             self.config_field_options.rebuild()
             self._on_fields_changed()
@@ -199,6 +192,44 @@ class FieldConfigConstructor(QObject):
             if name == getattr(self.source.source_config, "name", None):
                 selector.setCurrentIndex(i)
         selector.blockSignals(False)
+
+    def _remember_selected_config(self):
+        source = self.source
+
+        if source is None or source.path is None or source.source_config is None:
+            return
+
+        manager = self.state.config_manager
+        path = source.path
+        config = source.source_config
+
+        file_format = manager.known_file_format(path)
+
+        # Normally registration already cached this. Restored sources
+        # can have a config without having gone through format detection.
+        if file_format is None and Path(path).suffix.lower() == ".mat":
+            completed, file_format = FileInspection.get_result(
+                "format",
+                path,
+                state=self.state,
+                parent=self._parent.window(),
+                title="Determining source format",
+            )
+
+            if not completed:
+                return
+
+            manager.remember_file_format(path, file_format)
+
+            if (
+                self.source is not source
+                or source.path != path
+                or source.source_config is not config
+            ):
+                return
+
+        if file_format is not None:
+            manager.remember_used_config(file_format, config)
 
     def build_config_field_options(self):
 
@@ -267,11 +298,41 @@ class FieldConfigConstructor(QObject):
             self.rebuild_config_selector()
 
     def on_set_default(self):
-        if self.source is None:
+        source = self.source
+
+        if source is None or source.path is None or source.source_config is None:
             return
 
-        self.state.config_manager.set_default_for_format(
-            self.source.path, self.source.source_config
+        manager = self.state.config_manager
+        path = source.path
+        config = source.source_config
+
+        if manager.known_file_format(path) is None:
+            completed, file_format = FileInspection.get_result(
+                "format",
+                path,
+                state=self.state,
+                parent=self._parent.window(),
+                title="Determining source format",
+            )
+
+            if not completed:
+                return
+
+            manager.remember_file_format(path, file_format)
+
+            # A modal dialog processes events while inspection runs.
+            if (
+                self.source is not source
+                or source.path != path
+                or source.source_config is not config
+            ):
+                return
+
+        manager.set_default_for_format(
+            path=path,
+            source_type=config.source_type,
+            config=config,
         )
         self.refresh()
 
@@ -288,9 +349,7 @@ class FieldConfigConstructor(QObject):
             self.expanded_changed.emit()
             return
 
-        is_default = self.state.config_manager.is_default(
-            self.source.path, config
-        )
+        is_default = self.state.config_manager.is_default(self.source.path, config)
         is_modified = self.state.config_manager.modified(config)
 
         self.load_config_save_button.setEnabled(is_modified)
@@ -308,7 +367,6 @@ class FieldConfigConstructor(QObject):
             )
 
         self.expanded_changed.emit()
-
 
     def _on_fields_changed(self):
         """Handle a field-change notification from FieldSelector."""
