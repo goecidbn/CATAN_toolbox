@@ -52,9 +52,7 @@ class NeuronNavigationBar(QWidget):
 
         self.footprint_slider.sliderMoved.connect(self._on_slider_moved)
         self.footprint_slider.sliderReleased.connect(
-            lambda: self._on_slider_moved(
-                self.footprint_slider.sliderPosition()
-            )
+            lambda: self._on_slider_moved(self.footprint_slider.sliderPosition())
         )
 
         self.footprint_id_prev.clicked.connect(self.on_prev_footprint)
@@ -110,6 +108,8 @@ class NeuronNavigationBar(QWidget):
     def iterate_footprint(self, step: int):
 
         neuron_ids = self.navigation_neuron_ids()
+        if not neuron_ids:
+            return
 
         # selected = self.state.selected_components
         focused = self.state.focused_component
@@ -137,24 +137,46 @@ class NeuronNavigationBar(QWidget):
         )
 
     def navigation_neuron_ids(self) -> list[int]:
+        assignments = self.data.assignments
 
-        if self.state.selected_components and len(self.state.selected_components) > 1:
+        if assignments is None or assignments.union is None:
+            return []
+
+        included = np.asarray(
+            assignments.union.included,
+            dtype=bool,
+        )
+
+        # Use the current data object rather than a potentially older
+        # state.assignments array during a GUI update.
+        count = min(
+            assignments.ids.shape[0],
+            included.size,
+        )
+
+        if count == 0:
+            return []
+
+        selected = self.state.selected_components
+
+        if selected and len(selected) > 1:
             neuron_ids = np.asarray(
-                [c.neuron_id for c in self.state.selected_components],
+                [component.neuron_id for component in selected],
                 dtype=int,
             )
         else:
-            neuron_ids = np.arange(self.state.assignments.shape[0])
+            neuron_ids = np.arange(count, dtype=int)
 
-        # Never navigate excluded neurons normally.
-        neuron_ids = neuron_ids[self.data.assignments.union.included[neuron_ids]]
+        neuron_ids = neuron_ids[(neuron_ids >= 0) & (neuron_ids < count)]
+
+        neuron_ids = neuron_ids[included[neuron_ids]]
 
         if self.only_open_checkbox.isChecked():
-            neuron_ids = neuron_ids[
-                self.data.assignments.review_status[neuron_ids] != ReviewStatus.REVIEWED
-            ]
+            status = assignments.review_status
+            neuron_ids = neuron_ids[neuron_ids < len(status)]
+            neuron_ids = neuron_ids[status[neuron_ids] != ReviewStatus.REVIEWED]
 
-        return list(np.unique(neuron_ids))
+        return np.unique(neuron_ids).tolist()
 
     def set_id_range(
         self,
@@ -201,6 +223,10 @@ class NeuronNavigationBar(QWidget):
         # slider position = index into selection.
         # --------------------------------------------------
         if selected and len(selected) > 1:
+            if not 0 <= int(value) < len(selected):
+                self.update_setup()
+                return
+
             component = self._resolve_selected_component(selected[int(value)])
 
         # --------------------------------------------------
@@ -212,6 +238,16 @@ class NeuronNavigationBar(QWidget):
             component = NeuronComponent(
                 neuron_id=int(value), session_id=self.state.current_session_id
             )
+
+        assignments = self.data.assignments
+
+        if (
+            component is None
+            or assignments is None
+            or not 0 <= component.neuron_id < assignments.ids.shape[0]
+        ):
+            self.update_setup()
+            return
 
         self.state.focused_component = component
         self.adjust_id()

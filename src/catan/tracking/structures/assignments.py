@@ -8,6 +8,7 @@ from catan.core.structures.load_config import LoadConfig, FieldSpec
 
 from catan.core.utils import pad_axis
 from catan.core.structures.session import SessionData
+from catan.core.structures.inclusion import snapshot_inclusion
 
 import numpy as np
 from scipy import sparse
@@ -106,6 +107,7 @@ class Assignments:
         }
 
         self.matched_status: np.ndarray = np.array([], dtype=bool)
+        self.session_included = None
 
         self.manipulations: dict[int, dict] = {}
         # Latest manipulation affecting each tracked neuron.
@@ -407,6 +409,7 @@ class Assignments:
         self.matched_status = np.any(self.ids >= 0, axis=0)
 
         curation = data.get("curation") or {}
+        self.session_included = deepcopy(curation.get("session_included"))
         review_status = curation.get("review_status")
 
         if review_status is None:
@@ -425,11 +428,17 @@ class Assignments:
 
         self.status["loaded"] = True
 
-    def prepare_save(self, fields_to_save=None):
+    def prepare_save(self, fields_to_save=None, *, sessions=None):
 
         fields_to_save = fields_to_save or LoadConfig.fields_from_resource(
             NATIVE_ASSIGNMENTS_CONFIG,
             enabled_only=False,
+        )
+        fields_to_save = deepcopy(fields_to_save)
+        fields_to_save.setdefault("curation", {})["session_included"] = FieldSpec(
+            path="/curation/session_included",
+            required=False,
+            exposed=False,
         )
 
         save_data = {
@@ -444,6 +453,20 @@ class Assignments:
             },
         }
 
+        if sessions is not None:
+            if self.ids.shape[1] != len(sessions):
+                raise ValueError(
+                    "Cannot save session inclusion: the assignments "
+                    "column count differs from the session count."
+                )
+
+            save_data["curation"]["session_included"] = snapshot_inclusion(sessions)
+
+        elif self.session_included is not None:
+            # Preserve metadata when re-saving a loaded object without
+            # access to its live sessions.
+            save_data["curation"]["session_included"] = self.session_included
+
         return deepcopy(
             {
                 "data": save_data,
@@ -455,8 +478,19 @@ class Assignments:
             }
         )
 
-    def save(self, path, fields_to_save=None, *, mat_version="7.3"):
-        prepared = self.prepare_save(fields_to_save)
+    def save(
+        self,
+        path,
+        fields_to_save=None,
+        *,
+        mat_version="7.3",
+        sessions=None,
+    ):
+        prepared = self.prepare_save(
+            fields_to_save,
+            sessions=sessions,
+        )
+
         save_file(
             path,
             prepared["data"],

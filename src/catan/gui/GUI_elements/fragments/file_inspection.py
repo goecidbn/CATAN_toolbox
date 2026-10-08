@@ -41,6 +41,7 @@ class FileInspection(QWidget):
     # Serialize metadata requests so creating several session rows
     # does not start a separate reader for every row at once.
     _pool = None
+    _navigation_pool = None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -48,6 +49,10 @@ class FileInspection(QWidget):
         if FileInspection._pool is None:
             FileInspection._pool = QThreadPool()
             FileInspection._pool.setMaxThreadCount(1)
+
+        if FileInspection._navigation_pool is None:
+            FileInspection._navigation_pool = QThreadPool()
+            FileInspection._navigation_pool.setMaxThreadCount(1)
 
         self._generation = 0
         self._running_generation = None
@@ -179,7 +184,18 @@ class FileInspection(QWidget):
         worker.signals.error.connect(self._on_error, connection)
         worker.signals.finished.connect(self._on_finished, connection)
 
-        FileInspection._pool.start(worker)
+        navigation_operations = {
+            "browse_directory",
+            "select_path",
+            "create_directory",
+        }
+
+        pool = (
+            FileInspection._navigation_pool
+            if request[0] in navigation_operations
+            else FileInspection._pool
+        )
+        pool.start(worker)
 
     @Slot(str)
     def _on_message(self, message):

@@ -102,6 +102,11 @@ class ManualAlignmentEditor(QWidget):
         self._estimate_task_id = None
         self._estimate_generation = 0
 
+        self._pair_shift_task_id = None
+        self._pair_shift_key = None
+        self._pair_shift_generation = 0
+        self._pair_shift_cache = {}
+
         self._fit_next_score = True
 
         self._hover_context = None
@@ -583,6 +588,16 @@ class ManualAlignmentEditor(QWidget):
         show_shifts.toggled.connect(self.shift_inset.setVisible)
         form.addRow(show_shifts)
 
+        self.pair_shift_status = QLabel(self.options)
+        self.pair_shift_status.setWordWrap(True)
+        form.addRow(self.pair_shift_status)
+
+        self.recalculate_pair_shifts = QPushButton(
+            "Recalculate comparisons", self.options
+        )
+        self.recalculate_pair_shifts.clicked.connect(self._retry_pair_shifts)
+        form.addRow(self.recalculate_pair_shifts)
+
         self._refresh_shift_inset(fit=True)
         self.shift_inset.show()
 
@@ -610,6 +625,18 @@ class ManualAlignmentEditor(QWidget):
             (self.state.tasks.task_failed, self._on_flow_task_stopped),
             (self.state.tasks.task_cancelled, self._on_estimate_stopped),
             (self.state.tasks.task_failed, self._on_estimate_stopped),
+            (
+                self.state.tasks.task_cancelled,
+                self._on_pair_shift_stopped,
+            ),
+            (
+                self.state.tasks.task_failed,
+                self._on_pair_shift_stopped,
+            ),
+            (
+                self.state.data_changed,
+                self._on_pair_shift_data_changed,
+            ),
         )
         for signal, slot in self._connections:
             signal.connect(slot)
@@ -820,6 +847,332 @@ class ManualAlignmentEditor(QWidget):
             self._references[index],
             self._reference_session_ids[index],
         )
+
+    def _pair_shift_context(self, owner_id):
+        if not 0 <= owner_id < len(self.data.sessions):
+            return None
+
+        session = self.data.sessions[owner_id]
+
+        if not session.status["spatial_loaded"] or session.background_template is None:
+            return None
+
+        active = session is self.draft.session
+
+        if active and not self.draft.is_current(self.data):
+            return None
+
+        dimensions = tuple(session.dims)
+
+        reference_ids = tuple(
+            reference_id
+            for reference_id, reference in enumerate(self.data.sessions[:owner_id])
+            if (
+                reference.status["aligned"]
+                and not self.data.alignment_is_stale(reference_id)
+                and reference.path is not None
+                and reference.background_template is not None
+                and reference.background is not None
+                and tuple(reference.background.shape) == dimensions
+            )
+        )
+
+        background_transposed = (
+            bool(self.draft.background_transposed) if active else False
+        )
+        transpose = (
+            bool(self.draft.transpose)
+            if active
+            else bool(getattr(session.remap, "transpose", False))
+        )
+
+        key = (
+            self.state.data_version,
+            owner_id,
+            background_transposed,
+            transpose,
+            float(session.params["max_session_shift"]),
+            reference_ids,
+        )
+
+        return key, reference_ids
+
+    def _cancel_pair_shift_task(self):
+        self._pair_shift_generation += 1
+
+        task_id = self._pair_shift_task_id
+        self._pair_shift_task_id = None
+        self._pair_shift_key = None
+
+        if task_id is not None:
+            self.state.tasks.cancel(task_id)
+
+    def _ensure_pair_shift_estimates(self, owner_id):
+        context = self._pair_shift_context(owner_id)
+        if context is None:
+            return None
+
+        key, reference_ids = context
+
+        if key in self._pair_shift_cache:
+            result = self._pair_shift_cache[key]
+            self.pair_shift_status.setText(result["message"])
+            return result
+
+        if self._pair_shift_key == key:
+            return None
+
+        self._cancel_pair_shift_task()
+
+        if not reference_ids:
+            result = {
+                "estimates": {},
+                "message": "No eligible earlier reference sessions.",
+            }
+            self._pair_shift_cache[key] = result
+            self.pair_shift_status.setText(result["message"])
+            return result
+
+        session = self.data.sessions[owner_id]
+        active = session is self.draft.session
+
+        template = np.asarray(
+            self.draft.template if active else session.background_template,
+            dtype=np.float32,
+        ).copy()
+
+        # Account for legacy remapping transposition separately from
+        # the editable background-template orientation.
+        if key[3]:
+            template = template.T.copy()
+
+        if tuple(template.shape) != tuple(session.dims):
+            result = {
+                "estimates": {},
+                "message": (
+                    "The oriented background does not match " "the session dimensions."
+                ),
+            }
+            self._pair_shift_cache[key] = result
+            self.pair_shift_status.setText(result["message"])
+            return result
+
+        # Snapshot worker inputs. No live session objects are accessed
+        # by the calculation below.
+        references = []
+
+        for reference_id in reference_ids:
+            reference = self.data.sessions[reference_id]
+            references.append(
+                (
+                    reference_id,
+                    str(reference.path),
+                    reference.background_template.copy(),
+                    deepcopy(reference.remap),
+                )
+            )
+
+        max_shift = key[4]
+        generation = self._pair_shift_generation
+        self._pair_shift_key = key
+
+        self.pair_shift_status.setText(
+            f"Calculating independent flow comparisons for S{owner_id}…"
+        )
+
+        def calculate():
+            ctx = current_task_context()
+            estimates = {}
+            rejected = []
+
+            def check_cancelled():
+                if ctx is not None:
+                    ctx.check_cancelled()
+
+            for reference_id, path, reference_template, reference_remap in references:
+                check_cancelled()
+
+                if ctx is not None:
+                    ctx.message(
+                        f"Comparing S{owner_id} independently "
+                        f"against S{reference_id}…"
+                    )
+
+                try:
+                    if reference_remap is None:
+                        aligned_reference = reference_template
+                        reference_valid = np.ones(
+                            reference_template.shape,
+                            dtype=bool,
+                        )
+                        reference_matrix = np.eye(3)
+                    else:
+                        aligned_reference = reference_remap.apply_remap(
+                            reference_template,
+                            use_optical_flow=True,
+                        )
+                        reference_valid = reference_remap.valid_mask(
+                            use_optical_flow=True
+                        )
+                        reference_matrix = reference_remap.matrix
+
+                    candidate = Remapping(
+                        template=template,
+                        references={
+                            path: {
+                                "template": reference_template,
+                                "matrix": reference_matrix,
+                                "aligned_template": aligned_reference,
+                                "valid_mask": reference_valid,
+                                "flow_candidate": True,
+                            }
+                        },
+                        use_optical_flow=True,
+                        max_shift=max_shift,
+                    )
+
+                    check_cancelled()
+
+                    if not candidate.success:
+                        raise ValueError(
+                            candidate.flow_info.get("reason")
+                            or "Flow comparison was rejected."
+                        )
+
+                    source_x, source_y = candidate.sampling_maps()
+                    height, width = candidate.dims
+                    yy, xx = np.indices(
+                        candidate.dims,
+                        dtype=np.float32,
+                    )
+
+                    valid = (
+                        np.isfinite(source_x)
+                        & np.isfinite(source_y)
+                        & (source_x >= 0)
+                        & (source_x <= width - 1)
+                        & (source_y >= 0)
+                        & (source_y <= height - 1)
+                    )
+
+                    if not valid.any():
+                        raise ValueError(
+                            "The estimated transformation has no valid pixels."
+                        )
+
+                    # Full transformation, including its residual flow.
+                    # Sampling maps point output → source, hence this sign.
+                    estimates[reference_id] = np.array(
+                        [
+                            np.mean(
+                                xx[valid] - source_x[valid],
+                                dtype=np.float64,
+                            ),
+                            np.mean(
+                                yy[valid] - source_y[valid],
+                                dtype=np.float64,
+                            ),
+                        ],
+                        dtype=float,
+                    )
+
+                except TaskCancelled:
+                    raise
+                except Exception as exc:
+                    rejected.append(f"S{reference_id}: {exc}")
+
+            check_cancelled()
+
+            message = (
+                f"{len(estimates)} of {len(references)} "
+                "independent flow comparisons accepted."
+            )
+            if rejected:
+                message += "\nRejected comparisons:\n" + "\n".join(rejected)
+
+            return {
+                "estimates": estimates,
+                "message": message,
+            }
+
+        self._pair_shift_task_id = self.state.tasks.start(
+            "calculating",
+            f"Flow comparison shifts: S{owner_id}",
+            calculate,
+            on_result=lambda result: self._on_pair_shifts_ready(
+                generation, key, result
+            ),
+            background=True,
+        )
+
+        return None
+
+    def _on_pair_shifts_ready(self, generation, key, result):
+        if self._disposed or generation != self._pair_shift_generation:
+            return
+
+        self._pair_shift_task_id = None
+        self._pair_shift_key = None
+
+        context = self._pair_shift_context(key[1])
+        if context is None or context[0] != key:
+            return
+
+        self._pair_shift_cache[key] = result
+
+        # Only small summaries are cached, never the candidate flow arrays.
+        while len(self._pair_shift_cache) > 4:
+            oldest = next(iter(self._pair_shift_cache))
+            del self._pair_shift_cache[oldest]
+
+        if self._inset_session_id == key[1]:
+            self.pair_shift_status.setText(result["message"])
+            # Add the calculated arrows without fitting the global overview.
+            self._refresh_shift_inset(fit=False)
+
+            # Only zoom if the user has explicitly selected this session.
+            # Hovering alone must not move the camera.
+            if self.shift_inset.locked_session_id == key[1]:
+                self.shift_inset.lock_session(key[1], force=True)
+
+    def _on_pair_shift_stopped(self, group, task_id, *_):
+        if self._disposed or task_id != self._pair_shift_task_id:
+            return
+
+        key = self._pair_shift_key
+        self._pair_shift_task_id = None
+        self._pair_shift_key = None
+
+        result = {
+            "estimates": {},
+            "message": (
+                "Comparison calculation stopped. "
+                "Use Recalculate comparisons to retry."
+            ),
+        }
+
+        # Prevent subsequent redraws from immediately restarting
+        # a calculation the user just cancelled.
+        if key is not None:
+            self._pair_shift_cache[key] = result
+
+        self.pair_shift_status.setText(result["message"])
+
+    def _retry_pair_shifts(self):
+        if self._disposed or self._inset_session_id is None:
+            return
+
+        self._cancel_pair_shift_task()
+        self._pair_shift_cache.clear()
+        self._refresh_shift_inset()
+
+    def _on_pair_shift_data_changed(self, *_):
+        if self._disposed:
+            return
+
+        self._cancel_pair_shift_task()
+        self._pair_shift_cache.clear()
+        self._refresh_shift_inset()
 
     def _clear_hover(self, *, render=True):
         self._hover_timer.stop()
@@ -1927,6 +2280,8 @@ class ManualAlignmentEditor(QWidget):
             signal.disconnect(slot)
 
         self.shift_inset.dispose()
+        self._cancel_pair_shift_task()
+        self._pair_shift_cache.clear()
 
         self.options.overlay_layout_changed.disconnect(self._position_options)
         self.canvas.events.resize.disconnect(self._position_options)
@@ -2028,17 +2383,15 @@ class ManualAlignmentEditor(QWidget):
 
             active = session is self.draft.session
 
-            if active:
-                xy = self.draft.values[:2].copy()
-            else:
+            if not active:
                 remap = session.remap
                 if remap is None or not remap.success:
                     continue
 
-                shift, _ = Remapping._rigid_parameters(
-                    tuple(session.dims), remap.matrix
-                )
-                xy = np.asarray(shift)[::-1].copy()
+            xy = self._session_mean_displacement(session_id)
+
+            if xy is None:
+                continue
 
             if not np.isfinite(xy).all():
                 continue
@@ -2055,6 +2408,7 @@ class ManualAlignmentEditor(QWidget):
                     "kind": "session",
                     "id": session_id,
                     "xy": xy,
+                    "rigid_xy": (self.draft.values[:2].copy() if active else xy.copy()),
                     "label": label,
                     "active": active,
                     "owner": session_id,
@@ -2074,53 +2428,32 @@ class ManualAlignmentEditor(QWidget):
             return
 
         owner_id = self._inset_session_id
-        session = self.data.sessions[owner_id]
-        dims = tuple(session.dims)
+        result = self._ensure_pair_shift_estimates(owner_id)
 
-        moving_mean = self._session_mean_displacement(owner_id)
+        if result is not None:
+            for reference_id, candidate_xy in result["estimates"].items():
+                candidate_xy = np.asarray(candidate_xy, dtype=float)
 
-        if moving_mean is not None:
-            for reference_id, reference in enumerate(self.data.sessions[:owner_id]):
-                if (
-                    not reference.status["aligned"]
-                    or reference.background is None
-                    or tuple(reference.background.shape) != dims
-                ):
+                if not np.isfinite(candidate_xy).all():
                     continue
 
-                reference_mean = self._session_mean_displacement(reference_id)
-
-                if reference_mean is None:
-                    continue
-
-                relative = moving_mean - reference_mean
-
-                if not np.isfinite(relative).all():
-                    continue
-
-                start = focus["xy"].copy()
-
-                label = (
-                    f"S{owner_id} → S{reference_id}: "
-                    f"mean dx={relative[0]:+.2f}, "
-                    f"dy={relative[1]:+.2f} px "
-                    "(from stored transformations)"
-                )
-
-                if self.data.alignment_is_stale(
-                    owner_id
-                ) or self.data.alignment_is_stale(reference_id):
-                    label += " (outdated)"
+                difference = candidate_xy - focus["xy"]
 
                 items.append(
                     {
                         "kind": "reference",
                         "id": reference_id,
-                        "xy": start + relative,
-                        "label": label,
-                        "active": False,
                         "owner": owner_id,
-                        "start": start,
+                        "start": focus["xy"].copy(),
+                        "xy": candidate_xy.copy(),
+                        "label": (
+                            f"S{owner_id} aligned only against S{reference_id}: "
+                            f"dx={candidate_xy[0]:+.2f}, "
+                            f"dy={candidate_xy[1]:+.2f} px; "
+                            f"difference from current mean "
+                            f"({difference[0]:+.2f}, {difference[1]:+.2f}) px"
+                        ),
+                        "active": False,
                         "focused": True,
                     }
                 )

@@ -98,11 +98,22 @@ def inspect_dimensions(
     from catan.core.io.inspection import inspect_file
     from catan.core.io.types import FieldSpec, normalize_path
 
+    structures = {}
+
+    def structure_for(spec):
+        source = resolve_source_path(path, spec.source_path)
+        key = str(source)
+
+        if key not in structures:
+            structures[key] = inspect_file(
+                source,
+                refresh=True,
+            )
+
+        return structures[key]
+
     def info(spec):
-        structure = inspect_file(
-            resolve_source_path(path, spec.source_path),
-            refresh=True,
-        )
+        structure = structure_for(spec)
         key = normalize_path(spec.path)
 
         if spec.source == "attribute":
@@ -184,10 +195,7 @@ def inspect_dimensions(
         background = spatial.get("background")
 
         if background is not None:
-            structure = inspect_file(
-                resolve_source_path(path, background.source_path),
-                refresh=True,
-            )
+            structure = structure_for(background)
             if structure.matches(background):
                 background_shape = info(background).shape
 

@@ -1,15 +1,16 @@
-from .neuron_component import NeuronComponent
-from .session import SessionData, sessiondata_type
-from .remap import Remapping
+from catan._lazy import install_exports as _install_exports
 
-# from .load_config import LoadConfig
-
-from .load_config import FieldSpec, FieldGroupSpec, LoadConfig, LoadConfigManager
-
-__all__ = [
-    "FieldSpec",
-    "FieldGroupSpec",
-    "LoadConfig",
-    "LoadConfigManager",
-    "NeuronComponent",
-]
+_install_exports(
+    globals(),
+    __name__,
+    {
+        "NeuronComponent": (".neuron_component", "NeuronComponent"),
+        "SessionData": (".session", "SessionData"),
+        "sessiondata_type": (".session", "sessiondata_type"),
+        "Remapping": (".remap", "Remapping"),
+        "FieldSpec": (".load_config", "FieldSpec"),
+        "FieldGroupSpec": (".load_config", "FieldGroupSpec"),
+        "LoadConfig": (".load_config", "LoadConfig"),
+        "LoadConfigManager": (".load_config", "LoadConfigManager"),
+    },
+)

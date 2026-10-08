@@ -1,6 +1,7 @@
 import os
 from fnmatch import fnmatchcase
 
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -59,12 +60,39 @@ class GuardedPathDialog(QDialog):
 
         navigation = QHBoxLayout()
         self.path_edit = QLineEdit(self._directory)
+        self.path_edit.setPlaceholderText(
+            "Type or paste a full folder/file path, then press Enter"
+        )
+        self.path_edit.setToolTip(
+            "Navigate directly to any accessible path. "
+            "Press Ctrl+L to edit this location."
+        )
+
+        self._location_shortcut = QShortcut(
+            QKeySequence("Ctrl+L"),
+            self,
+        )
+        self._location_shortcut.activated.connect(self._focus_location)
         self.up_button = QPushButton("Up")
         self.go_button = QPushButton("Go")
 
         self.new_folder_button = QPushButton("New folder…")
 
+        self.home_button = QPushButton("Home")
+        self.root_button = QPushButton("Root")
+
+        for button in (self.home_button, self.root_button):
+            button.setAutoDefault(False)
+            button.setDefault(False)
+
+        self.home_button.clicked.connect(lambda: self._browse(os.path.expanduser("~")))
+        self.root_button.clicked.connect(
+            lambda: self._browse(os.path.splitdrive(self._directory)[0] + os.sep)
+        )
+
         navigation.addWidget(self.up_button)
+        navigation.addWidget(self.home_button)
+        navigation.addWidget(self.root_button)
         navigation.addWidget(self.path_edit, 1)
         navigation.addWidget(self.go_button)
         navigation.addWidget(self.new_folder_button)
@@ -147,6 +175,10 @@ class GuardedPathDialog(QDialog):
             self._directory,
             allow_missing_file=not pick_dir and not only_existing,
         )
+
+    def _focus_location(self):
+        self.path_edit.setFocus()
+        self.path_edit.selectAll()
 
     def _remember_save_filename(self, text):
         if not self.pick_dir and not self.only_existing:

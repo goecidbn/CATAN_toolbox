@@ -54,8 +54,16 @@
                     "required": false,
                     "source": "dataset",
                     "attribute": null
+                },
+                "session_included": {
+                    "path": "/curation/session_included",
+                    "required": false,
+                    "source": "dataset",
+                    "attribute": null,
+                    "exposed": false
                 }
             }
+            
         }
     },
     "native": true

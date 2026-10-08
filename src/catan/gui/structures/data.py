@@ -26,6 +26,11 @@ from catan.core.structures.load_config import FieldSpec, LoadConfig
 from catan.core.structures.session_snapshot import (
     prepare_session_snapshot,
 )
+from catan.core.structures.inclusion import (
+    has_exclusions,
+    inclusion_mask,
+    inclusion_to_restore,
+)
 from catan.core.io.isolated_read import read_fields, read_operation
 
 from catan.tracking.structures import Assignments, ReviewStatus
@@ -1337,7 +1342,11 @@ class Data(Tracking):
             return
 
         try:
-            prepared = source.prepare_save()
+            prepared = (
+                source.prepare_save(sessions=tuple(self.sessions))
+                if key == "assignments"
+                else source.prepare_save()
+            )
         except Exception as exc:
             self.state.issue(
                 "warning",
@@ -1349,6 +1358,60 @@ class Data(Tracking):
         return tasks.start(
             "saving",
             f"Saving {key}: {Path(path).name}",
+            save_prepared_file_task,
+            self.state,
+            str(path),
+            prepared,
+        )
+
+    def queue_save_included(self, session, path):
+        tasks = self.state.tasks
+
+        if tasks.processing_busy() or tasks.processing_requested:
+            self.state.issue(
+                "info",
+                "Cannot save inclusion while processing",
+                "Finish or cancel processing, then try again.",
+            )
+            return None
+
+        if not any(item is session for item in self.sessions):
+            return None
+
+        if not has_exclusions(session):
+            return None
+
+        mask = inclusion_mask(
+            session.included,
+            session.n_neurons,
+            session.name,
+        )
+
+        prepared = {
+            "data": {
+                "spatial": {
+                    "included": mask,
+                }
+            },
+            "fields": {
+                "spatial": {
+                    "included": FieldSpec(
+                        path="/included",
+                        required=True,
+                    )
+                }
+            },
+            "attributes": {
+                "object_type": "SessionIncludedData",
+                "format_version": 1,
+                "source_path": str(session.path or ""),
+                "n_footprints": int(session.n_neurons),
+            },
+        }
+
+        return tasks.start(
+            "saving",
+            f"Saving inclusion: {session.name}",
             save_prepared_file_task,
             self.state,
             str(path),
@@ -1462,6 +1525,15 @@ class Data(Tracking):
         self.assignments.load()
         self.restore_manipulations()
 
+        restored_masks = inclusion_to_restore(
+            self.assignments.session_included,
+            self.sessions,
+        )
+
+        if restored_masks is not None:
+            for session, mask in zip(self.sessions, restored_masks):
+                session.included = mask
+
         self.rebuild_union()
 
         self.state.assignments = self.assignments.ids
@@ -1559,6 +1631,17 @@ class Data(Tracking):
                 ctx.check_cancelled()
 
             worker.restore_manipulations()
+            restored_masks = inclusion_to_restore(
+                candidate.session_included,
+                worker.sessions,
+            )
+
+            if restored_masks is not None:
+                for session, mask in zip(
+                    worker.sessions,
+                    restored_masks,
+                ):
+                    session.included = mask
 
             worker.check_assignments_compatibility(
                 candidate,
@@ -2201,56 +2284,40 @@ class Data(Tracking):
                 NeuronComponent(neuron_id=neuron_id, session_id=session_id)
             )
 
-    def remove_component(self, component: NeuronComponent | int, notify=True) -> None:
-
-        if isinstance(component, int):
-            self.remove_neuron(component)
+    def remove_component(self, component: NeuronComponent | int) -> None:
+        if isinstance(component, (int, np.integer)):
+            self.remove_neuron(int(component))
             return
 
-        if self.assignments is None:
-            raise ValueError("No assignments available.")
+        targets = self.curation_targets(
+            [component],
+            remove=True,
+            whole_neurons=False,
+        )
 
-        if component.session_id is None:
-            raise ValueError("A concrete session component is required.")
-
-        session_id = int(component.session_id)
-        neuron_id = int(component.neuron_id)
-
-        fp_id = int(self.assignments.ids[component.id])
-
-        if fp_id < 0:
-            raise ValueError(f"{component} has no assigned footprint.")
-
-        # No longer part of the usable session data.
-        self.sessions[session_id].included[fp_id] = False
-
-        # Remove from tracked-neuron structure entirely.
-        self.assignments.ids[component.id] = -1
-
-        # Clear tracking statistics for that slot.
-        for key, values in self.assignments.stats.items():
-            values[*component.id, ...] = np.nan
-
-        self.state.assignments = self.assignments.ids
-        if notify:
-            self.rebuild_union_neurons([neuron_id])
-            self.assignments.updating_neuron_presence()
-            self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
+        self.apply_curation_targets(
+            targets,
+            remove=True,
+            whole_neurons=False,
+        )
 
     def remove_neuron(self, neuron_id: int) -> None:
+        targets = self.curation_targets(
+            [
+                NeuronComponent(
+                    neuron_id=int(neuron_id),
+                    session_id=None,
+                )
+            ],
+            remove=True,
+            whole_neurons=True,
+        )
 
-        if self.assignments is None:
-            raise ValueError("No assignments available.")
-
-        for session_id in range(self.assignments.ids.shape[1]):
-            component = NeuronComponent(neuron_id=neuron_id, session_id=session_id)
-            if self.assignments.ids[component.id] >= 0:
-                self.remove_component(component, notify=False)
-
-        self.assignments.updating_neuron_presence()
-        self.state.assignments = self.assignments.ids
-        self.rebuild_union_neurons([neuron_id])
-        self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
+        self.apply_curation_targets(
+            targets,
+            remove=True,
+            whole_neurons=True,
+        )
 
     def add_synthetic_component(
         self,

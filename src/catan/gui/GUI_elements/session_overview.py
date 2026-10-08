@@ -44,6 +44,7 @@ from catan.core.changes import (
 )
 from catan.core.structures import sessiondata_type
 from catan.core.structures.load_config import FieldSpec
+from catan.core.structures.inclusion import has_exclusions
 from catan.core.io import resolve_source_path
 from catan.core.io.isolated_read import read_operation
 
@@ -83,6 +84,7 @@ class SessionRowWidget(QFrame):
     loadRequested = Signal(int)  # session_id
     backgroundRequested = Signal(int)
     manualAlignmentRequested = Signal(int)
+    saveIncludedRequested = Signal(int)
 
     traceToggled = Signal(int)
     qualityToggled = Signal(int)
@@ -693,6 +695,18 @@ class SessionRowWidget(QFrame):
                 lambda: self.manualAlignmentRequested.emit(self.index),
             )
 
+        save_included = menu.addAction(
+            "Save included data…",
+            lambda: self.saveIncludedRequested.emit(self.index),
+        )
+        save_included.setEnabled(
+            bool(self.session.path) and has_exclusions(self.session)
+        )
+        save_included.setToolTip(
+            "Save this session's inclusion mask. "
+            "Available when at least one footprint is excluded."
+        )
+
         menu.addSeparator()
         remove_action = QAction("Remove session", menu)
         remove_action.triggered.connect(lambda: self.removeRequested.emit(self.index))
@@ -1043,6 +1057,9 @@ class LoadSessionRowWidget(QFrame):
         save_menu = QMenu(self.button_save_sessions)
         save_recipe_action = save_menu.addAction("Save loading recipe (.json)…")
         save_recipe_action.triggered.connect(self.save_loading_recipe)
+
+        save_included_action = save_menu.addAction("Save all included data…")
+        save_included_action.triggered.connect(self.save_all_included)
 
         self.button_save_sessions.setMenu(save_menu)
         self.button_save_sessions.setPopupMode(
@@ -2169,6 +2186,161 @@ class LoadSessionRowWidget(QFrame):
             flags=re.IGNORECASE if os.name == "nt" else 0,
         )
 
+    def save_included(self, session):
+        """Return False when cancelled or blocked, to stop bulk saving."""
+        tasks = self.state.tasks
+
+        if tasks.processing_busy() or tasks.processing_requested:
+            self.state.issue(
+                "info",
+                "Cannot save inclusion while processing",
+                "Finish or cancel processing, then try again.",
+                parent=self.window(),
+            )
+            return False
+
+        if not session.path or not has_exclusions(session):
+            return True
+
+        source = Path(session.path)
+
+        supported = {".hdf5", ".h5", ".mat", ".npz"}
+        filename = f"included_{source.name}"
+
+        if source.suffix.lower() not in supported:
+            filename += ".hdf5"
+
+        path = choose_path(
+            self,
+            pick_dir=False,
+            init_path=str(source.parent),
+            display_text=f"Save included data — {session.name}",
+            only_existing=False,
+            default_suffix="hdf5",
+            default_filename=filename,
+            file_filters=[
+                ("HDF5 inclusion file", ("*.hdf5", "*.h5")),
+                ("MATLAB inclusion file", ("*.mat",)),
+                ("NumPy inclusion file", ("*.npz",)),
+            ],
+            state=self.state,
+        )
+
+        if path is None:
+            return False
+
+        # The dialog may have run a nested event loop.
+        if not any(item is session for item in self.data.sessions):
+            return False
+
+        if not has_exclusions(session):
+            return True
+
+        return self.data.queue_save_included(session, path) is not None
+
+    def save_all_included(self):
+        tasks = self.state.tasks
+
+        if tasks.processing_busy() or tasks.processing_requested:
+            self.state.issue(
+                "info",
+                "Cannot save inclusion while processing",
+                "Finish or cancel processing, then try again.",
+                parent=self.window(),
+            )
+            return
+
+        sessions = tuple(
+            session
+            for session in self.data.sessions
+            if session.path and has_exclusions(session)
+        )
+
+        if not sessions:
+            self.state.issue(
+                "info",
+                "No inclusion data to save",
+                "No sessions currently contain excluded footprints.",
+                parent=self.window(),
+            )
+            return
+
+        prefix, accepted = QInputDialog.getText(
+            self,
+            "Save all included data",
+            "Filename prefix:\n"
+            "Files will be saved in their source session folders.\n"
+            "Existing files with the resulting names will be replaced.",
+            text="included_",
+        )
+
+        if not accepted:
+            return
+
+        if not prefix.strip() or re.search(r'[<>:"/\\|?*\x00-\x1f]', prefix):
+            self.state.issue(
+                "warning",
+                "Invalid filename prefix",
+                "Enter a non-empty prefix without path separators "
+                "or special filename characters.",
+                parent=self.window(),
+            )
+            return
+
+        # The input dialog runs a nested event loop.
+        if tasks.processing_busy() or tasks.processing_requested:
+            self.state.issue(
+                "info",
+                "Saving not started",
+                "Processing started while the dialog was open. "
+                "Finish or cancel it, then try again.",
+                parent=self.window(),
+            )
+            return
+
+        jobs = []
+        destinations = set()
+        supported = {".hdf5", ".h5", ".mat", ".npz"}
+
+        for session in sessions:
+            if not any(item is session for item in self.data.sessions):
+                continue
+            if not session.path or not has_exclusions(session):
+                continue
+
+            source = Path(session.path)
+            filename = prefix + source.name
+
+            if source.suffix.lower() not in supported:
+                filename += ".hdf5"
+
+            destination = source.parent / filename
+
+            # Lexical normalization only: no filesystem access here.
+            destination_key = os.path.normcase(os.path.abspath(os.fspath(destination)))
+
+            if destination_key in destinations:
+                self.state.issue(
+                    "warning",
+                    "Duplicate inclusion filenames",
+                    "Multiple sessions would save to the same file:\n"
+                    f"{destination}\n\n"
+                    "Save those sessions individually with distinct names.",
+                    parent=self.window(),
+                )
+                return
+
+            destinations.add(destination_key)
+            jobs.append((session, destination))
+
+        for session, destination in jobs:
+            task_id = self.data.queue_save_included(
+                session,
+                destination,
+            )
+            if task_id is None:
+                break
+
 
 class SessionList(QListWidget):
     drag_n_dropped = Signal(int, int)  # old_index, new_index
@@ -2299,6 +2471,11 @@ class SessionOverview(QWidget):
         row.loadRequested.connect(lambda id=session_id: self.load_requested.emit(id))
         row.backgroundRequested.connect(self.change_session_background)
         row.manualAlignmentRequested.connect(self.adjust_session_alignment)
+        row.saveIncludedRequested.connect(
+            lambda session_id: self.load_row.save_included(
+                self.data.sessions[session_id]
+            )
+        )
 
         row.traceToggled.connect(
             lambda id, which="traces": self.toggle_session_data(id, which)

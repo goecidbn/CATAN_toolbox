@@ -38,7 +38,7 @@ class AlignmentShiftInset(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
 
-        title = QLabel("Shifts · dx → / dy ↑ · pixels", self)
+        title = QLabel("Mean shifts · dx → / dy ↑ · pixels", self)
         layout.addWidget(title)
 
         self.canvas = scene.SceneCanvas(bgcolor="#20252b")
@@ -217,7 +217,7 @@ class AlignmentShiftInset(QWidget):
             size=np.asarray(sizes, dtype=np.float32),
         )
 
-        if fit:
+        if fit and self.locked_session_id is None:
             points = np.vstack(([0, 0], tips))
             lower = points.min(axis=0) - 5
             upper = points.max(axis=0) + 5
@@ -318,26 +318,41 @@ class AlignmentShiftInset(QWidget):
         self._arrow_scale = scale.copy()
         self.set_items(self.items)
 
-    def lock_session(self, session_id):
-        if self.locked_session_id == session_id:
+    def lock_session(self, session_id, *, force=False):
+        if self.locked_session_id == session_id and not force:
             return
 
         if self.locked_session_id is None:
             self._overview_state = deepcopy(self.view.camera.get_state())
 
         self.locked_session_id = session_id
+
+        comparisons = [
+            item
+            for item in self.items
+            if item["kind"] == "reference" and item["owner"] == session_id
+        ]
+
+        # Comparisons may still be calculating. Avoid an initial zoom
+        # onto one isolated point, followed by another zoom later.
+        if not comparisons:
+            return
+
         points = []
 
         for item in self.items:
             if item["kind"] == "session" and item["id"] == session_id:
                 points.append(item["xy"])
-            elif item["kind"] == "reference" and item["owner"] == session_id:
-                points.extend((item["start"], item["xy"]))
 
-        if not points:
+        for item in comparisons:
+            points.extend((item["start"], item["xy"]))
+
+        points = np.asarray(points, dtype=float)
+        points = points[np.isfinite(points).all(axis=1)]
+
+        if not len(points):
             return
 
-        points = np.asarray(points)
         span = np.ptp(points, axis=0)
         padding = np.maximum(1.0, span * 0.2)
         lower = points.min(axis=0) - padding
@@ -434,9 +449,24 @@ class AlignmentShiftInset(QWidget):
 
                 if self._moved:
                     point = np.asarray(self._transform().imap(event.pos)[:2])
-                    xy = np.asarray(item["xy"]) + point - start_point
-                    self.shift_changed.emit(float(xy[0]), float(xy[1]))
-                    self.info.setText(f"Draft: dx={xy[0]:.2f}, dy={xy[1]:.2f}")
+                    delta = point - start_point
+
+                    rigid_xy = (
+                        np.asarray(
+                            item.get("rigid_xy", item["xy"]),
+                            dtype=float,
+                        )
+                        + delta
+                    )
+
+                    self.shift_changed.emit(
+                        float(rigid_xy[0]),
+                        float(rigid_xy[1]),
+                    )
+
+                    self.info.setText(
+                        f"Rigid draft: dx={rigid_xy[0]:.2f}, " f"dy={rigid_xy[1]:.2f}"
+                    )
             return
 
         # Do not switch previews while panning.

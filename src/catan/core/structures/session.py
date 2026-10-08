@@ -13,6 +13,7 @@ from catan.core.io import (
     NATIVE_SESSION_CONFIG,
 )
 from catan.core.structures.load_config import LoadConfig, FieldSpec
+from catan.core.structures.inclusion import inclusion_mask
 from catan.core.data import center_of_mass
 from catan.core.io.isolated_read import read_fields
 
@@ -453,6 +454,14 @@ class SessionData:
             )
 
         footprints = sparse.csc_matrix(footprints)
+        loaded_included = None
+
+        if data.get("included") is not None:
+            loaded_included = inclusion_mask(
+                data["included"],
+                footprints.shape[1],
+                "Loaded session inclusion",
+            )
 
         loaded_background = data.get("background")
         if loaded_background is not None:
@@ -533,6 +542,9 @@ class SessionData:
         else:
             self.remap = Remapping.identity(self.dims)
             self.postprocess_spatial_data()
+
+        if loaded_included is not None:
+            self.included = loaded_included
 
         self.evaluate_alignment_status()
 

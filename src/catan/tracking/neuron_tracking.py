@@ -229,54 +229,23 @@ class Tracking:
         return list(self._assignments.keys())
 
     def update_sessions_with_assignments(self):
+        """Keep inclusion independent of membership in an assignment set."""
+        for session in self.sessions:
+            if not session.status["spatial_loaded"]:
+                continue
 
-        if self.assignments is None:
-            return
-
-        # for session in self.sessions:
-        # if session.id >= (n_status := len(self.assignments.matched_status)):
-        #     self.assignments.matched_status.extend(
-        #         [False] * (session.id - n_status + 1)
-        #     )
-        # print(
-        #     "Warning: trying to update matched_status with invalid session_id:", session.id
-        # )
-        # continue
-        # self.assignments.matched_status[session.id] = False
-
-        for session, assignment_ids in zip(self.sessions, self.assignments.ids.T):
-
-            # if np.any(assignment_ids >= 0):
-            #     # mark session as matched, if it has assignments
-            #     self.assignments.matched_status[session.id] = True
-
-            update_included = False
-            if session.included is not None:
-                idx_assigned_from_session = np.where(session.included)[0]
-                idx_assigned_from_assignments = assignment_ids[assignment_ids >= 0]
-
-                assignment_in_session = np.isin(
-                    idx_assigned_from_assignments, idx_assigned_from_session
+            if session.included is None:
+                session.included = np.ones(
+                    session.n_neurons,
+                    dtype=bool,
                 )
-                if not assignment_in_session.all():
-                    # warnings.warn(f"Session {session_id} has neurons in 'assignments' that are not marked as valid in the session data (included).")
-                    # warnings.warn(f"Neurons in assignments but not in session included: {idx_assigned_from_assignments[~assignment_in_session]}")
-                    update_included = True
+                continue
 
-                session_in_assignment = np.isin(
-                    idx_assigned_from_session, idx_assigned_from_assignments
+            if np.asarray(session.included).shape != (session.n_neurons,):
+                raise ValueError(
+                    f"Session {session.name}: inclusion mask does not "
+                    "match the footprint count."
                 )
-                if not session_in_assignment.all():
-                    # warnings.warn(f"Session {session_id} has neurons marked as valid in the session data (included) that are not present in 'assignments'.")
-                    # warnings.warn(f"Neurons in session included but not in assignments: {idx_assigned_from_session[~session_in_assignment]}")
-                    update_included = True
-            else:
-                # warnings.warn(f"Session {session_id} does not have 'included' defined. It will be updated based on 'assignments'.")
-                update_included = True
-
-            if update_included:
-                session.included = np.zeros(session.n_neurons, dtype=bool)
-                session.included[assignment_ids[assignment_ids >= 0]] = True
 
     ### ============================================= ###
     ### ============= DEFINE DATA LOADING =========== ###
@@ -2770,7 +2739,10 @@ class Tracking:
             )
         else:
             self.get_result_directory(Path(output_fname).parent)
-        self.assignments.save(str(output_fname))
+        self.assignments.save(
+            str(output_fname),
+            sessions=self.sessions,
+        )
 
     def get_result_directory(
         self,

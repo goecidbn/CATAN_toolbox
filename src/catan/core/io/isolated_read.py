@@ -253,7 +253,10 @@ def read_fields(
                     ),
                 )
 
-            time.sleep(0.1)
+            try:
+                process.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                pass
 
         _check_cancelled(ctx)
 

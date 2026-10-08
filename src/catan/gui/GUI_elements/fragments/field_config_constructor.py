@@ -102,13 +102,18 @@ class FieldConfigConstructor(QObject):
 
         # layout.addWidget(QLabel("Load config:"))
         self.load_config_selector = QComboBox()
-        self.load_config_selector.setMaximumWidth(120)
+        self.load_config_selector.setMinimumWidth(240)
+        self.load_config_selector.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.load_config_selector.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.load_config_selector.setMinimumContentsLength(24)
         self.rebuild_config_selector()
 
-        layout.addWidget(
-            self.load_config_selector, alignment=Qt.AlignmentFlag.AlignLeft
-        )
-        layout.addStretch()
+        layout.addWidget(self.load_config_selector, 1)
 
         def load_config_changed(idx):
 
