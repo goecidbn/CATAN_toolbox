@@ -1,5 +1,4 @@
-from dataclasses import dataclass, fields, is_dataclass
-
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Optional
 from collections.abc import Callable
 
@@ -34,10 +33,7 @@ def _retained_array_bytes(value):
             return item.nbytes
 
         if is_dataclass(item) and not isinstance(item, type):
-            return sum(
-                visit(getattr(item, field.name))
-                for field in fields(item)
-            )
+            return sum(visit(getattr(item, field.name)) for field in fields(item))
 
         if isinstance(item, dict):
             return sum(visit(value) for value in item.values())
@@ -48,6 +44,7 @@ def _retained_array_bytes(value):
         return 0
 
     return visit(value)
+
 
 @dataclass(frozen=True, slots=True)
 class StatisticsTaskResult:
@@ -97,7 +94,6 @@ class StatisticEngine(QObject):
         self.state.data_changed.connect(self._on_data_changed)
         self.state.statistics_sources_changed.connect(self.refresh_registry)
 
-
     def data_version(self):
         # Increase/change this whenever tracking/data/statistics change.
         return getattr(self.state, "data_version", 0)
@@ -118,16 +114,13 @@ class StatisticEngine(QObject):
         )
 
         registry_changes = (
-            self.refresh_registry(emit=False)
-            if check_registry
-            else frozenset()
+            self.refresh_registry(emit=False) if check_registry else frozenset()
         )
 
         value_changes = self._invalidate(
             key
             for key, definition in self.registry.items()
-            if key not in registry_changes
-            and definition.is_affected_by(event)
+            if key not in registry_changes and definition.is_affected_by(event)
         )
 
         if registry_changes:
@@ -135,7 +128,7 @@ class StatisticEngine(QObject):
 
         if value_changes:
             self.values_changed.emit(value_changes)
-            
+
     def _definition_signature(self, definition):
         # Registry factories recreate partials; compare their configuration,
         # not the identity of the newly created partial object.
@@ -148,10 +141,7 @@ class StatisticEngine(QObject):
             )
 
         coordinates = None
-        if (
-            definition.dims
-            and getattr(self.state, "assignments", None) is not None
-        ):
+        if definition.dims and getattr(self.state, "assignments", None) is not None:
             coords = definition.coord_getter(self.state)
             coordinates = tuple(
                 (dim, tuple(np.asarray(coords[dim]).tolist()))
@@ -194,6 +184,13 @@ class StatisticEngine(QObject):
             definition.dependencies,
             definition.availability_dependencies,
             sources,
+            definition.parameters,
+            definition.independent_pairs,
+            definition.query_getter,
+            definition.compact_values,
+            definition.component_axes,
+            definition.curation_kind,
+            definition.relationship_axes,
         )
 
     def refresh_registry(self, *, emit=True):
@@ -224,14 +221,12 @@ class StatisticEngine(QObject):
 
         return changed
 
-
     def query_revision(self, query):
         if query is None:
             return 0
 
         with self._cache_lock:
             return self._revisions.get(query.statistic_key, 0)
-
 
     def _invalidate(self, keys):
         keys = frozenset(keys)
@@ -260,6 +255,14 @@ class StatisticEngine(QObject):
             return None
 
         with self._cache_lock:
+            definition = self.registry[query.statistic_key]
+
+            parameters = definition.resolve_parameters(dict(query.parameters))
+            query = replace(
+                query,
+                parameters=tuple(sorted(parameters.items())),
+            )
+
             revision = self._revisions.get(query.statistic_key, 0)
             key = (query, revision)
 
@@ -269,10 +272,10 @@ class StatisticEngine(QObject):
                 self._cache[key] = result
                 return result
 
-            definition = self.registry[query.statistic_key]
-
         # Calculation happens outside the cache lock.
         result = self._evaluate_uncached(query, definition)
+        if definition.compact_values:
+            _compact_statistic_values(result)
 
         with self._cache_lock:
             # A relevant change during calculation must not repopulate
@@ -298,16 +301,59 @@ class StatisticEngine(QObject):
         self,
         query: StatisticQuery,
         stat_def=None,
+        *,
+        select_values=None,
+        requested_pairs=None,
     ) -> StatisticArray:
+
         if stat_def is None:
             stat_def = self.registry[query.statistic_key]
+
         reductions = query.reduction_dict()
-        if stat_def.key == "footprint_similarity":
+        if stat_def.independent_pairs:
+
             from .queries import normalize_footprint_pair_reductions
+
             reductions = normalize_footprint_pair_reductions(
-                stat_def, reductions, query.filters,
+                stat_def,
+                reductions,
+                query.filters,
                 session_series=query.context == "session_series",
             )
+
+        if stat_def.query_getter is not None:
+            prepared_query = replace(
+                query,
+                reductions=tuple(reductions.items()),
+            )
+
+            parameters = stat_def.resolve_parameters(dict(query.parameters))
+
+            execution_options = {}
+
+            if select_values is not None:
+                execution_options["select_values"] = select_values
+
+            if requested_pairs is not None:
+                execution_options["requested_pairs"] = requested_pairs
+
+            stat = stat_def.query_getter(
+                self.data,
+                self.state,
+                prepared_query,
+                **parameters,
+                **execution_options,
+            )
+
+            stat.name = stat_def.key
+            stat.title = stat_def.title_with_parameters(parameters)
+            stat.category = stat_def.category
+            stat.component_axes = stat_def.component_axes
+            stat.curation_kind = stat_def.curation_kind
+            stat.relationship_axes = stat_def.relationship_axes
+            stat.validate()
+
+            return stat
 
         indexers = {
             dim: spec.index
@@ -320,11 +366,13 @@ class StatisticEngine(QObject):
             state=self.state,
             indexers=indexers,
             filters=query.filters,
+            parameters=dict(query.parameters),
         )
 
         requested_order = tuple(query.reduction_order or ())
         reduction_order = requested_order + tuple(
-            dim for dim in stat_def.dims
+            dim
+            for dim in stat_def.dims
             if dim not in requested_order
             and reductions.get(dim, ReductionSpec("keep")).method
             not in ("keep", "single")
@@ -383,6 +431,83 @@ class StatisticEngine(QObject):
 
         return table
 
+    def evaluate_matching_table(
+        self,
+        query,
+        select_values,
+        *,
+        requested_pairs=None,
+    ):
+        """Return selected rows without caching a threshold-specific result."""
+        if query is None or query.statistic_key == "none":
+            return None
+
+        if self.data is None or not self.data.sessions:
+            return None
+
+        if requested_pairs is not None and not self.supports_requested_pairs(query):
+            raise ValueError(
+                "This statistic does not support evaluation of requested pairs."
+            )
+
+        with self._cache_lock:
+            definition = self.registry[query.statistic_key]
+            revision = self._revisions.get(query.statistic_key, 0)
+
+        def select(values):
+            mask = select_values(values)
+
+            if mask is None:
+                raise ValueError("The value selector returned no mask.")
+
+            mask = np.asarray(mask, dtype=bool)
+
+            if mask.shape != values.shape:
+                raise ValueError("The value selector returned an invalid mask shape.")
+
+            return mask & ~np.isnan(values)
+
+        getter = definition.query_getter
+
+        while isinstance(getter, partial):
+            getter = getter.func
+
+        if getattr(getter, "supports_value_selection", False):
+            stat = self._evaluate_uncached(
+                query,
+                definition,
+                select_values=select,
+                requested_pairs=requested_pairs,
+            )
+
+            if definition.compact_values:
+                _compact_statistic_values(stat)
+
+            table = PickTable.from_stat(stat)
+
+            remaining = tuple(
+                f
+                for f in (query.filters or ())
+                if f.target not in stat.applied_pair_filters
+            )
+
+            if remaining:
+                table = table.filtered(remaining)
+
+        else:
+            # Existing getters, including sparse footprint similarity,
+            # retain their current calculation and reduction paths.
+            table = self.evaluate_table(query)
+
+            if table is not None:
+                table = table.subset_rows(np.flatnonzero(select(table.values)))
+
+        with self._cache_lock:
+            if self._revisions.get(query.statistic_key, 0) != revision:
+                raise RuntimeError("The data changed during filtering. Evaluate again.")
+
+        return table
+
     def _validate_filters_possible(self, query: StatisticQuery, stat: StatisticArray):
         remaining = set(stat.dims)
 
@@ -402,3 +527,46 @@ class StatisticEngine(QObject):
                     f"required dimensions {required} are not available after reductions. "
                     f"Remaining dims are {stat.dims}. Missing: {missing}."
                 )
+
+    def supports_requested_pairs(self, query):
+        definition = self.registry[query.statistic_key]
+        getter = definition.query_getter
+
+        while isinstance(getter, partial):
+            getter = getter.func
+
+        return (
+            getattr(getter, "supports_requested_pairs", False)
+            and getattr(getter, "supports_value_selection", False)
+            and definition.relationship_axes is not None
+            and all(
+                spec.method in ("keep", "single")
+                for spec in query.reduction_dict().values()
+            )
+        )
+
+
+def _compact_statistic_values(stat):
+    if stat is None:
+        return
+
+    values = np.asarray(stat.values)
+    flat = values.reshape(-1)
+    peak = 0.0
+
+    # Inspect in blocks, avoiding a full-size temporary array.
+    for start in range(0, flat.size, 65_536):
+        block = flat[start : start + 65_536]
+        finite = block[np.isfinite(block)]
+
+        if finite.size:
+            peak = max(peak, float(np.max(np.abs(finite))))
+
+    if peak <= np.finfo(np.float16).max:
+        dtype = np.float16
+    elif peak <= np.finfo(np.float32).max:
+        dtype = np.float32
+    else:
+        dtype = np.float64
+
+    stat.values = values.astype(dtype, copy=False)

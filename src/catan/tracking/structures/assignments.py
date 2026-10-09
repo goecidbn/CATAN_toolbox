@@ -9,6 +9,10 @@ from catan.core.structures.load_config import LoadConfig, FieldSpec
 from catan.core.utils import pad_axis
 from catan.core.structures.session import SessionData
 from catan.core.structures.inclusion import snapshot_inclusion
+from catan.core.spatial_coverage import (
+    session_valid_mask,
+    signed_border_distance,
+)
 
 import numpy as np
 from scipy import sparse
@@ -105,6 +109,8 @@ class Assignments:
             "shifts": 0.0,
             "fp_corr": 1.0,
         }
+
+        self._common_spatial_cache = None
 
         self.matched_status: np.ndarray = np.array([], dtype=bool)
         self.session_included = None
@@ -427,6 +433,59 @@ class Assignments:
         self._deserialize_manipulations(curation.get("manipulations") or {})
 
         self.status["loaded"] = True
+
+    def common_spatial_coverage(self, sessions, *, revision=None):
+        sessions = tuple(sessions)
+
+        if not sessions:
+            raise ValueError(
+                "Load sessions before calculating the shared imaging area."
+            )
+
+        if any(session is None for session in sessions):
+            raise ValueError(
+                "A session is missing; finish loading before calculating "
+                "the shared imaging area."
+            )
+
+        key = (
+            revision,
+            tuple(
+                (
+                    id(session),
+                    id(session.remap),
+                    tuple(session.dims),
+                    session.status.get("spatial_loaded", False),
+                    session.status.get("aligned", False),
+                )
+                for session in sessions
+            ),
+        )
+
+        cached = self._common_spatial_cache
+
+        if revision is not None and cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+
+        shape = tuple(sessions[0].dims)
+        common = np.ones(shape, dtype=bool)
+
+        for session in sessions:
+            if tuple(session.dims) != shape:
+                raise ValueError("Sessions must share the same aligned pixel grid.")
+
+            common &= session_valid_mask(session)
+
+        distance = signed_border_distance(common)
+
+        # Callers must not accidentally alter the shared cached arrays.
+        common.setflags(write=False)
+        distance.setflags(write=False)
+
+        if revision is not None:
+            self._common_spatial_cache = (key, common, distance)
+
+        return common, distance
 
     def prepare_save(self, fields_to_save=None, *, sessions=None):
 

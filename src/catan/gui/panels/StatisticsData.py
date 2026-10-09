@@ -13,6 +13,9 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QToolButton,
     QVBoxLayout,
+    QCheckBox,
+    QDoubleSpinBox,
+    QFormLayout,
 )
 
 from catan.gui.data.statistics import (
@@ -245,6 +248,62 @@ class ReductionPopup(QDialog):
         title = QLabel(f"<b>{stat_def.title}</b>")
         layout.addWidget(title)
 
+        if stat_def.parameters:
+            form = QFormLayout()
+            values = self.selector.current_parameters()
+
+            for spec in stat_def.parameters:
+                if spec.kind is bool:
+                    editor = QCheckBox()
+                    editor.setChecked(values[spec.key])
+                    changed = editor.toggled
+
+                elif spec.kind is int:
+                    editor = QSpinBox()
+                    editor.setRange(
+                        (
+                            int(spec.minimum)
+                            if spec.minimum is not None
+                            else -2_147_483_647
+                        ),
+                        (
+                            int(spec.maximum)
+                            if spec.maximum is not None
+                            else 2_147_483_647
+                        ),
+                    )
+                    editor.setSingleStep(max(1, int(spec.step)))
+                    editor.setKeyboardTracking(False)
+                    editor.setValue(values[spec.key])
+                    changed = editor.valueChanged
+
+                elif spec.kind is float:
+                    editor = QDoubleSpinBox()
+                    editor.setDecimals(spec.decimals)
+                    editor.setRange(
+                        float(spec.minimum) if spec.minimum is not None else -1e12,
+                        float(spec.maximum) if spec.maximum is not None else 1e12,
+                    )
+                    editor.setSingleStep(spec.step)
+                    editor.setKeyboardTracking(False)
+                    editor.setValue(values[spec.key])
+                    changed = editor.valueChanged
+
+                else:
+                    raise TypeError(f"Unsupported parameter type: {spec.kind}")
+
+                editor.setToolTip(spec.tooltip)
+
+                changed.connect(
+                    lambda value, key=spec.key: self.selector._on_parameter_changed(
+                        key, value
+                    )
+                )
+
+                form.addRow(spec.label, editor)
+
+            layout.addLayout(form)
+
         for dim in stat_def.dims:
 
             methods = self.selector.reduction_methods_for_dim(dim)
@@ -466,6 +525,7 @@ def format_query_expression(
 
     # Use the short/internal statistic name here,
     # not the verbose menu title.
+    # base_name = stat_def.title_with_parameters(dict(query.parameters))
     base_name = stat_def.title
 
     if arguments:
@@ -534,6 +594,9 @@ class StatisticQuerySelector(QWidget):
 
         self.default_reduction_provider = None
         self.current_reductions: dict[str, ReductionSpec] = {}
+
+        self._parameter_values = {}
+
         self._popup = None
 
         self._current_stat_key = next(iter(self.engine.registry.keys()))
@@ -583,6 +646,23 @@ class StatisticQuerySelector(QWidget):
         self._on_statistic_changed()
         self._update_filter_visibility()
 
+    def current_parameters(self):
+        return self.current_stat_def().resolve_parameters(
+            self._parameter_values.get(self.current_stat_key(), {})
+        )
+
+    def _on_parameter_changed(self, key, value):
+        values = self.current_parameters()
+        values[key] = value
+
+        self._parameter_values[self.current_stat_key()] = (
+            self.current_stat_def().resolve_parameters(values)
+        )
+
+        self._update_stat_button()
+        self._update_summary()
+        self._emit_query_changed_once()
+
     def dispose(self):
         if self._disposed:
             return
@@ -613,6 +693,9 @@ class StatisticQuerySelector(QWidget):
             raise KeyError(query.statistic_key)
 
         self._current_stat_key = query.statistic_key
+        self._parameter_values[query.statistic_key] = (
+            self.current_stat_def().resolve_parameters(dict(query.parameters))
+        )
         self.current_reductions = dict(query.reductions)
 
         neuron_relation = "all"
@@ -648,7 +731,7 @@ class StatisticQuerySelector(QWidget):
     def refresh_statistics(self):
         if self._disposed:
             return
-        
+
         old_key = self._current_stat_key
 
         if old_key not in self.engine.registry:
@@ -849,6 +932,7 @@ class StatisticQuerySelector(QWidget):
             reductions=tuple(sorted(self.current_reductions.items())),
             filters=self.current_filters(),
             context=self.query_mode,
+            parameters=tuple(sorted(self.current_parameters().items())),
         )
 
     def effective_query(self) -> StatisticQuery | None:
@@ -967,9 +1051,10 @@ class StatisticQuerySelector(QWidget):
 
     def _update_stat_button(self):
         stat_def = self.current_stat_def()
+        title = stat_def.title_with_parameters(self.current_parameters())
 
-        self.stat_button.setText(stat_def.title)
-        self.stat_button.setToolTip(stat_def.description)
+        self.stat_button.setText(title)
+        self.stat_button.setToolTip(f"{title}\n\n{stat_def.description}")
 
     def _update_filter_visibility(self):
         stat_def = self.current_stat_def()
@@ -1028,21 +1113,23 @@ class StatisticQuerySelector(QWidget):
 
         self.current_reductions[dim_name] = spec
 
-        if self.current_stat_key() == "footprint_similarity":
+        if self.current_stat_def().independent_pairs:
             filters = {f.target: f for f in self.current_filters()}
             target = dim_name.removesuffix("_i")
             pair_filter = filters.get(target)
             if (
-                dim_name.endswith("_i") and pair_filter is not None
+                dim_name.endswith("_i")
+                and pair_filter is not None
                 and pair_filter.collapse_same
-                and (pair_filter.relation == "same" or (
-                    target == "session" and pair_filter.relation == "with previous"
-                ))
+                and (
+                    pair_filter.relation == "same"
+                    or (target == "session" and pair_filter.relation == "with previous")
+                )
             ):
                 self.current_reductions[target + "_j"] = spec
 
         if (
-            self.current_stat_key() == "footprint_similarity"
+            self.current_stat_def().independent_pairs
             and self.query_mode == "session_series"
             and dim_name in ("session_i", "session_j")
             and self.session_filter_button.current_relation() in ("all", "different")
@@ -1112,6 +1199,8 @@ class StatisticQuerySelector(QWidget):
 
             parts.append(format_reduction_short(dim, spec))
 
+        if stat_def.parameters:
+            parts.append("Parameters…")
         self.reduction_button.setText(", ".join(parts))
 
     def reduction_methods_for_dim(
@@ -1130,15 +1219,26 @@ class StatisticQuerySelector(QWidget):
 
         methods = tuple(m for m in specific if m in general)
 
-        if stat_def.key == "footprint_similarity" and self.query_mode in ("generic", "session_series"):
+        if stat_def.independent_pairs and self.query_mode in (
+            "generic",
+            "session_series",
+        ):
             relations = {f.target: f.relation for f in self.current_filters()}
             collapsed = {f.target: f.collapse_same for f in self.current_filters()}
-            linked_n = relations.get("neuron") == "same" and collapsed.get("neuron", True)
-            linked_s = relations.get("session") in ("same", "with previous") and collapsed.get("session", True)
+            linked_n = relations.get("neuron") == "same" and collapsed.get(
+                "neuron", True
+            )
+            linked_s = relations.get("session") in (
+                "same",
+                "with previous",
+            ) and collapsed.get("session", True)
             if (linked_n and dim == "neuron_j") or (linked_s and dim == "session_j"):
                 return ()
             if self.query_mode == "session_series":
                 if dim in SESSION_DIMS:
+                    if dim == "session":
+                        return ("keep",)
+
                     return () if linked_s else specific
                 if dim in NEURON_DIMS:
                     return tuple(m for m in specific if m != "keep")
@@ -1251,9 +1351,7 @@ class StatisticQuerySelector(QWidget):
                 # The reference session follows from the relation.
                 if dim == "session_i":
                     return tuple(
-                        method
-                        for method in methods
-                        if method in ("keep", "single")
+                        method for method in methods if method in ("keep", "single")
                     )
                 return ()
 
@@ -1282,7 +1380,7 @@ class StatisticQuerySelector(QWidget):
             context=self.query_mode,
         )
 
-        if self.current_stat_key() == "footprint_similarity":
+        if self.current_stat_def().independent_pairs:
             methods = tuple(m for m in methods if m != "bootstrap")
             if (
                 dim == "neuron_i"

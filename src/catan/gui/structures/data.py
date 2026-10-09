@@ -2417,7 +2417,98 @@ class Data(Tracking):
         )
         return float(distance) if np.isfinite(distance) else np.inf
 
+    def prepare_manipulation(self, plan, *, detach_occupied=False):
+        from catan.gui.data.curation_actions import prepare
+
+        if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
+            raise ValueError("Wait for current processing to finish.")
+
+        return prepare(
+            self,
+            plan,
+            detach_occupied=detach_occupied,
+        )
+
+    def validate_prepared_manipulation(self, prepared, spec):
+        from catan.gui.data.curation_actions import (
+            validate_prepared,
+        )
+
+        return validate_prepared(prepared, spec)
+
+    def commit_manipulation(self, prepared):
+        from catan.gui.data.curation_actions import commit
+
+        return commit(self, prepared)
+
+    def _apply_manipulation(self, kind, sources, targets):
+        from catan.gui.data.curation_actions import (
+            ManipulationPlan,
+            ManipulationSpec,
+        )
+
+        plan = ManipulationPlan.capture(
+            self,
+            kind,
+            sources,
+            targets,
+        )
+
+        def perform():
+            prepared = self.prepare_manipulation(plan)
+
+            prepared.validation = self.validate_prepared_manipulation(
+                prepared,
+                ManipulationSpec(),
+            )
+
+            return self.commit_manipulation(prepared)
+
+        if self.state.tasks.processing_busy():
+            raise ValueError("Wait for current processing to finish.")
+
+        if self.state.tasks.defer_for_background(perform):
+            return None
+
+        return perform()
+
+    def process_component_request(self, request):
+        if request.stage != "destination" or not request.is_complete:
+            raise ValueError("Complete both request stages before applying.")
+
+        return self._apply_manipulation(
+            request.type,
+            tuple(request.destination),
+            tuple(request.origin),
+        )
+
     def merge_neuron_request(self, request):
+        if request.assignments is not self.assignments:
+            raise ValueError("The active assignments changed. " "Start a new request.")
+
+        return self._apply_manipulation(
+            "neuron_merge",
+            (NeuronComponent(request.source_id, None),),
+            (NeuronComponent(request.target_id, None),),
+        )
+
+    def reassign_footprint(self, source, target_neuron=None):
+        return self._apply_manipulation(
+            ("new_neuron" if target_neuron is None else "reassign"),
+            (source,),
+            (
+                ()
+                if target_neuron is None
+                else (
+                    NeuronComponent(
+                        int(target_neuron),
+                        None,
+                    ),
+                )
+            ),
+        )
+
+    def _merge_neuron_request_inplace(self, request):
         assignments = self.assignments
 
         if request.assignments is not assignments:
@@ -2560,7 +2651,10 @@ class Data(Tracking):
         else:
             self.state.update_selected_components(None)
 
-    def process_component_request(self, request: RequestHandler):
+    def _process_component_request_inplace(
+        self,
+        request: RequestHandler,
+    ):
         if self.assignments is None:
             raise ValueError("No assignments available.")
 

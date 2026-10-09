@@ -96,6 +96,24 @@ class Display(BasePlot.BaseCanvas):
 
         self.plot_root = scene.Node(parent=self.view.scene)
 
+        self.common_boundary_overlay = Image(
+            np.zeros((1, 1, 4), dtype=np.float32),
+            interpolation="nearest",
+            method="subdivide",
+            parent=self.plot_root,
+        )
+
+        # Background: -1000; footprint visuals: 0 and above.
+        self.common_boundary_overlay.order = -900
+        self.common_boundary_overlay.interactive = False
+        self.common_boundary_overlay.visible = False
+
+        self.common_boundary_overlay.set_gl_state(
+            depth_test=False,
+            blend=True,
+            blend_func=("src_alpha", "one_minus_src_alpha"),
+        )
+
         self.changes_on_click = "selected"
 
         self.control_overlay = None
@@ -247,9 +265,9 @@ class Display(BasePlot.BaseCanvas):
             text.visible = False
 
     def initialize_overlays(self):
-
-        for style in ["selected", "focused", "highlighted", "hovered"]:
-            self.add_overlay(style)
+        for style in self.overlays:
+            if not self.plotting["overlays"].get(style):
+                self.add_overlay(style)
 
     def _on_canvas_resize(self, event=None):
         self._position_overlay_controls()
@@ -432,21 +450,6 @@ class Display(BasePlot.BaseCanvas):
                 ),  # Make overlaps visible
             )
 
-            # record = self.plotting["data"][key]
-
-            # colors, style = self._colors_for_record(
-            #     key,
-            #     record,
-            # )
-
-            # plot_options = self.styles.get_plot_options(
-            #     style=style,
-            #     plot_type="marker",
-            #     values=record.vals,
-            #     colors=colors,
-            #     edge_width=0,
-            # )
-
             footprints.set_data(record.pos)  # , **plot_options)
 
             if key == "union":
@@ -456,6 +459,40 @@ class Display(BasePlot.BaseCanvas):
             self.plotting["visuals"][key] = footprints
 
         self._update_statistic_colors()
+
+    def set_common_boundary(self, mask):
+        visual = self.common_boundary_overlay
+        visual.visible = False
+
+        background = self.plotting.get("background")
+        session = self.data.current_session
+
+        if mask is None or background is None or session is None:
+            self.update()
+            return
+
+        mask = np.asarray(mask, dtype=bool)
+
+        if mask.shape != tuple(session.dims):
+            self.update()
+            return
+
+        outside = ~mask
+
+        if not outside.any():
+            self.update()
+            return
+
+        rgba = np.zeros(mask.shape + (4,), dtype=np.float32)
+        rgba[..., :3] = (1.0, 0.30, 0.30)
+        rgba[..., 3] = outside * 0.16
+
+        visual.set_data(rgba)
+
+        # Follow any positioning applied to the background image.
+        visual.transform = background.transform
+        visual.visible = True
+        self.update()
 
     def clean(self, with_union=True):
 
@@ -1033,6 +1070,9 @@ class Display(BasePlot.BaseCanvas):
             self.update()
             return
 
+        if not visuals:
+            self.add_overlay(style)
+
         if not isinstance(component, list):
             component = [component]
 
@@ -1207,6 +1247,9 @@ class Controller(BasePlot.CanvasController):
 
     def build_controls(self):
 
+        self._boundary_task_id = None
+        self._boundary_generation = 0
+
         self.current_statistic_query = None
         self.statistic_table = None
 
@@ -1254,6 +1297,96 @@ class Controller(BasePlot.CanvasController):
         self.controls["panel"].review_filter.changed.connect(
             self._on_review_filter_changed
         )
+
+    def _cancel_boundary_task(self):
+        self._boundary_generation += 1
+
+        task_id = self._boundary_task_id
+        self._boundary_task_id = None
+
+        if task_id is not None:
+            self.state.tasks.cancel(task_id)
+
+    def _refresh_common_boundary(self):
+        self._cancel_boundary_task()
+        self.canvas.set_common_boundary(None)
+
+        if self._deactivated:
+            return
+
+        assignments = self.data.assignments
+        sessions = tuple(self.data.sessions)
+
+        if (
+            assignments is None
+            or not sessions
+            or self.state.current_session_id is None
+            or self.data.current_session is None
+        ):
+            return
+
+        # During loading/realignment, hide the overlay rather than
+        # displaying a boundary derived from incomplete geometry.
+        for session_id, session in enumerate(sessions):
+            if (
+                session is None
+                or not session.status.get("spatial_loaded", False)
+                or not session.status.get("aligned", False)
+                or self.data.alignment_is_stale(session_id)
+            ):
+                return
+
+        generation = self._boundary_generation
+        revision = self.state.data_version
+
+        def calculate():
+            from catan.gui.background_tasks.runtime import (
+                current_task_context,
+            )
+
+            ctx = current_task_context()
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            try:
+                mask, _ = assignments.common_spatial_coverage(
+                    sessions,
+                    revision=revision,
+                )
+            except ValueError:
+                # Coverage can become unavailable while loading changes.
+                # Do not turn an optional visual into a modal error.
+                return None
+
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            return mask
+
+        self._boundary_task_id = self.state.tasks.start(
+            "calculating",
+            "Calculate shared imaging boundary",
+            calculate,
+            on_result=lambda mask: self._on_common_boundary_ready(
+                mask,
+                generation,
+                revision,
+            ),
+            background=True,
+        )
+
+    def _on_common_boundary_ready(self, mask, generation, revision):
+        if self._deactivated or generation != self._boundary_generation:
+            return
+
+        self._boundary_task_id = None
+
+        if revision != self.state.data_version:
+            # A change occurred during calculation. Request current data.
+            self._refresh_common_boundary()
+            return
+
+        self.canvas.set_common_boundary(mask)
 
     def _on_statistic_query_changed(self, query):
         self.current_statistic_query = query
@@ -1392,6 +1525,8 @@ class Controller(BasePlot.CanvasController):
             self.initialize_display()
         elif event.has(C.REVIEW_STATUS):
             self._on_review_filter_changed()
+        elif event.has(C.PROCESSING_STATUS):
+            self._refresh_common_boundary()
 
     def _on_session_changed(self):
         if (
@@ -1402,6 +1537,7 @@ class Controller(BasePlot.CanvasController):
             return
 
         self.canvas.plot_background()
+        self._refresh_common_boundary()
         if self.section.display_mode == "tracked_overview":
             if "union" not in self.canvas.plotting["data"]:
                 self.canvas.build_neuron_visuals_union()
@@ -1441,6 +1577,10 @@ class Controller(BasePlot.CanvasController):
 
         if self._deactivated:
             return
+
+        self._cancel_boundary_task()
+        self.canvas.set_common_boundary(None)
+
         self.canvas.clean()
         super().deactivate()
 

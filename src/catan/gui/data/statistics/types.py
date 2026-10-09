@@ -6,6 +6,7 @@ import numpy as np
 
 from .dimensions import Dimension, DimensionInfo, get_default_coords
 from .queries import ReductionSpec, DEFAULT_REDUCTIONS
+from .parameters import StatisticParameter
 
 from catan.core.changes import ChangeKind, DataChange
 
@@ -40,9 +41,24 @@ class StatisticArray:
 
     # Original query dimensions -> compact calculation dimensions.
     reduction_aliases: dict[str, str] = field(default_factory=dict)
+    reference_aliases: dict = field(default_factory=dict)
 
     # Pair-filter targets already handled by the calculation.
     applied_pair_filters: tuple[str, ...] = ()
+
+    # None: use the existing dimension-based interpretation.
+    # (): this statistic contains no concrete footprint identities.
+    component_axes: tuple[tuple[str, str], ...] | None = None
+
+    # Optional identity used for combining curation conditions.
+    curation_kind: str | None = None
+
+    # Endpoint order: source, target.
+    # A session axis identifies a footprint.
+    # None explicitly identifies a neuron.
+    relationship_axes: tuple[tuple[str, str | None], tuple[str, str | None]] | None = (
+        None
+    )
 
     @property
     def dims(self) -> tuple[str, ...]:
@@ -285,7 +301,9 @@ class StatisticArray:
             return np.nanmin(values, axis=axis)
 
         if method == "sum":
-            return np.nansum(values, axis=axis)
+            total = np.nansum(values, axis=axis)
+            observed = np.any(~np.isnan(values), axis=axis)
+            return np.where(observed, total, np.nan)
 
         if method == "std":
             return np.nanstd(values, axis=axis)
@@ -341,7 +359,9 @@ class StatisticArray:
         elif method == "min":
             reducer = np.nanmin
         elif method == "sum":
-            reducer = np.nansum
+            reducer = lambda values, axis: self._compute_center(values, axis, "sum")
+        elif method == "std":
+            reducer = np.nanstd
         else:
             raise ValueError(
                 f"Do not know how to reduce existing errors with method {method!r}."
@@ -421,7 +441,11 @@ class StatisticArray:
             ),
             n=None if self.n is None else np.array(self.n, copy=True),
             reduction_aliases=dict(self.reduction_aliases),
+            reference_aliases=dict(self.reference_aliases),
             applied_pair_filters=self.applied_pair_filters,
+            component_axes=self.component_axes,
+            curation_kind=self.curation_kind,
+            relationship_axes=self.relationship_axes,
         )
 
 
@@ -454,6 +478,32 @@ class StatisticDefinition:
     # Field groups whose loading/unloading affects this statistic.
     availability_dependencies: frozenset[str] = frozenset()
 
+    parameters: tuple[StatisticParameter, ...] = ()
+
+    # Supports independently constrained neuron/session pairs.
+    independent_pairs: bool = False
+
+    # Optional calculation that consumes the complete query and applies
+    # its reductions itself, before materializing a large result.
+    query_getter: Callable | None = None
+
+    # Compact stored values after calculation and reduction.
+    compact_values: bool = False
+
+    # None: use the existing dimension-based interpretation.
+    # (): this statistic contains no concrete footprint identities.
+    component_axes: tuple[tuple[str, str], ...] | None = None
+
+    # Optional identity used for combining curation conditions.
+    curation_kind: str | None = None
+
+    # Endpoint order: source, target.
+    # A session axis identifies a footprint.
+    # None explicitly identifies a neuron.
+    relationship_axes: tuple[tuple[str, str | None], tuple[str, str | None]] | None = (
+        None
+    )
+
     def is_affected_by(self, event: DataChange) -> bool:
         if self.dependencies is None:
             return True
@@ -468,9 +518,7 @@ class StatisticDefinition:
             ):
                 if (
                     change.fields is None
-                    or self.availability_dependencies.intersection(
-                        change.fields
-                    )
+                    or self.availability_dependencies.intersection(change.fields)
                 ):
                     return True
 
@@ -482,6 +530,7 @@ class StatisticDefinition:
         state,
         indexers: dict[str, int] | None = None,
         filters=(),
+        parameters=None,
     ) -> StatisticArray:
         """
         Compute statistic values and construct a consistent StatisticArray.
@@ -491,6 +540,9 @@ class StatisticDefinition:
         values without the 'session' axis.
         """
         indexers = indexers or {}
+
+        parameters = self.resolve_parameters(parameters)
+        title = self.title_with_parameters(parameters)
 
         for dim_name in indexers:
             if dim_name not in self.dims:
@@ -504,13 +556,17 @@ class StatisticDefinition:
             state,
             indexers=indexers,
             filters=filters,
+            **parameters,
         )
         # Some getters return an already compact, labelled result.
         if isinstance(values, StatisticArray):
             values.name = self.key
-            values.title = self.title
+            values.title = title
             values.category = self.category
             values.validate()
+            values.component_axes = self.component_axes
+            values.curation_kind = self.curation_kind
+            values.relationship_axes = self.relationship_axes
             return values
 
         coords = self.coord_getter(state)
@@ -529,10 +585,13 @@ class StatisticDefinition:
 
         stat = StatisticArray(
             name=self.key,
-            title=self.title,
+            title=title,
             values=np.asarray(values),
             dimensions=dimensions,
             category=self.category,
+            component_axes=self.component_axes,
+            curation_kind=self.curation_kind,
+            relationship_axes=self.relationship_axes,
         )
 
         # Mark dimensions already consumed by the getter.
@@ -550,6 +609,42 @@ class StatisticDefinition:
         # )
         stat.validate()
         return stat
+
+    def resolve_parameters(self, values=None):
+        values = dict(values or {})
+        known = {spec.key for spec in self.parameters}
+
+        unknown = values.keys() - known
+        if unknown:
+            raise ValueError(
+                f"Unknown parameters for {self.title}: " + ", ".join(sorted(unknown))
+            )
+
+        return {
+            spec.key: spec.validate(values.get(spec.key, spec.default))
+            for spec in self.parameters
+        }
+
+    def title_with_parameters(self, values=None):
+        values = self.resolve_parameters(values)
+
+        if not self.parameters:
+            return self.title
+
+        parts = []
+        for spec in self.parameters:
+            value = values[spec.key]
+
+            if isinstance(value, bool):
+                text = "yes" if value else "no"
+            elif isinstance(value, float):
+                text = f"{value:g}"
+            else:
+                text = str(value)
+
+            parts.append(f"{spec.label}={text}")
+
+        return f"{self.title} [" + ", ".join(parts) + "]"
 
     def get_default_reductions(self) -> dict[str, ReductionSpec]:
         if self.default_reductions is not None:

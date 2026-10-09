@@ -103,11 +103,12 @@ def refs_equal(left, right):
 
     return all(
         np.array_equal(
-            left[start:start + ROW_BLOCK_SIZE],
-            right[start:start + ROW_BLOCK_SIZE],
+            left[start : start + ROW_BLOCK_SIZE],
+            right[start : start + ROW_BLOCK_SIZE],
         )
         for start in range(0, left.size, ROW_BLOCK_SIZE)
     )
+
 
 @dataclass
 class PickTable:
@@ -144,6 +145,7 @@ class PickTable:
     @classmethod
     def from_stat(cls, stat: StatisticArray) -> "PickTable":
         from .sparse_values import SparseStatisticArray
+
         if isinstance(stat, SparseStatisticArray):
             return stat.to_pick_table()
         stat.validate()
@@ -158,9 +160,7 @@ class PickTable:
             coords = stat.dimensions[dim_name].coords
 
             if coords is None:
-                raise ValueError(
-                    f"Remaining dimension {dim_name!r} has no coords."
-                )
+                raise ValueError(f"Remaining dimension {dim_name!r} has no coords.")
 
             refs[dim_name] = GridRef(
                 coords=np.asarray(coords),
@@ -234,10 +234,7 @@ class PickTable:
         # their coordinates across the whole table.
         probe = self._row_block(slice(0, min(1, self.n_rows)))
 
-        if (
-            probe._values_for_dim(dim_i) is None
-            or probe._values_for_dim(dim_j) is None
-        ):
+        if probe._values_for_dim(dim_i) is None or probe._values_for_dim(dim_j) is None:
             return self
 
         if pair_filter.relation not in (
@@ -247,13 +244,8 @@ class PickTable:
         ):
             raise ValueError(pair_filter.relation)
 
-        if (
-            pair_filter.relation == "with previous"
-            and pair_filter.target != "session"
-        ):
-            raise ValueError(
-                "'with previous' is only meaningful for session pairs."
-            )
+        if pair_filter.relation == "with previous" and pair_filter.target != "session":
+            raise ValueError("'with previous' is only meaningful for session pairs.")
 
         def select(block):
             ref_i = block._values_for_dim(dim_i)
@@ -271,11 +263,7 @@ class PickTable:
 
         rows = self._collect_rows(select)
 
-        table = (
-            self
-            if rows.size == self.n_rows
-            else self.subset_rows(rows)
-        )
+        table = self if rows.size == self.n_rows else self.subset_rows(rows)
 
         if not pair_filter.collapse_same:
             return table
@@ -316,18 +304,9 @@ class PickTable:
         return replace(
             self,
             values=self.values[rows],
-            refs={
-                name: column[rows]
-                for name, column in self.refs.items()
-            },
-            errors_low=(
-                None if self.errors_low is None
-                else self.errors_low[rows]
-            ),
-            errors_high=(
-                None if self.errors_high is None
-                else self.errors_high[rows]
-            ),
+            refs={name: column[rows] for name, column in self.refs.items()},
+            errors_low=(None if self.errors_low is None else self.errors_low[rows]),
+            errors_high=(None if self.errors_high is None else self.errors_high[rows]),
             n=None if self.n is None else self.n[rows],
         )
 
@@ -363,9 +342,7 @@ class PickTable:
 
                 if key not in row_maps:
                     row_maps[key] = (
-                        rows
-                        if column.row_ids is None
-                        else column.row_ids[rows]
+                        rows if column.row_ids is None else column.row_ids[rows]
                     )
 
                 refs[name] = replace(
@@ -379,17 +356,11 @@ class PickTable:
             self,
             values=self.values[rows],
             refs=refs,
-            errors_low=(
-                None if self.errors_low is None
-                else self.errors_low[rows]
-            ),
-            errors_high=(
-                None if self.errors_high is None
-                else self.errors_high[rows]
-            ),
+            errors_low=(None if self.errors_low is None else self.errors_low[rows]),
+            errors_high=(None if self.errors_high is None else self.errors_high[rows]),
             n=None if self.n is None else self.n[rows],
         )
-    
+
     def collapse_pair_dims(
         self,
         *,
@@ -527,6 +498,12 @@ class PickTable:
                     dim.parameter,
                 )
 
+        # Restore original identities from collapsed axes, including the
+        # offset between current and previous sessions.
+        for original, (compact, offset) in self.stat.reference_aliases.items():
+            if original not in result and compact in result:
+                result[original] = result[compact] + offset
+
         return result
 
     def values_for_rows(self, rows) -> np.ndarray:
@@ -547,9 +524,7 @@ class PickTable:
 
         values = np.asarray(list(values))
         return self._collect_rows(
-            lambda block: np.flatnonzero(
-                np.isin(block.refs[dim_name], values)
-            )
+            lambda block: np.flatnonzero(np.isin(block.refs[dim_name], values))
         )
 
     def tooltip_for_row(self, row: int, *, value_name: str = "value") -> str:
@@ -652,7 +627,7 @@ class PickTable:
                 include_self_pairs=include_self_pairs,
             )
         )
-    
+
     def _rows_matching_components(
         self,
         components,
@@ -680,10 +655,7 @@ class PickTable:
 
         components = list(components)
 
-        selected_neurons = {
-            int(component.neuron_id)
-            for component in components
-        }
+        selected_neurons = {int(component.neuron_id) for component in components}
 
         neuron_arrays = self._available_neuron_arrays()
 
@@ -701,9 +673,9 @@ class PickTable:
             if component.session_id is None:
                 wildcard_neurons.add(neuron_id)
             else:
-                neurons_by_session.setdefault(
-                    int(component.session_id), set()
-                ).add(neuron_id)
+                neurons_by_session.setdefault(int(component.session_id), set()).add(
+                    neuron_id
+                )
 
         wildcard_ids = np.asarray(sorted(wildcard_neurons), dtype=int)
 
@@ -731,9 +703,7 @@ class PickTable:
                 session_mask = np.zeros(self.n_rows, dtype=bool)
 
                 for session_values in session_arrays:
-                    session_mask |= (
-                        np.asarray(session_values) == session_id
-                    )
+                    session_mask |= np.asarray(session_values) == session_id
 
                 rows = np.flatnonzero(session_mask & ~mask)
 
@@ -762,14 +732,10 @@ class PickTable:
                     "session_i",
                     "session_j",
                 ):
-                    values = self._values_for_dim(
-                        dim_name
-                    )
+                    values = self._values_for_dim(dim_name)
 
                     if values is not None:
-                        session_arrays.append(
-                            values
-                        )
+                        session_arrays.append(values)
 
             mask = component_mask(
                 neuron_arrays[0],
@@ -786,26 +752,14 @@ class PickTable:
 
         if use_session_filter:
 
-            session_i = self._values_for_dim(
-                "session_i"
-            )
-            session_j = self._values_for_dim(
-                "session_j"
-            )
+            session_i = self._values_for_dim("session_i")
+            session_j = self._values_for_dim("session_j")
 
             # _values_for_dim() also resolves collapsed/shared
             # session dimensions where applicable.
-            sessions_i = (
-                [session_i]
-                if session_i is not None
-                else []
-            )
+            sessions_i = [session_i] if session_i is not None else []
 
-            sessions_j = (
-                [session_j]
-                if session_j is not None
-                else []
-            )
+            sessions_j = [session_j] if session_j is not None else []
 
         else:
             sessions_i = []

@@ -10,7 +10,7 @@ from vispy.scene import visuals
 from catan.gui.interaction import click_events
 
 ThresholdAxis = Literal["x", "y"]
-ThresholdDirection = Literal["greater", "less"]
+ThresholdDirection = Literal["greater", "less", "between"]
 
 # THRESHOLD_STYLE = {
 #     "inactive_line": (0.15, 0.35, 0.55, 0.35),  # muted blue-gray
@@ -34,9 +34,29 @@ class ThresholdSpec:
     direction: ThresholdDirection = "greater"
     active: bool = False
 
+    # In interval mode, value is the lower bound.
+    upper_value: float | None = None
+
+    def validate(self):
+        if self.direction not in ("greater", "less", "between"):
+            raise ValueError(f"Unknown threshold direction: {self.direction}")
+
+        if self.direction == "between":
+            if self.upper_value is None:
+                raise ValueError("Enter an upper bound for the interval.")
+
+            if not (np.isfinite(self.value) and np.isfinite(self.upper_value)):
+                raise ValueError("Interval bounds must be finite.")
+
+            if self.value > self.upper_value:
+                raise ValueError("The lower bound must not exceed the upper bound.")
+
     def mask(self, values):
         if not self.active:
             return None
+
+        self.validate()
+        values = np.asarray(values)
 
         if self.direction == "greater":
             return values >= self.value
@@ -44,7 +64,19 @@ class ThresholdSpec:
         if self.direction == "less":
             return values <= self.value
 
-        raise ValueError(self.direction)
+        return (values >= self.value) & (values <= self.upper_value)
+
+    def expression(self, label="value", precision=4):
+        self.validate()
+
+        lower = f"{self.value:.{precision}g}"
+
+        if self.direction == "between":
+            upper = f"{self.upper_value:.{precision}g}"
+            return f"{lower} ≤ {label} ≤ {upper}"
+
+        symbol = "≥" if self.direction == "greater" else "≤"
+        return f"{label} {symbol} {lower}"
 
 
 class ThresholdOverlay:

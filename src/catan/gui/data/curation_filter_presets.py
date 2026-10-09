@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from importlib.resources import files
 import json
 from pathlib import Path
+from importlib.metadata import distribution, PackageNotFoundError
 
 from PySide6.QtCore import (
     QSettings,
@@ -127,7 +128,10 @@ class CurationFilterPresetStore:
                 )
             )
 
-        return presets
+        return sorted(
+            presets,
+            key=lambda preset: (preset.name.casefold(), preset.key),
+        )
 
     def preset_info(
         self,
@@ -447,3 +451,62 @@ class CurationFilterPresetStore:
         if self.default_preset_key == key:
             self.settings.remove(self.DEFAULT_PRESET_SETTING)
             self.settings.sync()
+
+    @staticmethod
+    def can_save_builtin() -> bool:
+        try:
+            text = distribution("catan-toolbox").read_text("direct_url.json")
+            metadata = json.loads(text or "{}")
+            return metadata.get("dir_info", {}).get("editable") is True
+        except (PackageNotFoundError, OSError, ValueError):
+            return False
+
+    def save_working_as_builtin(self, name: str, *, overwrite=False):
+        if not self.can_save_builtin():
+            raise PermissionError(
+                "Saving CATAN presets requires an editable installation."
+            )
+
+        name = name.strip()
+        slug = self._slug(name)
+        new_key = f"builtin:{slug}"
+        destination = Path(str(self._builtin_directory())) / f"{slug}.json"
+
+        old_key = self._working_preset_key
+        old_user_path = None
+
+        if old_key is not None:
+            source, old_slug = self._split_key(old_key)
+            if source == "user":
+                old_user_path = self.user_directory / f"{old_slug}.json"
+
+        # Read before deleting the old preset.
+        was_default = old_key is not None and self.default_preset_key == old_key
+
+        document = curation_filter_to_dict(
+            self._working_filter,
+            name=name,
+        )
+        text = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+
+        # Finish writing the native preset before removing the user version.
+        with destination.open(
+            "w" if overwrite else "x",
+            encoding="utf-8",
+        ) as stream:
+            stream.write(text)
+
+        if old_user_path is not None:
+            old_user_path.unlink(missing_ok=True)
+
+        self._working_preset_key = new_key
+        self._working_dirty = False
+
+        if was_default:
+            self.settings.setValue(
+                self.DEFAULT_PRESET_SETTING,
+                new_key,
+            )
+            self.settings.sync()
+
+        return new_key

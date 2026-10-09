@@ -150,6 +150,7 @@ class StatisticQuery:
     reduction_order: tuple[str, ...] = ()
     filters: tuple[PairFilter, ...] = ()
     context: Contexts = "generic"
+    parameters: tuple[tuple[str, float | int | bool], ...] = ()
 
     def reduction_dict(self):
         return dict(self.reductions)
@@ -175,6 +176,7 @@ class StatisticQuery:
                 for f in self.filters
             ],
             "context": self.context,
+            "parameters": dict(self.parameters),
         }
 
     @classmethod
@@ -211,6 +213,7 @@ class StatisticQuery:
                 for f in data.get("filters", ())
             ),
             context=data.get("context", "generic"),
+            parameters=tuple(sorted(data.get("parameters", {}).items())),
         )
 
 
@@ -291,61 +294,89 @@ def validate_error_reductions(reductions: dict[str, ReductionSpec]):
 
 
 def normalize_footprint_pair_reductions(
-    stat_def, reductions, filters=(), *, session_series=False,
+    stat_def,
+    reductions,
+    filters=(),
+    *,
+    session_series=False,
 ):
-    """One reduction per logical axis, before any values are calculated.
-
-    The i side controls a collapsed pair. The hidden j side mirrors it,
-    except that a fixed previous session uses i-1. Non-linked axes remain
-    independent. Existing queries are upgraded deterministically.
-    """
     out = {d: reductions.get(d, ReductionSpec("keep")) for d in stat_def.dims}
+
     relations = {f.target: f.relation for f in filters}
     collapse = {f.target: f.collapse_same for f in filters}
+
     linked = {
-        "neuron": relations.get("neuron") == "same" and collapse.get("neuron", True),
-        "session": relations.get("session") in ("same", "with previous") and collapse.get("session", True),
+        target: (
+            {target + "_i", target + "_j"}.issubset(out)
+            and collapse.get(target, True)
+            and (
+                relations.get(target) == "same"
+                or (target == "session" and relations.get(target) == "with previous")
+            )
+        )
+        for target in ("neuron", "session")
     }
 
     if session_series:
-        if linked["session"]:
-            out["session_i"] = out["session_j"] = ReductionSpec("keep")
-        else:
-            kept = [d for d in ("session_i", "session_j") if out[d].method == "keep"]
-            if not kept:
-                out["session_i"] = ReductionSpec("keep")
-            elif len(kept) == 2:
-                out["session_j"] = ReductionSpec("single", index=0)
+        if {"session_i", "session_j"}.issubset(out):
+            if linked["session"]:
+                out["session_i"] = out["session_j"] = ReductionSpec("keep")
+            else:
+                kept = [
+                    d for d in ("session_i", "session_j") if out[d].method == "keep"
+                ]
 
-        logical_neurons = ["neuron_i"] if linked["neuron"] else ["neuron_i", "neuron_j"]
-        for d in logical_neurons:
-            if out[d].method == "keep":
-                out[d] = ReductionSpec("median", error_method="none")
-        # Upgrade the previous two-neuron-axis series default. Interactive
-        # edits mirror both settings before normalization, so choosing
-        # 'none' on the visible axis remains possible.
+                if not kept:
+                    out["session_i"] = ReductionSpec("keep")
+                elif len(kept) == 2:
+                    out["session_j"] = ReductionSpec("single", index=0)
+
+        elif "session" in out:
+            out["session"] = ReductionSpec("keep")
+
+        for d in NEURON_DIMS:
+            if d in out and not (linked["neuron"] and d == "neuron_j"):
+                if out[d].method == "keep":
+                    out[d] = ReductionSpec(
+                        "median",
+                        error_method="none",
+                    )
+
         if linked["neuron"] and out["neuron_i"].error_method == "none":
             old = out["neuron_j"]
+
             if old.method == out["neuron_i"].method:
-                out["neuron_i"] = replace(out["neuron_i"], error_method=old.error_method)
+                out["neuron_i"] = replace(
+                    out["neuron_i"],
+                    error_method=old.error_method,
+                )
 
     for target in ("neuron", "session"):
         if not linked[target]:
             continue
+
         left, right = target + "_i", target + "_j"
         spec = out[left]
+
         if spec.method == "single":
-            index = int(spec.index) if spec.index is not None else 0
             previous = target == "session" and relations.get(target) == "with previous"
-            index = max(1 if previous else 0, index)
+
+            index = max(int(previous), int(spec.index or 0))
+
             out[left] = ReductionSpec("single", index=index)
-            out[right] = ReductionSpec("single", index=index - int(previous))
+            out[right] = ReductionSpec(
+                "single",
+                index=index - int(previous),
+            )
         else:
             out[right] = spec
 
-    # Validate logical axes, not duplicated names of one collapsed axis.
-    logical = {d: spec for d, spec in out.items()
-               if not (d.endswith("_j") and linked.get(d[:-2], False))}
+    logical = {
+        d: spec
+        for d, spec in out.items()
+        if not (d.endswith("_j") and linked.get(d[:-2], False))
+    }
+
     validate_error_reductions(logical)
     return out
 
@@ -356,9 +387,12 @@ def normalize_session_series_reductions(
     filters: tuple[PairFilter, ...] = (),
 ) -> dict[str, ReductionSpec]:
 
-    if stat_def.key == "footprint_similarity":
+    if stat_def.independent_pairs:
         return normalize_footprint_pair_reductions(
-            stat_def, reductions, filters, session_series=True,
+            stat_def,
+            reductions,
+            filters,
+            session_series=True,
         )
 
     out = dict(reductions)
@@ -417,9 +451,7 @@ def normalize_session_series_reductions(
             dim,
             context="session_series",
         )
-        method = (
-            old.method if old.method in allowed_methods else "median"
-        )
+        method = old.method if old.method in allowed_methods else "median"
 
         if dim != error_dim:
             error_method = "none"
@@ -440,9 +472,7 @@ def normalize_session_series_reductions(
                 }.get(method, "none")
 
                 error_method = (
-                    default_error
-                    if default_error in allowed_errors
-                    else "none"
+                    default_error if default_error in allowed_errors else "none"
                 )
 
         out[dim] = ReductionSpec(
@@ -493,7 +523,7 @@ def normalize_generic_session_pair_reductions(
     reductions,
     filters,
 ):
-    if stat_def.key == "footprint_similarity":
+    if stat_def.independent_pairs:
         return normalize_footprint_pair_reductions(stat_def, reductions, filters)
 
     out = dict(reductions)

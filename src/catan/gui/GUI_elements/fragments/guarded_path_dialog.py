@@ -195,7 +195,11 @@ class GuardedPathDialog(QDialog):
         return os.path.abspath(path)
 
     def _set_busy(self, busy):
-        self.tree.setEnabled(not busy)
+        previous = self.tree.blockSignals(True)
+        try:
+            self.tree.setEnabled(not busy)
+        finally:
+            self.tree.blockSignals(previous)
         self.ok_button.setEnabled(not busy)
         self.name_edit.setEnabled(not busy)
         self.new_folder_button.setEnabled(not busy)
@@ -221,6 +225,15 @@ class GuardedPathDialog(QDialog):
         )
 
     def _render(self, *_):
+        previous = self.tree.blockSignals(True)
+        try:
+            self._populate_tree()
+            self.tree.clearSelection()
+            self.tree.setCurrentItem(None)
+        finally:
+            self.tree.blockSignals(previous)
+
+    def _populate_tree(self):
         self.tree.clear()
 
         patterns = self.filter_combo.currentData() or ("*",)

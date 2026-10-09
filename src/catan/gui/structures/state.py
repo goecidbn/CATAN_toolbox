@@ -80,6 +80,7 @@ class AppState(QObject):
         self._selected_components: Optional[List[NeuronComponent]] = None
         self._focused_component: Optional[NeuronComponent] = None
         self._highlighted_components: Optional[List[NeuronComponent]] = None
+        self.highlight_roles = {}
 
         self.current_job = None
         self.tasks = TaskManager()
@@ -420,6 +421,7 @@ class AppState(QObject):
         modifiers=(),
         *,
         max_components: int | None = None,
+        roles=None,
     ):
 
         if isinstance(components, NeuronComponent):
@@ -463,15 +465,27 @@ class AppState(QObject):
             # click/insertion order.
             highlighted_components = list(dict.fromkeys(highlighted_components))
 
-        if highlighted_components == self._highlighted_components:
-            return
-
         if (
             highlighted_components is not None
             and max_components is not None
             and len(highlighted_components) > max_components
         ):
             highlighted_components = highlighted_components[-max_components:]
+
+        new_roles = {
+            component: role
+            for component, role in (roles or {}).items()
+            if component in (highlighted_components or ())
+            and role in ("source", "target")
+        }
+
+        if (
+            highlighted_components == self._highlighted_components
+            and new_roles == self.highlight_roles
+        ):
+            return
+
+        self.highlight_roles = new_roles
 
         self._highlighted_components = highlighted_components
 
@@ -588,12 +602,20 @@ class AppState(QObject):
         focused = remap_component(self._focused_component)
         highlighted = remap_components(self._highlighted_components)
 
+        highlight_roles = {}
+
+        for component, role in self.highlight_roles.items():
+            mapped = remap_component(component)
+            if mapped is not None:
+                highlight_roles[mapped] = role
+
         # Update everything before emitting any signals. The ordinary
         # selection setters affect one another and emit immediately.
         self.assignments = assignments
         self._selected_components = selected
         self._focused_component = focused
         self._highlighted_components = highlighted
+        self.highlight_roles = highlight_roles
         self._hovered_components = None
         request = self._current_request
         if (

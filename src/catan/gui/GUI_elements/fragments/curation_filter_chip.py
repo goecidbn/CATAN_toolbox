@@ -1,3 +1,4 @@
+from html import escape
 from PySide6.QtCore import Qt, Signal, QMimeData, QPoint
 from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
@@ -92,7 +93,7 @@ class CurationFilterChip(QFrame):
 
         self.drag_handle = CurationFilterDragHandle(condition_id, self)
         self.drag_handle.setObjectName("curationConditionDragHandle")
-        self.drag_handle.setFixedWidth(28)
+        self.drag_handle.setFixedWidth(20)
         layout.addWidget(self.drag_handle)
 
         self.condition_button = QToolButton()
@@ -103,7 +104,7 @@ class CurationFilterChip(QFrame):
         self.remove_button.setObjectName("curationConditionRemoveButton")
         self.remove_button.setText("×")
         self.remove_button.setAutoRaise(True)
-        self.remove_button.setFixedWidth(28)
+        self.remove_button.setFixedWidth(20)
         self.remove_button.setToolTip("Remove condition")
 
         layout.addWidget(self.condition_button)
@@ -146,12 +147,17 @@ class CurationFilterChip(QFrame):
                 background-color: #463438;
             }
 
+            QFrame#curationConditionChip[filterInvalid="true"] {
+                border: 2px solid #d45b5b;
+                background-color: #463438;
+            }
+
             QFrame#curationConditionChip QToolButton {
                 color: #e8eaed;
                 background: transparent;
                 border: none;
                 border-radius: 0px;
-                padding: 5px 8px;
+                padding: 1px 6px;
             }
 
             QFrame#curationConditionChip
@@ -191,9 +197,25 @@ class CurationFilterChip(QFrame):
         self.condition_button.setText(text)
 
         if tooltip is not None:
-            tooltip += "\n\nClick: show evidence" "\nRight-click: edit/remove"
+            self._normal_tooltip = (
+                tooltip + "\n\nClick: show evidence" + "\nRight-click: edit/remove"
+            )
+            self._refresh_condition_tooltip()
 
-            self.condition_button.setToolTip(tooltip)
+    def _refresh_condition_tooltip(self):
+        text = getattr(self, "_normal_tooltip", "")
+        error = getattr(self, "_evaluation_error", None)
+
+        if error:
+            text += f"\n\nEvaluation error:\n{error}"
+
+        body = escape(text).replace("\n", "<br>")
+
+        self.condition_button.setToolTip(
+            f'<qt><table width="440" cellspacing="0" cellpadding="4">'
+            f"<tr><td>{body}</td></tr>"
+            f"</table></qt>"
+        )
 
     def _open_context_menu(self, pos):
 
@@ -214,23 +236,10 @@ class CurationFilterChip(QFrame):
         self,
         message: str | None,
     ):
+        self._evaluation_error = message
+        self.setProperty("evaluationError", message is not None)
 
-        active = message is not None
-
-        self.setProperty("evaluationError", active)
-
-        if not hasattr(
-            self,
-            "_normal_tooltip",
-        ):
-            self._normal_tooltip = self.condition_button.toolTip()
-
-        if message is None:
-            self.condition_button.setToolTip(self._normal_tooltip)
-        else:
-            self.condition_button.setToolTip(
-                self._normal_tooltip + "\n\nEvaluation error:\n" + message
-            )
+        self._refresh_condition_tooltip()
 
         self.style().unpolish(self)
         self.style().polish(self)

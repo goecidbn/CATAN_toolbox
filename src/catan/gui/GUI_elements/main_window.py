@@ -26,6 +26,7 @@ from catan.gui.resources import (
 from catan.gui.GUI_elements import NeuronNavigationBar
 from catan.gui.structures import AppState, Data
 from catan.gui.interaction import click_events
+from catan.gui.data.curation_filter_presets import CurationFilterPresetStore
 
 from catan.tracking.structures import ReviewStatus
 
@@ -55,13 +56,12 @@ class MainWindow(QMainWindow):
         )
 
         self.state = AppState(settings=self.settings)
-        
+
         self.data: Data = Data(self.state)
         self.state.tasks.start_queue_timer()
 
         # self.settings = QSettings()
         self._restore_settings()
-
 
         # --- UI setup ---
         self._init_ui()
@@ -74,11 +74,11 @@ class MainWindow(QMainWindow):
         self._setup_review_shortcuts()
         self._setup_curation_shortcuts()
 
-        # --- setting up reload logic ---
-        reload_action = QAction("Reload plotting logic", self)
-        reload_action.setShortcut("Ctrl+R")
-        reload_action.triggered.connect(self.reload_logic)
-        self.menuBar().addAction(reload_action)
+        if CurationFilterPresetStore.can_save_builtin():
+            reload_action = QAction("Reload plotting logic", self)
+            reload_action.setShortcut("Ctrl+R")
+            reload_action.triggered.connect(self.reload_logic)
+            self.menuBar().addAction(reload_action)
 
         # print_debug = QAction("Print debug info", self)
         # print_debug.setShortcut("Ctrl+D")
@@ -106,6 +106,9 @@ class MainWindow(QMainWindow):
         self.settings.sync()
 
     def reload_logic(self):
+        if not CurationFilterPresetStore.can_save_builtin():
+            return
+
         tasks = self.state.tasks
         # print(self.data.assignments.union.footprints)
 
@@ -145,9 +148,7 @@ class MainWindow(QMainWindow):
         self.reset_stylesheet()
 
     def _reload_model_logic(self):
-        module = importlib.import_module(
-            "catan.tracking.structures.model"
-        )
+        module = importlib.import_module("catan.tracking.structures.model")
         existing_class = module.Model
 
         importlib.invalidate_caches()
@@ -198,7 +199,7 @@ class MainWindow(QMainWindow):
         for gui in self.gui_elements.values():
             if hasattr(gui, "_save_settings"):
                 gui._save_settings()
-        
+
         # Flush after every panel has written its settings.
         self.settings.sync()
 
@@ -211,7 +212,7 @@ class MainWindow(QMainWindow):
                 f"Location: {self.settings.fileName()}\n"
                 f"Status: {status.name}",
             )
-        
+
         super().closeEvent(event)
         # print("MainWindow closeEvent finished")
 
@@ -344,7 +345,7 @@ class MainWindow(QMainWindow):
                 )
             )
             self._review_shortcuts.append(batch_shortcut)
-    
+
     def _setup_curation_shortcuts(self):
         self._curation_shortcuts = []
 
@@ -362,8 +363,7 @@ class MainWindow(QMainWindow):
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.setAutoRepeat(False)
             shortcut.activated.connect(
-                lambda remove=remove, batch=batch, whole_neurons=whole_neurons:
-                self._curate_from_shortcut(
+                lambda remove=remove, batch=batch, whole_neurons=whole_neurons: self._curate_from_shortcut(
                     remove=remove,
                     batch=batch,
                     whole_neurons=whole_neurons,
@@ -448,10 +448,8 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 f"{action} selection",
-                f"{action} {scope}?\n\n"
-                f"{consequence}\nSource files are unchanged.",
-                QMessageBox.StandardButton.Ok
-                | QMessageBox.StandardButton.Cancel,
+                f"{action} {scope}?\n\n" f"{consequence}\nSource files are unchanged.",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
 

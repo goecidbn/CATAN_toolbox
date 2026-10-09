@@ -12,6 +12,12 @@ import numpy as np
 from scipy import sparse, spatial
 
 from catan.core.image_correlation import calculate_img_correlation
+from catan.core.spatial_coverage import (
+    session_valid_mask,
+    signed_border_distance,
+    distances_at_centroids,
+)
+
 from catan.gui.background_tasks.runtime import current_task_context
 
 if TYPE_CHECKING:
@@ -251,9 +257,7 @@ def calculate_temporal_correlation(
 
             rows -= rows.mean(axis=1, keepdims=True)
 
-            lengths = np.sqrt(
-                np.einsum("ij,ij->i", rows, rows)
-            )
+            lengths = np.sqrt(np.einsum("ij,ij->i", rows, rows))
 
             with np.errstate(divide="ignore", invalid="ignore"):
                 rows /= lengths[:, None]
@@ -264,11 +268,7 @@ def calculate_temporal_correlation(
         ids_j = fp_j[valid_j]
 
         ti = normalized_rows(ids_i)
-        tj = (
-            ti
-            if np.array_equal(ids_i, ids_j)
-            else normalized_rows(ids_j)
-        )
+        tj = ti if np.array_equal(ids_i, ids_j) else normalized_rows(ids_j)
 
         rows_i = np.flatnonzero(valid_i)
         rows_j = np.flatnonzero(valid_j)
@@ -282,9 +282,7 @@ def calculate_temporal_correlation(
             stop = min(start + 256, len(rows_i))
             corr = ti[start:stop] @ tj.T
 
-            values[
-                np.ix_(rows_i[start:stop], rows_j, [k])
-            ] = corr[..., None]
+            values[np.ix_(rows_i[start:stop], rows_j, [k])] = corr[..., None]
 
             del corr
 
@@ -365,29 +363,52 @@ def calculate_distances(
 
 
 def calculate_border_proximity(
-    data: Data, state: AppState, indexers: dict[str, int] | None = None, filters=()
-) -> np.ndarray:
-    """
-    Calculate the proximity of each centroid to the borders of the field of view.
+    data,
+    state,
+    indexers=None,
+    filters=(),
+    common_border=False,
+):
+    common_distance = None
 
-    Parameters:
+    def check_alignment_current(session_id):
+        if data.alignment_is_stale(session_id):
+            raise ValueError(
+                f"Session {session_id} has an outdated alignment. "
+                "Rerun alignment before calculating border distance."
+            )
 
-    Returns:
-    np.ndarray: 1D array of border proximities.
-    """
-    # print("dims:", data.sessions[0].dims)
-    # print("centroids:", data.sessions[0].centroids)
+    if common_border:
+        # "Shared" always means all loaded sessions, independently
+        # of the statistic's session reduction or selected session.
+        for session_id in range(len(data.sessions)):
+            check_alignment_current(session_id)
+
+        _, common_distance = data.assignments.common_spatial_coverage(
+            data.sessions,
+            revision=getattr(state, "data_version", None),
+        )
+
+    session_ids = {
+        id(session): session_id for session_id, session in enumerate(data.sessions)
+    }
 
     def get_distances(session):
-        width, height = session.dims
+        if common_distance is not None:
+            distance_map = common_distance
+        else:
+            check_alignment_current(session_ids[id(session)])
 
-        ctrs = session.centroids
+            distance_map = signed_border_distance(session_valid_mask(session))
 
-        x_proximity = np.minimum(ctrs[:, 0], width - ctrs[:, 0])
-        y_proximity = np.minimum(ctrs[:, 1], height - ctrs[:, 1])
-        return np.minimum(x_proximity, y_proximity)
+        return distances_at_centroids(session, distance_map)
 
-    return get_stat_from_session(data, state, indexers, get_distances)
+    return get_stat_from_session(
+        data,
+        state,
+        indexers,
+        get_distances,
+    )
 
 
 def calculate_occurrence(
@@ -476,12 +497,22 @@ def calculate_centroid_shift(
 
 
 def calculate_footprint_similarity(
-    data, state, indexers=None, filters=(), neighborhood_thr=10,
+    data,
+    state,
+    indexers=None,
+    filters=(),
+    neighborhood_thr=10,
+    gamma=0.1,
 ):
     from .footprint_pairs import calculate_footprint_pairs
+
     return calculate_footprint_pairs(
-        data, state, indexers=indexers, filters=filters,
+        data,
+        state,
+        indexers=indexers,
+        filters=filters,
         neighborhood_thr=neighborhood_thr,
+        gamma=gamma,
     )
 
 
@@ -494,4 +525,3 @@ def get_pair_relation(
             return f.relation
 
     return "all"
-

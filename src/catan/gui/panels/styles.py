@@ -49,6 +49,15 @@ class Styles:
             "edge_width": 1.5,
         },
     }
+    opts["highlighted_source"] = {
+        **opts["highlighted"],
+        "cmap": color.Colormap(["#C9A6FF", "#C9A6FF"]),
+    }
+
+    opts["highlighted_target"] = {
+        **opts["highlighted"],
+        "cmap": color.Colormap(["#FFB36B", "#FFB36B"]),
+    }
 
     overview = {
         "tracked_current_alpha": 0.85,
@@ -94,24 +103,16 @@ class Styles:
 
         if colors is None:
             values = np.asarray(values, dtype=np.float32)
-            cmap = color.get_colormap(
-                kwargs.get("cmap_name", self.opts[style]["cmap"])
-            )
-            color_array = np.asarray(
-                cmap.map(values), dtype=np.float32
-            ).copy()
+            cmap = color.get_colormap(kwargs.get("cmap_name", self.opts[style]["cmap"]))
+            color_array = np.asarray(cmap.map(values), dtype=np.float32).copy()
             color_array[..., 3] = style_alpha
 
         else:
             # Determine whether the caller supplied per-item RGBA before
             # ColorArray converts everything into an (N, 4) array.
-            raw = np.asarray(
-                colors.rgba if hasattr(colors, "rgba") else colors
-            )
+            raw = np.asarray(colors.rgba if hasattr(colors, "rgba") else colors)
             per_item_rgba = (
-                raw.ndim == 2
-                and raw.shape[-1] == 4
-                and raw.dtype.kind in "fiu"
+                raw.ndim == 2 and raw.shape[-1] == 4 and raw.dtype.kind in "fiu"
             )
 
             if raw.ndim == 2 and raw.shape[0] == 0:
@@ -127,9 +128,7 @@ class Styles:
                 color_array[..., 3] = style_alpha
 
             # Preserve the previous single-numeric-color return shape.
-            if isinstance(colors, str) or (
-                raw.ndim == 1 and raw.dtype.kind in "fiu"
-            ):
+            if isinstance(colors, str) or (raw.ndim == 1 and raw.dtype.kind in "fiu"):
                 color_array = color_array[0]
 
         color_array[..., 3] = np.clip(

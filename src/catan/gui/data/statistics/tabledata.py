@@ -25,6 +25,7 @@ def prepare_neuron_table_query(
         reduction_order=query.reduction_order,
         filters=query.filters,
         context="neuron_bound",
+        parameters=query.parameters,
     )
 
 
@@ -46,6 +47,7 @@ def prepare_component_table_query(
         reduction_order=query.reduction_order,
         filters=query.filters,
         context="component_bound",
+        parameters=query.parameters,
     )
 
 
@@ -70,6 +72,7 @@ def prepare_neuron_pair_table_query(
         reduction_order=query.reduction_order,
         filters=query.filters,
         context="neuron_pair_bound",
+        parameters=query.parameters,
     )
 
 
@@ -94,4 +97,5 @@ def prepare_component_pair_table_query(
         reduction_order=query.reduction_order,
         filters=query.filters,
         context="component_pair_bound",
+        parameters=query.parameters,
     )

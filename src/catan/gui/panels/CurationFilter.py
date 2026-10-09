@@ -1,4 +1,5 @@
 import importlib
+from copy import deepcopy
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -33,11 +34,20 @@ from catan.core.structures import NeuronComponent
 from catan.gui.panels import StatisticsData
 from catan.gui.panels.helper.Threshold import ThresholdSpec
 from catan.gui.data.curation_filter import CurationFilterCondition
+from catan.gui.data.curation_results import RetainedResults
 from catan.gui.GUI_elements.fragments.curation_filter_group import (
     CurationFilterGroupWidget,
 )
-
+from catan.gui.GUI_elements.fragments.curation_actions_widget import (
+    CuratorActions,
+)
 from catan.gui.data.curation_filter_presets import CurationFilterPresetStore
+from catan.gui.panels.helper.ReviewStatusFilter import (
+    ReviewStatusFilter,
+)
+from catan.gui.GUI_elements.fragments.curator_interaction_guard import (
+    CuratorInteractionGuard,
+)
 
 from catan.gui.panels import BasePlot
 
@@ -101,6 +111,19 @@ class CurationFilterConditionPopup(QDialog):
         statistic_layout = QVBoxLayout(statistic_group)
         statistic_layout.setContentsMargins(10, 12, 10, 10)
 
+        review_row = QHBoxLayout()
+        review_row.addWidget(QLabel("Target review status:"))
+
+        self.review_filter = ReviewStatusFilter(self)
+        self.review_filter.setToolTip(
+            "Choose review states of the neurons being selected or edited. "
+            "Reference sources may have any review state."
+        )
+
+        review_row.addWidget(self.review_filter)
+        review_row.addStretch()
+        layout.addLayout(review_row)
+
         self.query_selector = StatisticsData.StatisticQuerySelector(
             engine=self.engine,
             axis="x",
@@ -129,11 +152,11 @@ class CurationFilterConditionPopup(QDialog):
         self.direction_selector = QComboBox()
         self.direction_selector.addItem("≥", "greater")
         self.direction_selector.addItem("≤", "less")
+        self.direction_selector.addItem("Between", "between")
 
         self.direction_selector.setCurrentIndex(0)
 
-        self.direction_selector.setMinimumWidth(50)
-        self.direction_selector.setMaximumWidth(70)
+        self.direction_selector.setMinimumWidth(100)
         self.direction_selector.setStyleSheet("""
             QComboBox {
                 color: #edf0f4;
@@ -158,9 +181,30 @@ class CurationFilterConditionPopup(QDialog):
         self.threshold_value.setValue(0.0)
         self.threshold_value.setSingleStep(0.1)
 
+        self.threshold_upper = QDoubleSpinBox()
+        self.threshold_upper.setDecimals(self.threshold_value.decimals())
+        self.threshold_upper.setRange(
+            self.threshold_value.minimum(),
+            self.threshold_value.maximum(),
+        )
+        self.threshold_upper.setSingleStep(self.threshold_value.singleStep())
+        self.threshold_upper.setValue(1.0)
+        self.threshold_upper.setToolTip("Inclusive upper bound")
+
+        self.interval_separator = QLabel("and")
+
         layout.addWidget(threshold_group)
         threshold_layout.addWidget(self.direction_selector)
         threshold_layout.addWidget(self.threshold_value, stretch=1)
+
+        threshold_layout.addWidget(self.interval_separator)
+        threshold_layout.addWidget(self.threshold_upper, stretch=1)
+
+        self.threshold_error = QLabel()
+        self.threshold_error.setWordWrap(True)
+        self.threshold_error.setStyleSheet("color: #ef9a9a;")
+        self.threshold_error.hide()
+        layout.addWidget(self.threshold_error)
 
         # ---------------------------------------------
         # Buttons
@@ -190,15 +234,27 @@ class CurationFilterConditionPopup(QDialog):
 
         self.query_selector.queryChanged.connect(self._on_query_changed)
 
-        self._on_query_changed(self.query_selector.effective_query())
+        self.direction_selector.currentIndexChanged.connect(
+            self._update_threshold_controls
+        )
+        self.threshold_value.valueChanged.connect(self._update_threshold_controls)
+        self.threshold_upper.valueChanged.connect(self._update_threshold_controls)
 
-    def _on_query_changed(
-        self,
-        query,
-    ):
+        self._update_threshold_controls()
+
+    def _on_query_changed(self, query):
+        error = ""
+
+        try:
+            self._threshold_spec().validate()
+        except ValueError as exc:
+            error = str(exc)
+
+        self.threshold_error.setText(error)
+        self.threshold_error.setVisible(bool(error))
 
         self.accept_button.setEnabled(
-            query is not None and query.statistic_key != "none"
+            query is not None and query.statistic_key != "none" and not error
         )
 
     def set_condition(
@@ -218,6 +274,13 @@ class CurationFilterConditionPopup(QDialog):
         )
 
         self.threshold_value.setValue(condition.threshold.value)
+        self.threshold_upper.setValue(
+            condition.threshold.upper_value
+            if condition.threshold.upper_value is not None
+            else max(1.0, condition.threshold.value)
+        )
+
+        self._update_threshold_controls()
 
         self.accept_button.setText("Apply")
 
@@ -230,11 +293,13 @@ class CurationFilterConditionPopup(QDialog):
         if query is None or query.statistic_key == "none":
             return
 
-        threshold = ThresholdSpec(
-            value=self.threshold_value.value(),
-            direction=self.direction_selector.currentData(),
-            active=True,
-        )
+        threshold = self._threshold_spec()
+
+        try:
+            threshold.validate()
+        except ValueError:
+            self._update_threshold_controls()
+            return
 
         if self.condition is None:
 
@@ -256,6 +321,31 @@ class CurationFilterConditionPopup(QDialog):
 
         self.accept()
 
+    def _threshold_spec(self):
+        direction = self.direction_selector.currentData()
+
+        return ThresholdSpec(
+            axis=(None if self.condition is None else self.condition.threshold.axis),
+            value=self.threshold_value.value(),
+            direction=direction,
+            active=True,
+            upper_value=(
+                self.threshold_upper.value() if direction == "between" else None
+            ),
+        )
+
+    def _update_threshold_controls(self, *_):
+        interval = self.direction_selector.currentData() == "between"
+
+        self.interval_separator.setVisible(interval)
+        self.threshold_upper.setVisible(interval)
+
+        self.threshold_value.setToolTip(
+            "Inclusive lower bound" if interval else "Threshold value"
+        )
+
+        self._on_query_changed(self.query_selector.effective_query())
+
 
 class Display(QWidget):
 
@@ -268,6 +358,10 @@ class Display(QWidget):
 
     operator_changed = Signal(str, str)
     match_level_changed = Signal(str, str)
+    count_changed = Signal(str, object)
+    inspection_changed = Signal()
+
+    comment_changed = Signal(str, str)
 
     evaluate_requested = Signal()
     select_requested = Signal()
@@ -287,6 +381,8 @@ class Display(QWidget):
     preset_set_default_requested = Signal()
     preset_rename_requested = Signal()
     preset_delete_requested = Signal()
+
+    binding_changed = Signal(str, str)
 
     def __init__(self, parent, controls=None, config=None):
         super().__init__(parent)
@@ -371,6 +467,19 @@ class Display(QWidget):
         self.preset_rename_action.triggered.connect(self.preset_rename_requested)
         self.preset_delete_action.triggered.connect(self.preset_delete_requested)
 
+        review_row = QHBoxLayout()
+        review_row.addWidget(QLabel("Target review status:"))
+
+        self.review_filter = ReviewStatusFilter(self)
+        self.review_filter.setToolTip(
+            "Restrict matching targets by review status. "
+            "Sources can have any review status."
+        )
+        review_row.addWidget(self.review_filter)
+        review_row.addStretch()
+
+        layout.addLayout(review_row)
+
         # ---------------------------------------------
         # Scrollable filter tree
         # ---------------------------------------------
@@ -439,6 +548,40 @@ class Display(QWidget):
 
         layout.addWidget(self.evidence_label)
 
+        self.inspection_row = QWidget()
+        inspection_layout = QHBoxLayout(self.inspection_row)
+        inspection_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.target_selector = QComboBox()
+        self.target_selector.setToolTip(
+            "Choose the specific target footprint to inspect."
+        )
+
+        self.highlight_selector = QComboBox()
+        self.highlight_selector.addItem("Highlight target", "target")
+        self.highlight_selector.addItem(
+            "Highlight sources",
+            "sources",
+        )
+        self.highlight_selector.addItem("Highlight both", "both")
+        self.highlight_selector.setToolTip(
+            "When highlighting both: targets are orange, " "sources are light violet."
+        )
+
+        inspection_layout.addWidget(self.target_selector)
+        inspection_layout.addWidget(self.highlight_selector)
+        inspection_layout.addStretch()
+
+        layout.addWidget(self.inspection_row)
+        self.inspection_row.hide()
+
+        self.target_selector.currentIndexChanged.connect(
+            lambda: self.inspection_changed.emit()
+        )
+        self.highlight_selector.currentIndexChanged.connect(
+            lambda: self.inspection_changed.emit()
+        )
+
         # ---------------------------------------------
         # Buttons
         # ---------------------------------------------
@@ -455,6 +598,10 @@ class Display(QWidget):
         button_layout.addStretch()
         button_layout.addWidget(self.evaluate_button)
         button_layout.addWidget(self.select_button)
+
+        self.clear_results_button = QPushButton("Clear results")
+        self.clear_results_button.setEnabled(False)
+        button_layout.addWidget(self.clear_results_button)
 
         layout.addLayout(button_layout)
 
@@ -565,7 +712,7 @@ class Display(QWidget):
                 background-color: #3a414a;
                 border: 1px solid #606a76;
                 border-radius: 5px;
-                padding: 4px 8px;
+                padding: 2px 6px;
             }
 
             QToolButton#curationConditionButton:hover {
@@ -579,7 +726,7 @@ class Display(QWidget):
                 border: 1px solid #606a76;
                 border-left: 0px;
                 border-radius: 4px;
-                padding: 3px;
+                padding: 1px;
             }
 
             QToolButton#curationConditionRemoveButton:hover {
@@ -598,7 +745,7 @@ class Display(QWidget):
                 background-color: transparent;
                 border: 1px solid #555d68;
                 border-radius: 4px;
-                padding: 4px 7px;
+                padding: 2px 6px;
             }
 
             QToolButton#curationAddButton:hover {
@@ -693,28 +840,24 @@ class Display(QWidget):
             }
         """)
 
-    def set_filter(
-        self,
-        root: CurationFilterGroup,
-    ):
-
-        if self.root_widget is not None:
-            self.filter_layout.removeWidget(self.root_widget)
-            self.root_widget.deleteLater()
-
-        self.root_widget = CurationFilterGroupWidget(
+    def set_filter(self, root: CurationFilterGroup):
+        new_widget = CurationFilterGroupWidget(
             root,
             format_condition=self.format_condition,
             is_root=True,
         )
+        self._connect_group_widget(new_widget)
 
-        self._connect_group_widget(self.root_widget)
+        old_widget = self.root_widget
+        self.root_widget = new_widget
+
+        if old_widget is not None:
+            self.filter_layout.removeWidget(old_widget)
+            old_widget.hide()
+            old_widget.deleteLater()
 
         # Insert before the stretch.
-        self.filter_layout.insertWidget(
-            0,
-            self.root_widget,
-        )
+        self.filter_layout.insertWidget(0, new_widget)
 
     def _connect_group_widget(
         self,
@@ -731,58 +874,104 @@ class Display(QWidget):
         widget.condition_evidence_requested.connect(self.condition_evidence_requested)
         widget.group_evidence_requested.connect(self.group_evidence_requested)
         widget.node_move_requested.connect(self.node_move_requested)
+        widget.count_changed.connect(self.count_changed)
+        widget.comment_changed.connect(self.comment_changed)
+        widget.binding_changed.connect(self.binding_changed)
 
     def _default_format_condition(
         self,
         condition: CurationFilterCondition,
     ):
+        key = condition.query.statistic_key
+        stat_def = self.data.statistic_engine.registry.get(key)
 
-        # threshold = condition.threshold
-        # symbol = "≥" if threshold.direction == "greater" else "≤"
-
-        stat_def = self.data.statistic_engine.registry[condition.query.statistic_key]
+        if stat_def is None:
+            text = condition.threshold.expression(key, precision=4)
+            tooltip = (
+                f"Statistic unavailable: {key}\n\n"
+                "Load data providing this statistic, or edit the condition "
+                "to choose another statistic.\n"
+                "This condition remains stored in the preset."
+            )
+            return text, tooltip
 
         query_title = StatisticsData.format_query_expression(
             condition.query,
             stat_def,
         )
 
-        symbol = "≥" if condition.threshold.direction == "greater" else "≤"
-        text = f"{query_title} " f"{symbol} " f"{condition.threshold.value:.4g}"
-        tooltip = (
-            f"{query_title}\n\n"
-            f"Threshold: {symbol} "
-            f"{condition.threshold.value:.6g}"
+        threshold = condition.threshold
+        text = threshold.expression(query_title, precision=4)
+
+        lines = [
+            query_title,
+            "",
+            f"Threshold: {threshold.expression(precision=6)}",
+        ]
+
+        if not threshold.active:
+            lines.append("Threshold disabled")
+
+        parameters = dict(condition.query.parameters)
+
+        if stat_def.parameters:
+            lines.extend(["", "Parameters:"])
+
+            for parameter in stat_def.parameters:
+                value = parameters.get(parameter.key, parameter.default)
+
+                if parameter.kind is bool:
+                    value_text = "Yes" if value else "No"
+                elif parameter.kind is int:
+                    value_text = str(int(value))
+                else:
+                    value_text = f"{float(value):.6g}"
+
+                lines.append(f"  {parameter.label}: {value_text}")
+
+        return text, "\n".join(lines)
+
+    def set_retained_results(self, count, note=""):
+        self.result_label.setText(
+            "Matching neurons: —" if count is None else f"Matching neurons: {count}"
         )
 
-        return text, tooltip
+        self.select_button.setEnabled(count is not None and count > 0)
+        self.clear_results_button.setEnabled(count is not None)
+
+        stale = count is not None and bool(note)
+
+        self.select_button.setText(
+            "Select matching neurons *" if stale else "Select matching neurons"
+        )
+        self.select_button.setToolTip(
+            note + "\nSelect uses the retained results. Evaluate replaces them."
+            if stale
+            else "Select the remaining evaluation results."
+        )
+        self.select_button.setStyleSheet(
+            "QPushButton {" " color: #F2CA7A;" " border: 1px solid #B88736;" "}"
+            if stale
+            else ""
+        )
 
     def set_dirty(
-        self, dirty: bool = True, dirty_text: str = "Filter changed — not evaluated"
+        self,
+        dirty=True,
+        dirty_text="Filter changed — not evaluated",
     ):
-
-        if dirty:
-            self.status_label.setText(dirty_text)
-            self.result_label.setText("Matching neurons: —")
-            self.select_button.setEnabled(False)
-        else:
-            self.status_label.clear()
+        self.status_label.setText(dirty_text if dirty else "")
 
     def set_evaluating(self):
         self.clear_evaluation_errors()
-        self.status_label.setText("Evaluating...")
-        self.result_label.setText("Matching neurons: —")
-
+        self.status_label.setText("Evaluating… Previous results remain available.")
         self.evaluate_button.setEnabled(False)
-        self.select_button.setEnabled(False)
 
-    def set_result_count(self, count: int):
+    def set_result_count(self, count):
         self.clear_evaluation_errors()
         self.status_label.clear()
-        self.result_label.setText(f"Matching neurons: {count}")
-
         self.evaluate_button.setEnabled(True)
-        self.select_button.setEnabled(count > 0)
+        self.set_retained_results(count)
 
     def set_evaluation_error(
         self,
@@ -796,10 +985,7 @@ class Display(QWidget):
 
         self.status_label.setText(f"Evaluation failed: {message}")
 
-        self.result_label.setText("Matching neurons: —")
-
         self.evaluate_button.setEnabled(True)
-        self.select_button.setEnabled(False)
 
         if (
             node_type is not None
@@ -815,6 +1001,7 @@ class Display(QWidget):
     ):
 
         if neuron_id is None:
+            self.set_target_inspection(None)
             self.evidence_label.setText("Highlighted evidence: —")
             return
 
@@ -831,12 +1018,55 @@ class Display(QWidget):
 
         self.root_widget.set_evidence_source(source_type, source_id)
 
+    def set_target_inspection(self, mapping):
+        previous = self.target_selector.currentData()
+
+        targets = sorted(
+            mapping or {},
+            key=lambda c: (c.neuron_id, -1 if c.session_id is None else c.session_id),
+        )
+
+        blocked = self.target_selector.blockSignals(True)
+
+        try:
+            self.target_selector.clear()
+
+            for target in targets:
+                self.target_selector.addItem(
+                    f"Target: neuron {target.neuron_id}"
+                    + (
+                        ""
+                        if target.session_id is None
+                        else f", session {target.session_id}"
+                    ),
+                    target,
+                )
+
+            if targets:
+                index = targets.index(previous) if previous in targets else 0
+                self.target_selector.setCurrentIndex(index)
+
+        finally:
+            self.target_selector.blockSignals(blocked)
+
+        self.inspection_row.setVisible(bool(targets))
+
+        return self.target_selector.currentData() if targets else None
+
     def set_invalid_groups(self, invalid_group_ids: set[str]):
 
         if self.root_widget is not None:
             self.root_widget.set_invalid_groups(invalid_group_ids)
 
         self.evaluate_button.setEnabled(not invalid_group_ids)
+
+    def refresh_condition_availability(self):
+        if self.root_widget is None:
+            return set()
+
+        return self.root_widget.refresh_condition_availability(
+            self.data.statistic_engine.registry
+        )
 
     def _on_preset_selector_changed(self, index: int):
 
@@ -869,8 +1099,8 @@ class Display(QWidget):
                 text = preset.name
                 tooltip = []
                 if preset.source == "builtin":
-                    tooltip.append("Built-in preset")
-                    # text = f"{text}"
+                    text = f"{text} [CATAN]"
+                    tooltip.append("Built-in CATAN preset")
 
                 if preset.key == default_key:
                     text = f"{text} (default)"
@@ -931,11 +1161,13 @@ class Controller(BasePlot.ControlsController):
                 settings=self.state.settings,
             )
         self.filter_store = self.state.curation_filter_store
+
         self.root_filter = self.filter_store.working_filter
 
         self.evaluator = CurationFilterEvaluator(self.data.statistic_engine)
 
         self.current_result = None
+        self._results_note = ""
         self._filter_generation = 0
 
         self._evidence_source = ("group", self.root_filter.id)
@@ -947,8 +1179,11 @@ class Controller(BasePlot.ControlsController):
         self.menu.group_remove_requested.connect(self._remove_group)
         self.menu.operator_changed.connect(self._set_group_operator)
         self.menu.match_level_changed.connect(self._set_group_match_level)
+        self.menu.count_changed.connect(self._set_group_count)
+        self.menu.comment_changed.connect(self._set_group_comment)
         self.menu.evaluate_requested.connect(self._evaluate_filter)
         self.menu.select_requested.connect(self._select_matching_neurons)
+        self.menu.inspection_changed.connect(self._update_evidence_highlight)
 
         self.menu.condition_add_requested.connect(self._add_condition_requested)
         self.menu.condition_edit_requested.connect(self._edit_condition_requested)
@@ -956,6 +1191,10 @@ class Controller(BasePlot.ControlsController):
         self.menu.group_evidence_requested.connect(self._show_group_evidence)
 
         self.menu.node_move_requested.connect(self._move_filter_node)
+        self.menu.binding_changed.connect(self._set_group_binding)
+
+        self.menu.clear_results_button.clicked.connect(self._clear_results)
+        self.menu.review_filter.changed.connect(self._on_review_filter_changed)
 
         # preset loading / saving
         self.menu.preset_selected.connect(self._select_filter_preset)
@@ -967,7 +1206,50 @@ class Controller(BasePlot.ControlsController):
         self.menu.preset_delete_requested.connect(self._delete_filter_preset)
 
         self.state.focused_component_changed.connect(self._on_focused_component_changed)
+
+        self.actions = CuratorActions(self)
+        self._interaction_guard = CuratorInteractionGuard(self)
+        self.menu.layout().addWidget(self.actions)
+
+        if self.filter_store.can_save_builtin():
+            self.menu.preset_menu.addSeparator()
+            action = self.menu.preset_menu.addAction("Save as CATAN preset…")
+            action.triggered.connect(self._save_builtin_filter_preset)
+
         self._rerender()
+
+        self.state.data_changed.connect(self._on_statistic_availability_changed)
+
+    def _set_group_binding(self, group_id: str, binding: str):
+        if binding not in (
+            "same",
+            "source",
+            "target",
+            "between_sources",
+            "between_targets",
+        ):
+            return
+            # raise ValueError(binding)
+
+        group = self._find_group(group_id)
+
+        if group is None or group.apply_to == binding:
+            return
+
+        group.apply_to = binding
+        self._mark_dirty()
+
+    def _set_group_comment(self, group_id: str, comment: str):
+        group = self._find_group(group_id)
+
+        if group is None or group.comment == comment:
+            return
+
+        group.comment = comment
+
+        # Documentation changes require saving, but not reevaluation.
+        self.filter_store.mark_working_dirty()
+        self._refresh_preset_controls()
 
     def _find_group(
         self,
@@ -1016,24 +1298,54 @@ class Controller(BasePlot.ControlsController):
 
         return None
 
-    def _mark_dirty(self):
+    def _set_group_count(self, group_id, spec):
+        group = self._find_group(group_id)
 
+        if group is None:
+            return
+
+        group.count = spec
+        self._mark_dirty()
+
+    def _refresh_results(self):
+        count = (
+            None if self.current_result is None else len(self.current_result.neurons)
+        )
+        self.menu.set_retained_results(count, self._results_note)
+
+    def _clear_results(self):
+        if self.actions.queue is not None:
+            self.actions._finish("Stopped: results cleared")
+
+        # Also discard an evaluation that was already running.
         self._filter_generation += 1
-        self.current_result = None
 
+        self.current_result = None
+        self._results_note = ""
+
+        self.state.update_highlighted_components(None)
+        self.menu.set_target_inspection(None)
+        self.menu.set_evidence_status(None)
+
+        self._update_filter_validity()
+        self.actions.refresh_candidates()
+
+    def _mark_dirty(self):
+        self._filter_generation += 1
         self.filter_store.mark_working_dirty()
 
-        self._evidence_source = ("group", self.root_filter.id)
-        self.menu.set_evidence_source(*self._evidence_source)
+        self._results_note = "Preset changed since evaluation."
+        self.menu.set_dirty(True, self._results_note)
 
-        self.menu.set_dirty(True)
-        self.state.update_highlighted_components(None)
-        self.menu.set_evidence_status(None)
+        self._refresh_results()
         self._refresh_preset_controls()
+        self.actions.refresh_candidates()
 
     def _rerender(self):
 
         self.menu.set_filter(self.root_filter)
+        self.menu.review_filter.set_visible_statuses(self.root_filter.review_statuses)
+        self.actions.sync()
         self.menu.set_evidence_source(*self._evidence_source)
 
         self._update_filter_validity()
@@ -1104,16 +1416,36 @@ class Controller(BasePlot.ControlsController):
         self._mark_dirty()
         self._rerender()
 
+    def _on_review_filter_changed(self):
+        selected = self.menu.review_filter.visible_statuses
+
+        statuses = (
+            None
+            if len(selected) == len(self.menu.review_filter.actions)
+            else tuple(sorted(int(status) for status in selected))
+        )
+
+        if statuses == self.root_filter.review_statuses:
+            return
+
+        self.root_filter.review_statuses = statuses
+        self._mark_dirty()
+
     def _evaluate_filter(self):
 
         generation = self._filter_generation
+        version = self.state.data_version
+        generation = self._filter_generation
+        snapshot = deepcopy(self.root_filter)
 
         self.menu.set_evaluating()
 
         def evaluate():
 
             try:
-                result = self.evaluator.evaluate(self.root_filter)
+                result = CurationFilterEvaluator(self.data.statistic_engine).evaluate(
+                    snapshot
+                )
                 return result, None
 
             except CurationFilterError as exc:
@@ -1130,6 +1462,7 @@ class Controller(BasePlot.ControlsController):
                 self._on_filter_evaluated(
                     result,
                     generation=generation,
+                    version=version,
                 )
             ),
         )
@@ -1139,17 +1472,21 @@ class Controller(BasePlot.ControlsController):
         result_and_error,
         *,
         generation: int,
+        version: int,
     ):
 
         result, error = result_and_error
 
         # Filter was edited while calculation ran.
-        if generation != self._filter_generation:
+        if generation != self._filter_generation or version != self.state.data_version:
+            self.menu.set_dirty(
+                True,
+                "Data or filter changed — evaluate again",
+            )
+            self._update_filter_validity()
             return
 
         if error is not None:
-
-            self.current_result = None
 
             message, node_type, node_id = error
 
@@ -1159,25 +1496,18 @@ class Controller(BasePlot.ControlsController):
 
             return
 
-        self.current_result = result
+        self.current_result = RetainedResults(result, self.data)
+        self._results_note = ""
 
-        self.menu.set_result_count(len(result.neurons))
+        self._evidence_source = (
+            "group",
+            self.current_result.root_id,
+        )
+        self.menu.set_evidence_source(*self._evidence_source)
+
+        self.actions.result_ready()
+        self.menu.set_result_count(len(self.current_result.neurons))
         self._update_evidence_highlight()
-
-        # import json
-        # from catan.gui.data.curation_filter import (
-        #     curation_filter_to_dict,
-        # )
-
-        # print(
-        #     json.dumps(
-        #         curation_filter_to_dict(
-        #             self.root_filter,
-        #             name="CATAN default",
-        #         ),
-        #         indent=2,
-        #     )
-        # )
 
     def _select_matching_neurons(self):
 
@@ -1193,6 +1523,37 @@ class Controller(BasePlot.ControlsController):
         ]
 
         self.state.update_selected_components(components, [])
+
+    def _highlight_endpoints(self, sources, targets):
+        mode = self.menu.highlight_selector.currentData()
+
+        source_components = set(self._display_components(sources))
+        target_components = set(self._display_components(targets))
+
+        roles = {}
+
+        if mode == "both":
+            components = source_components | target_components
+            roles = {component: "source" for component in source_components}
+            roles.update({component: "target" for component in target_components})
+            showing = (
+                '<span style="color:#FFB36B">targets</span> + '
+                '<span style="color:#C9A6FF">sources</span> highlighted'
+            )
+
+        elif mode == "target":
+            components = target_components
+            showing = "target highlighted"
+
+        else:
+            components = source_components
+            showing = "sources highlighted"
+
+        self.state.update_highlighted_components(
+            list(components) or None,
+            roles=roles,
+        )
+        return showing
 
     def _add_condition_requested(self, group_id: str):
 
@@ -1296,44 +1657,113 @@ class Controller(BasePlot.ControlsController):
     def _on_focused_component_changed(self):
         self._update_evidence_highlight()
 
+    def _display_components(self, endpoints):
+        """Expand neuron endpoints for display only."""
+        result = set()
+        ids = self.state.assignments
+
+        for endpoint in endpoints:
+            if endpoint.session_id is not None:
+                result.add(endpoint)
+                continue
+
+            neuron = int(endpoint.neuron_id)
+
+            if not 0 <= neuron < ids.shape[0]:
+                continue
+
+            for sid, session in enumerate(self.data.sessions[: ids.shape[1]]):
+                if session is None:
+                    continue
+
+                footprint = int(ids[neuron, sid])
+
+                if not 0 <= footprint < session.n_neurons:
+                    continue
+
+                if session.included is not None and not session.included[footprint]:
+                    continue
+
+                result.add(NeuronComponent(neuron, sid))
+
+        return sorted(
+            result,
+            key=lambda c: (c.neuron_id, c.session_id),
+        )
+
     def _update_evidence_highlight(self):
 
-        # No evaluated filter yet.
-        if self.current_result is None:
-            self.menu.set_evidence_status(None)
+        if hasattr(self, "actions") and self.actions.committing:
             return
 
         focused = self.state.focused_component
-        if focused is None:
+
+        if self.current_result is None or focused is None:
             self.state.update_highlighted_components(None)
             self.menu.set_evidence_status(None)
             return
 
         neuron_id = int(focused.neuron_id)
 
-        # Focus may belong to some unrelated neuron.
         if neuron_id not in self.current_result.neurons:
             self.state.update_highlighted_components(None)
+            self.menu.set_target_inspection(None)
             self.menu.set_evidence_status(neuron_id, 0)
             return
 
         source_type, source_id = self._evidence_source
 
+        mapping = self.current_result.inspection_targets(
+            neuron_id,
+            source_type,
+            source_id,
+        )
+
+        if mapping is not None:
+            target = self.menu.set_target_inspection(mapping)
+
+            if target is None:
+                self.state.update_highlighted_components(None)
+                self.menu.evidence_label.setText("No matching target in this group.")
+                return
+
+            sources = mapping[target]
+            source_neurons = {c.neuron_id for c in sources}
+
+            showing = self._highlight_endpoints(sources, {target})
+
+            self.menu.evidence_label.setText(
+                f"Target n{target.neuron_id}"
+                + (
+                    ""
+                    if target.session_id is None
+                    else f", session {target.session_id}"
+                )
+                + f": {showing}. Sources: "
+                + f"{len(source_neurons)} neurons, "
+                + f"{sum(c.session_id is not None for c in sources)} "
+                + "concrete footprints."
+            )
+            return
+
+        # Existing display behavior for the other matching modes.
+        self.menu.set_target_inspection(None)
+
         if source_type == "condition":
             components = self.current_result.components_for_condition(
-                neuron_id, source_id
+                neuron_id,
+                source_id,
             )
-
         elif source_type == "group":
-            components = self.current_result.components_for_group(neuron_id, source_id)
-
+            components = self.current_result.components_for_group(
+                neuron_id,
+                source_id,
+            )
         else:
             raise ValueError(source_type)
 
-        condition_result = next(iter(self.current_result.condition_results.values()))
-
         self.state.update_highlighted_components(
-            list(components) if components else None
+            self._display_components(components) or None
         )
 
         self.menu.set_evidence_status(neuron_id, len(components))
@@ -1422,31 +1852,42 @@ class Controller(BasePlot.ControlsController):
 
         return False
 
+    def _on_statistic_availability_changed(self, *args):
+        self._update_filter_validity()
+
     def _update_filter_validity(self):
-
         invalid_groups = empty_filter_group_ids(self.root_filter)
-
         self.menu.set_invalid_groups(invalid_groups)
 
+        invalid_conditions = self.menu.refresh_condition_availability()
+
+        problems = []
         if invalid_groups:
-
-            n = len(invalid_groups)
-
-            text = "Filter incomplete — " f"{n} empty group" f"{'s' if n != 1 else ''}"
-
-            self.menu.set_dirty(
-                True,
-                text,
+            problems.append(f"{len(invalid_groups)} empty group(s)")
+        if invalid_conditions:
+            problems.append(
+                f"{len(invalid_conditions)} condition(s) " "with unavailable statistics"
             )
 
-            return False
+        valid = not problems
 
-        if self.filter_store.working_dirty:
-            self.menu.set_dirty(True)
+        if problems:
+            self.menu.set_dirty(
+                True,
+                "Filter incomplete — " + "; ".join(problems),
+            )
+        elif self.current_result is not None:
+            self.menu.set_dirty(
+                bool(self._results_note),
+                self._results_note,
+            )
         else:
-            self.menu.set_dirty(False)
+            self.menu.set_dirty(True, "Evaluate to obtain results.")
 
-        return True
+        self.menu.evaluate_button.setEnabled(valid and self.actions.queue is None)
+
+        self._refresh_results()
+        return valid
 
     def _load_filter_preset(self, key: str):
 
@@ -1454,8 +1895,7 @@ class Controller(BasePlot.ControlsController):
 
         self.root_filter = self.filter_store.working_filter
 
-        self.current_result = None
-        self._filter_generation += 1
+        self._clear_results()
 
         self._evidence_source = (
             "group",
@@ -1561,6 +2001,50 @@ class Controller(BasePlot.ControlsController):
 
             QMessageBox.warning(self.menu, "Could not save preset", str(exc))
 
+            return
+
+        self._refresh_preset_controls()
+
+    def _save_builtin_filter_preset(self):
+        info = self.filter_store.preset_info(self.filter_store.working_preset_key)
+        name, accepted = QInputDialog.getText(
+            self.menu,
+            "Save as CATAN preset",
+            "Preset name:",
+            text=info.name if info is not None else "",
+        )
+
+        if not accepted or not name.strip():
+            return
+
+        name = name.strip()
+
+        try:
+            try:
+                self.filter_store.save_working_as_builtin(name)
+            except FileExistsError:
+                answer = QMessageBox.question(
+                    self.menu,
+                    "Replace CATAN preset?",
+                    f"A built-in preset with this filename already exists "
+                    f"for {name!r}.\n\nReplace it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+
+                self.filter_store.save_working_as_builtin(
+                    name,
+                    overwrite=True,
+                )
+
+        except Exception as exc:
+            QMessageBox.warning(
+                self.menu,
+                "Could not save CATAN preset",
+                str(exc),
+            )
             return
 
         self._refresh_preset_controls()

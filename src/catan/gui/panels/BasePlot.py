@@ -321,6 +321,8 @@ class BaseCanvas(scene.SceneCanvas):
             "selected": 70,
             "focused": 80,
             "highlighted": 90,
+            "highlighted_source": 90,
+            "highlighted_target": 91,
             "hovered": 100,
         }
         if style in order:
@@ -365,10 +367,7 @@ class BaseCanvas(scene.SceneCanvas):
         # - the statistics registry was rebuilt
         signature = (
             entity_mode,
-            tuple(
-                (query, engine.query_revision(query))
-                for query in raw_queries
-            ),
+            tuple((query, engine.query_revision(query)) for query in raw_queries),
         )
 
         if signature == self._tooltip_statistic_signature:
@@ -517,13 +516,10 @@ class BaseDisplayController(QObject):
         ):
             self.connect_signal(signal, slot)
 
-
     def connect_signal(self, signal, slot, *, controls=False):
         connection = signal.connect(slot)
 
-        connections = (
-            self._control_connections if controls else self._connections
-        )
+        connections = self._control_connections if controls else self._connections
         connections.append(connection)
 
     @staticmethod
@@ -593,7 +589,7 @@ class BaseDisplayController(QObject):
 
     def disconnect_signals(self):
         self._disconnect_connections(self._connections)
-    
+
     def get_config(self):
         return dict(self.config)
 
@@ -660,7 +656,14 @@ CanvasT = TypeVar("CanvasT", bound=BaseCanvas)
 
 
 class CanvasController(BaseDisplayController, Generic[CanvasT]):
-
+    overlays = [
+        "selected",
+        "focused",
+        "highlighted",
+        "highlighted_source",
+        "highlighted_target",
+        "hovered",
+    ]
     canvas: CanvasT
 
     def configure_display(self):
@@ -674,7 +677,18 @@ class CanvasController(BaseDisplayController, Generic[CanvasT]):
         self.canvas.update_style(self.state.hovered_components, "hovered")
         self.canvas.update_style(self.state.selected_components, "selected")
         self.canvas.update_style(self.state.focused_component, "focused")
-        self.canvas.update_style(self.state.highlighted_components, "highlighted")
+
+        highlighted = self.state.highlighted_components or ()
+        roles = self.state.highlight_roles
+        for role, style in (
+            (None, "highlighted"),
+            ("source", "highlighted_source"),
+            ("target", "highlighted_target"),
+        ):
+            components = [
+                component for component in highlighted if roles.get(component) == role
+            ]
+            self.canvas.update_style(components or None, style)
 
 
 class TableController(BaseDisplayController):

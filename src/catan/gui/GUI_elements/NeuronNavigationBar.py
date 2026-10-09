@@ -31,6 +31,9 @@ class NeuronNavigationBar(QWidget):
 
         selector_layout = QHBoxLayout(self)
 
+        self.neuron_count_label = QLabel()
+        selector_layout.addWidget(self.neuron_count_label)
+
         self.footprint_edit = QLineEdit()
         self.footprint_edit.setFixedWidth(60)
 
@@ -41,7 +44,7 @@ class NeuronNavigationBar(QWidget):
         self.footprint_id_next = QPushButton(">")
         self.footprint_id_next.setFixedWidth(30)
 
-        selector_layout.addWidget(QLabel("Neuron ID:"))
+        selector_layout.addWidget(QLabel("Focused ID:"))
         selector_layout.addWidget(self.footprint_edit)
         selector_layout.addWidget(self.footprint_id_prev)
         selector_layout.addWidget(self.footprint_slider, stretch=1)
@@ -73,10 +76,12 @@ class NeuronNavigationBar(QWidget):
             lambda value: self.update_adj_radius(value)
         )
 
+        self.state.data_changed.connect(self._on_data_changed)
         self.state.focused_component_changed.connect(self._on_focus_changed)
         self.state.selected_components_changed.connect(self._on_selection_changed)
 
         self.update_setup()
+        print("updated navbar")
         # self.footprint_edit.editingFinished.connect(self.on_neuron_edit_return)
 
         # selector_layout = self.controls.build_footprint_selector()
@@ -87,6 +92,7 @@ class NeuronNavigationBar(QWidget):
         self.state.adjacency_radius = value
 
     def _on_selection_changed(self):
+        self.update_neuron_count_label()
         self.update_setup()
 
     def _on_focus_changed(self):
@@ -95,7 +101,22 @@ class NeuronNavigationBar(QWidget):
     def _on_data_changed(self):
         self.update_setup()
 
+    def update_neuron_count_label(self):
+        if (
+            self.state.selected_components is None
+            or len(self.state.selected_components) <= 1
+        ):
+            self.neuron_count_label.setText(
+                f"Iterating {self.data.assignments.union.included.sum()} neurons"
+            )
+        else:
+            neuron_ids = self.navigation_neuron_ids()
+            self.neuron_count_label.setText(
+                f"Selected {len(neuron_ids)} / {self.data.assignments.union.included.sum()} neurons"
+            )
+
     def update_setup(self):
+        self.update_neuron_count_label()
         self.set_id_range()
         self.adjust_id()
 

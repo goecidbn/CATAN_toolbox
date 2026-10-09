@@ -57,6 +57,17 @@ class ReviewStatusFilter(QToolButton):
     def visible_statuses(self):
         return {status for status, action in self.actions.items() if action.isChecked()}
 
+    def set_visible_statuses(self, statuses):
+        values = None if statuses is None else {int(status) for status in statuses}
+
+        for status, action in self.actions.items():
+            previous = action.blockSignals(True)
+            action.setChecked(values is None or int(status) in values)
+            action.blockSignals(previous)
+
+        self._custom = False
+        self._update_text()
+
     def _on_changed(self):
         # User interacted with the review-state selector,
         # so selection is review-state based again.

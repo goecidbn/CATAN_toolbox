@@ -1199,43 +1199,14 @@ class Display(BasePlot.BaseCanvas):
         )
 
     def change_neuron_assignment_dialog(
-        self, component: NeuronComponent, new_neuron: Optional[int] = None
+        self,
+        component: NeuronComponent,
+        new_neuron: Optional[int] = None,
     ):
-
-        session_id = component.session_id
-        fp_id = self.state.get_footprint_from_component(component)
-
-        if new_neuron is None:
-            ## append new neuron
-            new_neuron = self.state.assignments.shape[0]
-            self.state.logger.debug(
-                f"Creating new neuron {new_neuron} for footprint {fp_id} in session {session_id}"
-            )
-            self.data.assignments.pad_empty(n_neurons=1, n_sessions=0)
-            self.state.assignments = self.data.assignments.ids
-
-        ## change assignments array
-        self.state.assignments[new_neuron, session_id] = fp_id
-        self.state.assignments[component.neuron_id, session_id] = -1
-
-        self.data.rebuild_union_neurons([new_neuron, component.neuron_id])
-
-        for values in self.data.assignments.stats.values():
-            values[new_neuron, ...] = np.nan
-            values[component.neuron_id, ...] = np.nan
-
-        self.data.assignments.review_status[new_neuron] = ReviewStatus.PENDING
-        self.data.assignments.review_status[component.neuron_id] = ReviewStatus.PENDING
-
-        self.data.rebuild_union_included()
-        self.data.assignments.updating_neuron_presence()
-        self.data.notify_change(
-            C.ASSIGNMENT_MAPPING,
-            C.UNION_GEOMETRY,
-            C.INCLUSION,
-            C.REVIEW_STATUS,
+        self.data.reassign_footprint(
+            component,
+            new_neuron,
         )
-
         self.plot_neurons(reset=True)
 
     def set_focused_footprint(self, component: NeuronComponent):
