@@ -1,3 +1,6 @@
+from catan.gui.background_tasks.runtime import (
+    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
+)
 from dataclasses import dataclass, replace
 from math import prod
 
@@ -143,6 +146,7 @@ class PickTable:
         return self.errors_low is not None and self.errors_high is not None
 
     @classmethod
+    @reports_progress("Constructing statistic table")
     def from_stat(cls, stat: StatisticArray) -> "PickTable":
         from .sparse_values import SparseStatisticArray
 
@@ -156,7 +160,7 @@ class PickTable:
         refs = {}
         grid_shape = np.asarray(stat.values).shape
 
-        for axis, dim_name in enumerate(dims):
+        for axis, dim_name in enumerate(progress_iter(dims, stop=85, every=1)):
             coords = stat.dimensions[dim_name].coords
 
             if coords is None:
@@ -211,11 +215,15 @@ class PickTable:
 
         return result
 
+    @reports_progress("Filtering statistic table")
     def filtered(self, filters: tuple[PairFilter, ...]) -> "PickTable":
         table = self
 
-        for f in filters:
-            table = table._apply_pair_filter(f)
+        for progress_index, (f) in enumerate(filters):
+            with progress_step(
+                progress_index, len(filters), start=0, stop=100,
+            ):
+                table = table._apply_pair_filter(f)
 
         return table
 
@@ -310,11 +318,12 @@ class PickTable:
             n=None if self.n is None else self.n[rows],
         )
 
+    @reports_progress("Filtering statistic table")
     def _collect_rows(self, select):
         """Collect selected row indices from bounded table blocks."""
         parts = []
 
-        for start, block in self.iter_row_blocks():
+        for start, block in progress_iter(self.iter_row_blocks(), total=(self.n_rows + ROW_BLOCK_SIZE - 1) // ROW_BLOCK_SIZE, stop=95, every=1):
             rows = select(block)
 
             if rows.size:
@@ -328,13 +337,14 @@ class PickTable:
 
         return np.concatenate(parts)
 
+    @reports_progress("Filtering statistic table")
     def subset_rows(self, rows) -> "PickTable":
         rows = np.atleast_1d(np.asarray(rows, dtype=np.intp))
 
         refs = {}
         row_maps = {}
 
-        for name, column in self.refs.items():
+        for name, column in progress_iter(self.refs.items(), stop=85, every=1):
             if isinstance(column, GridRef):
                 # Coordinate columns using the same original row mapping
                 # share their new mapping too.

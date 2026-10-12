@@ -1,3 +1,6 @@
+from catan.gui.background_tasks.runtime import (
+    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
+)
 from dataclasses import dataclass, field, replace, asdict
 from typing import List, Literal, ClassVar
 from uuid import uuid4
@@ -396,6 +399,7 @@ class CurationFilterEvaluator:
     ):
         self.engine = engine
 
+    @reports_progress("Evaluating curator preset")
     def evaluate(
         self,
         root: CurationFilterGroup,
@@ -431,12 +435,14 @@ class CurationFilterEvaluator:
                 np.flatnonzero(np.isin(statuses, root.review_statuses))
             )
 
-        self._prepare_count_domains(root)
-        root_result = self._evaluate_group(root, condition_results, group_results)
+        with progress_scope(0, 3, "Preparing curator domains"):
+            self._prepare_count_domains(root)
+        with progress_scope(3, 97):
+            root_result = self._evaluate_group(root, condition_results, group_results)
 
         neurons = set()
 
-        for match in root_result.matches:
+        for match in progress_iter(root_result.matches, start=97, stop=99):
             neurons.update(match_neurons(match))
 
         return CurationFilterResult(
@@ -447,6 +453,7 @@ class CurationFilterEvaluator:
             bound_inspections=self._bound_inspections,
         )
 
+    @reports_progress(None)
     def _evaluate_condition(
         self,
         condition: CurationFilterCondition,
@@ -463,11 +470,12 @@ class CurationFilterEvaluator:
         except ValueError as exc:
             raise CurationFilterError(str(exc)) from exc
 
-        table = self.engine.evaluate_matching_table(
-            condition.query,
-            condition.threshold.mask,
-            requested_pairs=requested_pairs,
-        )
+        with progress_scope(0, 85, f"Statistic: {condition.query.statistic_key}"):
+            table = self.engine.evaluate_matching_table(
+                condition.query,
+                condition.threshold.mask,
+                requested_pairs=requested_pairs,
+            )
 
         if table is None:
             raise CurationFilterError("No statistic is available for this condition.")
@@ -477,12 +485,13 @@ class CurationFilterEvaluator:
             table.n_rows,
             dtype=np.intp,
         )
-        (
-            neurons,
-            components,
-            rows_by_neuron,
-            rows_by_component,
-        ) = self._project_rows(table, matching_rows)
+        with progress_scope(85, 100, "Projecting matching rows"):
+            (
+                neurons,
+                components,
+                rows_by_neuron,
+                rows_by_component,
+            ) = self._project_rows(table, matching_rows)
 
         return CurationFilterConditionResult(
             condition=condition,
@@ -602,6 +611,7 @@ class CurationFilterEvaluator:
 
         visit(group)
 
+    @reports_progress('Evaluating partner requirements')
     def _apply_support_groups(
         self,
         group,
@@ -633,7 +643,8 @@ class CurationFilterEvaluator:
                 "per actual anchor type."
             )
 
-        buckets = self._relationship_buckets(result, spec)
+        with progress_scope(0, 5):
+            buckets = self._relationship_buckets(result, spec)
 
         partner_sets = [
             {pair.target if spec.anchor == "source" else pair.source for pair in pairs}
@@ -647,7 +658,7 @@ class CurationFilterEvaluator:
         # Only compare supports belonging to a common outer target.
         candidates = set()
 
-        for sources in partner_sets:
+        for sources in progress_iter(partner_sets, start=5, stop=15, every=1):
             if ctx is not None:
                 ctx.check_cancelled()
 
@@ -663,46 +674,49 @@ class CurationFilterEvaluator:
 
         compatible = set(candidates)
 
-        for child in support_groups:
-            if (
-                child.operator != "and"
-                or child.match_level != "relationship"
-                or child.count is not None
-                or any(not is_filter_condition(c) for c in child.children)
+        for progress_index, (child) in enumerate(support_groups):
+            with progress_step(
+                progress_index, len(support_groups), start=15, stop=65,
             ):
-                raise CurationFilterError(
-                    "Use an AND source-target group with conditions "
-                    "and no count for comparisons between partners.",
-                    node_id=child.id,
-                    node_type="group",
-                )
-
-            for condition in child.children:
-                if not self.engine.supports_requested_pairs(condition.query):
+                if (
+                    child.operator != "and"
+                    or child.match_level != "relationship"
+                    or child.count is not None
+                    or any(not is_filter_condition(c) for c in child.children)
+                ):
                     raise CurationFilterError(
-                        "This between-partner condition needs a statistic "
-                        "supporting requested footprint pairs, with all "
-                        "identities kept or fixed.",
-                        node_id=condition.id,
-                        node_type="condition",
+                        "Use an AND source-target group with conditions "
+                        "and no count for comparisons between partners.",
+                        node_id=child.id,
+                        node_type="group",
                     )
 
-            child_result = self._evaluate_group(
-                child,
-                condition_results,
-                group_results,
-                initial_pairs=compatible,
-                initial_kinds=(
-                    result.endpoint_kinds[1 if spec.anchor == "source" else 0],
-                )
-                * 2,
-            )
+                for condition in child.children:
+                    if not self.engine.supports_requested_pairs(condition.query):
+                        raise CurationFilterError(
+                            "This between-partner condition needs a statistic "
+                            "supporting requested footprint pairs, with all "
+                            "identities kept or fixed.",
+                            node_id=condition.id,
+                            node_type="condition",
+                        )
 
-            compatible.intersection_update(child_result.matches)
+                child_result = self._evaluate_group(
+                    child,
+                    condition_results,
+                    group_results,
+                    initial_pairs=compatible,
+                    initial_kinds=(
+                        result.endpoint_kinds[1 if spec.anchor == "source" else 0],
+                    )
+                    * 2,
+                )
+
+                compatible.intersection_update(child_result.matches)
 
         selected_pairs = set()
 
-        for pairs, sources in zip(buckets.values(), partner_sets):
+        for pairs, sources in progress_iter(zip(buckets.values(), partner_sets), total=len(partner_sets), start=65, stop=95, every=1):
             if ctx is not None:
                 ctx.check_cancelled()
 
@@ -780,6 +794,7 @@ class CurationFilterEvaluator:
             for child in group.children:
                 self._bound_inspections[child.id] = mapping
 
+    @reports_progress("Evaluating curator group")
     def _evaluate_group(
         self,
         group: CurationFilterGroup,
@@ -845,120 +860,128 @@ class CurationFilterEvaluator:
 
         progressive = group.operator == "and" and group.match_level == "relationship"
 
-        for child in ordinary_children:
+        for progress_index, (child) in enumerate(ordinary_children):
+            with progress_step(
+                progress_index, len(ordinary_children), start=0, stop=70,
+            ):
 
-            # -------------------------------------
-            # Condition
-            # -------------------------------------
+                # -------------------------------------
+                # Condition
+                # -------------------------------------
 
-            if is_filter_condition(child):
+                if is_filter_condition(child):
 
-                try:
-                    requested_pairs = None
+                    try:
+                        requested_pairs = None
 
-                    if (
-                        progressive
-                        and remaining_pairs is not None
-                        and self.engine.supports_requested_pairs(child.query)
-                    ):
-                        requested_pairs = np.fromiter(
-                            (
-                                value
-                                for pair in remaining_pairs
-                                for value in (
-                                    pair.source.neuron_id,
-                                    pair.target.neuron_id,
-                                    (
-                                        -1
-                                        if pair.source.session_id is None
-                                        else pair.source.session_id
-                                    ),
-                                    (
-                                        -1
-                                        if pair.target.session_id is None
-                                        else pair.target.session_id
-                                    ),
-                                )
-                            ),
-                            dtype=np.int64,
-                            count=4 * len(remaining_pairs),
-                        ).reshape(-1, 4)
+                        if (
+                            progressive
+                            and remaining_pairs is not None
+                            and self.engine.supports_requested_pairs(child.query)
+                        ):
+                            requested_pairs = np.fromiter(
+                                (
+                                    value
+                                    for pair in remaining_pairs
+                                    for value in (
+                                        pair.source.neuron_id,
+                                        pair.target.neuron_id,
+                                        (
+                                            -1
+                                            if pair.source.session_id is None
+                                            else pair.source.session_id
+                                        ),
+                                        (
+                                            -1
+                                            if pair.target.session_id is None
+                                            else pair.target.session_id
+                                        ),
+                                    )
+                                ),
+                                dtype=np.int64,
+                                count=4 * len(remaining_pairs),
+                            ).reshape(-1, 4)
 
-                    condition_result = self._evaluate_condition(
-                        child,
-                        requested_pairs=requested_pairs,
-                    )
-
-                    condition_results[child.id] = condition_result
-
-                    child_result = self._condition_result_for_level(
-                        condition_result, group.match_level
-                    )
-                    if group.match_level == "relationship":
-                        kinds = child_result.endpoint_kinds
-
-                        if endpoint_kinds is not None and kinds != endpoint_kinds:
-                            raise CurationFilterError(
-                                "Pair types differ after reduction: "
-                                f"expected {endpoint_kinds}, received {kinds}. "
-                                "Keep/fix a session for a footprint endpoint, "
-                                "or reduce it for a neuron endpoint."
+                        with progress_scope(0, 85):
+                            condition_result = self._evaluate_condition(
+                                child,
+                                requested_pairs=requested_pairs,
                             )
 
-                        endpoint_kinds = kinds
+                        condition_results[child.id] = condition_result
 
-                    self._set_count_domains(
-                        child_result,
-                        condition_result.table,
-                    )
+                        with progress_scope(85, 95, "Constructing condition matches"):
+                            child_result = self._condition_result_for_level(
+                                condition_result, group.match_level
+                            )
+                        if group.match_level == "relationship":
+                            kinds = child_result.endpoint_kinds
 
-                except CurationFilterError as exc:
-                    exc.attach_node(child.id, "condition")
-                    raise
+                            if endpoint_kinds is not None and kinds != endpoint_kinds:
+                                raise CurationFilterError(
+                                    "Pair types differ after reduction: "
+                                    f"expected {endpoint_kinds}, received {kinds}. "
+                                    "Keep/fix a session for a footprint endpoint, "
+                                    "or reduce it for a neuron endpoint."
+                                )
 
-            # -------------------------------------
-            # Nested group
-            # -------------------------------------
+                            endpoint_kinds = kinds
 
-            elif is_filter_group(child):
+                        with progress_scope(95, 100, "Preparing condition domains"):
+                            self._set_count_domains(
+                                child_result,
+                                condition_result.table,
+                            )
 
-                try:
-                    child_result = self._evaluate_group(
-                        child, condition_results, group_results
-                    )
+                    except CurationFilterError as exc:
+                        exc.attach_node(child.id, "condition")
+                        raise
 
-                    child_result = self._project_group_result(
-                        child_result, group.match_level
-                    )
+                # -------------------------------------
+                # Nested group
+                # -------------------------------------
 
-                except CurationFilterError as exc:
-                    exc.attach_node(child.id, "group")
-                    raise
+                elif is_filter_group(child):
 
-            else:
-                raise TypeError(f"Unknown curation filter node: " f"{type(child)!r}")
+                    try:
+                        with progress_scope(0, 85):
+                            child_result = self._evaluate_group(
+                                child, condition_results, group_results
+                            )
 
-            if group.match_level == "relationship":
-                if (
-                    endpoint_kinds is not None
-                    and child_result.endpoint_kinds != endpoint_kinds
-                ):
-                    raise CurationFilterError(
-                        "Combined relationship groups must "
-                        "have the same endpoint types.",
-                        node_id=child.id,
-                        node_type=child.node_type,
-                    )
+                        with progress_scope(85, 100, "Projecting subgroup matches"):
+                            child_result = self._project_group_result(
+                                child_result, group.match_level
+                            )
 
-                endpoint_kinds = child_result.endpoint_kinds
+                    except CurationFilterError as exc:
+                        exc.attach_node(child.id, "group")
+                        raise
 
-            child_results.append(child_result)
-
-            if progressive:
-                if remaining_pairs is None:
-                    remaining_pairs = set(child_result.matches)
                 else:
-                    remaining_pairs.intersection_update(child_result.matches)
+                    raise TypeError(f"Unknown curation filter node: " f"{type(child)!r}")
+
+                if group.match_level == "relationship":
+                    if (
+                        endpoint_kinds is not None
+                        and child_result.endpoint_kinds != endpoint_kinds
+                    ):
+                        raise CurationFilterError(
+                            "Combined relationship groups must "
+                            "have the same endpoint types.",
+                            node_id=child.id,
+                            node_type=child.node_type,
+                        )
+
+                    endpoint_kinds = child_result.endpoint_kinds
+
+                child_results.append(child_result)
+
+                if progressive:
+                    if remaining_pairs is None:
+                        remaining_pairs = set(child_result.matches)
+                    else:
+                        remaining_pairs.intersection_update(child_result.matches)
 
         # -----------------------------------------
         # Empty group
@@ -981,62 +1004,64 @@ class CurationFilterEvaluator:
         # Boolean operation
         # -----------------------------------------
 
-        if group.operator == "and":
+        with progress_scope(70, 73, "Combining curator conditions"):
+            if group.operator == "and":
 
-            matches = set(child_results[0].matches)
+                matches = set(child_results[0].matches)
 
-            for child_result in child_results[1:]:
-                matches.intersection_update(child_result.matches)
+                for child_result in child_results[1:]:
+                    matches.intersection_update(child_result.matches)
 
-        elif group.operator == "or":
+            elif group.operator == "or":
 
-            matches = set()
+                matches = set()
 
-            for child_result in child_results:
-                matches.update(child_result.matches)
+                for child_result in child_results:
+                    matches.update(child_result.matches)
 
-        else:
-            raise ValueError(group.operator)
+            else:
+                raise ValueError(group.operator)
 
         # -----------------------------------------
         # Evidence only for identities which
         # survived this group's Boolean operation.
         # -----------------------------------------
 
-        evidence_by_match = {}
+        with progress_scope(73, 80, "Combining match evidence"):
+            evidence_by_match = {}
 
-        for match in matches:
+            for match in progress_iter(matches):
 
-            evidence = set()
+                evidence = set()
 
-            for child_result in child_results:
+                for child_result in child_results:
 
-                # With OR, only contributing children matter.
-                # With AND, every child contains the match anyway.
-                if match not in child_result.matches:
-                    continue
+                    # With OR, only contributing children matter.
+                    # With AND, every child contains the match anyway.
+                    if match not in child_result.matches:
+                        continue
 
-                evidence.update(child_result.evidence_by_match.get(match, set()))
+                    evidence.update(child_result.evidence_by_match.get(match, set()))
 
-            evidence_by_match[match] = evidence
+                evidence_by_match[match] = evidence
 
-        result = CurationFilterGroupResult(
-            group_id=group.id,
-            match_level=group.match_level,
-            matches=matches,
-            evidence_by_match=evidence_by_match,
-            target_evidence=combined_targets(
-                child_results,
-                matches,
-                group.match_level,
-            ),
-        )
+            result = CurationFilterGroupResult(
+                group_id=group.id,
+                match_level=group.match_level,
+                matches=matches,
+                evidence_by_match=evidence_by_match,
+                target_evidence=combined_targets(
+                    child_results,
+                    matches,
+                    group.match_level,
+                ),
+            )
 
-        result.endpoint_kinds = endpoint_kinds
-        combine = set.intersection if group.operator == "and" else set.union
+            result.endpoint_kinds = endpoint_kinds
+            combine = set.intersection if group.operator == "and" else set.union
 
-        result.neuron_domain = combine(*(r.neuron_domain for r in child_results))
-        result.footprint_domain = combine(*(r.footprint_domain for r in child_results))
+            result.neuron_domain = combine(*(r.neuron_domain for r in child_results))
+            result.footprint_domain = combine(*(r.footprint_domain for r in child_results))
 
         if group is self._review_root and self._review_allowed is not None:
             allowed = self._review_allowed
@@ -1064,124 +1089,134 @@ class CurationFilterEvaluator:
                 },
             )
 
-        for child in endpoint_groups:
-            try:
-                child_result = self._evaluate_group(
-                    child,
+        for progress_index, (child) in enumerate(endpoint_groups):
+            with progress_step(
+                progress_index, len(endpoint_groups), start=80, stop=86,
+            ):
+                try:
+                    child_result = self._evaluate_group(
+                        child,
+                        condition_results,
+                        group_results,
+                    )
+
+                    result = self._apply_endpoint_group(
+                        result,
+                        child_result,
+                        child.apply_to,
+                    )
+
+                except CurationFilterError as exc:
+                    exc.attach_node(child.id, "group")
+                    raise
+
+        with progress_scope(86, 92, "Evaluating partner requirements"):
+            if support_groups:
+                result = self._apply_support_groups(
+                    group,
+                    result,
+                    support_groups,
                     condition_results,
                     group_results,
                 )
-
-                result = self._apply_endpoint_group(
-                    result,
-                    child_result,
-                    child.apply_to,
-                )
-
-            except CurationFilterError as exc:
-                exc.attach_node(child.id, "group")
-                raise
-
-        if support_groups:
-            result = self._apply_support_groups(
-                group,
-                result,
-                support_groups,
-                condition_results,
-                group_results,
-            )
 
         # Subsequent counting and condition projection must use the
         # relationships that survived all source/target requirements.
         matches = result.matches
 
-        if group.count is not None:
-            try:
-                result = self._apply_count(group, result)
-            except CurationFilterError as exc:
-                exc.attach_node(group.id, "group")
-                raise
+        with progress_scope(92, 95, "Counting surviving matches"):
+            if group.count is not None:
+                try:
+                    result = self._apply_count(group, result)
+                except CurationFilterError as exc:
+                    exc.attach_node(group.id, "group")
+                    raise
 
-        for child, child_result in zip(ordinary_children, child_results):
-            if not is_filter_condition(child):
-                continue
+        for progress_index, (child, child_result) in enumerate(zip(ordinary_children, child_results)):
+            with progress_step(
+                progress_index, len(ordinary_children), start=95, stop=98, message="Projecting surviving conditions",
+            ):
+                if not is_filter_condition(child):
+                    continue
 
-            surviving = child_result.matches & matches
-
-            projected = replace(
-                child_result,
-                matches=surviving,
-                evidence_by_match={
-                    match: child_result.evidence_by_match[match] for match in surviving
-                },
-                target_evidence=restrict_targets(
-                    child_result.target_evidence,
-                    surviving,
-                    child_result.match_level,
-                ),
-            )
-
-            if group.count is not None and result.match_level == "relationship":
-                kept = projected.matches & result.matches
+                surviving = child_result.matches & matches
 
                 projected = replace(
-                    projected,
-                    matches=kept,
+                    child_result,
+                    matches=surviving,
                     evidence_by_match={
-                        pair: projected.evidence_by_match[pair] for pair in kept
-                    },
-                    target_evidence=pair_target_evidence(kept),
-                )
-
-            elif group.count is not None:
-                _, evidence = self._count_buckets(
-                    projected,
-                    group.count.target,
-                    group.count.unit,
-                )
-
-                projected = replace(
-                    result,
-                    evidence_by_match={
-                        subject: evidence.get(subject, set())
-                        for subject in result.matches
+                        match: child_result.evidence_by_match[match] for match in surviving
                     },
                     target_evidence=restrict_targets(
-                        projected.target_evidence,
-                        result.matches,
-                        result.match_level,
+                        child_result.target_evidence,
+                        surviving,
+                        child_result.match_level,
                     ),
                 )
 
-            condition_results[child.id].projected_result = projected
+                if group.count is not None and result.match_level == "relationship":
+                    kept = projected.matches & result.matches
 
-        if bound_children:
-            surviving_pairs = {
-                pair
-                for pair in matches
-                if (
-                    pair in result.matches
-                    if result.match_level == "relationship"
-                    else self._endpoint_matches(result, pair.target)
-                )
-            }
+                    projected = replace(
+                        projected,
+                        matches=kept,
+                        evidence_by_match={
+                            pair: projected.evidence_by_match[pair] for pair in kept
+                        },
+                        target_evidence=pair_target_evidence(kept),
+                    )
 
-            self._record_support_inspection(
-                support_groups,
-                surviving_pairs,
-            )
+                elif group.count is not None:
+                    _, evidence = self._count_buckets(
+                        projected,
+                        group.count.target,
+                        group.count.unit,
+                    )
 
-            for child in endpoint_groups:
-                self._record_bound_inspection(
-                    child,
-                    child.apply_to,
+                    projected = replace(
+                        result,
+                        evidence_by_match={
+                            subject: evidence.get(subject, set())
+                            for subject in result.matches
+                        },
+                        target_evidence=restrict_targets(
+                            projected.target_evidence,
+                            result.matches,
+                            result.match_level,
+                        ),
+                    )
+
+                condition_results[child.id].projected_result = projected
+
+        with progress_scope(98, 99, "Constructing bound inspections"):
+            if bound_children:
+                surviving_pairs = {
+                    pair
+                    for pair in matches
+                    if (
+                        pair in result.matches
+                        if result.match_level == "relationship"
+                        else self._endpoint_matches(result, pair.target)
+                    )
+                }
+
+                self._record_support_inspection(
+                    support_groups,
                     surviving_pairs,
-                    condition_results,
-                    group_results,
                 )
+
+                for child in endpoint_groups:
+                    self._record_bound_inspection(
+                        child,
+                        child.apply_to,
+                        surviving_pairs,
+                        condition_results,
+                        group_results,
+                    )
         group_results[group.id] = result
         return result
 
+    @reports_progress('Preparing count domains')
     def _prepare_count_domains(self, root):
         def enabled(group):
             return group.count is not None or any(
@@ -1206,7 +1241,7 @@ class CurationFilterEvaluator:
             if included.shape != (ids.shape[0],):
                 raise CurationFilterError("Union inclusion mask has the wrong length.")
 
-        for sid, session in enumerate(self.engine.data.sessions[: ids.shape[1]]):
+        for sid, session in enumerate(progress_iter(self.engine.data.sessions[: ids.shape[1]], stop=95, every=1)):
             if session is None:
                 continue
 
@@ -1230,6 +1265,7 @@ class CurationFilterEvaluator:
 
         self._count_neurons = {c.neuron_id for c in self._count_components}
 
+    @reports_progress('Preparing condition domains')
     def _set_count_domains(self, result, table):
         if not self._counting:
             return
@@ -1321,6 +1357,7 @@ class CurationFilterEvaluator:
                 *(coords(n) or set() for n in ("neuron", "neuron_i", "neuron_j"))
             )
 
+    @reports_progress('Grouping counts')
     def _count_buckets(self, result, target, unit="footprint"):
         if target == "footprint" and result.match_level not in (
             "footprint",
@@ -1345,7 +1382,7 @@ class CurationFilterEvaluator:
         buckets = {}
         evidence = {}
 
-        for match in result.matches:
+        for match in progress_iter(result.matches, stop=95):
             if isinstance(match, RelationshipMatch):
                 subject = (
                     match.target if target == "footprint" else match.target.neuron_id
@@ -1398,6 +1435,7 @@ class CurationFilterEvaluator:
 
         return buckets, evidence
 
+    @reports_progress('Grouping relationships')
     def _relationship_buckets(self, result, spec):
         if result.match_level != "relationship":
             raise CurationFilterError(
@@ -1425,7 +1463,7 @@ class CurationFilterEvaluator:
 
         buckets = {}
 
-        for pair in result.matches:
+        for pair in progress_iter(result.matches, stop=95):
             anchor, partner = (
                 (pair.source, pair.target)
                 if spec.anchor == "source"
@@ -1444,6 +1482,7 @@ class CurationFilterEvaluator:
 
         return buckets
 
+    @reports_progress("Counting relationship partners")
     def _filter_relationship_count(self, result, spec):
         if spec.accepts(0):
             raise CurationFilterError(
@@ -1453,11 +1492,12 @@ class CurationFilterEvaluator:
                 "zero matches."
             )
 
-        buckets = self._relationship_buckets(result, spec)
+        with progress_scope(0, 30):
+            buckets = self._relationship_buckets(result, spec)
         counts = {}
         kept = set()
 
-        for key, pairs in buckets.items():
+        for key, pairs in progress_iter(buckets.items(), start=30, stop=90):
             partners = {
                 pair.target if spec.anchor == "source" else pair.source
                 for pair in pairs
@@ -1482,6 +1522,7 @@ class CurationFilterEvaluator:
             target_evidence=pair_target_evidence(kept),
         )
 
+    @reports_progress('Counting matches')
     def _apply_count(self, group, result):
         spec = group.count
         if spec.anchor == "source" or spec.separate_partner_sessions:
@@ -1493,19 +1534,22 @@ class CurationFilterEvaluator:
                 "each. Use source-target matching to count distinct partners."
             )
 
-        buckets, evidence = self._count_buckets(
-            result,
-            spec.target,
-            spec.unit,
-        )
+        with progress_scope(0, 65):
+            buckets, evidence = self._count_buckets(
+                result,
+                spec.target,
+                spec.unit,
+            )
 
         domain = (
             result.neuron_domain if spec.target == "neuron" else result.footprint_domain
         )
 
-        counts = {subject: len(buckets.get(subject, ())) for subject in domain}
+        with progress_scope(65, 85, "Counting matched subjects"):
+            counts = {subject: len(buckets.get(subject, ())) for subject in domain}
 
-        matches = {subject for subject, value in counts.items() if spec.accepts(value)}
+        with progress_scope(85, 95, "Applying count threshold"):
+            matches = {subject for subject, value in counts.items() if spec.accepts(value)}
 
         return CurationFilterGroupResult(
             group_id=result.group_id,
@@ -1528,6 +1572,7 @@ class CurationFilterEvaluator:
             ),
         )
 
+    @reports_progress("Constructing candidate matches")
     def _candidate_result(self, result, match_level):
         table = result.table
         refs = table.refs_for_rows(
@@ -1598,7 +1643,7 @@ class CurationFilterEvaluator:
 
         evidence = {}
 
-        for index in range(len(result.matching_rows)):
+        for index in progress_iter(range(len(result.matching_rows)), start=5, stop=90):
             a = int(refs["neuron_i"][index])
             b = int(refs["neuron_j"][index])
 
@@ -1686,6 +1731,7 @@ class CurationFilterEvaluator:
 
         return tuple(effective)
 
+    @reports_progress('Constructing relationships')
     def _relationship_result(self, result):
         table = result.table
         axes = self._relationship_axes_for_stat(table.stat)
@@ -1723,7 +1769,7 @@ class CurationFilterEvaluator:
 
         evidence = {}
 
-        for index in range(len(result.matching_rows)):
+        for index in progress_iter(range(len(result.matching_rows)), start=5, stop=90):
             source = endpoint(axes[0], index)
             target = endpoint(axes[1], index)
 
@@ -1741,6 +1787,7 @@ class CurationFilterEvaluator:
             ),
         )
 
+    @reports_progress('Projecting matching rows')
     def _project_rows(self, table, rows):
         rows = np.asarray(rows, dtype=int)
 
@@ -1752,7 +1799,7 @@ class CurationFilterEvaluator:
         rows_by_neuron = {}
         rows_by_component = {}
 
-        for index, table_row in enumerate(rows):
+        for index, table_row in enumerate(progress_iter(rows, start=5, stop=90)):
             neurons = {
                 int(refs[key][index])
                 for key in ("neuron", "neuron_i", "neuron_j")
@@ -1787,6 +1834,7 @@ class CurationFilterEvaluator:
             rows_by_component,
         )
 
+    @reports_progress("Constructing condition evidence")
     def _condition_result_for_level(
         self,
         result: CurationFilterConditionResult,
@@ -1803,7 +1851,7 @@ class CurationFilterEvaluator:
 
             evidence_by_match = {
                 neuron_id: result.components_for_neuron(neuron_id)
-                for neuron_id in matches
+                for neuron_id in progress_iter(matches, stop=95)
             }
 
         elif match_level == "footprint":
@@ -1828,7 +1876,7 @@ class CurationFilterEvaluator:
 
             evidence_by_match = {
                 component: result.components_for_component(component)
-                for component in matches
+                for component in progress_iter(matches, stop=95)
             }
 
         else:
@@ -1841,6 +1889,7 @@ class CurationFilterEvaluator:
             evidence_by_match=evidence_by_match,
         )
 
+    @reports_progress("Projecting subgroup evidence")
     def _project_group_result(self, result, match_level):
         if result.match_level == match_level:
             return result
@@ -1848,7 +1897,7 @@ class CurationFilterEvaluator:
         if match_level == "neuron":
             evidence = {}
 
-            for match in result.matches:
+            for match in progress_iter(result.matches, stop=95):
                 for neuron_id in match_neurons(match):
                     evidence.setdefault(neuron_id, set()).update(
                         result.evidence_by_match.get(match, set())

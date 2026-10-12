@@ -4,6 +4,10 @@ Only exceptions to a scalar fill value are stored. In particular, an empty
 sum is zero (NumPy's existing behaviour), including in later reductions.
 No Cartesian array is constructed during calculation or reduction.
 """
+
+from catan.gui.background_tasks.runtime import (
+    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
+)
 from dataclasses import dataclass, field
 from copy import deepcopy
 from math import prod
@@ -88,6 +92,7 @@ class SparseStatisticArray(StatisticArray):
         self.validate()
         return self
 
+    @reports_progress("Reducing sparse statistic")
     def reduce_dimension(self, dim_name, spec):
         from catan.gui.background_tasks.runtime import current_task_context
 
@@ -114,25 +119,26 @@ class SparseStatisticArray(StatisticArray):
         else:
             new_error_fill = (np.nan, np.nan, 0)
 
-        remaining = np.delete(self.positions, axis, axis=1)
-        if len(remaining):
-            if remaining.shape[1]:
-                order = np.lexsort(remaining.T[::-1])
-                sorted_positions = remaining[order]
-                starts = np.r_[0, 1 + np.flatnonzero(np.any(
-                    sorted_positions[1:] != sorted_positions[:-1], axis=1))]
+        with progress_scope(0, 15, "Grouping sparse reduction rows"):
+            remaining = np.delete(self.positions, axis, axis=1)
+            if len(remaining):
+                if remaining.shape[1]:
+                    order = np.lexsort(remaining.T[::-1])
+                    sorted_positions = remaining[order]
+                    starts = np.r_[0, 1 + np.flatnonzero(np.any(
+                        sorted_positions[1:] != sorted_positions[:-1], axis=1))]
+                else:
+                    order = np.arange(len(remaining))
+                    starts = np.array([0])
+                stops = np.r_[starts[1:], len(order)]
             else:
-                order = np.arange(len(remaining))
-                starts = np.array([0])
-            stops = np.r_[starts[1:], len(order)]
-        else:
-            order = starts = stops = np.empty(0, dtype=int)
+                order = starts = stops = np.empty(0, dtype=int)
 
         out = np.empty(len(starts), dtype=float)
         positions = np.empty((len(starts), self.ndim - 1), dtype=np.int64)
         auxiliary = np.empty((3, len(starts))) if had_errors or spec.error_method != "none" else None
         ctx = current_task_context()
-        for group, (start, stop) in enumerate(zip(starts, stops)):
+        for group, (start, stop) in enumerate(progress_iter(zip(starts, stops), total=len(starts), start=15, stop=95)):
             if group % 256 == 0 and ctx is not None:
                 ctx.check_cancelled()
             rows = order[start:stop]
@@ -165,38 +171,41 @@ class SparseStatisticArray(StatisticArray):
         self.validate()
         return self
 
+    @reports_progress("Constructing sparse statistic table")
     def to_pick_table(self):
         from .table import PickTable
 
         self.validate()
         positions, values = self.positions, self.values
         low, high, counts = self.errors_low, self.errors_high, self.n
-        if np.isfinite(self.fill_value):
-            # Empty sums are valid zero results, so they must be shown too.
-            shape = tuple(len(self.dimensions[d].coords) for d in self.dims)
-            rows = prod(shape)
-            if rows > 2_000_000:
-                raise ValueError(
-                    f"The result contains {rows:,} finite rows (including empty-sum zeros). "
-                    "Reduce another axis or select a session before displaying it."
-                )
-            linear = np.arange(rows, dtype=np.int64)
-            positions = (np.column_stack(np.unravel_index(linear, shape))
-                         if shape else np.empty((1, 0), dtype=np.int64))
-            stored = (np.ravel_multi_index(self.positions.T, shape)
-                      if shape else np.zeros(len(self.values), dtype=int))
-            values = np.full(rows, self.fill_value)
-            values[stored] = self.values
-            if self.has_errors:
-                arrays = []
-                for source, fill in zip((low, high, counts), self.error_fill):
-                    target = np.full(rows, fill, dtype=float)
-                    target[stored] = source
-                    arrays.append(target)
-                low, high, counts = arrays
+        with progress_scope(0, 80, "Expanding finite sparse values"):
+            if np.isfinite(self.fill_value):
+                # Empty sums are valid zero results, so they must be shown too.
+                shape = tuple(len(self.dimensions[d].coords) for d in self.dims)
+                rows = prod(shape)
+                if rows > 2_000_000:
+                    raise ValueError(
+                        f"The result contains {rows:,} finite rows (including empty-sum zeros). "
+                        "Reduce another axis or select a session before displaying it."
+                    )
+                linear = np.arange(rows, dtype=np.int64)
+                positions = (np.column_stack(np.unravel_index(linear, shape))
+                             if shape else np.empty((1, 0), dtype=np.int64))
+                stored = (np.ravel_multi_index(self.positions.T, shape)
+                          if shape else np.zeros(len(self.values), dtype=int))
+                values = np.full(rows, self.fill_value)
+                values[stored] = self.values
+                if self.has_errors:
+                    arrays = []
+                    for source, fill in zip((low, high, counts), self.error_fill):
+                        target = np.full(rows, fill, dtype=float)
+                        target[stored] = source
+                        arrays.append(target)
+                    low, high, counts = arrays
         # Unstored NaNs need no pickable rows; all coordinate domains remain
         # in stat.dimensions. Finite zeros, however, are retained.
-        refs = {name: np.asarray(self.dimensions[name].coords)[positions[:, axis]]
-                for axis, name in enumerate(self.dims)}
+        with progress_scope(80, 100, "Constructing table coordinates"):
+            refs = {name: np.asarray(self.dimensions[name].coords)[positions[:, axis]]
+                    for axis, name in enumerate(self.dims)}
         return PickTable(stat=self, values=values, dims=self.dims, refs=refs,
                          errors_low=low, errors_high=high, n=counts)

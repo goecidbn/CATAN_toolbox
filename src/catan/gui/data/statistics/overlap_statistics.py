@@ -6,12 +6,19 @@ from functools import lru_cache
 import numpy as np
 from scipy import sparse
 
-from catan.gui.background_tasks.runtime import current_task_context
+from catan.gui.background_tasks.runtime import (
+    current_task_context,
+    progress_scope,
+    progress_step,
+    progress_iter,
+    reports_progress,
+)
 
 from .blockwise import evaluate_blockwise
 from .distance_statistics import pair_plan
 
 
+@reports_progress("Calculating footprint overlap")
 def overlap_query(
     data,
     state,
@@ -56,6 +63,7 @@ def overlap_query(
             raise ValueError("Union inclusion mask does not match assignments.")
 
     @lru_cache(maxsize=16)
+    @reports_progress("Preparing overlap supports")
     def prepare(sid, columns):
         session = data.sessions[sid]
 
@@ -101,7 +109,7 @@ def overlap_query(
 
             keep = session_included[columns]
 
-        for col in range(a.shape[1]):
+        for col in progress_iter(range(a.shape[1]), start=10, stop=90):
             if col % 128 == 0 and ctx is not None:
                 ctx.check_cancelled()
 
@@ -121,12 +129,13 @@ def overlap_query(
                 if not weighted:
                     values[:] = values > 0
 
-        a.eliminate_zeros()
+        with progress_scope(90, 100, "Measuring footprint support"):
+            a.eliminate_zeros()
 
-        support = a.copy()
-        support.data.fill(1)
+            support = a.copy()
+            support.data.fill(1)
 
-        mass = np.asarray(a.sum(axis=0)).ravel()
+            mass = np.asarray(a.sum(axis=0)).ravel()
 
         return a, support, mass, shape
 
@@ -144,6 +153,7 @@ def overlap_query(
         if pairs.ndim != 2 or pairs.shape[1] != 4:
             raise ValueError("Requested pairs must have four coordinate columns.")
 
+        @reports_progress("Calculating requested overlap")
         def read_rows(refs):
             ni, nj, si, sj = (refs[name] for name in names)
 
@@ -168,73 +178,84 @@ def overlap_query(
                 axis=0,
             )
 
-            for source, target in session_pairs:
-                rows = np.flatnonzero(permitted & (si == source) & (sj == target))
+            for progress_index, (source, target) in enumerate(session_pairs):
+                with progress_step(
+                    progress_index,
+                    len(session_pairs),
+                    start=0,
+                    stop=100,
+                ):
+                    rows = np.flatnonzero(permitted & (si == source) & (sj == target))
 
-                if not rows.size:
-                    continue
+                    if not rows.size:
+                        continue
 
-                if ctx is not None:
-                    ctx.check_cancelled()
+                    if ctx is not None:
+                        ctx.check_cancelled()
 
-                fi = ids[ni[rows], source]
-                fj = ids[nj[rows], target]
+                    fi = ids[ni[rows], source]
+                    fj = ids[nj[rows], target]
 
-                present = (fi >= 0) & (fj >= 0)
-                rows = rows[present]
-                fi = fi[present]
-                fj = fj[present]
+                    present = (fi >= 0) & (fj >= 0)
+                    rows = rows[present]
+                    fi = fi[present]
+                    fj = fj[present]
 
-                if not rows.size:
-                    continue
+                    if not rows.size:
+                        continue
 
-                columns_i = np.unique(fi)
-                columns_j = np.unique(fj)
+                    columns_i = np.unique(fi)
+                    columns_j = np.unique(fj)
 
-                left = prepare(
-                    int(source),
-                    tuple(int(value) for value in columns_i),
-                )
-                right = prepare(
-                    int(target),
-                    tuple(int(value) for value in columns_j),
-                )
+                    with progress_scope(0, 20):
+                        left = prepare(
+                            int(source),
+                            tuple(int(value) for value in columns_i),
+                        )
+                    with progress_scope(20, 40):
+                        right = prepare(
+                            int(target),
+                            tuple(int(value) for value in columns_j),
+                        )
 
-                if left is None or right is None:
-                    continue
+                    if left is None or right is None:
+                        continue
 
-                a, _, ma, shape_a = left
-                b, _, mb, shape_b = right
+                    a, _, ma, shape_a = left
+                    b, _, mb, shape_b = right
 
-                if shape_a != shape_b:
-                    raise ValueError("Overlap requires the same registered pixel grid.")
+                    if shape_a != shape_b:
+                        raise ValueError(
+                            "Overlap requires the same registered pixel grid."
+                        )
 
-                fi = np.searchsorted(columns_i, fi)
-                fj = np.searchsorted(columns_j, fj)
+                    fi = np.searchsorted(columns_i, fi)
+                    fj = np.searchsorted(columns_j, fj)
 
-                # Compare corresponding columns, not their Cartesian product.
-                # Binary supports and weighted footprints both use min().
-                intersection = np.asarray(
-                    a[:, fi].minimum(b[:, fj]).sum(axis=0)
-                ).ravel()
+                    # Compare corresponding columns, not their Cartesian product.
+                    # Binary supports and weighted footprints both use min().
+                    with progress_scope(40, 90, "Intersecting requested footprints"):
+                        intersection = np.asarray(
+                            a[:, fi].minimum(b[:, fj]).sum(axis=0)
+                        ).ravel()
 
-                if directional:
-                    denominator = mb[fj] if normalize_by_target else ma[fi]
-                elif containment:
-                    denominator = np.minimum(ma[fi], mb[fj])
-                else:
-                    denominator = ma[fi] + mb[fj] - intersection
+                    if directional:
+                        denominator = mb[fj] if normalize_by_target else ma[fi]
+                    elif containment:
+                        denominator = np.minimum(ma[fi], mb[fj])
+                    else:
+                        denominator = ma[fi] + mb[fj] - intersection
 
-                valid = (ma[fi] > 0) & (mb[fj] > 0) & (denominator > 0)
+                    valid = (ma[fi] > 0) & (mb[fj] > 0) & (denominator > 0)
 
-                values = np.full(len(rows), np.nan, dtype=np.float32)
-                np.divide(
-                    intersection,
-                    denominator,
-                    out=values,
-                    where=valid,
-                )
-                out[rows] = np.clip(values, 0, 1)
+                    values = np.full(len(rows), np.nan, dtype=np.float32)
+                    np.divide(
+                        intersection,
+                        denominator,
+                        out=values,
+                        where=valid,
+                    )
+                    out[rows] = np.clip(values, 0, 1)
 
             return out
 
@@ -254,12 +275,18 @@ def overlap_query(
     cache_bytes = 0
     cache_budget = 64 * 1024**2
 
-    def pair_scores(si, sj, columns_i, columns_j):
+    @reports_progress("Calculating overlap pairs")
+    def calculate_pair_scores(si, sj, columns_i, columns_j):
         nonlocal cache_bytes
 
         # Both overlap normalizations are symmetric.
         if not directional and si > sj:
-            result = pair_scores(sj, si, columns_j, columns_i)
+            result = calculate_pair_scores(
+                sj,
+                si,
+                columns_j,
+                columns_i,
+            )
             return None if result is None else result.T
 
         key = (si, sj, columns_i, columns_j)
@@ -269,8 +296,10 @@ def overlap_query(
             cache[key] = result
             return result
 
-        left = prepare(si, columns_i)
-        right = prepare(sj, columns_j)
+        with progress_scope(0, 15):
+            left = prepare(si, columns_i)
+        with progress_scope(15, 30):
+            right = prepare(sj, columns_j)
 
         if left is None or right is None:
             return None
@@ -281,94 +310,102 @@ def overlap_query(
         if shape_a != shape_b:
             raise ValueError("Overlap requires the same registered pixel grid.")
 
-        if a.shape[1] * b.shape[1] <= 64:
-            # Small queries: intersect sparse pixel indices directly.
-            intersection = np.zeros(
-                (a.shape[1], b.shape[1]),
-                dtype=np.float32,
-            )
-
-            for i in range(a.shape[1]):
-                if ctx is not None:
-                    ctx.check_cancelled()
-
-                ia, ib = a.indptr[i : i + 2]
-
-                for j in range(b.shape[1]):
-                    ja, jb = b.indptr[j : j + 2]
-
-                    shared, ai, bi = np.intersect1d(
-                        a.indices[ia:ib],
-                        b.indices[ja:jb],
-                        assume_unique=True,
-                        return_indices=True,
-                    )
-
-                    if weighted:
-                        intersection[i, j] = np.minimum(
-                            a.data[ia:ib][ai],
-                            b.data[ja:jb][bi],
-                        ).sum(dtype=np.float64)
-                    else:
-                        intersection[i, j] = shared.size
-
-        else:
-            # Larger queries retain the efficient sparse matrix approach.
-            intersections = (sa.T @ sb).tocoo()
-
-            if weighted:
+        with progress_scope(30, 85, "Intersecting overlap supports"):
+            if a.shape[1] * b.shape[1] <= 64:
+                # Small queries: intersect sparse pixel indices directly.
                 intersection = np.zeros(
                     (a.shape[1], b.shape[1]),
                     dtype=np.float32,
                 )
 
-                for k, (i, j) in enumerate(zip(intersections.row, intersections.col)):
-                    if k % 128 == 0 and ctx is not None:
+                for i in progress_iter(range(a.shape[1]), every=1):
+                    if ctx is not None:
                         ctx.check_cancelled()
 
                     ia, ib = a.indptr[i : i + 2]
-                    ja, jb = b.indptr[j : j + 2]
 
-                    _, ai, bi = np.intersect1d(
-                        a.indices[ia:ib],
-                        b.indices[ja:jb],
-                        assume_unique=True,
-                        return_indices=True,
-                    )
+                    for j in range(b.shape[1]):
+                        ja, jb = b.indptr[j : j + 2]
 
-                    intersection[i, j] = np.minimum(
-                        a.data[ia:ib][ai],
-                        b.data[ja:jb][bi],
-                    ).sum(dtype=np.float64)
+                        shared, ai, bi = np.intersect1d(
+                            a.indices[ia:ib],
+                            b.indices[ja:jb],
+                            assume_unique=True,
+                            return_indices=True,
+                        )
+
+                        if weighted:
+                            intersection[i, j] = np.minimum(
+                                a.data[ia:ib][ai],
+                                b.data[ja:jb][bi],
+                            ).sum(dtype=np.float64)
+                        else:
+                            intersection[i, j] = shared.size
 
             else:
-                intersection = intersections.toarray()
+                # Larger queries retain the efficient sparse matrix approach.
+                intersections = (sa.T @ sb).tocoo()
 
-        if directional:
-            # Rows: source footprints (neuron_i, session_i).
-            # Columns: target footprints (neuron_j, session_j).
-            denominator = mb[None, :] if normalize_by_target else ma[:, None]
-        elif containment:
-            denominator = np.minimum(ma[:, None], mb[None, :])
-        else:
-            denominator = ma[:, None] + mb[None, :] - intersection
+                if weighted:
+                    intersection = np.zeros(
+                        (a.shape[1], b.shape[1]),
+                        dtype=np.float32,
+                    )
 
-        valid = (ma[:, None] > 0) & (mb[None, :] > 0) & (denominator > 0)
+                    for k, (i, j) in enumerate(
+                        progress_iter(
+                            zip(intersections.row, intersections.col),
+                            total=intersections.nnz,
+                            start=20,
+                        )
+                    ):
+                        if k % 128 == 0 and ctx is not None:
+                            ctx.check_cancelled()
 
-        scores = np.full(
-            intersection.shape,
-            np.nan,
-            dtype=np.float32,
-        )
+                        ia, ib = a.indptr[i : i + 2]
+                        ja, jb = b.indptr[j : j + 2]
 
-        np.divide(
-            intersection,
-            denominator,
-            out=scores,
-            where=valid,
-        )
+                        _, ai, bi = np.intersect1d(
+                            a.indices[ia:ib],
+                            b.indices[ja:jb],
+                            assume_unique=True,
+                            return_indices=True,
+                        )
 
-        np.clip(scores, 0, 1, out=scores)
+                        intersection[i, j] = np.minimum(
+                            a.data[ia:ib][ai],
+                            b.data[ja:jb][bi],
+                        ).sum(dtype=np.float64)
+
+                else:
+                    intersection = intersections.toarray()
+
+        with progress_scope(85, 100, "Normalizing overlap scores"):
+            if directional:
+                # Rows: source footprints (neuron_i, session_i).
+                # Columns: target footprints (neuron_j, session_j).
+                denominator = mb[None, :] if normalize_by_target else ma[:, None]
+            elif containment:
+                denominator = np.minimum(ma[:, None], mb[None, :])
+            else:
+                denominator = ma[:, None] + mb[None, :] - intersection
+
+            valid = (ma[:, None] > 0) & (mb[None, :] > 0) & (denominator > 0)
+
+            scores = np.full(
+                intersection.shape,
+                np.nan,
+                dtype=np.float32,
+            )
+
+            np.divide(
+                intersection,
+                denominator,
+                out=scores,
+                where=valid,
+            )
+
+            np.clip(scores, 0, 1, out=scores)
 
         if scores.nbytes <= cache_budget:
             while cache and cache_bytes + scores.nbytes > cache_budget:
@@ -380,25 +417,146 @@ def overlap_query(
 
         return scores
 
+    full_neuron_domain = all(
+        dims[references.get(name, (name, 0))[0]].mode == "remaining"
+        and len(dims[references.get(name, (name, 0))[0]].coords) == n
+        for name in ("neuron_i", "neuron_j")
+    )
+
+    batch_matrices = select_values is not None and full_neuron_domain
+
+    @lru_cache(maxsize=16)
+    def session_columns(sid):
+        assigned = ids[included, sid]
+
+        return tuple(int(value) for value in np.unique(assigned[assigned >= 0]))
+
+    def pair_scores(si, sj, columns_i, columns_j):
+        if batch_matrices:
+            full_i = session_columns(si)
+            full_j = session_columns(sj)
+
+            # At most 1 MiB per float32 matrix.
+            # The existing total cache budget remains in effect.
+            if len(full_i) * len(full_j) <= 262_144:
+                scores = calculate_pair_scores(
+                    si,
+                    sj,
+                    full_i,
+                    full_j,
+                )
+
+                if scores is None:
+                    return None
+
+                rows = np.searchsorted(full_i, columns_i)
+                columns = np.searchsorted(full_j, columns_j)
+
+                return scores[np.ix_(rows, columns)]
+
+        return calculate_pair_scores(
+            si,
+            sj,
+            columns_i,
+            columns_j,
+        )
+
+    @reports_progress("Calculating overlap block")
     def read(selected):
-        ni, nj, si, sj = np.broadcast_arrays(*(coord(name, selected) for name in names))
+        from itertools import product
 
-        out = np.full(
-            ni.shape,
-            np.nan,
-            dtype=np.float32,
+        base_dims = tuple(
+            name for name, info in dims.items() if info.mode == "remaining"
         )
 
-        permitted = (
-            allowed(selected) & included[ni] & included[nj] & ~((ni == nj) & (si == sj))
+        shape = tuple(len(selected[name]) for name in base_dims)
+
+        out = np.full(shape, np.nan, dtype=np.float32)
+
+        session_axes = [
+            (axis, name)
+            for axis, name in enumerate(base_dims)
+            if name in ("session", "session_i", "session_j")
+        ]
+
+        # These coordinate arrays have not been expanded into
+        # the neuron × neuron × session × session grid.
+        neuron_i = np.asarray(coord("neuron_i", selected)).reshape(-1)
+
+        neuron_j = np.asarray(coord("neuron_j", selected)).reshape(-1)
+
+        source_present = np.any(
+            (ids[neuron_i] >= 0) & included[neuron_i, None],
+            axis=0,
         )
 
-        for source in np.unique(si):
-            for reference in np.unique(sj):
-                if ctx is not None:
-                    ctx.check_cancelled()
+        target_present = np.any(
+            (ids[neuron_j] >= 0) & included[neuron_j, None],
+            axis=0,
+        )
 
-                mask = permitted & (si == source) & (sj == reference)
+        # Restrict session iteration to sessions containing
+        # relevant assigned footprints.
+        session_positions = {
+            name: np.ones(
+                len(selected[name]),
+                dtype=bool,
+            )
+            for _, name in session_axes
+        }
+
+        for original, present in (
+            ("session_i", source_present),
+            ("session_j", target_present),
+        ):
+            logical, offset = references.get(
+                original,
+                (original, 0),
+            )
+            info = dims[logical]
+
+            if info.mode == "fixed":
+                if not present[int(info.parameter) + offset]:
+                    return out
+            else:
+                physical = np.asarray(selected[logical], dtype=int) + offset
+                session_positions[logical] &= present[physical]
+
+        choices = [np.flatnonzero(session_positions[name]) for _, name in session_axes]
+
+        pair_count = int(np.prod([len(choice) for choice in choices])) if choices else 1
+
+        for pair_index, positions in enumerate(product(*choices)):
+            with progress_step(pair_index, pair_count):
+                block_selection = dict(selected)
+                output_index = [slice(None)] * len(base_dims)
+
+                for (axis, name), position in zip(
+                    session_axes,
+                    positions,
+                ):
+                    block_selection[name] = selected[name][position : position + 1]
+                    output_index[axis] = slice(
+                        position,
+                        position + 1,
+                    )
+
+                coordinates = tuple(coord(name, block_selection) for name in names)
+
+                if any(values.size == 0 for values in coordinates):
+                    continue
+
+                source = int(coordinates[2].flat[0])
+                reference = int(coordinates[3].flat[0])
+
+                ni, nj, si, sj = np.broadcast_arrays(*coordinates)
+
+                mask = (
+                    allowed(block_selection)
+                    & included[ni]
+                    & included[nj]
+                    & ~((ni == nj) & (si == sj))
+                )
 
                 if not np.any(mask):
                     continue
@@ -408,30 +566,48 @@ def overlap_query(
 
                 present = (fi >= 0) & (fj >= 0)
 
+                if not np.any(present):
+                    continue
+
+                columns_i = np.unique(fi[present])
+                columns_j = np.unique(fj[present])
+
+                with progress_scope(0, 95):
+                    scores = pair_scores(
+                        source,
+                        reference,
+                        tuple(int(value) for value in columns_i),
+                        tuple(int(value) for value in columns_j),
+                    )
+
+                if scores is None:
+                    continue
+
                 values = np.full(
                     fi.shape,
                     np.nan,
                     dtype=np.float32,
                 )
 
-                if np.any(present):
-                    columns_i = np.unique(fi[present])
-                    columns_j = np.unique(fj[present])
+                local_i = np.searchsorted(
+                    columns_i,
+                    fi[present],
+                )
+                local_j = np.searchsorted(
+                    columns_j,
+                    fj[present],
+                )
 
-                    scores = pair_scores(
-                        int(source),
-                        int(reference),
-                        tuple(int(value) for value in columns_i),
-                        tuple(int(value) for value in columns_j),
-                    )
+                values[present] = scores[local_i, local_j]
 
-                    if scores is not None:
-                        local_i = np.searchsorted(columns_i, fi[present])
-                        local_j = np.searchsorted(columns_j, fj[present])
+                block = np.full(
+                    ni.shape,
+                    np.nan,
+                    dtype=np.float32,
+                )
+                block[mask] = values
 
-                        values[present] = scores[local_i, local_j]
-
-                out[mask] = values
+                out[tuple(output_index)] = block
 
         return out
 

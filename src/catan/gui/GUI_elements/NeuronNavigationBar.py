@@ -157,7 +157,7 @@ class NeuronNavigationBar(QWidget):
 
         selected = self.state.selected_components
 
-        if not selected or len(selected) <= 1:
+        if len(self._navigation_selection()) <= 1:
             text = f"Iterating {total} neurons"
         else:
             text = f"Selected {len(self.navigation_neuron_ids())} " f"/ {total} neurons"
@@ -182,7 +182,6 @@ class NeuronNavigationBar(QWidget):
         if not neuron_ids:
             return
 
-        # selected = self.state.selected_components
         focused = self.state.focused_component
 
         # Global neuron navigation
@@ -228,7 +227,7 @@ class NeuronNavigationBar(QWidget):
         if count == 0:
             return []
 
-        selected = self.state.selected_components
+        selected = self._navigation_selection()
 
         if selected and len(selected) > 1:
             neuron_ids = np.asarray(
@@ -249,10 +248,14 @@ class NeuronNavigationBar(QWidget):
 
         return np.unique(neuron_ids).tolist()
 
-    def set_id_range(
-        self,
-    ):
+    def _navigation_selection(self) -> list[NeuronComponent]:
+        """One representative per selected neuron, preserving selection order."""
+        by_neuron = {}
+        for component in self.state.selected_components or ():
+            by_neuron.setdefault(int(component.neuron_id), component)
+        return list(by_neuron.values())
 
+    def set_id_range(self):
         enabled = not (
             self.data is None
             or self.state.current_session_id is None
@@ -267,7 +270,7 @@ class NeuronNavigationBar(QWidget):
         if not enabled:
             return
 
-        selected = self.state.selected_components
+        selected = self._navigation_selection()
 
         if selected and len(selected) > 1:
             maximum = len(selected) - 1
@@ -287,7 +290,7 @@ class NeuronNavigationBar(QWidget):
         ):
             return
 
-        selected = self.state.selected_components
+        selected = self._navigation_selection()
 
         # --------------------------------------------------
         # Multiple selected neurons:
@@ -334,7 +337,7 @@ class NeuronNavigationBar(QWidget):
         """
 
         focused = self.state.focused_component
-        selected = self.state.selected_components
+        selected = self._navigation_selection()
 
         if focused is None:
             self.footprint_edit.clear()
@@ -348,7 +351,14 @@ class NeuronNavigationBar(QWidget):
         # slider represents position within selection.
         # --------------------------------------------------
         if selected and len(selected) > 1:
-            index = self.state.selected_component_index(focused)
+            index = next(
+                (
+                    i
+                    for i, component in enumerate(selected)
+                    if component.neuron_id == focused.neuron_id
+                ),
+                None,
+            )
             if index is None:
                 return
 

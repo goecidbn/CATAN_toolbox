@@ -1,3 +1,6 @@
+from catan.gui.background_tasks.runtime import (
+    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
+)
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Optional
 from collections.abc import Callable
@@ -277,6 +280,7 @@ class StatisticEngine(QObject):
             definition.independent_pairs,
             definition.query_getter,
             definition.compact_values,
+            definition.foreground_safe,
             definition.component_axes,
             definition.curation_kind,
             definition.relationship_axes,
@@ -336,7 +340,60 @@ class StatisticEngine(QObject):
         with self._cache_lock:
             self._cache.clear()
 
+    def _query_cache_key(self, query):
+        """Normalize cache identity. Caller must hold _cache_lock."""
+        definition = self.registry[query.statistic_key]
+
+        parameters = definition.resolve_parameters(dict(query.parameters))
+        reductions = query.reduction_dict()
+
+        if definition.independent_pairs:
+            from .queries import normalize_footprint_pair_reductions
+
+            reductions = normalize_footprint_pair_reductions(
+                definition,
+                reductions,
+                query.filters,
+                session_series=query.context == "session_series",
+            )
+
+        query = replace(
+            query,
+            reductions=tuple(sorted(reductions.items())),
+            parameters=tuple(sorted(parameters.items())),
+        )
+
+        revision = self._revisions.get(query.statistic_key, 0)
+        key = (query, revision)
+
+        return definition, query, revision, key
+
+    def peek_cached(self, query):
+        """Return (found, result) without calculating or submitting work."""
+        if (
+            self.data is None
+            or not self.data.sessions
+            or query is None
+            or query.statistic_key == "none"
+        ):
+            return False, None
+
+        with self._cache_lock:
+            if query.statistic_key not in self.registry:
+                return False, None
+
+            _, _, _, key = self._query_cache_key(query)
+
+            if key not in self._cache:
+                return False, None
+
+            # Keep the same recency policy as evaluate(), including cached None.
+            result = self._cache.pop(key)
+            self._cache[key] = result
+            return True, result
+
     @trace_statistic_request
+    @reports_progress("Evaluating statistic")
     def evaluate(
         self,
         query: Optional[StatisticQuery],
@@ -345,30 +402,7 @@ class StatisticEngine(QObject):
             return None
 
         with self._cache_lock:
-            definition = self.registry[query.statistic_key]
-
-            parameters = definition.resolve_parameters(dict(query.parameters))
-            reductions = query.reduction_dict()
-
-            if definition.independent_pairs:
-                from .queries import normalize_footprint_pair_reductions
-
-                reductions = normalize_footprint_pair_reductions(
-                    definition,
-                    reductions,
-                    query.filters,
-                    session_series=query.context == "session_series",
-                )
-
-            query = replace(
-                query,
-                reductions=tuple(sorted(reductions.items())),
-                parameters=tuple(sorted(parameters.items())),
-            )
-
-            revision = self._revisions.get(query.statistic_key, 0)
-            key = (query, revision)
-
+            definition, query, revision, key = self._query_cache_key(query)
             if key in self._cache:
 
                 if TRACE_STATISTICS:
@@ -383,9 +417,11 @@ class StatisticEngine(QObject):
                 return result
 
         # Calculation happens outside the cache lock.
-        result = self._evaluate_uncached(query, definition)
-        if definition.compact_values:
-            _compact_statistic_values(result)
+        with progress_scope(0, 90):
+            result = self._evaluate_uncached(query, definition)
+        with progress_scope(90, 95, "Compacting statistic values"):
+            if definition.compact_values:
+                _compact_statistic_values(result)
 
         with self._cache_lock:
             # A relevant change during calculation must not repopulate
@@ -408,6 +444,7 @@ class StatisticEngine(QObject):
         return result
 
     @trace_statistic_request
+    @reports_progress("Evaluating statistic")
     def _evaluate_uncached(
         self,
         query: StatisticQuery,
@@ -453,13 +490,14 @@ class StatisticEngine(QObject):
             if requested_pairs is not None:
                 execution_options["requested_pairs"] = requested_pairs
 
-            stat = stat_def.query_getter(
-                data,
-                state,
-                prepared_query,
-                **parameters,
-                **execution_options,
-            )
+            with progress_scope(0, 98, f"Calculating {stat_def.key}"):
+                stat = stat_def.query_getter(
+                    data,
+                    state,
+                    prepared_query,
+                    **parameters,
+                    **execution_options,
+                )
 
             stat.name = stat_def.key
             stat.title = stat_def.title_with_parameters(parameters)
@@ -477,13 +515,14 @@ class StatisticEngine(QObject):
             if spec.method == "single"
         }
 
-        stat = stat_def.get_values(
-            data=data,
-            state=state,
-            indexers=indexers,
-            filters=query.filters,
-            parameters=dict(query.parameters),
-        )
+        with progress_scope(0, 70, f"Calculating {stat_def.key}"):
+            stat = stat_def.get_values(
+                data=data,
+                state=state,
+                indexers=indexers,
+                filters=query.filters,
+                parameters=dict(query.parameters),
+            )
 
         requested_order = tuple(query.reduction_order or ())
         reduction_order = requested_order + tuple(
@@ -517,12 +556,16 @@ class StatisticEngine(QObject):
 
             planned_reductions[target] = spec
 
-        for target, spec in planned_reductions.items():
-            stat.reduce_dimension(target, spec)
+        for progress_index, (target, spec) in enumerate(planned_reductions.items()):
+            with progress_step(
+                progress_index, len(planned_reductions), start=70, stop=100, message=f"Reducing {target}: {spec.method}",
+            ):
+                stat.reduce_dimension(target, spec)
 
         return stat
 
     @trace_statistic_request
+    @reports_progress("Building statistic table")
     def evaluate_table(self, query: Optional[StatisticQuery]) -> Optional[PickTable]:
 
         if query is None:
@@ -531,11 +574,13 @@ class StatisticEngine(QObject):
         if query.statistic_key == "none":
             return None
 
-        stat = self.evaluate(query)
+        with progress_scope(0, 85):
+            stat = self.evaluate(query)
         if stat is None:
             return None
 
-        table = PickTable.from_stat(stat)
+        with progress_scope(88, 95, "Constructing statistic table"):
+            table = PickTable.from_stat(stat)
 
         remaining_filters = tuple(
             f
@@ -544,10 +589,12 @@ class StatisticEngine(QObject):
         )
 
         if remaining_filters:
-            table = table.filtered(remaining_filters)
+            with progress_scope(95, 99, "Filtering statistic table"):
+                table = table.filtered(remaining_filters)
 
         return table
 
+    @reports_progress("Building statistic table")
     def evaluate_assignment_table(
         self,
         query: StatisticQuery,
@@ -599,17 +646,20 @@ class StatisticEngine(QObject):
             parameters=tuple(sorted(parameters.items())),
         )
 
-        stat = self._evaluate_uncached(
-            prepared_query,
-            definition,
-            data=bound_data,
-            state=bound_state,
-        )
+        with progress_scope(0, 85):
+            stat = self._evaluate_uncached(
+                prepared_query,
+                definition,
+                data=bound_data,
+                state=bound_state,
+            )
 
         if definition.compact_values:
-            _compact_statistic_values(stat)
+            with progress_scope(85, 88, "Compacting statistic values"):
+                _compact_statistic_values(stat)
 
-        table = PickTable.from_stat(stat)
+        with progress_scope(88, 95, "Constructing statistic table"):
+            table = PickTable.from_stat(stat)
 
         remaining_filters = tuple(
             item
@@ -618,10 +668,12 @@ class StatisticEngine(QObject):
         )
 
         if remaining_filters:
-            table = table.filtered(remaining_filters)
+            with progress_scope(95, 99, "Filtering statistic table"):
+                table = table.filtered(remaining_filters)
 
         return table
 
+    @reports_progress("Building statistic table")
     def evaluate_matching_table(
         self,
         query,
@@ -664,17 +716,20 @@ class StatisticEngine(QObject):
             getter = getter.func
 
         if getattr(getter, "supports_value_selection", False):
-            stat = self._evaluate_uncached(
-                query,
-                definition,
-                select_values=select,
-                requested_pairs=requested_pairs,
-            )
+            with progress_scope(0, 85):
+                stat = self._evaluate_uncached(
+                    query,
+                    definition,
+                    select_values=select,
+                    requested_pairs=requested_pairs,
+                )
 
             if definition.compact_values:
-                _compact_statistic_values(stat)
+                with progress_scope(85, 88, "Compacting statistic values"):
+                    _compact_statistic_values(stat)
 
-            table = PickTable.from_stat(stat)
+            with progress_scope(88, 95, "Constructing statistic table"):
+                table = PickTable.from_stat(stat)
 
             remaining = tuple(
                 f
@@ -683,15 +738,18 @@ class StatisticEngine(QObject):
             )
 
             if remaining:
-                table = table.filtered(remaining)
+                with progress_scope(95, 99, "Filtering statistic table"):
+                    table = table.filtered(remaining)
 
         else:
             # Existing getters, including sparse footprint similarity,
             # retain their current calculation and reduction paths.
-            table = self.evaluate_table(query)
+            with progress_scope(0, 85):
+                table = self.evaluate_table(query)
 
             if table is not None:
-                table = table.subset_rows(np.flatnonzero(select(table.values)))
+                with progress_scope(95, 99, "Filtering statistic table"):
+                    table = table.subset_rows(np.flatnonzero(select(table.values)))
 
         with self._cache_lock:
             if self._revisions.get(query.statistic_key, 0) != revision:
@@ -737,6 +795,7 @@ class StatisticEngine(QObject):
         )
 
 
+@reports_progress("Compacting statistic values")
 def _compact_statistic_values(stat):
     if stat is None:
         return
@@ -746,7 +805,7 @@ def _compact_statistic_values(stat):
     peak = 0.0
 
     # Inspect in blocks, avoiding a full-size temporary array.
-    for start in range(0, flat.size, 65_536):
+    for start in progress_iter(range(0, flat.size, 65_536), every=1):
         block = flat[start : start + 65_536]
         finite = block[np.isfinite(block)]
 

@@ -1,3 +1,10 @@
+from catan.gui.background_tasks.runtime import (
+    current_task_context,
+    progress_scope,
+    progress_step,
+    progress_iter,
+    reports_progress,
+)
 from dataclasses import dataclass, field
 from typing import Literal, Any, Optional
 from collections.abc import Callable
@@ -230,6 +237,7 @@ class StatisticArray:
         # self.validate()
         return self
 
+    @reports_progress("Reducing statistic")
     def reduce_dimension(self, dim_name: str, spec: ReductionSpec):
         axis = self.axis(dim_name)
 
@@ -245,26 +253,28 @@ class StatisticArray:
 
         values = np.asarray(self.values, dtype=float)
 
-        center = self._compute_center(values, axis, spec.method)
+        with progress_scope(0, 65, f"Reducing {dim_name}: {spec.method}"):
+            center = self._compute_center(values, axis, spec.method)
         self.values = center
 
-        if spec.error_method != "none":
+        with progress_scope(65, 95, "Reducing uncertainty arrays"):
+            if spec.error_method != "none":
 
-            self.errors_low, self.errors_high, self.n = self._compute_error(
-                values,
-                axis=axis,
-                center=center,
-                method=spec.error_method,
-            )
-        else:
-            # If errors already exist and we now reduce another dimension normally,
-            # reduce the auxiliary arrays consistently.
-            if self.has_errors:
-                self._reduce_existing_errors(axis=axis, method=spec.method)
+                self.errors_low, self.errors_high, self.n = self._compute_error(
+                    values,
+                    axis=axis,
+                    center=center,
+                    method=spec.error_method,
+                )
             else:
-                self.errors_low = None
-                self.errors_high = None
-                self.n = None
+                # If errors already exist and we now reduce another dimension normally,
+                # reduce the auxiliary arrays consistently.
+                if self.has_errors:
+                    self._reduce_existing_errors(axis=axis, method=spec.method)
+                else:
+                    self.errors_low = None
+                    self.errors_high = None
+                    self.n = None
 
         # if errors_low is not None:
         #     self.errors_low = errors_low
@@ -503,6 +513,9 @@ class StatisticDefinition:
     relationship_axes: tuple[tuple[str, str | None], tuple[str, str | None]] | None = (
         None
     )
+
+    # Loaded-data lookups and explicitly cheap statistics may run immediately.
+    foreground_safe: bool = False
 
     def is_affected_by(self, event: DataChange) -> bool:
         if self.dependencies is None:

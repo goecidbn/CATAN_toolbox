@@ -7,9 +7,12 @@ import numpy as np
 
 from .types import StatisticArray
 from .queries import ReductionSpec
-from catan.gui.background_tasks.runtime import current_task_context
+from catan.gui.background_tasks.runtime import (
+    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
+)
 
 
+@reports_progress("Evaluating statistic blocks")
 def evaluate_blockwise(
     dimensions,
     read_block,
@@ -83,6 +86,7 @@ def evaluate_blockwise(
 
     ctx = current_task_context()
 
+    @reports_progress(None)
     def calculate(level, selected):
         if ctx is not None:
             ctx.check_cancelled()
@@ -109,31 +113,36 @@ def evaluate_blockwise(
 
             result = None
 
-            for start in range(0, len(coords), length):
-                stop = min(start + length, len(coords))
+            for progress_index, (start) in enumerate(range(0, len(coords), length)):
+                with progress_step(
+                    progress_index, (len(coords) + length - 1) // length, start=0, stop=100,
+                ):
+                    stop = min(start + length, len(coords))
 
-                part = dict(selected)
-                part[split] = coords[start:stop]
-                chunk = calculate(level, part)
+                    part = dict(selected)
+                    part[split] = coords[start:stop]
+                    with progress_scope(0, 90):
+                        chunk = calculate(level, part)
 
-                if result is None:
-                    result = chunk
-                    result.dimensions = deepcopy(chunk.dimensions)
-                    result.dimensions[split].coords = coords
+                    with progress_scope(90, 100, "Assembling result blocks"):
+                        if result is None:
+                            result = chunk
+                            result.dimensions = deepcopy(chunk.dimensions)
+                            result.dimensions[split].coords = coords
 
-                    arrays = {}
-                    for name in ("values", "errors_low", "errors_high", "n"):
-                        value = getattr(chunk, name)
-                        arrays[name] = (
-                            None if value is None else np.empty(shape, value.dtype)
-                        )
+                            arrays = {}
+                            for name in ("values", "errors_low", "errors_high", "n"):
+                                value = getattr(chunk, name)
+                                arrays[name] = (
+                                    None if value is None else np.empty(shape, value.dtype)
+                                )
 
-                index = [slice(None)] * len(dims)
-                index[axis] = slice(start, stop)
+                        index = [slice(None)] * len(dims)
+                        index[axis] = slice(start, stop)
 
-                for name, array in arrays.items():
-                    if array is not None:
-                        array[tuple(index)] = getattr(chunk, name)
+                        for name, array in arrays.items():
+                            if array is not None:
+                                array[tuple(index)] = getattr(chunk, name)
 
             for name, array in arrays.items():
                 setattr(result, name, array)
@@ -144,27 +153,29 @@ def evaluate_blockwise(
             expanded_selection = dict(selected)
             expanded_selection[axis_name] = dimensions[axis_name].coords
 
-            result = calculate(level - 1, expanded_selection)
+            with progress_scope(0, 85):
+                result = calculate(level - 1, expanded_selection)
 
-            if result.values.shape[result.axis(axis_name)] == 0:
-                result.values = np.full(
-                    shape,
-                    0.0 if spec.method == "sum" else np.nan,
-                )
+            with progress_scope(85, 100, f"Reducing {axis_name}: {spec.method}"):
+                if result.values.shape[result.axis(axis_name)] == 0:
+                    result.values = np.full(
+                        shape,
+                        0.0 if spec.method == "sum" else np.nan,
+                    )
 
-                if result.has_errors or spec.error_method != "none":
-                    result.errors_low = np.full(shape, np.nan)
-                    result.errors_high = np.full(shape, np.nan)
-                    result.n = np.zeros(shape, dtype=int)
+                    if result.has_errors or spec.error_method != "none":
+                        result.errors_low = np.full(shape, np.nan)
+                        result.errors_high = np.full(shape, np.nan)
+                        result.n = np.zeros(shape, dtype=int)
 
-                info = result.dimensions[axis_name]
-                info.mode = "reduced"
-                info.parameter = {
-                    "method": spec.method,
-                    "error_method": spec.error_method,
-                }
-            else:
-                result.reduce_dimension(axis_name, spec)
+                    info = result.dimensions[axis_name]
+                    info.mode = "reduced"
+                    info.parameter = {
+                        "method": spec.method,
+                        "error_method": spec.error_method,
+                    }
+                else:
+                    result.reduce_dimension(axis_name, spec)
 
             return result
 
@@ -173,7 +184,8 @@ def evaluate_blockwise(
         for dim in base_dims:
             metadata[dim].coords = selected[dim]
 
-        values = np.asarray(read_block(selected), dtype=np.float32)
+        with progress_scope(0, 100, "Calculating statistic block"):
+            values = np.asarray(read_block(selected), dtype=np.float32)
 
         if values.shape != shape:
             raise ValueError(f"Block shape {values.shape} does not match {shape}.")
@@ -215,53 +227,60 @@ def evaluate_blockwise(
         position_parts = []
         metadata = None
 
+        completed_values = 0
         for selected, offsets in output_blocks(
             {d: dimensions[d].coords for d in output_dims},
             {d: 0 for d in output_dims},
         ):
             # Complete all requested reductions before selecting rows.
-            chunk = calculate(len(operations), selected)
-            chunk.validate()
+            block_count = prod(len(selected[d]) for d in output_dims)
+            block_start = 95 * completed_values / max(1, count)
+            completed_values += block_count
+            with progress_scope(block_start, 95 * completed_values / max(1, count)):
+                with progress_scope(0, 85):
+                    chunk = calculate(len(operations), selected)
+                with progress_scope(85, 100, "Filtering statistic block"):
+                    chunk.validate()
 
-            if metadata is None:
-                metadata = deepcopy(chunk.dimensions)
+                    if metadata is None:
+                        metadata = deepcopy(chunk.dimensions)
 
-                # Preserve the complete coordinate domains.
-                for dim in output_dims:
-                    metadata[dim].coords = dimensions[dim].coords
+                        # Preserve the complete coordinate domains.
+                        for dim in output_dims:
+                            metadata[dim].coords = dimensions[dim].coords
 
-            values = np.asarray(chunk.values).reshape(-1)
-            mask = select_values(values)
+                    values = np.asarray(chunk.values).reshape(-1)
+                    mask = select_values(values)
 
-            if mask is None:
-                raise ValueError("The value selector returned no mask.")
+                    if mask is None:
+                        raise ValueError("The value selector returned no mask.")
 
-            mask = np.asarray(mask, dtype=bool)
+                    mask = np.asarray(mask, dtype=bool)
 
-            if mask.shape != values.shape:
-                raise ValueError("The value selector returned an invalid mask shape.")
+                    if mask.shape != values.shape:
+                        raise ValueError("The value selector returned an invalid mask shape.")
 
-            rows = np.flatnonzero(mask & ~np.isnan(values))
+                    rows = np.flatnonzero(mask & ~np.isnan(values))
 
-            if not rows.size:
-                continue
+                    if not rows.size:
+                        continue
 
-            if output_dims:
-                positions = np.column_stack(np.unravel_index(rows, chunk.values.shape))
-                positions += np.array([offsets[d] for d in output_dims])
-            else:
-                positions = np.empty(
-                    (rows.size, 0),
-                    dtype=np.int64,
-                )
+                    if output_dims:
+                        positions = np.column_stack(np.unravel_index(rows, chunk.values.shape))
+                        positions += np.array([offsets[d] for d in output_dims])
+                    else:
+                        positions = np.empty(
+                            (rows.size, 0),
+                            dtype=np.int64,
+                        )
 
-            position_parts.append(positions)
+                    position_parts.append(positions)
 
-            for name in names:
-                array = getattr(chunk, name)
+                    for name in names:
+                        array = getattr(chunk, name)
 
-                if array is not None:
-                    parts[name].append(np.asarray(array).reshape(-1)[rows])
+                        if array is not None:
+                            parts[name].append(np.asarray(array).reshape(-1)[rows])
 
         def joined(name):
             if parts[name]:
@@ -271,34 +290,36 @@ def evaluate_blockwise(
 
             return None if array is None else np.empty(0, dtype=array.dtype)
 
-        result = SparseStatisticArray(
-            name="",
-            title="",
-            dimensions=metadata,
-            values=joined("values"),
-            positions=(
-                np.concatenate(position_parts, axis=0)
-                if position_parts
-                else np.empty(
-                    (0, len(output_dims)),
-                    dtype=np.int64,
-                )
-            ),
-            errors_low=joined("errors_low"),
-            errors_high=joined("errors_high"),
-            n=joined("n"),
-            reduction_aliases=dict(aliases),
-            reference_aliases=dict(reference_aliases or {}),
-            applied_pair_filters=tuple(applied_filters),
-        )
+        with progress_scope(95, 100, "Assembling filtered statistic"):
+            result = SparseStatisticArray(
+                name="",
+                title="",
+                dimensions=metadata,
+                values=joined("values"),
+                positions=(
+                    np.concatenate(position_parts, axis=0)
+                    if position_parts
+                    else np.empty(
+                        (0, len(output_dims)),
+                        dtype=np.int64,
+                    )
+                ),
+                errors_low=joined("errors_low"),
+                errors_high=joined("errors_high"),
+                n=joined("n"),
+                reduction_aliases=dict(aliases),
+                reference_aliases=dict(reference_aliases or {}),
+                applied_pair_filters=tuple(applied_filters),
+            )
 
-        result.validate()
+            result.validate()
         return result
 
-    result = calculate(
-        len(operations),
-        {d: dimensions[d].coords for d in output_dims},
-    )
+    with progress_scope(0, 98):
+        result = calculate(
+            len(operations),
+            {d: dimensions[d].coords for d in output_dims},
+        )
 
     result.validate()
     return result

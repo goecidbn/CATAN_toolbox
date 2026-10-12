@@ -9,7 +9,9 @@ from catan.core.image_correlation import (
     compact_positive_footprint,
     footprint_similarity_peak,
 )
-from catan.gui.background_tasks.runtime import current_task_context
+from catan.gui.background_tasks.runtime import (
+    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
+)
 
 from .dimensions import Dimension
 from .sparse_values import SparseStatisticArray
@@ -20,6 +22,7 @@ from time import perf_counter
 TRACE_FOOTPRINT_PAIRS = False
 
 
+@reports_progress("Calculating footprint similarity")
 def calculate_footprint_pairs(
     data,
     state,
@@ -201,142 +204,149 @@ def calculate_footprint_pairs(
     score_cache_sessions = None
 
     ctx = current_task_context()
-    for step, (si, sj) in enumerate(pairs):
-
-        session_key = (min(si, sj), max(si, sj))
-
-        if session_key != score_cache_sessions:
-            score_cache.clear()
-            score_cache_sessions = session_key
-
-        if ctx is not None:
-            ctx.check_cancelled()
-            ctx.progress(int(100 * step / max(1, len(pairs))))
-        source, reference = data.sessions[si], data.sessions[sj]
-        if any(
-            session is None or session.centroids is None or session.footprints is None
-            for session in (source, reference)
+    for progress_index, (step, (si, sj)) in enumerate(enumerate(pairs)):
+        with progress_step(
+            progress_index, len(pairs), start=0, stop=95, message=f"Similarity: sessions {si + 1} / {sj + 1}",
         ):
-            continue
 
-        if tuple(source.dims) != tuple(reference.dims):
-            raise ValueError(
-                "Footprint similarity requires the same aligned pixel grid; "
-                f"received {source.dims} and {reference.dims}."
-            )
+            session_key = (min(si, sj), max(si, sj))
 
-        fi = state.assignments[ni_ids, si]
-        fj = state.assignments[nj_ids, sj]
+            if session_key != score_cache_sessions:
+                score_cache.clear()
+                score_cache_sessions = session_key
 
-        if nr == "same":
-            if si == sj:  # Existing self-comparison policy.
-                continue
-            valid = np.flatnonzero((fi >= 0) & (fj >= 0))
-            delta = source.centroids[fi[valid]] - reference.centroids[fj[valid]]
-            distance = np.linalg.norm(delta, axis=1)
-            valid = valid[np.isfinite(distance) & (distance < neighborhood_thr)]
-            candidates = ((int(k), int(k)) for k in valid)
-        else:
-            vi, vj = np.flatnonzero(fi >= 0), np.flatnonzero(fj >= 0)
-            ci, cj = source.centroids[fi[vi]], reference.centroids[fj[vj]]
-            good_i, good_j = np.all(np.isfinite(ci), axis=1), np.all(
-                np.isfinite(cj), axis=1
-            )
-            vi, ci, vj, cj = vi[good_i], ci[good_i], vj[good_j], cj[good_j]
-            if not len(vj):
-                continue
-            tree = cKDTree(cj)
-
-            def nearby_pairs():
-                for count, (i, center) in enumerate(zip(vi, ci)):
-                    if count % 64 == 0 and ctx is not None:
-                        ctx.check_cancelled()
-                    for local_j in tree.query_ball_point(center, neighborhood_thr):
-                        j = vj[local_j]
-                        if (nr == "different" or si == sj) and ni_ids[i] == nj_ids[j]:
-                            continue
-                        if np.linalg.norm(center - cj[local_j]) < neighborhood_thr:
-                            yield int(i), int(j)
-
-            candidates = nearby_pairs()
-
-        for count, (i, j) in enumerate(candidates):
-            if count % 64 == 0 and ctx is not None:
+            if ctx is not None:
                 ctx.check_cancelled()
+            source, reference = data.sessions[si], data.sessions[sj]
+            if any(
+                session is None or session.centroids is None or session.footprints is None
+                for session in (source, reference)
+            ):
+                continue
 
-            if TRACE_FOOTPRINT_PAIRS:
-                trace_count += 1
-                trace_neurons_i.add(int(ni_ids[i]))
-                trace_neurons_j.add(int(nj_ids[j]))
-                trace_sessions[(int(si), int(sj))] += 1
-
-                if len(trace_examples) < 8:
-                    trace_examples.append(
-                        (
-                            (int(ni_ids[i]), int(si), int(fi[i])),
-                            (int(nj_ids[j]), int(sj), int(fj[j])),
-                        )
-                    )
-
-            if TRACE_FOOTPRINT_PAIRS:
-                score_started = perf_counter()
-
-            left_key = (int(si), int(fi[i]))
-            right_key = (int(sj), int(fj[j]))
-            pair_key = tuple(sorted((left_key, right_key)))
-
-            if pair_key not in score_cache:
-                if trace:
-                    trace_score_evaluations += 1
-
-                score_cache[pair_key] = footprint_similarity_peak(
-                    prepared_patch(*left_key),
-                    prepared_patch(*right_key),
-                    gamma=gamma,
+            if tuple(source.dims) != tuple(reference.dims):
+                raise ValueError(
+                    "Footprint similarity requires the same aligned pixel grid; "
+                    f"received {source.dims} and {reference.dims}."
                 )
 
-            similarity = score_cache[pair_key]
+            fi = state.assignments[ni_ids, si]
+            fj = state.assignments[nj_ids, sj]
 
-            if TRACE_FOOTPRINT_PAIRS:
-                trace_score_seconds += perf_counter() - score_started
+            if nr == "same":
+                if si == sj:  # Existing self-comparison policy.
+                    continue
+                valid = np.flatnonzero((fi >= 0) & (fj >= 0))
+                delta = source.centroids[fi[valid]] - reference.centroids[fj[valid]]
+                distance = np.linalg.norm(delta, axis=1)
+                valid = valid[np.isfinite(distance) & (distance < neighborhood_thr)]
+                candidates = ((int(k), int(k)) for k in progress_iter(valid, stop=98, every=16))
+            else:
+                vi, vj = np.flatnonzero(fi >= 0), np.flatnonzero(fj >= 0)
+                ci, cj = source.centroids[fi[vi]], reference.centroids[fj[vj]]
+                good_i, good_j = np.all(np.isfinite(ci), axis=1), np.all(
+                    np.isfinite(cj), axis=1
+                )
+                vi, ci, vj, cj = vi[good_i], ci[good_i], vj[good_j], cj[good_j]
+                if not len(vj):
+                    continue
+                tree = cKDTree(cj)
 
-            if not np.isfinite(similarity):
-                continue
-            refs = {
-                "neuron_i": int(ni_ids[i]),
-                "neuron_j": int(nj_ids[j]),
-                "session_i": si,
-                "session_j": sj,
-                "neuron": int(ni_ids[i]),
-                "session": si,
-            }
-            positions.append(tuple(lookups[d][refs[d]] for d in dims))
-            values.append(float(similarity))
-            if len(values) == 4096:
-                flush()
-        flush()
+                def nearby_pairs():
+                    for count, (i, center) in enumerate(progress_iter(zip(vi, ci), total=len(vi), stop=98, every=1)):
+                        if count % 64 == 0 and ctx is not None:
+                            ctx.check_cancelled()
+                        for local_j in progress_iter(
+                            tree.query_ball_point(center, neighborhood_thr),
+                            start=98 * count / max(1, len(vi)),
+                            stop=98 * (count + 1) / max(1, len(vi)), every=16,
+                        ):
+                            j = vj[local_j]
+                            if (nr == "different" or si == sj) and ni_ids[i] == nj_ids[j]:
+                                continue
+                            if np.linalg.norm(center - cj[local_j]) < neighborhood_thr:
+                                yield int(i), int(j)
 
-    stat = SparseStatisticArray(
-        name="footprint_similarity",
-        title="Footprint similarity",
-        category="pair",
-        values=np.concatenate(value_blocks) if value_blocks else np.empty(0),
-        positions=(
-            np.concatenate(position_blocks)
-            if position_blocks
-            else np.empty((0, len(dims)), dtype=np.int64)
-        ),
-        dimensions=dimensions,
-        reduction_aliases=aliases,
-        applied_pair_filters=tuple(f.target for f in filters),
-        reference_aliases={
-            original: (
-                compact,
-                -1 if original == "session_j" and sr == "with previous" else 0,
-            )
-            for original, compact in aliases.items()
-        },
-    )
+                candidates = nearby_pairs()
+
+            for count, (i, j) in enumerate(candidates):
+                if count % 64 == 0 and ctx is not None:
+                    ctx.check_cancelled()
+
+                if TRACE_FOOTPRINT_PAIRS:
+                    trace_count += 1
+                    trace_neurons_i.add(int(ni_ids[i]))
+                    trace_neurons_j.add(int(nj_ids[j]))
+                    trace_sessions[(int(si), int(sj))] += 1
+
+                    if len(trace_examples) < 8:
+                        trace_examples.append(
+                            (
+                                (int(ni_ids[i]), int(si), int(fi[i])),
+                                (int(nj_ids[j]), int(sj), int(fj[j])),
+                            )
+                        )
+
+                if TRACE_FOOTPRINT_PAIRS:
+                    score_started = perf_counter()
+
+                left_key = (int(si), int(fi[i]))
+                right_key = (int(sj), int(fj[j]))
+                pair_key = tuple(sorted((left_key, right_key)))
+
+                if pair_key not in score_cache:
+                    if trace:
+                        trace_score_evaluations += 1
+
+                    score_cache[pair_key] = footprint_similarity_peak(
+                        prepared_patch(*left_key),
+                        prepared_patch(*right_key),
+                        gamma=gamma,
+                    )
+
+                similarity = score_cache[pair_key]
+
+                if TRACE_FOOTPRINT_PAIRS:
+                    trace_score_seconds += perf_counter() - score_started
+
+                if not np.isfinite(similarity):
+                    continue
+                refs = {
+                    "neuron_i": int(ni_ids[i]),
+                    "neuron_j": int(nj_ids[j]),
+                    "session_i": si,
+                    "session_j": sj,
+                    "neuron": int(ni_ids[i]),
+                    "session": si,
+                }
+                positions.append(tuple(lookups[d][refs[d]] for d in dims))
+                values.append(float(similarity))
+                if len(values) == 4096:
+                    flush()
+            flush()
+
+    with progress_scope(95, 99, "Assembling similarity results"):
+        stat = SparseStatisticArray(
+            name="footprint_similarity",
+            title="Footprint similarity",
+            category="pair",
+            values=np.concatenate(value_blocks) if value_blocks else np.empty(0),
+            positions=(
+                np.concatenate(position_blocks)
+                if position_blocks
+                else np.empty((0, len(dims)), dtype=np.int64)
+            ),
+            dimensions=dimensions,
+            reduction_aliases=aliases,
+            applied_pair_filters=tuple(f.target for f in filters),
+            reference_aliases={
+                original: (
+                    compact,
+                    -1 if original == "session_j" and sr == "with previous" else 0,
+                )
+                for original, compact in aliases.items()
+            },
+        )
 
     if TRACE_FOOTPRINT_PAIRS:
 
@@ -374,6 +384,6 @@ def calculate_footprint_pairs(
 
     if ctx is not None:
         ctx.check_cancelled()
-        ctx.progress(100)
+        current_task_context().progress(100)
 
     return stat
