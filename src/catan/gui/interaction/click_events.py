@@ -71,10 +71,29 @@ def print_debug(state: AppState, data: Data):
 
     print("session neurons:", data.sessions[0].n_neurons)
 
-    print("Model")
-    print("Model details:", data.model)
-    print("Model counts:", data.model.aggregate_counts())
-    print("Model single counts", data.model.counts)
+    id = 30
+    print(f"Neuron ID {id}:", state.assignments[id, :])
+    print("centroids:", data.assignments.union.centroids.shape)
+    print("ID centroid:", data.assignments.union.centroids[id, :])
+
+    print("stats keys:", list(data.assignments.stats.keys()))
+    print("weights:", data.assignments.stats.get("fp_corr").shape)
+    print("shift:", data.assignments.stats.get("shifts").shape)
+
+    print(f"fp_corr for neuron {id}:", data.assignments.stats.get("fp_corr")[id, :])
+    print(f"shifts for neuron {id}:", data.assignments.stats.get("shifts")[id, ...])
+    for s, fp_id in enumerate(data.assignments.ids[id, :]):
+
+        if fp_id >= 0:
+            print(f"Session {s}, assignment for neuron {id}:", fp_id)
+            print(
+                "Centroid for this footprint:",
+                data.sessions[s].centroids[fp_id, :],
+            )
+    # print("Model")
+    # print("Model details:", data.model)
+    # print("Model counts:", data.model.aggregate_counts())
+    # print("Model single counts", data.model.counts)
 
     # for session in data.sessions:
     #     print(f"remap {session.id}:", session.remap.report)

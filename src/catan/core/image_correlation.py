@@ -1,7 +1,7 @@
 from typing import Tuple
 import numpy as np
 
-from scipy import signal, sparse
+from scipy import signal, sparse, fft
 from scipy.signal import fftconvolve
 
 from .utils import crop_to_common_bbox
@@ -466,3 +466,110 @@ def _as_dense_image(value, dims):
         raise ValueError(f"Expected a 2D image, got {image.shape}.")
 
     return image
+
+
+def compact_positive_footprint(column, dims):
+    """Dense positive-support patch from one flattened sparse footprint."""
+    dims = tuple(int(value) for value in dims)
+
+    if len(dims) != 2 or min(dims) <= 0:
+        raise ValueError(f"Invalid image dimensions: {dims}")
+
+    if not sparse.issparse(column):
+        raise TypeError("Expected one sparse footprint column.")
+
+    if column.shape != (int(np.prod(dims)), 1):
+        raise ValueError(f"Footprint shape {column.shape} does not match dims={dims}.")
+
+    column = sparse.csc_matrix(column, dtype=np.float64, copy=True)
+    column.sum_duplicates()
+    column.sort_indices()
+
+    if not np.all(np.isfinite(column.data)):
+        raise ValueError("Footprint contains NaN or Inf values.")
+
+    positive = column.data > 0
+    if not np.any(positive):
+        return None
+
+    pixels = column.indices[positive]
+    values = column.data[positive]
+
+    # Same C-order interpretation as _as_dense_image(...).reshape(dims).
+    rows, columns = np.divmod(pixels, dims[1])
+    rows = rows - rows.min()
+    columns = columns - columns.min()
+
+    patch = np.zeros(
+        (int(rows.max()) + 1, int(columns.max()) + 1),
+        dtype=np.float64,
+    )
+    patch[rows, columns] = values
+    return patch
+
+
+def footprint_similarity_peak(left, right, *, gamma=0.1):
+    """Cosine-union peak with shared FFTs.
+
+    Inputs are compact 2D patches from compact_positive_footprint().
+    """
+    if left is None or right is None:
+        return np.nan
+
+    a = np.asarray(left, dtype=np.float64)
+    b = np.asarray(right, dtype=np.float64)
+
+    ma = (a > 0).astype(np.float64)
+    mb = (b > 0).astype(np.float64)
+
+    a = a * ma
+    b = b * mb
+
+    full_shape = tuple(x + y - 1 for x, y in zip(a.shape, b.shape))
+    fft_shape = tuple(fft.next_fast_len(size, real=True) for size in full_shape)
+    full_slice = tuple(slice(size) for size in full_shape)
+
+    # Each input contributes values, squared values, and support.
+    fa = fft.rfftn(a, s=fft_shape)
+    fa2 = fft.rfftn(a * a, s=fft_shape)
+    fma = fft.rfftn(ma, s=fft_shape)
+
+    # Reversal converts convolution into full linear correlation.
+    fb = fft.rfftn(b[::-1, ::-1], s=fft_shape)
+    fb2 = fft.rfftn((b * b)[::-1, ::-1], s=fft_shape)
+    fmb = fft.rfftn(mb[::-1, ::-1], s=fft_shape)
+
+    def inverse_product(x, y):
+        return fft.irfftn(
+            x * y,
+            s=fft_shape,
+        )[full_slice]
+
+    numerator = inverse_product(fa, fb)
+    s1 = inverse_product(fa2, fmb)
+    s2 = inverse_product(fma, fb2)
+    intersection = inverse_product(fma, fmb)
+
+    # Preserve the existing normalization and numerical policies.
+    eps = 1e-12
+
+    denominator = np.sqrt(np.maximum(s1, 0.0) * np.maximum(s2, 0.0))
+
+    cosine = np.zeros_like(numerator)
+    valid = denominator > eps
+    cosine[valid] = np.clip(
+        numerator[valid] / denominator[valid],
+        0.0,
+        1.0,
+    )
+
+    support_mass = max(min(ma.sum(), mb.sum()), eps)
+    overlap = np.clip(
+        intersection / support_mass,
+        0.0,
+        1.0,
+    )
+
+    peak = float(np.max(cosine * np.power(overlap, gamma)))
+
+    return peak if np.isfinite(peak) and peak != 0 else np.nan

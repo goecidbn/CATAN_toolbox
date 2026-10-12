@@ -12,6 +12,8 @@ class PlotData:
     x_table: PickTable
     y_table: PickTable
 
+    row_matcher: object = field(default=None, repr=False)
+
     title: dict[str, str] = field(init=False)
 
     # matched row -> source-table row
@@ -28,15 +30,11 @@ class PlotData:
     # matched row -> marker, -1 if not plotted
     row_to_marker: np.ndarray = field(init=False, repr=False)
 
-    _pick_tree: cKDTree | None = field(
-        init=False, default=None, repr=False
-    )
+    _pick_tree: cKDTree | None = field(init=False, default=None, repr=False)
     _pick_origin: np.ndarray = field(init=False, repr=False)
     _pick_scale: np.ndarray = field(init=False, repr=False)
 
-    _neuron_index: dict = field(
-        init=False, default_factory=dict, repr=False
-    )
+    _neuron_index: dict = field(init=False, default_factory=dict, repr=False)
 
     def __post_init__(self):
 
@@ -45,7 +43,9 @@ class PlotData:
             "y": self.y_table.stat.display_title,
         }
 
-        self.x_rows, self.y_rows = _matching_rows(
+        matcher = self.row_matcher or _matching_rows
+
+        self.x_rows, self.y_rows = matcher(
             self.x_table,
             self.y_table,
         )
@@ -67,7 +67,6 @@ class PlotData:
         del x_values, y_values, valid
 
         self._build_interaction_indices()
-
 
     @property
     def n_rows(self) -> int:
@@ -165,17 +164,12 @@ class PlotData:
         return self.ref_sets_for_rows(rows)
 
     def markers_matching_components(self, components):
-        components = (
-            [] if components is None else list(components)
-        )
+        components = [] if components is None else list(components)
 
         if not components or not self.n_markers:
             return np.empty(0, dtype=np.intp)
 
-        neuron_ids = {
-            int(component.neuron_id)
-            for component in components
-        }
+        neuron_ids = {int(component.neuron_id) for component in components}
 
         matches = []
 
@@ -185,9 +179,7 @@ class PlotData:
         ):
             parts = []
 
-            for order, ranges in self._neuron_index.get(
-                side, ()
-            ):
+            for order, ranges in self._neuron_index.get(side, ()):
                 for neuron_id in neuron_ids:
                     bounds = ranges.get(neuron_id)
 
@@ -198,22 +190,14 @@ class PlotData:
             if not parts:
                 continue
 
-            candidates = np.unique(
-                np.concatenate(parts)
-            )
+            candidates = np.unique(np.concatenate(parts))
 
-            rows = source_rows[
-                self.marker_rows[candidates]
-            ]
+            rows = source_rows[self.marker_rows[candidates]]
             candidate_table = table.subset_rows(rows)
 
             # Keep the existing session, wildcard, and pair rules,
             # but evaluate them only on candidate markers.
-            selected = (
-                candidate_table.rows_matching_components(
-                    components
-                )
-            )
+            selected = candidate_table.rows_matching_components(components)
 
             if selected.size:
                 matches.append(candidates[selected])
@@ -222,7 +206,7 @@ class PlotData:
             return np.empty(0, dtype=np.intp)
 
         return np.unique(np.concatenate(matches))
-    
+
     def tooltip_for_marker(
         self,
         marker_index: int,
@@ -269,36 +253,32 @@ class PlotData:
             return
 
         # Spatial index for mouse picking.
-        self._pick_origin = np.array([
-            self.x.min(),
-            self.y.min(),
-        ])
+        self._pick_origin = np.array(
+            [
+                self.x.min(),
+                self.y.min(),
+            ]
+        )
 
-        self._pick_scale = np.array([
-            np.ptp(self.x),
-            np.ptp(self.y),
-        ])
+        self._pick_scale = np.array(
+            [
+                np.ptp(self.x),
+                np.ptp(self.y),
+            ]
+        )
         self._pick_scale[self._pick_scale == 0] = 1.0
 
         points = np.empty(
             (self.n_markers, 2),
             dtype=np.float64,
         )
-        points[:, 0] = (
-            self.x - self._pick_origin[0]
-        ) / self._pick_scale[0]
-        points[:, 1] = (
-            self.y - self._pick_origin[1]
-        ) / self._pick_scale[1]
+        points[:, 0] = (self.x - self._pick_origin[0]) / self._pick_scale[0]
+        points[:, 1] = (self.y - self._pick_origin[1]) / self._pick_scale[1]
 
         self._pick_tree = cKDTree(points, copy_data=False)
 
         # Neuron -> candidate markers for linked highlighting.
-        index_dtype = (
-            np.int32
-            if self.n_markers <= np.iinfo(np.int32).max
-            else np.int64
-        )
+        index_dtype = np.int32 if self.n_markers <= np.iinfo(np.int32).max else np.int64
 
         for side, table, source_rows in (
             ("x", self.x_table, self.x_rows),
@@ -312,15 +292,9 @@ class PlotData:
                     dtype=np.int64,
                 )
 
-                for start in range(
-                    0, self.n_markers, ROW_BLOCK_SIZE
-                ):
-                    markers = slice(
-                        start, start + ROW_BLOCK_SIZE
-                    )
-                    rows = source_rows[
-                        self.marker_rows[markers]
-                    ]
+                for start in range(0, self.n_markers, ROW_BLOCK_SIZE):
+                    markers = slice(start, start + ROW_BLOCK_SIZE)
+                    rows = source_rows[self.marker_rows[markers]]
                     neuron_ids[markers] = column[rows]
 
                 order = np.argsort(
@@ -331,9 +305,7 @@ class PlotData:
 
                 starts = np.r_[
                     0,
-                    np.flatnonzero(
-                        ordered_ids[1:] != ordered_ids[:-1]
-                    ) + 1,
+                    np.flatnonzero(ordered_ids[1:] != ordered_ids[:-1]) + 1,
                 ]
                 stops = np.r_[
                     starts[1:],
@@ -341,16 +313,16 @@ class PlotData:
                 ]
 
                 ranges = {
-                    int(ordered_ids[start]): (
-                        int(start), int(stop)
-                    )
+                    int(ordered_ids[start]): (int(start), int(stop))
                     for start, stop in zip(starts, stops)
                 }
 
-                groups.append((
-                    order.astype(index_dtype, copy=False),
-                    ranges,
-                ))
+                groups.append(
+                    (
+                        order.astype(index_dtype, copy=False),
+                        ranges,
+                    )
+                )
 
                 del neuron_ids, ordered_ids, order
 
@@ -378,9 +350,7 @@ class PlotData:
         ):
             return None
 
-        query = (
-            pos - self._pick_origin
-        ) / self._pick_scale
+        query = (pos - self._pick_origin) / self._pick_scale
 
         # A nearby point provides an upper bound on the search.
         _, seed = self._pick_tree.query(query)
@@ -402,10 +372,7 @@ class PlotData:
             height / self._pick_scale[1],
         )
 
-        search_radius += (
-            16 * np.finfo(float).eps
-            * (1 + np.linalg.norm(query))
-        )
+        search_radius += 16 * np.finfo(float).eps * (1 + np.linalg.norm(query))
 
         candidates = np.asarray(
             self._pick_tree.query_ball_point(
@@ -429,9 +396,7 @@ class PlotData:
             return None
 
         # Preserve the original first-marker behaviour for ties.
-        return int(
-            candidates[distances == best].min()
-        )
+        return int(candidates[distances == best].min())
 
 
 def build_plot_data(
@@ -443,6 +408,7 @@ def build_plot_data(
         x_table=x_table,
         y_table=y_table,
     )
+
 
 def _matching_rows(
     x_table: PickTable,

@@ -30,11 +30,9 @@ def make_session_stat_definition(
             calculations.get_quality_metric,
             key=name,
         ),
-        dependencies=(
-            TRACKED_STATISTIC_STRUCTURE
-            | {ChangeKind.QUALITY_VALUES}
-        ),
+        dependencies=(TRACKED_STATISTIC_STRUCTURE | {ChangeKind.QUALITY_VALUES}),
         availability_dependencies=frozenset({"quality"}),
+        foreground_safe=True,
     )
 
 
@@ -61,10 +59,8 @@ def make_match_stat_definition(
             dims,
             values.shape,
         ),
-        dependencies=(
-            TRACKED_STATISTIC_STRUCTURE
-            | {ChangeKind.MATCH_VALUES}
-        ),
+        dependencies=(TRACKED_STATISTIC_STRUCTURE | {ChangeKind.MATCH_VALUES}),
+        foreground_safe=True,
     )
 
 

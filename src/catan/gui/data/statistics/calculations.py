@@ -417,11 +417,12 @@ def calculate_occurrence(
     indexers=None,
     filters=(),
 ):
-    return apply_indexers(
-        state.assignments >= 0,
+    selected = apply_indexers(
+        state.assignments,
         ("neuron", "session"),
         indexers,
     )
+    return selected >= 0
 
 
 def calculate_centroid_shift(

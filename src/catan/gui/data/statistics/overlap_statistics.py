@@ -55,8 +55,8 @@ def overlap_query(
         if included.shape != (n,):
             raise ValueError("Union inclusion mask does not match assignments.")
 
-    @lru_cache(maxsize=None)
-    def prepare(sid):
+    @lru_cache(maxsize=16)
+    def prepare(sid, columns):
         session = data.sessions[sid]
 
         if (
@@ -70,16 +70,23 @@ def overlap_query(
 
         shape = tuple(session.dims)
 
-        a = sparse.csc_matrix(
-            session.footprints,
-            dtype=np.float32,
-            copy=True,
-        )
+        source = session.footprints
 
-        if a.shape[0] != int(np.prod(shape)):
+        if source.shape[0] != int(np.prod(shape)):
             raise ValueError(
                 f"Session {sid}: footprint shape does not match dimensions."
             )
+
+        columns = np.asarray(columns, dtype=np.int64)
+
+        if np.any(columns < 0) or np.any(columns >= source.shape[1]):
+            raise ValueError("Assignments reference missing footprints.")
+
+        a = sparse.csc_matrix(
+            source[:, columns],
+            dtype=np.float32,
+            copy=True,
+        )
 
         a.sum_duplicates()
         a.sort_indices()
@@ -87,10 +94,12 @@ def overlap_query(
         keep = np.ones(a.shape[1], dtype=bool)
 
         if session.included is not None:
-            keep = np.asarray(session.included, dtype=bool)
+            session_included = np.asarray(session.included, dtype=bool)
 
-            if keep.shape != (a.shape[1],):
+            if session_included.shape != (source.shape[1],):
                 raise ValueError(f"Session {sid}: invalid inclusion mask.")
+
+            keep = session_included[columns]
 
         for col in range(a.shape[1]):
             if col % 128 == 0 and ctx is not None:
@@ -168,8 +177,28 @@ def overlap_query(
                 if ctx is not None:
                     ctx.check_cancelled()
 
-                left = prepare(int(source))
-                right = prepare(int(target))
+                fi = ids[ni[rows], source]
+                fj = ids[nj[rows], target]
+
+                present = (fi >= 0) & (fj >= 0)
+                rows = rows[present]
+                fi = fi[present]
+                fj = fj[present]
+
+                if not rows.size:
+                    continue
+
+                columns_i = np.unique(fi)
+                columns_j = np.unique(fj)
+
+                left = prepare(
+                    int(source),
+                    tuple(int(value) for value in columns_i),
+                )
+                right = prepare(
+                    int(target),
+                    tuple(int(value) for value in columns_j),
+                )
 
                 if left is None or right is None:
                     continue
@@ -180,19 +209,8 @@ def overlap_query(
                 if shape_a != shape_b:
                     raise ValueError("Overlap requires the same registered pixel grid.")
 
-                fi = ids[ni[rows], source]
-                fj = ids[nj[rows], target]
-
-                if np.any(fi >= a.shape[1]) or np.any(fj >= b.shape[1]):
-                    raise ValueError("Assignments reference missing footprints.")
-
-                present = (fi >= 0) & (fj >= 0)
-                rows = rows[present]
-                fi = fi[present]
-                fj = fj[present]
-
-                if not rows.size:
-                    continue
+                fi = np.searchsorted(columns_i, fi)
+                fj = np.searchsorted(columns_j, fj)
 
                 # Compare corresponding columns, not their Cartesian product.
                 # Binary supports and weighted footprints both use min().
@@ -236,23 +254,23 @@ def overlap_query(
     cache_bytes = 0
     cache_budget = 64 * 1024**2
 
-    def pair_scores(si, sj):
+    def pair_scores(si, sj, columns_i, columns_j):
         nonlocal cache_bytes
 
         # Both overlap normalizations are symmetric.
         if not directional and si > sj:
-            result = pair_scores(sj, si)
+            result = pair_scores(sj, si, columns_j, columns_i)
             return None if result is None else result.T
 
-        key = (si, sj)
+        key = (si, sj, columns_i, columns_j)
 
         if key in cache:
             result = cache.pop(key)
             cache[key] = result
             return result
 
-        left = prepare(si)
-        right = prepare(sj)
+        left = prepare(si, columns_i)
+        right = prepare(sj, columns_j)
 
         if left is None or right is None:
             return None
@@ -263,37 +281,68 @@ def overlap_query(
         if shape_a != shape_b:
             raise ValueError("Overlap requires the same registered pixel grid.")
 
-        # Sparse multiplication identifies all intersecting supports.
-        # No centroid-distance cutoff is applied.
-        intersections = (sa.T @ sb).tocoo()
-
-        if weighted:
+        if a.shape[1] * b.shape[1] <= 64:
+            # Small queries: intersect sparse pixel indices directly.
             intersection = np.zeros(
                 (a.shape[1], b.shape[1]),
                 dtype=np.float32,
             )
 
-            for k, (i, j) in enumerate(zip(intersections.row, intersections.col)):
-                if k % 128 == 0 and ctx is not None:
+            for i in range(a.shape[1]):
+                if ctx is not None:
                     ctx.check_cancelled()
 
                 ia, ib = a.indptr[i : i + 2]
-                ja, jb = b.indptr[j : j + 2]
 
-                _, ai, bi = np.intersect1d(
-                    a.indices[ia:ib],
-                    b.indices[ja:jb],
-                    assume_unique=True,
-                    return_indices=True,
-                )
+                for j in range(b.shape[1]):
+                    ja, jb = b.indptr[j : j + 2]
 
-                intersection[i, j] = np.minimum(
-                    a.data[ia:ib][ai],
-                    b.data[ja:jb][bi],
-                ).sum(dtype=np.float64)
+                    shared, ai, bi = np.intersect1d(
+                        a.indices[ia:ib],
+                        b.indices[ja:jb],
+                        assume_unique=True,
+                        return_indices=True,
+                    )
+
+                    if weighted:
+                        intersection[i, j] = np.minimum(
+                            a.data[ia:ib][ai],
+                            b.data[ja:jb][bi],
+                        ).sum(dtype=np.float64)
+                    else:
+                        intersection[i, j] = shared.size
 
         else:
-            intersection = intersections.toarray()
+            # Larger queries retain the efficient sparse matrix approach.
+            intersections = (sa.T @ sb).tocoo()
+
+            if weighted:
+                intersection = np.zeros(
+                    (a.shape[1], b.shape[1]),
+                    dtype=np.float32,
+                )
+
+                for k, (i, j) in enumerate(zip(intersections.row, intersections.col)):
+                    if k % 128 == 0 and ctx is not None:
+                        ctx.check_cancelled()
+
+                    ia, ib = a.indptr[i : i + 2]
+                    ja, jb = b.indptr[j : j + 2]
+
+                    _, ai, bi = np.intersect1d(
+                        a.indices[ia:ib],
+                        b.indices[ja:jb],
+                        assume_unique=True,
+                        return_indices=True,
+                    )
+
+                    intersection[i, j] = np.minimum(
+                        a.data[ia:ib][ai],
+                        b.data[ja:jb][bi],
+                    ).sum(dtype=np.float64)
+
+            else:
+                intersection = intersections.toarray()
 
         if directional:
             # Rows: source footprints (neuron_i, session_i).
@@ -354,19 +403,8 @@ def overlap_query(
                 if not np.any(mask):
                     continue
 
-                scores = pair_scores(
-                    int(source),
-                    int(reference),
-                )
-
-                if scores is None:
-                    continue
-
                 fi = ids[ni[mask], source]
                 fj = ids[nj[mask], reference]
-
-                if np.any(fi >= scores.shape[0]) or np.any(fj >= scores.shape[1]):
-                    raise ValueError("Assignments reference missing footprints.")
 
                 present = (fi >= 0) & (fj >= 0)
 
@@ -376,10 +414,22 @@ def overlap_query(
                     dtype=np.float32,
                 )
 
-                values[present] = scores[
-                    fi[present],
-                    fj[present],
-                ]
+                if np.any(present):
+                    columns_i = np.unique(fi[present])
+                    columns_j = np.unique(fj[present])
+
+                    scores = pair_scores(
+                        int(source),
+                        int(reference),
+                        tuple(int(value) for value in columns_i),
+                        tuple(int(value) for value in columns_j),
+                    )
+
+                    if scores is not None:
+                        local_i = np.searchsorted(columns_i, fi[present])
+                        local_j = np.searchsorted(columns_j, fj[present])
+
+                        values[present] = scores[local_i, local_j]
 
                 out[mask] = values
 

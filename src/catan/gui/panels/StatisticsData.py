@@ -1,4 +1,5 @@
 from typing import get_args
+from types import SimpleNamespace
 
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtCore import Qt, Signal, QPoint
@@ -45,10 +46,13 @@ from catan.gui.data.statistics.queries import (
     neuron_pair_bound_dims,
     component_pair_bound_dims,
     normalize_neuron_bound_reductions,
+    normalize_footprint_pair_reductions,
     normalize_session_series_reductions,
     normalize_generic_session_pair_reductions,
+    linked_pair_axes,
 )
 from catan.gui.utils.popups import constrain_popup
+from catan.gui.data.assignment_colors import assignment_label
 
 
 class ReductionRow(QWidget):
@@ -247,6 +251,33 @@ class ReductionPopup(QDialog):
 
         title = QLabel(f"<b>{stat_def.title}</b>")
         layout.addWidget(title)
+
+        if self.selector.assignment_selection_enabled:
+            assignment_row = QHBoxLayout()
+            assignment_row.addWidget(QLabel("Assignments"))
+
+            assignment_selector = QComboBox()
+            assignment_selector.addItem("Active assignments", None)
+
+            data = self.selector.engine.data
+
+            for name in data.available_assignments:
+                assignment_selector.addItem(
+                    assignment_label(name),
+                    name,
+                )
+
+            current = assignment_selector.findData(self.selector.assignment_name)
+            assignment_selector.setCurrentIndex(max(0, current))
+
+            assignment_selector.currentIndexChanged.connect(
+                lambda index: self.selector._on_assignment_changed(
+                    assignment_selector.itemData(index)
+                )
+            )
+
+            assignment_row.addWidget(assignment_selector, 1)
+            layout.addLayout(assignment_row)
 
         if stat_def.parameters:
             form = QFormLayout()
@@ -503,6 +534,15 @@ def format_query_expression(
 ) -> str:
 
     reductions = query.reduction_dict()
+    linked = linked_pair_axes(stat_def, query.filters)
+
+    if stat_def.independent_pairs:
+        reductions = normalize_footprint_pair_reductions(
+            stat_def,
+            reductions,
+            query.filters,
+            session_series=query.context == "session_series",
+        )
 
     # -----------------------------------------
     # Dimensions that remain arguments
@@ -511,6 +551,9 @@ def format_query_expression(
     arguments = []
 
     for dim in stat_def.dims:
+
+        if dim in linked:
+            continue
 
         spec = reductions.get(
             dim,
@@ -560,6 +603,7 @@ def format_query_expression(
             not in ("keep", "single")
         ]
 
+    reduction_dims = [dim for dim in reduction_dims if dim not in linked]
     for dim in reduction_dims:
 
         spec = reductions[dim]
@@ -576,6 +620,7 @@ def format_query_expression(
 
 class StatisticQuerySelector(QWidget):
     queryChanged = Signal(object)  # StatisticQuery | None
+    assignmentChanged = Signal(object)
 
     def __init__(self, engine: StatisticEngine, axis=None, parent=None):
         super().__init__(parent)
@@ -608,6 +653,9 @@ class StatisticQuerySelector(QWidget):
 
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addStretch()
+
+        self.assignment_selection_enabled = False
+        self.assignment_name = None
 
         self.stat_button = QToolButton()
         self.stat_button.setMaximumWidth(120)
@@ -662,6 +710,10 @@ class StatisticQuerySelector(QWidget):
         self._update_stat_button()
         self._update_summary()
         self._emit_query_changed_once()
+
+    def _on_assignment_changed(self, name):
+        self.assignment_name = name
+        self.assignmentChanged.emit(name)
 
     def dispose(self):
         if self._disposed:
@@ -909,6 +961,7 @@ class StatisticQuerySelector(QWidget):
             reductions = normalize_neuron_bound_reductions(
                 stat_def,
                 reductions,
+                self.current_filters(),
             )
 
         self.current_reductions = reductions
@@ -1073,6 +1126,16 @@ class StatisticQuerySelector(QWidget):
             self.session_filter_button.set_relation("all", emit=False)
 
     def _get_dimension_info(self, stat_def):
+        if self.assignment_selection_enabled:
+            data = self.engine.data
+            name = self.assignment_name or data.current_assignments
+            assignments = data._assignments.get(name)
+
+            if assignments is not None:
+                return stat_def.get_dimension_info(
+                    SimpleNamespace(assignments=assignments.ids)
+                )
+
         return stat_def.get_dimension_info(self.engine.state)
 
     def _open_reduction_popup(self):
@@ -1209,6 +1272,11 @@ class StatisticQuerySelector(QWidget):
     ) -> tuple[str, ...]:
 
         stat_def = self.current_stat_def()
+        if dim in linked_pair_axes(
+            stat_def,
+            self.current_filters(),
+        ):
+            return ()
 
         general = allowed_reduction_methods(
             dim,

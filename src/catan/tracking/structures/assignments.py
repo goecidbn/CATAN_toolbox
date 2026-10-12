@@ -123,16 +123,17 @@ class Assignments:
         self.union = SessionData(name="union")
 
     def copy(self) -> "Assignments":
-        """
-        Create a deep copy of the Assignments instance.
-        """
-        new_instance = Assignments()
-        new_instance.ids = self.ids.copy()
-        new_instance.review_status = self.review_status.copy()
-        new_instance.stats = {k: v.copy() for k, v in self.stats.items()}
-        new_instance.stats_default_value = self.stats_default_value.copy()
-        # new_instance.union = self.union.copy() if self.union is not None else None
-        return new_instance
+        """Copy assignment state; the caller rebuilds the derived union."""
+        result = Assignments()
+
+        for key, value in self.__dict__.items():
+            if key in {"union", "_common_spatial_cache"}:
+                continue
+
+            setattr(result, key, deepcopy(value))
+
+        result._common_spatial_cache = None
+        return result
 
     def copy_prefix(self, from_session_id: int):
         """Copy assignments before from_session_id, preserving session columns."""

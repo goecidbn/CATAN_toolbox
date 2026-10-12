@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from functools import partial
 import traceback
+from html import escape
 
 import numpy as np
 import numbers
@@ -17,6 +18,9 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFrame,
     QVBoxLayout,
+    QToolButton,
+    QMenu,
+    QCheckBox,
 )
 from PySide6.QtGui import (
     QCursor,
@@ -32,6 +36,7 @@ from catan.core.changes import (
 from catan.gui.panels import StatisticsData
 from catan.gui.panels.helper import HistogramMesh, series_with_confidence, ControlPanel
 
+from catan.gui.background_tasks.runtime import current_task_context
 
 from catan.gui.data.statistics.engine import StatisticsTaskResult
 from catan.gui.data.statistics.errors import StatisticsPlotError
@@ -45,6 +50,16 @@ from catan.gui.data.statistics import (
 from catan.gui.structures.state import NeuronComponent
 from catan.gui.panels import BasePlot
 from catan.gui.panels.helper import Threshold, ReviewStatusFilter
+from catan.gui.data.assignment_colors import (
+    assignment_color,
+    assignment_label,
+    assignment_shade,
+)
+from catan.gui.data.statistics.plotdata_comparison import (
+    ASSIGNMENTS_REF,
+    ComparisonHistogram,
+    ComparisonScatter,
+)
 
 from catan.gui.background_tasks.runtime import TaskCancelled
 import catan.gui.data.curation_filter as curation_filter
@@ -63,12 +78,14 @@ SERIES_BAND_ALPHA = 0.18
 SeriesPoint = tuple[str, int]
 VisualIndex = int | SeriesPoint
 
+
 @dataclass
 class RectangleData:
 
     center: Tuple[float, float]
     width: float
     height: float
+    color: object = None
 
 
 class DisplaySignals(QObject):
@@ -146,6 +163,7 @@ class Display(BasePlot.BaseCanvas):
         }
 
         self.hist_base_layer = None
+        self.hist_bar_bounds = None
         self.hist_selected_layer = None
 
         self._hovered_series_session_id = None
@@ -160,6 +178,22 @@ class Display(BasePlot.BaseCanvas):
 
         self.events.resize.connect(self._on_canvas_resize)
         self.view.scene.transform.changed.connect(self._on_view_transform_changed)
+
+        self.assignment_legend = Text(
+            text="",
+            parent=self.view,
+            anchor_x="right",
+            anchor_y="center",
+            font_size=10,
+            color="#38404a",
+        )
+        self.assignment_legend_swatches = Markers(parent=self.view)
+        self.assignment_legend_swatches.visible = False
+        self.assignment_legend_swatch_colors = np.empty(
+            (0, 4),
+            dtype=np.float32,
+        )
+        self.assignment_legend.visible = False
 
         self.freeze()
 
@@ -200,6 +234,8 @@ class Display(BasePlot.BaseCanvas):
 
         if self.error_overlay.isVisible():
             self._position_error_overlay()
+
+        self.position_assignment_legend()
 
     def _on_view_transform_changed(self, event=None):
         if self.thresholds:
@@ -442,6 +478,49 @@ class Display(BasePlot.BaseCanvas):
 
         self.status_progress_bg.width = self._status_progress_width
 
+    def position_assignment_legend(self):
+        legend = self.assignment_legend
+
+        if not legend.visible:
+            return
+
+        text_count = len(legend.text)
+        right = max(24, self.view.size[0] - 12)
+
+        row_centres = 18 + 18 * np.arange(text_count, dtype=np.float32)
+
+        legend.pos = np.column_stack(
+            (
+                np.full(text_count, right - 16, dtype=np.float32),
+                row_centres,
+            )
+        )
+
+        colors = self.assignment_legend_swatch_colors
+        swatch_count = min(len(colors), text_count)
+
+        if swatch_count == 0:
+            self.assignment_legend_swatches.visible = False
+            return
+
+        self.assignment_legend_swatches.set_data(
+            pos=np.column_stack(
+                (
+                    np.full(
+                        swatch_count,
+                        right - 4,
+                        dtype=np.float32,
+                    ),
+                    row_centres[:swatch_count],
+                )
+            ),
+            face_color=colors[:swatch_count],
+            edge_width=0,
+            symbol="square",
+            size=8,
+        )
+        self.assignment_legend_swatches.visible = True
+
     def _set_status_progress(
         self,
         progress: int | None,
@@ -558,24 +637,23 @@ class Display(BasePlot.BaseCanvas):
         bin_counts = np.asarray(self.plot_data.bin_counts, dtype=np.float32)
         n_bins = len(bin_counts)
 
+        self.hist_bar_bounds = self._histogram_bar_bounds()
+        hover_colors = self._histogram_colors("hovered")
+
         # build the rectangles for the histogram bars
         for k in range(n_bins):
-            x0 = bin_edges[k]
-            x1 = bin_edges[k + 1]
+            x0, x1 = self.hist_bar_bounds[k]
             h = bin_counts[k]
 
             self.plotting["data"][k] = RectangleData(
                 center=(0.5 * (x0 + x1), 0.5 * h),
                 width=x1 - x0,
                 height=h,
+                color=hover_colors[k],
             )
 
-        default_color = self.styles.get_color_array("default")
-        selected_overlay_color = self.styles.get_color_array("selected", alpha=0.65)
-
-        # print(f"{n_bins=}")
-        base_colors = np.tile(default_color, (n_bins, 1))
-        selected_overlay_color = np.tile(selected_overlay_color, (n_bins, 1))
+        base_colors = self._histogram_colors("default")
+        selected_overlay_color = self._histogram_colors("selected")
 
         # Optional: make zero-height bars fully transparent.
         zero_mask = bin_counts <= 0
@@ -593,17 +671,19 @@ class Display(BasePlot.BaseCanvas):
             bin_edges=bin_edges,
             counts=bin_counts,
             bin_colors=base_colors,
+            bar_bounds=self.hist_bar_bounds,
         )
 
         self.hist_selected_layer = HistogramMesh.HistogramMeshLayer(
             parent=self.plot_root,
-            order=110.0,
+            order=90.0,
             draw_edges=False,
         )
         self.hist_selected_layer.build_from_counts(
             bin_edges=bin_edges,
             counts=np.zeros_like(bin_counts),
             bin_colors=selected_overlay_color,
+            bar_bounds=self.hist_bar_bounds,
         )
         self.hist_selected_layer.set_visible(False)
 
@@ -621,6 +701,45 @@ class Display(BasePlot.BaseCanvas):
 
         self._init_threshold_overlays(kind="histogram")
         self.update()
+
+    def _histogram_bar_bounds(self):
+        plot_data = self.plot_data
+
+        if isinstance(plot_data, ComparisonHistogram):
+            edges = plot_data.shared_edges
+            dataset_count = len(plot_data.names)
+        else:
+            edges = plot_data.bin_edges
+            dataset_count = 1
+
+        widths = np.diff(edges)
+        group_gap = 0.10
+
+        left = edges[:-1] + 0.5 * group_gap * widths
+        bar_width = (1.0 - group_gap) * widths / dataset_count
+
+        return np.asarray(
+            [
+                (
+                    start + dataset * width,
+                    start + (dataset + 1) * width,
+                )
+                for start, width in zip(left, bar_width)
+                for dataset in range(dataset_count)
+            ],
+            dtype=np.float32,
+        )
+
+    def _histogram_colors(self, style):
+        if isinstance(self.plot_data, ComparisonHistogram):
+            colors = self.plot_data.bar_colors
+        else:
+            colors = np.tile(
+                assignment_color(self.data.current_assignments),
+                (len(self.plot_data.bin_counts), 1),
+            )
+
+        return assignment_shade(colors, style)
 
     def _draw_session_series(self):
 
@@ -827,6 +946,7 @@ class Display(BasePlot.BaseCanvas):
 
         style = "default" if self.state.selected_components is None else "background"
         plot_options = self.styles.get_plot_options(style, "marker", 0.7, size=5.0)
+        plot_options.update(self._scatter_colors("default"))
 
         self.plotting["visuals"]["base"] = visuals.Markers(
             pos=np.column_stack((self.plot_data.x, self.plot_data.y)),
@@ -855,6 +975,18 @@ class Display(BasePlot.BaseCanvas):
         self._init_threshold_overlays(kind="scatter")
 
         self.update()
+
+    def _scatter_colors(self, style):
+        if isinstance(self.plot_data, ComparisonScatter):
+            x_name, y_name = self.plot_data.names
+        else:
+            x_name = y_name = self.data.current_assignments
+
+        return {
+            "face_color": assignment_shade(assignment_color(x_name), style),
+            "edge_color": assignment_shade(assignment_color(y_name), style),
+            "edge_width": 1.0,
+        }
 
     def _init_threshold_overlays(self, kind: str):
         self._destroy_threshold_overlays()
@@ -1042,30 +1174,31 @@ class Display(BasePlot.BaseCanvas):
 
         return None
 
-    def find_bin_from_data(self, data_pos) -> Optional[int]:
-        """
-        Given data coords x_data, y_data, return bin index (int) or None.
-        We require x within bin range and y >= 0 and y <= bar height.
-        """
-        assert isinstance(self.plot_data, plotdata_histogram.PlotData)
-
-        nbins = int(self.controls["bin_selector"].value())
-        if self.plot_data is None or nbins == 0:
+    def find_bin_from_data(self, data_pos):
+        if (
+            not isinstance(self.plot_data, plotdata_histogram.PlotData)
+            or self.hist_bar_bounds is None
+        ):
             return None
 
-        # Find bin where x is inside [edge_k, edge_k+1)
-        k = np.searchsorted(self.plot_data.bin_edges, data_pos[0], side="right") - 1
+        x, y = data_pos[:2]
+        bounds = self.hist_bar_bounds
 
-        # if k < 0 or k >= nbins:
-        if not (k in self.plotting["data"]):
+        index = np.searchsorted(bounds[:, 0], x, side="right") - 1
+
+        if not 0 <= index < len(bounds):
             return None
 
-        # only pick bin, if mouse is on bin
-        h = self.plot_data.bin_counts[k]
-        if h != 0 and (data_pos[1] < 0 or data_pos[1] > h):
+        # Ignore the gaps between groups.
+        if x > bounds[index, 1]:
             return None
 
-        return int(k)
+        height = self.plot_data.bin_counts[index]
+
+        if height <= 0 or y < 0 or y > height:
+            return None
+
+        return int(index)
 
     def find_marker_from_data(self, data_pos) -> Optional[int]:
         if not isinstance(
@@ -1253,6 +1386,7 @@ class Display(BasePlot.BaseCanvas):
                 "center": rec.center,
                 "width": rec.width,
                 "height": rec.height,
+                "color": rec.color,
             }
 
         if isinstance(self.plot_data, plotdata_scatter.PlotData):
@@ -1270,6 +1404,9 @@ class Display(BasePlot.BaseCanvas):
                 size=8.0,
                 edge_width=0.0,
             )
+
+            if style in {"selected", "focused", "hovered"}:
+                plot_options.update(self._scatter_colors(style))
 
             return {"pos": pos, **plot_options}
 
@@ -1305,7 +1442,9 @@ class Display(BasePlot.BaseCanvas):
 
         self.state.timeit()
 
-        if self.state.selected_components is None:
+        if self.state.selected_components is None and not isinstance(
+            plot_data, ComparisonHistogram
+        ):
             selected_counts = np.zeros_like(plot_data.bin_counts, dtype=int)
             selected_bins = np.asarray([], dtype=int)
         else:
@@ -1329,33 +1468,8 @@ class Display(BasePlot.BaseCanvas):
         self.state.timeit("updated histogram mesh selection")
 
     def _histogram_base_colors_for_selection(self, selected_bins):
-        """
-        helper function to define colors for histogram
-        """
-        assert isinstance(self.plot_data, plotdata_histogram.PlotData)
-
-        n_bins = len(self.plot_data.bin_counts)
-        bin_counts = np.asarray(self.plot_data.bin_counts)
-
-        selected_bins = np.asarray(selected_bins, dtype=int)
-
-        highlighted = np.zeros(n_bins, dtype=bool)
-
-        if selected_bins.size > 0:
-            highlighted[selected_bins] = True
-
-        has_selection = highlighted.any()
-        base_style = "background" if has_selection else "default"
-
-        selected_color = self.styles.get_color_array("selected", alpha=0.4)
-        base_color = self.styles.get_color_array(base_style)
-
-        colors = np.tile(base_color, (n_bins, 1))
-        colors[highlighted] = selected_color
-
-        # Optional: keep empty bins invisible.
-        colors[bin_counts <= 0, 3] = 0.0
-
+        colors = self._histogram_colors("default")
+        colors[self.plot_data.bin_counts <= 0, 3] = 0.0
         return colors
 
     # def highlight_markers_from_selection(self):
@@ -1769,6 +1883,11 @@ class Controller(BasePlot.CanvasController):
             "y": None,
             "y_2nd": None,
         }
+        self._statistic_tokens = {
+            "x": None,
+            "y": None,
+            "y_2nd": None,
+        }
 
         self.statistic_progress: dict[str, int | None] = {
             "x": None,
@@ -1779,10 +1898,13 @@ class Controller(BasePlot.CanvasController):
         self.displayed_results = {}
         self.current_plot_data = None
 
-        self.connect_signal(self.state.tasks.task_progress,self._on_task_progress)
-        self.connect_signal(self.state.tasks.task_cancelled,self._on_statistics_task_stopped)
-        self.connect_signal(self.state.tasks.task_failed,self._on_statistics_task_stopped)
-
+        self.connect_signal(self.state.tasks.task_progress, self._on_task_progress)
+        self.connect_signal(
+            self.state.tasks.task_cancelled, self._on_statistics_task_stopped
+        )
+        self.connect_signal(
+            self.state.tasks.task_failed, self._on_statistics_task_stopped
+        )
 
     def build_controls(self):
         super().build_controls()
@@ -1801,11 +1923,16 @@ class Controller(BasePlot.CanvasController):
         bin_selector.setRange(2.0, 100.0)
         bin_selector.setSingleStep(1)
         bin_selector.setValue(initial_nbin)
+
         self.controls["bin_selector"] = bin_selector
         self.controls["bin_label"] = QLabel("Histogram bins:")
 
-        self.section.x_options_layout.addWidget(self.controls["bin_label"])
-        self.section.x_options_layout.addWidget(self.controls["bin_selector"])
+        self.controls["panel"].form.addRow(
+            self.controls["bin_label"], self.controls["bin_selector"]
+        )
+
+        self.controls["bin_selector"].hide()
+        self.controls["bin_label"].hide()
 
         self.controls["x_selector"] = StatisticsData.StatisticQuerySelector(
             engine=self.data.statistic_engine, axis="x"
@@ -1837,13 +1964,54 @@ class Controller(BasePlot.CanvasController):
         self.section.y_options_layout.addStretch()
 
         self.controls["bin_selector"].valueChanged.connect(self._on_plot_params_changed)
-        self.connect_signal(self.canvas.signals.marker_hovered, self._on_marker_hovered,controls=True)
-        self.connect_signal(self.canvas.signals.marker_clicked, self._on_visual_clicked,controls=True)
-        self.connect_signal(self.canvas.signals.bin_clicked, self._on_visual_clicked,controls=True)
+        self.connect_signal(
+            self.canvas.signals.marker_hovered, self._on_marker_hovered, controls=True
+        )
+        self.connect_signal(
+            self.canvas.signals.marker_clicked, self._on_visual_clicked, controls=True
+        )
+        self.connect_signal(
+            self.canvas.signals.bin_clicked, self._on_visual_clicked, controls=True
+        )
 
-        self.connect_signal(self.data.statistic_engine.values_changed, self._on_statistics_values_changed, controls=True)
-        
+        self.connect_signal(
+            self.data.statistic_engine.values_changed,
+            self._on_statistics_values_changed,
+            controls=True,
+        )
+
         self.canvas._on_threshold_changed = self._on_threshold_changed
+
+        comparison_button = QToolButton()
+        comparison_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+
+        comparison_menu = QMenu(comparison_button)
+        comparison_menu.aboutToShow.connect(self._populate_comparison_menu)
+        comparison_button.setMenu(comparison_menu)
+
+        self.controls["comparison_button"] = comparison_button
+        self.controls["comparison_menu"] = comparison_menu
+
+        self.controls["panel"].form.addRow(
+            "Assignments",
+            comparison_button,
+        )
+
+        compare_scatter = QCheckBox("Compare assignments")
+        compare_scatter.setChecked(bool(self.config.get("compare_scatter", False)))
+        compare_scatter.toggled.connect(self._set_scatter_comparison)
+
+        self.controls["compare_scatter"] = compare_scatter
+        self.controls["panel"].form.addRow(compare_scatter)
+
+        for slot in ("x", "y"):
+            selector = self.controls[f"{slot}_selector"]
+            selector.assignment_name = self.config.get(f"scatter_assignments_{slot}")
+            selector.assignmentChanged.connect(
+                lambda name, slot=slot: self._set_scatter_assignment(slot, name)
+            )
+
+        self._sync_comparison_controls()
 
     def _on_data_changed(self, event: DataChange):
         if event.has(
@@ -1855,7 +2023,14 @@ class Controller(BasePlot.CanvasController):
         ):
             self._sync_review_selector_to_selection()
 
+        if self._uses_assignment_comparison():
+            self.recalculate_statistics(force=True)
+
     def _on_statistics_values_changed(self, statistic_keys):
+
+        if self._uses_assignment_comparison():
+            return
+
         for slot, query in tuple(self.current_query.items()):
             if query is not None and query.statistic_key in statistic_keys:
                 self._recalculate_statistic(slot)
@@ -1933,7 +2108,43 @@ class Controller(BasePlot.CanvasController):
             self.controls["x_selector"].set_query_mode("generic")
             self.controls["x_selector"].set_query_preparer(None)
 
-        self.recalculate_statistics(which)
+        self._sync_comparison_controls()
+        self.recalculate_statistics()
+
+    def _scatter_comparison_enabled(self):
+        return self.plot_type == "scatter" and bool(
+            self.config.get("compare_scatter", False)
+        )
+
+    def _set_scatter_comparison(self, enabled):
+        self.config["compare_scatter"] = bool(enabled)
+        self._sync_comparison_controls()
+        self.recalculate_statistics(force=True)
+
+    def _set_scatter_assignment(self, slot, name):
+        self.config[f"scatter_assignments_{slot}"] = name
+
+        if self._scatter_comparison_enabled():
+            self._recalculate_statistic(slot, force=True)
+
+    def _assignment_names_for_slot(self, slot):
+        if self.plot_type == "histogram" and slot == "x":
+            return self._histogram_assignment_names()
+
+        if self._scatter_comparison_enabled() and slot in {"x", "y"}:
+            name = (
+                self.config.get(f"scatter_assignments_{slot}")
+                or self.data.current_assignments
+            )
+            return (name,) if name is not None else ()
+
+        return ()
+
+    def _uses_assignment_comparison(self):
+        return (
+            bool(self._histogram_assignment_names())
+            or self._scatter_comparison_enabled()
+        )
 
     def recalculate_statistics(
         self,
@@ -1953,10 +2164,11 @@ class Controller(BasePlot.CanvasController):
 
                 task_id = self.statistic_tasks[slot]
                 self.statistic_tasks[slot] = None
+                self._statistic_tokens[slot] = None
 
                 if task_id is not None:
                     self.state.tasks.cancel(task_id)
-        
+
         if which is None:
             slots = tuple(
                 slot for slot, query in self.current_query.items() if query is not None
@@ -1976,18 +2188,17 @@ class Controller(BasePlot.CanvasController):
         *,
         force: bool = False,
     ):
-        """
-        Recalculates the statistic for the specified slot
-        and cancels any obsolete tasks.
-        """
-
         query = (
             self.current_query[which]
             if which in self._required_statistic_slots()
             else None
         )
 
-        # Cancel obsolete task for THIS slot.
+        # Invalidate callbacks from an older task, even if its query happens
+        # to equal the new query.
+        token = object()
+        self._statistic_tokens[which] = token
+
         old_task = self.statistic_tasks[which]
 
         if old_task is not None:
@@ -2006,35 +2217,60 @@ class Controller(BasePlot.CanvasController):
             not force
             and existing is not None
             and existing.query == query
-            and existing.statistic_revision == self.data.statistic_engine.query_revision(query)
+            and existing.statistic_revision
+            == self.data.statistic_engine.query_revision(query)
+            and self._result_context_matches(existing)
         ):
             self.rebuild_plot()
             return
 
         self.current_results[which] = None
-        existing = None
         self._release_plot_data()
 
-        # Important: snapshot the query.
         requested_query = query
-        requested_revision = self.data.statistic_engine.query_revision(
-            requested_query
-        )
+        requested_revision = self.data.statistic_engine.query_revision(query)
+        requested_names = self._assignment_names_for_slot(which)
+        requested_version = self.state.data_version if requested_names else None
 
         def evaluate():
+            ctx = current_task_context()
 
             try:
-                table = self.data.statistic_engine.evaluate_table(requested_query)
+                if requested_names:
+                    table = {}
+
+                    for name in requested_names:
+                        ctx.check_cancelled()
+                        ctx.message(f"Calculating statistics: {name}")
+
+                        result_table = (
+                            self.data.statistic_engine.evaluate_assignment_table(
+                                requested_query,
+                                name,
+                            )
+                        )
+
+                        if result_table is None:
+                            raise ValueError(
+                                f"{name}: the requested statistic has no data."
+                            )
+
+                        table[name] = result_table
+
+                    ctx.check_cancelled()
+                else:
+                    table = self.data.statistic_engine.evaluate_table(requested_query)
 
                 return StatisticsTaskResult(
                     slot=which,
                     query=requested_query,
                     statistic_revision=requested_revision,
                     table=table,
+                    assignment_names=requested_names,
+                    data_version=requested_version,
                 )
 
             except TaskCancelled:
-                # Important: let Worker handle cancellation.
                 raise
 
             except Exception as exc:
@@ -2042,20 +2278,27 @@ class Controller(BasePlot.CanvasController):
                     slot=which,
                     query=requested_query,
                     statistic_revision=requested_revision,
-                    error=(f"{type(exc).__name__}: {exc}"),
+                    assignment_names=requested_names,
+                    data_version=requested_version,
+                    error=f"{type(exc).__name__}: {exc}",
                     traceback=traceback.format_exc(),
                 )
+
+        def accept_result(result):
+            if self._statistic_tokens[which] is token and isinstance(
+                result, StatisticsTaskResult
+            ):
+                self._on_statistic_ready(result)
 
         task_id = self.state.tasks.start(
             "calculating",
             f"Calculate {which}: {requested_query.statistic_key}",
             evaluate,
-            on_result=self._on_statistic_ready,
+            on_result=accept_result,
             background=True,
         )
 
         self.statistic_tasks[which] = task_id
-
         self.statistic_progress[which] = None
         self._update_statistics_status()
 
@@ -2095,7 +2338,7 @@ class Controller(BasePlot.CanvasController):
     ):
         if self._deactivated:
             return
-        
+
         which = result.slot
         if which not in self._required_statistic_slots():
             return
@@ -2105,10 +2348,15 @@ class Controller(BasePlot.CanvasController):
             return
 
         # Data changed while this calculation was running.
-        if (
-            result.statistic_revision
-            != self.data.statistic_engine.query_revision(result.query)
+        if result.statistic_revision != self.data.statistic_engine.query_revision(
+            result.query
         ):
+            return
+
+        if not self._result_context_matches(result):
+            self.statistic_tasks[which] = None
+            self.statistic_progress[which] = None
+            self._update_statistics_status()
             return
 
         self.statistic_tasks[which] = None
@@ -2129,7 +2377,9 @@ class Controller(BasePlot.CanvasController):
         return (
             result is not None
             and result.query == query
-            and result.statistic_revision == self.data.statistic_engine.query_revision(query)
+            and result.statistic_revision
+            == self.data.statistic_engine.query_revision(query)
+            and self._result_context_matches(result)
         )
 
     def _required_statistic_slots(self):
@@ -2151,6 +2401,146 @@ class Controller(BasePlot.CanvasController):
             return tuple(slots)
 
         return ()
+
+    def _histogram_assignment_names(self):
+        if self.plot_type != "histogram":
+            return ()
+
+        return tuple(dict.fromkeys(self.config.get("histogram_assignments", ())))
+
+    def _populate_comparison_menu(self):
+        menu = self.controls["comparison_menu"]
+        menu.clear()
+
+        selected = set(self.config.get("histogram_assignments", ()))
+
+        follow_action = menu.addAction("Follow active assignments")
+        follow_action.setCheckable(True)
+        follow_action.setChecked(not selected)
+        follow_action.triggered.connect(
+            lambda checked=False: self._set_histogram_assignments(())
+        )
+
+        menu.addSeparator()
+
+        # Keep unavailable configured names visible so they can be unchecked.
+        names = sorted(
+            set(self.data.available_assignments) | selected,
+            key=str.casefold,
+        )
+
+        for name in names:
+            available = name in self.data._assignments
+            label = assignment_label(name)
+
+            if not available:
+                label += " — not loaded"
+
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(name in selected)
+            action.toggled.connect(
+                lambda checked, name=name: self._toggle_histogram_assignment(
+                    name, checked
+                )
+            )
+
+    def _toggle_histogram_assignment(self, name, checked):
+        names = list(self.config.get("histogram_assignments", ()))
+
+        if checked and name not in names:
+            names.append(name)
+        elif not checked:
+            names = [item for item in names if item != name]
+
+        self._set_histogram_assignments(names)
+
+    def _set_histogram_assignments(self, names):
+        self.config["histogram_assignments"] = list(dict.fromkeys(names))
+        self._sync_comparison_controls()
+
+        if self.plot_type == "histogram":
+            self._recalculate_statistic("x", force=True)
+
+    def _sync_comparison_controls(self):
+        button = self.controls.get("comparison_button")
+
+        if button is None:
+            return
+
+        names = tuple(self.config.get("histogram_assignments", ()))
+        button.setVisible(self.plot_type == "histogram")
+
+        if names:
+            button.setText(f"Assignments ({len(names)})")
+            button.setToolTip("\n".join(assignment_label(name) for name in names))
+        else:
+            button.setText("Assignments: active")
+            button.setToolTip("Follow the assignments selected in the navigation bar.")
+
+        checkbox = self.controls.get("compare_scatter")
+
+        if checkbox is not None:
+            checkbox.setVisible(self.plot_type == "scatter")
+
+        enabled = self._scatter_comparison_enabled()
+
+        for slot in ("x", "y"):
+            selector = self.controls.get(f"{slot}_selector")
+
+            if selector is not None:
+                selector.assignment_selection_enabled = enabled
+
+    def _update_comparison_legend(self):
+        legend = self.canvas.assignment_legend
+        plot_data = self.current_plot_data
+
+        if isinstance(plot_data, ComparisonHistogram):
+            labels = [assignment_label(name) for name in plot_data.names]
+            colors = plot_data.dataset_colors
+
+        elif isinstance(plot_data, ComparisonScatter):
+            labels = [
+                f"X: {assignment_label(plot_data.names[0])}",
+                f"Y: {assignment_label(plot_data.names[1])}",
+                (
+                    f"{plot_data.n_markers} points; "
+                    f"{plot_data.unmatched_count} X neurons unmatched"
+                ),
+            ]
+            colors = np.asarray(
+                [
+                    assignment_color(plot_data.names[0]),
+                    assignment_color(plot_data.names[1]),
+                    (0.22, 0.25, 0.29, 1.0),
+                ]
+            )
+
+        else:
+            legend.visible = False
+            self.canvas.assignment_legend_swatches.visible = False
+            return
+
+        legend.text = labels
+        legend.color = colors
+        legend.visible = True
+
+        # Scatter has an additional summary line, without a swatch.
+        swatch_count = len(plot_data.names)
+
+        self.canvas.assignment_legend_swatch_colors = np.asarray(
+            colors[:swatch_count],
+            dtype=np.float32,
+        )
+        self.canvas.assignment_legend_swatches.visible = True
+        self.canvas.position_assignment_legend()
+
+    def _result_context_matches(self, result):
+        expected_names = self._assignment_names_for_slot(result.slot)
+
+        return result.assignment_names == expected_names and (
+            not expected_names or result.data_version == self.state.data_version
+        )
 
     def identify_plot_type(self):
         x_query = self.current_query["x"]
@@ -2272,11 +2662,18 @@ class Controller(BasePlot.CanvasController):
     ):
 
         if self.plot_type == "histogram":
-
             nbins = int(self.controls["bin_selector"].value())
+            histogram_tables = tables["x"]
+
+            if isinstance(histogram_tables, dict):
+                return ComparisonHistogram(
+                    histogram_tables,
+                    bins=nbins,
+                    data=self.data,
+                )
 
             return plotdata_histogram.build_plot_data(
-                tables["x"],
+                histogram_tables,
                 bins=nbins,
             )
 
@@ -2288,6 +2685,17 @@ class Controller(BasePlot.CanvasController):
             )
 
         if self.plot_type == "scatter":
+            if self._scatter_comparison_enabled():
+                x_name = self._assignment_names_for_slot("x")[0]
+                y_name = self._assignment_names_for_slot("y")[0]
+
+                return ComparisonScatter(
+                    tables["x"][x_name],
+                    tables["y"][y_name],
+                    x_name,
+                    y_name,
+                    self.data,
+                )
 
             return plotdata_scatter.build_plot_data(
                 x_table=tables["x"],
@@ -2313,7 +2721,7 @@ class Controller(BasePlot.CanvasController):
 
     def update_canvas(self):
         self.canvas.set_plot_data(self.current_plot_data)
-
+        self._update_comparison_legend()
         self.update_neuron_selection()
 
     def update_neuron_selection(self):
@@ -2355,23 +2763,38 @@ class Controller(BasePlot.CanvasController):
         self._handle_picked_ref_sets(ref_sets, modifiers)
 
     def _on_marker_hovered(self, marker_id):
-
         plot_data = self.current_plot_data
 
         if marker_id is None or not isinstance(plot_data, plotdata_scatter.PlotData):
             self.state.update_hovered_components(None)
             return
 
-        rows = plot_data.rows_for_markers(marker_id)
+        ref_sets = plot_data.ref_sets_for_rows(plot_data.rows_for_markers(marker_id))
 
-        ref_sets = plot_data.ref_sets_for_rows(rows)
+        if isinstance(plot_data, ComparisonScatter):
+            preferred = (
+                self.data.current_assignments
+                if self.data.current_assignments in plot_data.names
+                else plot_data.names[0]
+            )
 
-        components = set()
+            refs = next(refs for refs in ref_sets if refs[ASSIGNMENTS_REF] == preferred)
 
-        for refs in ref_sets:
-            components.update(self._components_from_refs(refs))
+            components = plot_data.map_components(
+                self._components_from_refs({"neuron": refs["neuron"]}),
+                preferred,
+                self.data.current_assignments,
+            )
+        else:
+            components = list(
+                {
+                    component
+                    for refs in ref_sets
+                    for component in self._components_from_refs(refs)
+                }
+            )
 
-        self.state.update_hovered_components(list(components) if components else None)
+        self.state.update_hovered_components(components or None)
 
     def _on_threshold_changed(self, spec: Threshold.ThresholdSpec):
         self._select_from_threshold()
@@ -2413,26 +2836,87 @@ class Controller(BasePlot.CanvasController):
             self._handle_picked_ref_sets(ref_sets, [])
             return
 
-    def _handle_picked_ref_sets(
-        self,
-        ref_sets: tuple[dict[str, np.ndarray], ...] | None,
-        modifiers,
-    ):
+    def _handle_picked_ref_sets(self, ref_sets, modifiers):
+        plot_data = self.current_plot_data
+        comparison = isinstance(plot_data, (ComparisonHistogram, ComparisonScatter))
 
         if ref_sets is None:
+            if comparison:
+                plot_data.local_selection = None
+
             self.state.update_selected_components(None, modifiers)
+            self.update_neuron_selection()
             return
 
         components = set()
+        local_components = {}
 
         for refs in ref_sets:
-            components.update(self._components_from_refs(refs))
+            assignment_name = refs.get(
+                ASSIGNMENTS_REF,
+                self.data.current_assignments,
+            )
 
-        if components:
+            component_refs = {
+                key: value for key, value in refs.items() if key != ASSIGNMENTS_REF
+            }
+
+            selected = self._components_from_refs(component_refs)
+
+            if comparison:
+                local_components.setdefault(assignment_name, []).extend(selected)
+
+                components.update(
+                    plot_data.map_components(
+                        selected,
+                        assignment_name,
+                        self.data.current_assignments,
+                    )
+                )
+            else:
+                components.update(selected)
+
+        if isinstance(plot_data, ComparisonScatter):
+            # Prefer the identities belonging directly to the active dataset.
+            # Translating both sides independently can otherwise select an
+            # additional neuron when the best match is not reciprocal.
+            origin_name = (
+                self.data.current_assignments
+                if self.data.current_assignments in local_components
+                else plot_data.names[0]
+            )
+
+            components = set(
+                plot_data.map_components(
+                    local_components.get(origin_name, ()),
+                    origin_name,
+                    self.data.current_assignments,
+                )
+            )
+
+        if comparison:
+            if modifiers:
+                # Modified clicks retain the existing active-selection
+                # toggle/add semantics.
+                plot_data.local_selection = None
+            else:
+                # Keep the clicked dataset's exact identities, including
+                # neurons that have no active counterpart.
+                plot_data.local_selection = (
+                    {
+                        name: list(dict.fromkeys(selected))
+                        for name, selected in local_components.items()
+                    },
+                    frozenset(components),
+                )
+
+        if components or (comparison and not modifiers):
             self.state.update_selected_components(
-                list(components),
+                list(components) or None,
                 modifiers,
             )
+
+        self.update_neuron_selection()
 
     def _components_from_refs(
         self,
@@ -2451,17 +2935,13 @@ class Controller(BasePlot.CanvasController):
 
         refs = {key: np.atleast_1d(value) for key, value in refs.items()}
 
-        component_keys: set[tuple[int, int]] = set()
+        component_keys: set[tuple[int | None, int]] = set()
 
         def add_components(neuron_key: str, session_key: str | None):
             neurons = np.asarray(refs[neuron_key]).reshape(-1)
 
             if session_key is None:
-                sessions = np.full(
-                    neurons.shape,
-                    self.state.current_session_id,
-                    dtype=int,
-                )
+                sessions = np.full(neurons.shape, None, dtype=object)
 
             else:
                 sessions = np.asarray(refs[session_key]).reshape(-1)
@@ -2474,7 +2954,10 @@ class Controller(BasePlot.CanvasController):
                     )
 
             component_keys.update(
-                (int(session_id), int(neuron_id))
+                (
+                    None if session_id is None else int(session_id),
+                    int(neuron_id),
+                )
                 for session_id, neuron_id in zip(sessions, neurons)
             )
 
@@ -2552,7 +3035,13 @@ class Controller(BasePlot.CanvasController):
             if result is None:
                 continue
 
-            if result.table is not None:
+            if isinstance(result.table, dict):
+                first_table = next(iter(result.table.values()))
+                title = first_table.stat.display_title
+                title += " — " + ", ".join(
+                    assignment_label(name) for name in result.assignment_names
+                )
+            elif result.table is not None:
                 title = result.table.stat.display_title
             else:
                 # Fallback for failed/incomplete results.
@@ -2778,13 +3267,12 @@ class Controller(BasePlot.CanvasController):
 
     def _cancel_background_tasks(self):
         task_ids = tuple(
-            task_id
-            for task_id in self.statistic_tasks.values()
-            if task_id is not None
+            task_id for task_id in self.statistic_tasks.values() if task_id is not None
         )
 
         for slot in self.statistic_tasks:
             self.statistic_tasks[slot] = None
+            self._statistic_tokens[slot] = None
 
         for task_id in task_ids:
             self.state.tasks.cancel(task_id)
@@ -2795,6 +3283,8 @@ class Controller(BasePlot.CanvasController):
         self.canvas.plot_data = None
         self.current_plot_data = None
         self.displayed_results = {}
+
+        self._update_comparison_legend()
 
 
 class StatisticsControlPanel(ControlPanel.ControlPanel):

@@ -1713,10 +1713,15 @@ class Tracking:
         ## shift union footprints to "new" location of neuron to ensure proper union construction
         if shifts is None:
             shifts = np.zeros((nA_post, 2))
+
+        shifts[~np.isfinite(shifts)] = 0.0
+
         distances = np.sqrt(np.square(shifts).sum(axis=-1))
 
         if weights is None:
             weights = np.full(nA_post, 1.0)
+
+        weights[~np.isfinite(weights)] = 0
 
         fp_updated: List[sparse.csc_matrix] = []
         for n_idx, fp_idx in enumerate(assignments_new):

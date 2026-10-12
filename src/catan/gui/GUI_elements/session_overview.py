@@ -85,6 +85,7 @@ class SessionRowWidget(QFrame):
     backgroundRequested = Signal(int)
     manualAlignmentRequested = Signal(int)
     saveIncludedRequested = Signal(int)
+    exportSeedsRequested = Signal(int)
 
     traceToggled = Signal(int)
     qualityToggled = Signal(int)
@@ -707,6 +708,12 @@ class SessionRowWidget(QFrame):
             "Available when at least one footprint is excluded."
         )
 
+        export_seeds = menu.addAction(
+            "Export redetection seeds…",
+            lambda: self.exportSeedsRequested.emit(self.index),
+        )
+        export_seeds.setEnabled(spatial_loaded)
+
         menu.addSeparator()
         remove_action = QAction("Remove session", menu)
         remove_action.triggered.connect(lambda: self.removeRequested.emit(self.index))
@@ -964,7 +971,7 @@ class LoadSessionRowWidget(QFrame):
         self.loading_inspection.message_formatter = self._format_loading_message
         status_layout.addWidget(self.loading_inspection)
 
-        self.loading_status_title.setText("Ready for loading further session data")
+        self.loading_status_title.setText(self._idle_loading_text())
         self.loading_inspection.hide()
         self.loading_status.show()
         root_layout.addWidget(self.loading_status)
@@ -1061,6 +1068,13 @@ class LoadSessionRowWidget(QFrame):
         save_included_action = save_menu.addAction("Save all included data…")
         save_included_action.triggered.connect(self.save_all_included)
 
+        export_seeds_action = save_menu.addAction(
+            "Export redetection seeds for all sessions…"
+        )
+        export_seeds_action.triggered.connect(
+            lambda checked=False: self.export_redetection()
+        )
+
         self.button_save_sessions.setMenu(save_menu)
         self.button_save_sessions.setPopupMode(
             QToolButton.ToolButtonPopupMode.MenuButtonPopup
@@ -1089,6 +1103,7 @@ class LoadSessionRowWidget(QFrame):
         # if data_type == "sessions":
         sessions_loaded = len(self.data.sessions) > 0
         self.button_save_sessions.setEnabled(sessions_loaded)
+        self._refresh_loading_status()
 
     def save_data(self, key):
 
@@ -2118,7 +2133,10 @@ class LoadSessionRowWidget(QFrame):
             return
 
         batch = self._loading_status_batch
+
         if batch is None:
+            self.loading_status_title.setText(self._idle_loading_text())
+            self.loading_inspection.hide()
             return
 
         pending = any(task.batch is batch for task in self.state.tasks.tasks.values())
@@ -2143,7 +2161,7 @@ class LoadSessionRowWidget(QFrame):
                 "configuration, use the session's open-folder button to retry."
             )
         else:
-            self.loading_status_title.setText("Ready for loading further data")
+            self.loading_status_title.setText(self._idle_loading_text())
             self.loading_inspection.label.clear()
             self.loading_inspection.hide()
 
@@ -2237,6 +2255,136 @@ class LoadSessionRowWidget(QFrame):
             return True
 
         return self.data.queue_save_included(session, path) is not None
+
+    def export_redetection(self, session_ids=None):
+        tasks = self.state.tasks
+
+        if (
+            tasks.processing_busy()
+            or tasks.processing_requested
+            or tasks.has_deferred_processing()
+            or self.state.current_request is not None
+        ):
+            self.state.issue(
+                "info",
+                "Export not started",
+                "Finish or cancel processing before exporting seeds.",
+                parent=self.window(),
+            )
+            return
+
+        batch = session_ids is None
+
+        if batch:
+            session_ids = [
+                index
+                for index, session in enumerate(self.data.sessions)
+                if session.path and session.status["spatial_loaded"]
+            ]
+
+        session_ids = list(session_ids)
+
+        if not session_ids:
+            self.state.issue(
+                "info",
+                "Nothing to export",
+                "Load spatial data for at least one session first.",
+                parent=self.window(),
+            )
+            return
+
+        version = self.state.data_version
+        selected_sessions = [self.data.sessions[index] for index in session_ids]
+
+        choices = [
+            "Present included footprints only",
+            "All included neurons, including inferred footprints",
+        ]
+
+        choice, accepted = QInputDialog.getItem(
+            self.window(),
+            "Export redetection seeds",
+            "Footprints to export from the active assignments:",
+            choices,
+            0,
+            False,
+        )
+
+        if not accepted:
+            return
+
+        include_missing = choice == choices[1]
+        jobs = []
+
+        if batch:
+            prefix, accepted = QInputDialog.getText(
+                self.window(),
+                "Export redetection seeds",
+                f"Export {len(selected_sessions)} sessions.\n"
+                "Filename prefix:\n\n"
+                "Each file is saved beside its session source file.\n"
+                "Existing files with these names will be replaced.",
+                text="seeds_",
+            )
+
+            if not accepted:
+                return
+
+            prefix = prefix.strip()
+
+            if not prefix or re.search(r'[<>:"/\\|?*\x00-\x1f]', prefix):
+                self.state.issue(
+                    "warning",
+                    "Invalid filename prefix",
+                    "Enter a non-empty prefix without path separators "
+                    "or special filename characters.",
+                    parent=self.window(),
+                )
+                return
+
+            for session_id, session in zip(session_ids, selected_sessions):
+                source = Path(session.path)
+                destination = source.parent / (prefix + source.stem + ".hdf5")
+                jobs.append((session_id, destination))
+
+        else:
+            session = selected_sessions[0]
+            source = Path(session.path)
+
+            path = choose_path(
+                self,
+                pick_dir=False,
+                init_path=str(source.parent),
+                display_text=(f"Export redetection seeds — {session.name}"),
+                only_existing=False,
+                default_suffix="hdf5",
+                default_filename=f"seeds_{source.stem}.hdf5",
+                file_filters=[
+                    ("HDF5 seed file", ("*.hdf5", "*.h5")),
+                ],
+                state=self.state,
+            )
+
+            if not path:
+                return
+
+            jobs.append((session_ids[0], path))
+
+        # Both dialogs run nested event loops.
+        if self.state.data_version != version:
+            self.state.issue(
+                "warning",
+                "Export not started",
+                "The data changed while the export dialog was open. "
+                "Please start export again.",
+                parent=self.window(),
+            )
+            return
+
+        self.data.queue_export_redetection(
+            jobs,
+            include_missing=include_missing,
+        )
 
     def save_all_included(self):
         tasks = self.state.tasks
@@ -2340,6 +2488,23 @@ class LoadSessionRowWidget(QFrame):
             )
             if task_id is None:
                 break
+
+    def _idle_loading_text(self):
+        count = sum(
+            session is not None
+            and any(
+                session.status.get(key, False)
+                for key in (
+                    "spatial_loaded",
+                    "traces_loaded",
+                    "quality_loaded",
+                )
+            )
+            for session in self.data.sessions
+        )
+
+        noun = "session" if count == 1 else "sessions"
+        return f"{count} {noun} loaded"
 
 
 class SessionList(QListWidget):
@@ -2475,6 +2640,9 @@ class SessionOverview(QWidget):
             lambda session_id: self.load_row.save_included(
                 self.data.sessions[session_id]
             )
+        )
+        row.exportSeedsRequested.connect(
+            lambda session_id: self.load_row.export_redetection([session_id])
         )
 
         row.traceToggled.connect(

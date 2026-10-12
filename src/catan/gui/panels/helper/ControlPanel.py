@@ -219,24 +219,28 @@ class ControlPanel(QWidget):
         self.display_parameter_changed.emit()
 
     def eventFilter(self, obj, event):
-
         if (
             self.toggle_button.isChecked()
             and event.type() == QEvent.Type.MouseButtonPress
         ):
             global_pos = event.globalPosition().toPoint()
 
-            # popup = self.review_filter.menu
-            popup = getattr(getattr(self, "review_filter", None), "menu", None)
+            # Include menus and combo-box popups owned by this panel,
+            # even when they extend beyond the panel's rectangle.
+            popup = QApplication.activePopupWidget()
+            owner = popup
 
-            if popup is not None and popup.isVisible():
-                popup_rect = popup.geometry()
-                if popup_rect.contains(global_pos):
-                    return super().eventFilter(obj, event)
+            while owner is not None:
+                if owner is self:
+                    if popup.rect().contains(popup.mapFromGlobal(global_pos)):
+                        return super().eventFilter(obj, event)
+                    break
 
-            local_pos = self.mapFromGlobal(global_pos)
-            inside_panel = self.rect().contains(local_pos)
+                owner = owner.parent()
+
+            inside_panel = self.rect().contains(self.mapFromGlobal(global_pos))
 
             if not inside_panel:
                 self.toggle_button.setChecked(False)
+
         return super().eventFilter(obj, event)

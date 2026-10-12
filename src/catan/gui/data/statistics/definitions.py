@@ -68,6 +68,7 @@ CALCULATED_STATISTICS = {
             "neuron": ReductionSpec("keep"),
             "session": ReductionSpec("sum"),
         },
+        foreground_safe=True,
     ),
     "centroid_shift": StatisticDefinition(
         key="centroid_shift",

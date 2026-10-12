@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from time import monotonic
 from contextvars import ContextVar, Token
 from typing import Protocol
 from collections.abc import Callable
@@ -16,6 +17,17 @@ class TaskContext:
     progress_callback: Callable[[int], None]
     message_callback: Callable[[str], None]
 
+    _last_progress_value: int | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _last_progress_time: float = field(
+        default=0.0,
+        init=False,
+        repr=False,
+    )
+
     def cancelled(self) -> bool:
         return self.cancel_check()
 
@@ -24,7 +36,24 @@ class TaskContext:
             raise TaskCancelled()
 
     def progress(self, value: int) -> None:
-        self.progress_callback(int(value))
+        value = max(0, min(100, int(value)))
+        previous = self._last_progress_value
+
+        # Repeated integer percentages do not need another UI update.
+        if value == previous:
+            return
+
+        now = monotonic()
+
+        # Forward the first update, completion, and a new phase immediately.
+        immediate = previous is None or value == 100 or value < previous
+
+        if not immediate and now - self._last_progress_time < 0.5:
+            return
+
+        self._last_progress_value = value
+        self._last_progress_time = now
+        self.progress_callback(value)
 
     def message(self, text: str) -> None:
         self.message_callback(text)

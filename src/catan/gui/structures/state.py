@@ -592,10 +592,15 @@ class AppState(QObject):
 
         def remap_components(components):
             result = []
+            seen = set()
+
             for component in components or []:
                 mapped = remap_component(component)
-                if mapped is not None:
+
+                if mapped is not None and mapped not in seen:
+                    seen.add(mapped)
                     result.append(mapped)
+
             return result or None
 
         selected = remap_components(self._selected_components)

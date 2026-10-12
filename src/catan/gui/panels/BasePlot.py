@@ -1,13 +1,14 @@
 from dataclasses import dataclass
 from typing import Generic, List, Optional, TypeVar, Tuple, Literal
 from collections.abc import Callable
+from collections import OrderedDict
 import numpy as np
 from time import perf_counter
 
 from vispy import scene
 from vispy.scene.visuals import Rectangle, Markers, Line
-from PySide6.QtCore import QObject, Signal, QTimer
-from PySide6.QtWidgets import QSizePolicy, QToolTip
+from PySide6.QtCore import Qt, QObject, Signal, QTimer
+from PySide6.QtWidgets import QSizePolicy, QToolTip, QApplication
 from PySide6.QtGui import QCursor
 
 import importlib
@@ -25,37 +26,425 @@ from catan.gui.data.statistics.tabledata import (
     prepare_neuron_table_query,
     prepare_component_table_query,
 )
+from catan.gui.data.statistics.tabledata import prepare_tooltip_query
 from catan.gui.GUI_elements.fragments import SaveDisplayButton
-
-
-@dataclass(slots=True)
-class TooltipStatisticResult:
-    table: PickTable
-    session_dim: str | None
-    row_lookup: dict
-    title: str
-
-    def value_for_component(self, component: NeuronComponent):
-        if self.session_dim is None:
-            key = int(component.neuron_id)
-        else:
-            if component.session_id is None:
-                return np.nan
-
-            key = (
-                int(component.neuron_id),
-                int(component.session_id),
-            )
-
-        row = self.row_lookup.get(key)
-
-        if row is None:
-            return np.nan
-
-        return self.table.values[row]
-
+from catan.gui.background_tasks.runtime import (
+    TaskCancelled,
+    current_task_context,
+)
 
 SelectionType = Literal["selected", "focused", "highlighted", "hovered"]
+PROFILE_TOOLTIP_STATISTICS = False
+
+
+def _calculate_tooltip_values(engine, jobs):
+    ctx = current_task_context()
+
+    lines = []
+
+    for title, query in jobs:
+
+        if PROFILE_TOOLTIP_STATISTICS:
+            started = perf_counter()
+
+        if ctx is not None:
+            ctx.check_cancelled()
+
+        try:
+            if query is None:
+                value = np.nan
+            else:
+                stat = engine.evaluate(query)
+
+                if stat is None:
+                    value = np.nan
+                else:
+                    values = np.asarray(stat.values)
+
+                    if values.size == 0:
+                        value = np.nan
+                    elif values.size == 1:
+                        value = float(values.reshape(-1)[0])
+                    else:
+                        raise ValueError(
+                            "Tooltip query did not reduce to one value: "
+                            f"{values.shape}"
+                        )
+
+            text = f"{value:.4g}" if np.isfinite(value) else "--"
+            lines.append(f"* {title}: {text}")
+
+        except TaskCancelled:
+            raise
+
+        except Exception:
+            engine.state.logger.exception(
+                "Failed to calculate tooltip statistic %r", title
+            )
+            lines.append(f"* {title}: unavailable")
+        finally:
+            if PROFILE_TOOLTIP_STATISTICS:
+                print(
+                    f"[tooltip timing] {title}: "
+                    f"{10**3 * (perf_counter() - started):.3f} ms\n"
+                    f"    {query!r}",
+                    flush=True,
+                )
+
+    if ctx is not None:
+        ctx.check_cancelled()
+
+    return lines
+
+
+def _tooltip_query_is_cheap(query, definition, *, session_count):
+    if query is None:
+        return True
+
+    if not definition.foreground_safe:
+        return False
+
+    # Query-aware getters need their own explicit cost assessment.
+    if definition.query_getter is not None or query.filters:
+        return False
+
+    reductions = query.reduction_dict()
+
+    if any(spec.error_method != "none" for spec in reductions.values()):
+        return False
+
+    session_reducers = {
+        "sum",
+        "mean",
+        "median",
+        "min",
+        "max",
+        "std",
+    }
+
+    for dim in definition.dims:
+        spec = reductions.get(dim)
+
+        if spec is None:
+            return False
+
+        if spec.method == "single":
+            if spec.index is None or spec.index < 0:
+                return False
+            continue
+
+        # Permit a small session reduction while every other
+        # dimension remains fixed to one coordinate.
+        if (
+            dim == "session"
+            and spec.method in session_reducers
+            and session_count <= 256
+        ):
+            continue
+
+        return False
+
+    return True
+
+
+def _tooltip_line_from_stat(title, stat):
+    values = np.asarray(stat.values) if stat is not None else np.empty(0)
+
+    if values.size == 0:
+        value = np.nan
+    elif values.size == 1:
+        value = float(values.reshape(-1)[0])
+    else:
+        raise ValueError(
+            "Tooltip query did not reduce to one value: " f"{values.shape}"
+        )
+
+    text = f"{value:.4g}" if np.isfinite(value) else "--"
+    return f"* {title}: {text}"
+
+
+class TooltipStatistics(QObject):
+    def __init__(self, canvas):
+        super().__init__(canvas.native)
+
+        self.canvas = canvas
+        self.tasks = canvas.state.tasks
+
+        self.component = None
+        self.changed_at = 0.0
+        self.closed = False
+
+        self.cache = OrderedDict()
+        self.task_id = None
+        self.task_key = None
+        self.cancelling = False
+        self.shown_key = None
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(200)
+        self.timer.timeout.connect(self._poll)
+
+        self.tasks.task_cancelled.connect(self._aborted)
+        self.tasks.task_failed.connect(self._aborted)
+
+        canvas.native.destroyed.connect(self._dispose)
+
+    def _describe(self):
+        canvas = self.canvas
+        engine = canvas.data.statistic_engine
+        assignments = canvas.data.assignments
+
+        if self.component is None or assignments is None or not canvas.data.sessions:
+            return None
+
+        mode = canvas._tooltip_statistic_entity_mode()
+        queries = canvas.data.statistic_display_config.queries(mode, "single")
+
+        jobs = []
+
+        for raw_query in queries:
+            if (
+                raw_query is None
+                or raw_query.statistic_key == "none"
+                or raw_query.statistic_key not in engine.registry
+            ):
+                continue
+
+            if mode == "neuron":
+                displayed = prepare_neuron_table_query(raw_query, engine.registry)
+            else:
+                displayed = prepare_component_table_query(raw_query, engine.registry)
+
+            if displayed is None:
+                continue
+
+            definition = engine.registry[displayed.statistic_key]
+            title = StatisticsData.format_query_expression(displayed, definition)
+
+            scoped = prepare_tooltip_query(
+                displayed,
+                engine.registry,
+                self.component,
+                mode,
+            )
+
+            job_key = (
+                mode,
+                canvas.data.current_assignments,
+                id(assignments),
+                displayed,
+                scoped,
+                engine.query_revision(displayed),
+            )
+
+            jobs.append((job_key, title, scoped))
+
+        return tuple(job[0] for job in jobs), tuple(jobs)
+
+    def lines(self, component):
+        if component != self.component:
+            self.component = component
+            self.changed_at = perf_counter()
+            self.shown_key = None
+
+        description = self._describe()
+        if description is None:
+            return []
+
+        _, jobs = description
+
+        if not jobs:
+            self.clear()
+            return []
+
+        self._fill_immediate(jobs)
+
+        if not self.timer.isActive():
+            self.timer.start()
+
+        lines = []
+
+        for job_key, title, _ in jobs:
+            if job_key in self.cache:
+                self.cache.move_to_end(job_key)
+                lines.append(self.cache[job_key])
+            else:
+                lines.append(f"* {title}: calculating…")
+
+        return lines
+
+    def _fill_immediate(self, jobs):
+        engine = self.canvas.data.statistic_engine
+
+        for job_key, title, query in jobs:
+            if job_key in self.cache:
+                continue
+
+            try:
+                if query is None:
+                    line = _tooltip_line_from_stat(title, None)
+                else:
+                    found, stat = engine.peek_cached(query)
+
+                    if found:
+                        line = _tooltip_line_from_stat(title, stat)
+                    elif _tooltip_query_is_cheap(
+                        query,
+                        engine.registry[query.statistic_key],
+                        session_count=len(self.canvas.data.sessions),
+                    ):
+                        # Synchronous: no debounce or worker queue.
+                        lines = _calculate_tooltip_values(
+                            engine,
+                            ((title, query),),
+                        )
+                        line = lines[0] if lines else f"* {title}: unavailable"
+                    else:
+                        # Expensive cache miss: leave for _poll().
+                        continue
+
+            except Exception:
+                engine.state.logger.exception(
+                    "Failed to get immediate tooltip statistic %r",
+                    title,
+                )
+                line = f"* {title}: unavailable"
+
+            # Do not retain a value under an obsolete revision.
+            if query is None or engine.query_revision(query) == job_key[-1]:
+                self._store(job_key, line)
+
+    def _cancel(self):
+        if self.task_id is not None and not self.cancelling:
+            self.cancelling = True
+            self.tasks.cancel(self.task_id)
+
+    def clear(self):
+        self.component = None
+        self.shown_key = None
+        self.timer.stop()
+        self._cancel()
+
+    def _poll(self):
+        if self.closed:
+            return
+
+        native = self.canvas.native
+
+        if (
+            self.component is None
+            or not native.isVisible()
+            or not native.underMouse()
+            or QApplication.mouseButtons() != Qt.MouseButton.NoButton
+        ):
+            self.clear()
+            return
+
+        description = self._describe()
+        if description is None:
+            self.clear()
+            return
+
+        key, jobs = description
+
+        if not jobs:
+            self.clear()
+            return
+
+        self._fill_immediate(jobs)
+
+        wanted = {job_key for job_key, _, _ in jobs}
+
+        # A different footprint may still need the same neuron statistic.
+        if self.task_id is not None and self.task_key not in wanted:
+            self._cancel()
+
+        rendered = tuple(
+            self.cache.get(job_key, f"* {title}: calculating…")
+            for job_key, title, _ in jobs
+        )
+        shown_key = (key, rendered)
+
+        if self.shown_key != shown_key:
+            self.shown_key = shown_key
+            self.canvas.handle_tooltip(self.component)
+
+        missing = [job for job in jobs if job[0] not in self.cache]
+
+        if not missing:
+            return
+
+        if (
+            self.task_id is not None
+            or perf_counter() - self.changed_at < 0.2
+            or self.tasks.processing_busy()
+        ):
+            return
+
+        job_key, title, query = missing[0]
+        self.task_key = job_key
+        self.cancelling = False
+
+        self.task_id = self.tasks.start(
+            "calculating",
+            f"Tooltip statistics ({id(self)})",
+            _calculate_tooltip_values,
+            self.canvas.data.statistic_engine,
+            ((title, query),),
+            background=True,
+            on_result=lambda lines, key=job_key: self._completed(key, lines),
+        )
+
+    def _store(self, key, lines):
+        self.cache[key] = lines
+        self.cache.move_to_end(key)
+
+        while len(self.cache) > 512:
+            self.cache.popitem(last=False)
+
+    def _completed(self, key, lines):
+        self.task_id = None
+        self.task_key = None
+        self.cancelling = False
+
+        if self.closed:
+            return
+
+        # Old results remain under their old revision/assignment key;
+        # _poll will never display them for a different current key.
+        self._store(
+            key,
+            lines[0] if lines else "* Statistics: unavailable",
+        )
+        self.shown_key = None
+        self._poll()
+
+    def _aborted(self, group, task_id):
+        if task_id != self.task_id:
+            return
+
+        key = self.task_key
+        internal_cancel = self.cancelling
+
+        self.task_id = None
+        self.task_key = None
+        self.cancelling = False
+
+        if self.closed:
+            return
+
+        # Avoid repeatedly resubmitting a failed or user-cancelled task.
+        if not internal_cancel and key is not None:
+            self._store(
+                key,
+                "* Statistics: calculation stopped.",
+            )
+            self.shown_key = None
+
+    def _dispose(self, *_):
+        self.closed = True
+        self.clear()
+        self.cache.clear()
 
 
 class BaseCanvas(scene.SceneCanvas):
@@ -83,8 +472,7 @@ class BaseCanvas(scene.SceneCanvas):
         self.data: Data = parent.data
         self.display_mode = parent.display_mode
 
-        self._tooltip_statistic_signature = None
-        self._tooltip_statistic_results = []
+        self._tooltip_statistics = TooltipStatistics(self)
 
         self.controls = controls
 
@@ -143,12 +531,14 @@ class BaseCanvas(scene.SceneCanvas):
         self, component: Optional[NeuronComponent | List[NeuronComponent]] = None
     ):
         if component is None:
+            self._tooltip_statistics.clear()
             QToolTip.hideText()
             return
 
         if isinstance(component, list):
 
             if len(component) == 0:
+                self._tooltip_statistics.clear()
                 QToolTip.hideText()
                 return
 
@@ -176,6 +566,11 @@ class BaseCanvas(scene.SceneCanvas):
         )
 
     def on_mouse_move(self, event):
+        # Camera interaction must not trigger picking or tooltip work.
+        if event.is_dragging:
+            self._tooltip_statistics.clear()
+            QToolTip.hideText()
+            return
 
         if (
             event.pos is None
@@ -185,7 +580,7 @@ class BaseCanvas(scene.SceneCanvas):
             return
 
         if not self.plotting["visuals"]:
-            # QToolTip.hideText()
+            QToolTip.hideText()
             return
 
         component = self.find_closest_component(event.pos)
@@ -352,126 +747,8 @@ class BaseCanvas(scene.SceneCanvas):
 
         return "footprint"
 
-    def _get_tooltip_statistic_results(self) -> list[TooltipStatisticResult]:
-
-        entity_mode = self._tooltip_statistic_entity_mode()
-
-        config = self.data.statistic_display_config
-        engine = self.data.statistic_engine
-
-        raw_queries = config.queries(entity_mode, "single")
-
-        # Rebuild if either:
-        # - configured columns changed
-        # - underlying data changed
-        # - the statistics registry was rebuilt
-        signature = (
-            entity_mode,
-            tuple((query, engine.query_revision(query)) for query in raw_queries),
-        )
-
-        if signature == self._tooltip_statistic_signature:
-            return self._tooltip_statistic_results
-
-        results = []
-
-        for raw_query in raw_queries:
-
-            try:
-                if entity_mode == "neuron":
-                    query = prepare_neuron_table_query(raw_query, engine.registry)
-                else:
-                    query = prepare_component_table_query(raw_query, engine.registry)
-
-                table = engine.evaluate_table(query)
-                if table is None:
-                    continue
-
-                # ------------------------------------------------
-                # Determine row binding
-                # ------------------------------------------------
-
-                if entity_mode == "neuron":
-                    neuron_dim = neuron_bound_dim(table.dims)
-                    if neuron_dim is None:
-                        continue
-
-                    session_dim = None
-
-                else:
-                    bound = component_bound_dims(table.dims)
-                    if bound is None:
-                        continue
-
-                    neuron_dim, session_dim = bound
-
-                # ------------------------------------------------
-                # Build semantic lookup
-                # ------------------------------------------------
-
-                neurons = np.asarray(table.refs[neuron_dim])
-
-                sessions = (
-                    np.asarray(table.refs[session_dim])
-                    if session_dim is not None
-                    else None
-                )
-
-                lookup = {}
-
-                for row in range(table.n_rows):
-                    neuron_id = int(neurons[row])
-
-                    if sessions is None:
-                        key = neuron_id
-                    else:
-                        key = (neuron_id, int(sessions[row]))
-
-                    lookup.setdefault(key, row)
-
-                stat_def = engine.registry[query.statistic_key]
-
-                title = StatisticsData.format_query_expression(
-                    query,
-                    stat_def,
-                )
-
-                results.append(
-                    TooltipStatisticResult(
-                        table=table,
-                        session_dim=session_dim,
-                        row_lookup=lookup,
-                        title=title,
-                    )
-                )
-
-            except Exception:
-                self.state.logger.exception(
-                    "Failed to prepare tooltip statistic "
-                    f"{raw_query.statistic_key!r}"
-                )
-
-        self._tooltip_statistic_signature = signature
-        self._tooltip_statistic_results = results
-
-        return results
-
     def _tooltip_statistic_lines(self, component: NeuronComponent) -> list[str]:
-
-        lines = []
-
-        for result in self._get_tooltip_statistic_results():
-
-            value = result.value_for_component(component)
-
-            if value is None or not np.isfinite(value):
-                text = "--"
-            else:
-                text = f"{float(value):.4g}"
-
-            lines.append(f"* {result.title}: {text}")
-
-        return lines
+        return self._tooltip_statistics.lines(component)
 
 
 class BaseDisplayController(QObject):

@@ -46,12 +46,17 @@ class ResourceMonitor(QWidget):
 
     @Slot(str, str)
     def _on_task_started(self, group, task_id):
-        task = self.state.tasks.tasks.get(task_id)
-        self._active_tasks[task_id] = task.name if task is not None else group
+        task = self.state.tasks.get_task(task_id)
+
+        if task is None or task.background:
+            return
+
+        self._active_tasks[task_id] = task.name
 
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
-        self.status_label.setText(self._active_tasks[task_id])
+        self.status_label.setText(task.name)
+        self.status_label.setToolTip("")
 
     @Slot(str, str, int)
     def _on_task_progress(self, group, task_id, value):
@@ -63,6 +68,9 @@ class ResourceMonitor(QWidget):
 
     @Slot(str, str, str)
     def _on_task_message(self, group, task_id, message):
+        if task_id not in self._active_tasks:
+            return
+
         self._task_messages[task_id] = message
         self.status_label.setText(message)
         self.status_label.setWordWrap(True)
@@ -70,6 +78,9 @@ class ResourceMonitor(QWidget):
 
     @Slot(str, str)
     def _on_task_ended(self, group, task_id):
+        if task_id not in self._active_tasks:
+            return
+
         self._active_tasks.pop(task_id, None)
         self._task_messages.pop(task_id, None)
 

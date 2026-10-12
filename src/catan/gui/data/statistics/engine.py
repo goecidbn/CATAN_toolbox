@@ -1,6 +1,8 @@
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Optional
 from collections.abc import Callable
+from copy import copy
+from types import SimpleNamespace
 
 from PySide6.QtCore import QObject, Qt, Signal
 import numpy as np
@@ -11,6 +13,17 @@ from catan.core.changes import Change, ChangeKind, DataChange
 from .table import PickTable
 from .types import StatisticArray
 from .queries import ReductionSpec, StatisticQuery
+
+
+import cProfile
+import io
+import pstats
+import traceback
+
+from contextvars import ContextVar
+from functools import wraps
+from itertools import count
+from time import perf_counter
 
 
 def _retained_array_bytes(value):
@@ -52,13 +65,89 @@ class StatisticsTaskResult:
     query: StatisticQuery
     statistic_revision: int
 
-    table: PickTable | None = None
+    table: PickTable | dict[str, PickTable] | None = None
+    assignment_names: tuple[str, ...] = ()
+    data_version: int | None = None
+
     error: str | None = None
     traceback: str | None = None
 
     @property
     def successful(self) -> bool:
         return self.error is None and self.table is not None
+
+
+TRACE_STATISTICS = False
+PROFILE_SLOW_STATISTICS = False
+PROFILE_THRESHOLD_MS = 100.0
+
+_statistic_request = ContextVar("statistic_request", default=None)
+_statistic_request_ids = count(1)
+
+
+def trace_statistic_request(method):
+    @wraps(method)
+    def wrapped(self, query, *args, **kwargs):
+        # Trace the outermost entry only. For example:
+        # evaluate_table -> evaluate -> _evaluate_uncached.
+        if not TRACE_STATISTICS or _statistic_request.get() is not None:
+            return method(self, query, *args, **kwargs)
+
+        request_id = next(_statistic_request_ids)
+        token = _statistic_request.set(request_id)
+
+        caller = " -> ".join(
+            f"{frame.name}:{frame.lineno}"
+            for frame in traceback.extract_stack(limit=6)[:-1]
+        )
+
+        print(
+            f"\n[stat #{request_id}] START {method.__name__}\n"
+            f"  caller: {caller}\n"
+            f"  query: {query!r}",
+            flush=True,
+        )
+
+        profiler = cProfile.Profile() if PROFILE_SLOW_STATISTICS else None
+
+        started = perf_counter()
+        outcome = "OK"
+
+        try:
+            if profiler is not None:
+                profiler.enable()
+
+            return method(self, query, *args, **kwargs)
+
+        except BaseException as exc:
+            outcome = type(exc).__name__
+            raise
+
+        finally:
+            if profiler is not None:
+                profiler.disable()
+
+            elapsed_ms = 1000 * (perf_counter() - started)
+            _statistic_request.reset(token)
+
+            print(
+                f"[stat #{request_id}] END {outcome}: " f"{elapsed_ms:.3f} ms",
+                flush=True,
+            )
+
+            if profiler is not None and elapsed_ms >= PROFILE_THRESHOLD_MS:
+                stream = io.StringIO()
+
+                pstats.Stats(profiler, stream=stream).sort_stats(
+                    "cumulative"
+                ).print_stats(20)
+
+                print(
+                    f"[stat #{request_id}] PROFILE\n{stream.getvalue()}",
+                    flush=True,
+                )
+
+    return wrapped
 
 
 class StatisticEngine(QObject):
@@ -247,6 +336,7 @@ class StatisticEngine(QObject):
         with self._cache_lock:
             self._cache.clear()
 
+    @trace_statistic_request
     def evaluate(
         self,
         query: Optional[StatisticQuery],
@@ -258,8 +348,21 @@ class StatisticEngine(QObject):
             definition = self.registry[query.statistic_key]
 
             parameters = definition.resolve_parameters(dict(query.parameters))
+            reductions = query.reduction_dict()
+
+            if definition.independent_pairs:
+                from .queries import normalize_footprint_pair_reductions
+
+                reductions = normalize_footprint_pair_reductions(
+                    definition,
+                    reductions,
+                    query.filters,
+                    session_series=query.context == "session_series",
+                )
+
             query = replace(
                 query,
+                reductions=tuple(sorted(reductions.items())),
                 parameters=tuple(sorted(parameters.items())),
             )
 
@@ -267,6 +370,13 @@ class StatisticEngine(QObject):
             key = (query, revision)
 
             if key in self._cache:
+
+                if TRACE_STATISTICS:
+                    print(
+                        f"[stat #{_statistic_request.get()}] CACHE HIT",
+                        flush=True,
+                    )
+
                 ## move entry to the end of the dict
                 result = self._cache.pop(key)
                 self._cache[key] = result
@@ -297,6 +407,7 @@ class StatisticEngine(QObject):
 
         return result
 
+    @trace_statistic_request
     def _evaluate_uncached(
         self,
         query: StatisticQuery,
@@ -304,7 +415,12 @@ class StatisticEngine(QObject):
         *,
         select_values=None,
         requested_pairs=None,
+        data=None,
+        state=None,
     ) -> StatisticArray:
+
+        data = self.data if data is None else data
+        state = self.state if state is None else state
 
         if stat_def is None:
             stat_def = self.registry[query.statistic_key]
@@ -338,8 +454,8 @@ class StatisticEngine(QObject):
                 execution_options["requested_pairs"] = requested_pairs
 
             stat = stat_def.query_getter(
-                self.data,
-                self.state,
+                data,
+                state,
                 prepared_query,
                 **parameters,
                 **execution_options,
@@ -362,8 +478,8 @@ class StatisticEngine(QObject):
         }
 
         stat = stat_def.get_values(
-            data=self.data,
-            state=self.state,
+            data=data,
+            state=state,
             indexers=indexers,
             filters=query.filters,
             parameters=dict(query.parameters),
@@ -406,6 +522,7 @@ class StatisticEngine(QObject):
 
         return stat
 
+    @trace_statistic_request
     def evaluate_table(self, query: Optional[StatisticQuery]) -> Optional[PickTable]:
 
         if query is None:
@@ -424,6 +541,80 @@ class StatisticEngine(QObject):
             f
             for f in (query.filters or ())
             if f.target not in stat.applied_pair_filters
+        )
+
+        if remaining_filters:
+            table = table.filtered(remaining_filters)
+
+        return table
+
+    def evaluate_assignment_table(
+        self,
+        query: StatisticQuery,
+        assignment_name: str,
+    ) -> PickTable | None:
+        """Evaluate without changing the globally active assignments."""
+        if query is None or query.statistic_key == "none":
+            return None
+
+        assignments = self.data._assignments.get(assignment_name)
+
+        if assignments is None:
+            raise ValueError(
+                f"Assignments dataset {assignment_name!r} is no longer loaded."
+            )
+
+        if not self.data.sessions:
+            raise ValueError("Load session data before calculating statistics.")
+
+        # Copy the small identity/context objects. Large spatial and temporal
+        # arrays remain shared with the loaded data.
+        bound_assignments = copy(assignments)
+        bound_assignments.ids = assignments.ids.copy()
+        bound_assignments.stats = dict(assignments.stats)
+
+        if assignments.union is not None:
+            bound_assignments.union = copy(assignments.union)
+
+        bound_state = SimpleNamespace(assignments=bound_assignments.ids)
+
+        bound_data = copy(self.data)
+        bound_data._current_assignments = assignment_name
+        bound_data._assignments = {assignment_name: bound_assignments}
+        bound_data.sessions = list(self.data.sessions)
+        bound_data.state = bound_state
+
+        registry = self.registry_factory(bound_data, bound_state)
+        definition = registry.get(query.statistic_key)
+
+        if definition is None:
+            raise ValueError(
+                f"{assignment_name}: statistic {query.statistic_key!r} "
+                "is not available for this assignments dataset."
+            )
+
+        parameters = definition.resolve_parameters(dict(query.parameters))
+        prepared_query = replace(
+            query,
+            parameters=tuple(sorted(parameters.items())),
+        )
+
+        stat = self._evaluate_uncached(
+            prepared_query,
+            definition,
+            data=bound_data,
+            state=bound_state,
+        )
+
+        if definition.compact_values:
+            _compact_statistic_values(stat)
+
+        table = PickTable.from_stat(stat)
+
+        remaining_filters = tuple(
+            item
+            for item in (query.filters or ())
+            if item.target not in stat.applied_pair_filters
         )
 
         if remaining_filters:

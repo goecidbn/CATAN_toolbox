@@ -86,19 +86,37 @@ def main() -> int:
 
         atexit.register(discard_fresh_settings)
 
-    # import faulthandler
-    # import tempfile
-    # from pathlib import Path
+    # Temporary Linux freeze diagnostics.
+    import faulthandler
+    import signal
+    import tempfile
+    import threading
+    from pathlib import Path
 
-    # traceback_path = Path(tempfile.gettempdir()) / "catan-loading-stacks.log"
-    # traceback_log = traceback_path.open("w", buffering=1)
+    if sys.platform.startswith("linux"):
+        freeze_log_path = (
+            Path(tempfile.gettempdir()) / f"catan-freeze-{os.getpid()}.log"
+        )
 
-    # faulthandler.dump_traceback_later(
-    #     15,
-    #     repeat=True,
-    #     file=traceback_log,
-    # )
-    # print(f"Loading diagnostics: {traceback_path}", flush=True)
+        # Keep the file alive for the application's lifetime.
+        app._freeze_log = freeze_log_path.open("a", buffering=1)
+
+        app._freeze_log.write(
+            f"CATAN PID: {os.getpid()}\n" f"GUI thread: {threading.get_ident():#x}\n\n"
+        )
+        app._freeze_log.flush()
+
+        faulthandler.register(
+            signal.SIGUSR1,
+            file=app._freeze_log,
+            all_threads=True,
+            chain=False,
+        )
+
+        print(
+            f"Freeze diagnostics ready: PID={os.getpid()}, " f"log={freeze_log_path}",
+            flush=True,
+        )
 
     window = MainWindow(settings=settings)
 

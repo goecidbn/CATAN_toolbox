@@ -46,6 +46,8 @@ from catan.gui.background_tasks.file_writes import (
     save_prepared_file_task,
 )
 
+from catan.gui.data.assignment_comparison import AssignmentComparison
+
 
 def after_display_tasks(method):
     @wraps(method)
@@ -783,7 +785,8 @@ class Data(Tracking):
         tasks = self.state.tasks
 
         if any(
-            tasks.current_task(group) is not None or tasks.queued_tasks(group)
+            tasks.current_task(group) is not None
+            or tasks.queued_tasks(group, include_deferred=False)
             for group in ("loading", "model update")
         ):
             return
@@ -828,21 +831,101 @@ class Data(Tracking):
         )
         return counts
 
-    @after_display_tasks
-    def queue_import_source(self, key, path, name, *, on_loaded=None):
+    def _source_loading_ready(self):
+        tasks = self.state.tasks
+
+        return (
+            not tasks.processing_busy()
+            and not tasks.processing_requested
+            and not tasks._background_running()
+            and not self._model_fit_requested
+            and self.state.current_request is None
+        )
+
+    def queue_import_source(
+        self,
+        key,
+        path,
+        name,
+        *,
+        use_as_working=False,
+        replace_empty_model=False,
+        on_loaded=None,
+    ):
         if key not in {"model", "assignments"}:
             raise ValueError(f"Unsupported source type: {key}")
 
-        tasks = self.state.tasks
+        return self.state.tasks.queue_after_processing(
+            f"Import {key}: {Path(path).name}",
+            lambda: self._queue_import_source_now(
+                key,
+                path,
+                name,
+                use_as_working=use_as_working,
+                replace_empty_model=replace_empty_model,
+                on_loaded=on_loaded,
+            ),
+            ready=lambda: (
+                not self._model_fit_requested and self.state.current_request is None
+            ),
+        )
 
-        if tasks.processing_busy():
+    def _queue_import_source_now(
+        self,
+        key,
+        path,
+        name,
+        *,
+        use_as_working=False,
+        replace_empty_model=False,
+        on_loaded=None,
+    ):
+        if key not in {"model", "assignments"}:
+            raise ValueError(f"Unsupported source type: {key}")
+
+        existing = self._model if key == "model" else self._assignments
+
+        if replace_empty_model:
+            if key != "model" or not self.can_replace_empty_model(name):
+                self.state.issue(
+                    "warning",
+                    "Model was not replaced",
+                    "The requested model is no longer empty. "
+                    "Load the file under a new name to preserve the existing model.",
+                )
+                return
+
+        elif name in existing:
             self.state.issue(
-                "info",
-                "Loading not started",
-                "Finish or cancel the current processing tasks, "
-                "then select the file again.",
+                "warning",
+                "Source not loaded",
+                "Choose a name that is not already in use.",
             )
             return
+
+        replacement_target = self._model.get(name) if replace_empty_model else None
+
+        if use_as_working and (
+            key != "assignments" or not self.can_use_working_assignments()
+        ):
+            self.state.issue(
+                "warning",
+                "Working assignments are not empty",
+                "Load this file as a separate assignments dataset.",
+            )
+            return
+
+        tasks = self.state.tasks
+
+        if not self._source_loading_ready():
+            return self.queue_import_source(
+                key,
+                path,
+                name,
+                use_as_working=use_as_working,
+                replace_empty_model=replace_empty_model,
+                on_loaded=on_loaded,
+            )
 
         path = os.path.abspath(os.path.expanduser(os.fspath(path)))
         params = deepcopy(self.params)
@@ -888,6 +971,7 @@ class Data(Tracking):
                 )
 
                 candidate = Assignments()
+                candidate._use_as_working = bool(use_as_working)
                 candidate.path = path
                 candidate.source_config = config
                 candidate._load_config_problems = check["problems"]
@@ -912,6 +996,18 @@ class Data(Tracking):
                     "Loaded source was not applied",
                     "The active data changed while loading. "
                     "Select the file again to load it into the current state.",
+                )
+                return
+
+            if replace_empty_model and (
+                self._model.get(name) is not replacement_target
+                or not self.can_replace_empty_model(name)
+            ):
+                self.state.issue(
+                    "warning",
+                    "Model was not replaced",
+                    "The target model changed while loading. "
+                    "Load this file under a new name instead.",
                 )
                 return
 
@@ -1364,6 +1460,242 @@ class Data(Tracking):
             prepared,
         )
 
+    @after_display_tasks
+    def queue_export_redetection(
+        self,
+        jobs,
+        *,
+        include_missing=False,
+        seed=0,
+    ):
+        from catan.core.redetection import build_seeds
+        from catan.gui.background_tasks.runtime import TaskCancelled
+
+        tasks = self.state.tasks
+
+        if (
+            tasks.processing_busy()
+            or tasks.processing_requested
+            or tasks.has_deferred_processing()
+            or self.state.current_request is not None
+        ):
+            self.state.issue(
+                "info",
+                "Export not started",
+                "Finish or cancel processing before exporting seeds.",
+            )
+            return
+
+        version = self.state.data_version
+        assignments_name = self.current_assignments
+        source = self.assignments
+
+        if source is None:
+            self.state.issue(
+                "warning",
+                "Export not started",
+                "No active assignments dataset is available.",
+            )
+            return
+
+        if include_missing and self._stale_assignments.get(assignments_name):
+            self.state.issue(
+                "warning",
+                "Export not started",
+                "Update the stale assignments before exporting " "inferred footprints.",
+            )
+            return
+
+        sessions = []
+
+        for original in self.sessions:
+            item = copy(original)
+            item.status = dict(original.status)
+            item.footprints = original.footprints.copy()
+
+            count = item.footprints.shape[1]
+
+            item.included = (
+                np.ones(count, dtype=bool)
+                if original.included is None
+                else np.asarray(original.included, dtype=bool).copy()
+            )
+
+            synthetic = getattr(original, "synthetic", None)
+            item.synthetic = (
+                np.zeros(count, dtype=bool)
+                if synthetic is None
+                else np.asarray(synthetic, dtype=bool).copy()
+            )
+
+            if item.included.shape != (count,) or item.synthetic.shape != (count,):
+                self.state.issue(
+                    "warning",
+                    "Export not started",
+                    f"Invalid component flags in {item.name}.",
+                )
+                return
+
+            item.remap = deepcopy(original.remap)
+            item.source_config = deepcopy(original.source_config)
+
+            # Hold references to existing trace arrays, without
+            # duplicating every session's traces. Export never
+            # modifies these arrays.
+            item._traces = dict(original.traces)
+
+            sessions.append(item)
+
+        ids = source.ids.copy()
+
+        union = copy(source.union)
+        union.footprints = source.union.footprints.copy()
+        union.included = np.asarray(source.union.included, dtype=bool).copy()
+
+        jobs = [(int(session_id), str(path)) for session_id, path in jobs]
+
+        destination_keys = [os.path.normcase(os.path.abspath(path)) for _, path in jobs]
+        original_paths = {
+            os.path.normcase(os.path.abspath(str(session.path)))
+            for session in sessions
+            if session.path
+        }
+
+        if len(set(destination_keys)) != len(destination_keys) or any(
+            key in original_paths for key in destination_keys
+        ):
+            self.state.issue(
+                "warning",
+                "Export not started",
+                "Export paths must be distinct and must not "
+                "overwrite session source files.",
+            )
+            return
+
+        def run():
+            ctx = current_task_context()
+            issues = []
+
+            for session_id, path in jobs:
+                ctx.check_cancelled()
+
+                if self.state.data_version != version:
+                    raise ValueError(
+                        "Data changed during export. Completed files "
+                        "remain available; retry the remaining sessions."
+                    )
+
+                session = sessions[session_id]
+                values = prepared = A = None
+
+                try:
+                    ctx.message(f"Preparing redetection seeds: {session.name}")
+
+                    values = build_seeds(
+                        sessions,
+                        ids,
+                        union,
+                        session_id,
+                        include_missing=include_missing,
+                        seed=seed,
+                        ctx=ctx,
+                        read_fields=read_fields,
+                    )
+
+                    A = values.pop("A")
+
+                    # Explicit CSC storage keeps the format easy
+                    # to consume without CATAN.
+                    values.update(
+                        A_data=A.data,
+                        A_indices=A.indices,
+                        A_indptr=A.indptr,
+                        A_shape=np.asarray(A.shape, dtype=np.int64),
+                    )
+
+                    fields = {
+                        key: FieldSpec(
+                            path=(
+                                "/A/" + key[2:] if key.startswith("A_") else "/" + key
+                            ),
+                            required=True,
+                        )
+                        for key in values
+                    }
+
+                    prepared = {
+                        "data": {"seeds": values},
+                        "fields": {"seeds": fields},
+                        "attributes": {
+                            "object_type": "RedetectionSeeds",
+                            "format_version": 1,
+                            "assignments": str(assignments_name),
+                            "session_id": session_id,
+                            "source_path": str(session.path),
+                            "coordinate_frame": "original_session",
+                            "pixel_order": "F",
+                            "sparse_format": "csc",
+                            "trace_axes": "seed,frame",
+                            "rng_seed": seed,
+                            "noise_method": (
+                                "median baseline; MAD of first "
+                                "differences / "
+                                "(0.67448975 * sqrt(2))"
+                            ),
+                        },
+                    }
+
+                    if self.state.data_version != version:
+                        raise ValueError("Data changed; retry export.")
+
+                    ctx.check_cancelled()
+
+                    save_prepared_file_task(
+                        self.state,
+                        path,
+                        prepared,
+                    )
+
+                    omitted = len(values["omitted_ids"])
+
+                    if omitted:
+                        issues.append(
+                            f"{session.name}: omitted {omitted} seeds "
+                            "because no detected location was available "
+                            "or the seed fell outside the imaging window. "
+                            "Their IDs are stored in omitted_ids."
+                        )
+
+                    ctx.message(f"Exported {session.name}: " f"{A.shape[1]} seeds")
+
+                except TaskCancelled:
+                    raise
+
+                except Exception as exc:
+                    issues.append(f"{session.name}: {exc}")
+
+                finally:
+                    # Release this session's output before loading
+                    # the next session's C.
+                    values = prepared = A = None
+
+            return issues
+
+        def finished(issues):
+            if issues:
+                self.state.issue(
+                    "warning",
+                    "Redetection export needs attention",
+                    "\n\n".join(issues),
+                )
+
+        return tasks.start(
+            "saving",
+            "Export redetection seeds",
+            run,
+            on_result=finished,
+        )
+
     def queue_save_included(self, session, path):
         tasks = self.state.tasks
 
@@ -1502,6 +1834,113 @@ class Data(Tracking):
             C.MODEL_COUNTS, C.MODEL_PARAMETERS, C.PROCESSING_STATUS
         )  # Notify that model has changed
 
+    @after_display_tasks
+    def remove_loaded_source(
+        self,
+        key,
+        name,
+        *,
+        expected_source,
+        on_removed=None,
+    ):
+        if key not in {"model", "assignments"}:
+            raise ValueError(f"Unknown source type: {key}")
+
+        tasks = self.state.tasks
+
+        if (
+            tasks.processing_busy()
+            or tasks.processing_requested
+            or tasks.has_deferred_processing()
+            or self.state.current_request is not None
+        ):
+            self.state.issue(
+                "info",
+                "Dataset not removed",
+                "Finish or cancel the current operations before removing it.",
+            )
+            return False
+
+        sources = self._model if key == "model" else self._assignments
+
+        if sources.get(name) is not expected_source:
+            self.state.issue(
+                "warning",
+                "Dataset not removed",
+                "The selected dataset changed. Select it again and retry.",
+            )
+            return False
+
+        if key == "model":
+            if name == "local":
+                # Keep the permanent Working slot, but empty its contents.
+                sources[name] = Model(params=self.params)
+            else:
+                if self.current_model_name == name:
+                    self.change_model("local")
+                del sources[name]
+
+            self.notify_change(
+                C.MODEL_COUNTS,
+                C.MODEL_PARAMETERS,
+                C.PROCESSING_STATUS,
+            )
+
+        else:
+            if name == "local":
+                replacement = Assignments()
+                replacement.source_config = deepcopy(expected_source.source_config)
+                self._ensure_assignment_session_count(replacement)
+
+                sources[name] = replacement
+                self._stale_assignments[name] = set()
+
+                if self.current_assignments == name:
+                    self.state.apply_assignment_rebuild(
+                        replacement.ids,
+                        {},
+                        from_session_id=0,
+                        component_id_map={},
+                    )
+                    self.state.assignments = replacement.ids
+
+            else:
+                # Switching must happen BEFORE deleting the source:
+                # correspondence mapping still needs the old assignments.
+                if self.current_assignments == name:
+                    if not self.change_assignments("local"):
+                        return False
+
+                del sources[name]
+                self._stale_assignments.pop(name, None)
+
+            self._comparison_cache = {}
+            self.statistic_engine.clear_cache()
+
+            self.notify_change(
+                C.ASSIGNMENT_SET,
+                *ASSIGNMENT_CONTENT_CHANGES,
+            )
+
+        if on_removed is not None:
+            on_removed()
+
+        return True
+
+    def can_replace_empty_model(self, name=None):
+        if name is None:
+            name = self.current_model_name
+
+        model = self._model.get(name)
+
+        return (
+            model is not None
+            and not model.loaded
+            and not model.fitted
+            and not model.parameters
+            and not any(model.counts.values())
+        )
+
     def register_assignments(self, path: str, name: str):
 
         assignments = Assignments()
@@ -1544,17 +1983,53 @@ class Data(Tracking):
             *ASSIGNMENT_CONTENT_CHANGES,
         )
 
-    @after_display_tasks
     def queue_load_assignments(self, *, on_config_required=None):
+        source = self.assignments
+        source_name = self.current_assignments
+
+        if source is None:
+            return
+
+        # Continue a just-imported assignments file immediately when idle.
+        # Its data-loading task must precede the next deferred file import.
+        if self._source_loading_ready():
+            return self._queue_load_assignments_now(
+                on_config_required=on_config_required,
+            )
+
+        def dispatch():
+            if (
+                self.current_assignments != source_name
+                or self.assignments is not source
+            ):
+                self.state.issue(
+                    "warning",
+                    "Queued assignments load was not applied",
+                    "The selected assignments changed while this request "
+                    "was waiting. Select the intended dataset and click "
+                    "its open-folder button again.",
+                )
+                return
+
+            self._queue_load_assignments_now(
+                on_config_required=on_config_required,
+            )
+
+        return self.state.tasks.queue_after_processing(
+            f"Load assignments: {source_name}",
+            dispatch,
+            ready=lambda: (
+                not self._model_fit_requested and self.state.current_request is None
+            ),
+        )
+
+    def _queue_load_assignments_now(self, *, on_config_required=None):
         tasks = self.state.tasks
 
-        if tasks.processing_busy():
-            self.state.issue(
-                "warning",
-                "Assignment loading not started",
-                "Wait for existing processing tasks to finish.",
+        if not self._source_loading_ready():
+            return self.queue_load_assignments(
+                on_config_required=on_config_required,
             )
-            return
 
         source = self.assignments
         if source is None:
@@ -1686,9 +2161,7 @@ class Data(Tracking):
 
             if isinstance(result, dict) and "config_problems" in result:
                 source.status["loading_possible"] = False
-
-                if on_config_required is not None:
-                    on_config_required()
+                source._load_config_problems = list(result["config_problems"])
 
                 self.state.issue(
                     "info",
@@ -1696,6 +2169,21 @@ class Data(Tracking):
                     "\n\n".join(result["config_problems"])
                     + "\n\nSelect a matching preset or correct the IDs field, "
                     "then click the assignments open-folder button to load again.",
+                )
+
+                if on_config_required is not None and self.assignments is source:
+                    on_config_required()
+
+                return
+
+            use_as_working = bool(getattr(source, "_use_as_working", False))
+
+            if use_as_working and not self.can_use_working_assignments():
+                self.state.issue(
+                    "warning",
+                    "Working assignments were not replaced",
+                    "The working assignments are no longer empty. "
+                    "Load the file again as a separate dataset.",
                 )
                 return
 
@@ -1717,6 +2205,16 @@ class Data(Tracking):
             # Preserve references held by configuration widgets.
             result.source_config = source.source_config
             source.__dict__.update(result.__dict__)
+            source.__dict__.pop("_use_as_working", None)
+
+            if use_as_working:
+                self._assignments["local"] = source
+                del self._assignments[assignment_name]
+
+                self._stale_assignments["local"] = self._stale_assignments.pop(
+                    assignment_name, set()
+                )
+                self._current_assignments = "local"
 
             self.state.assignments = source.ids
             self.notify_change(
@@ -1766,11 +2264,151 @@ class Data(Tracking):
         )  # Notify that assignments have changed
 
     def change_assignments(self, name: str):
+        if name == self.current_assignments:
+            return True
+
+        tasks = self.state.tasks
+
+        if (
+            self.state.current_request is not None
+            or tasks.processing_busy()
+            or tasks.processing_requested
+            or any(task is not None for task in tasks.current.values())
+        ):
+            self.state.issue(
+                "warning",
+                "Assignments not switched",
+                "Finish or cancel the current operation before "
+                "switching the active assignments.",
+            )
+            return False
+
+        try:
+            comparison = self.assignment_comparison(
+                self.current_assignments,
+                name,
+            )
+
+            neuron_map = {}
+
+            for neuron in range(len(comparison.source_rows)):
+                partners = comparison.partners(neuron)
+                if partners:
+                    neuron_map[neuron] = partners[0].neuron_id
+
+            components = set(self.state.selected_components or [])
+            components.update(self.state.highlighted_components or [])
+            components.update(self.state.highlight_roles)
+
+            if self.state.focused_component is not None:
+                components.add(self.state.focused_component)
+
+            component_map = {
+                (component.neuron_id, component.session_id): comparison.translate(
+                    component.neuron_id,
+                    component.session_id,
+                )
+                for component in components
+            }
+
+        except (KeyError, ValueError) as exc:
+            self.state.issue(
+                "error",
+                "Could not switch assignments",
+                str(exc),
+            )
+            return False
+
         super().change_assignments(name)
-        self.state.assignments = self.assignments.ids
-        self.notify_change(
-            *ASSIGNMENT_CONTENT_CHANGES
-        )  # Notify that assignments have changed
+
+        self.state.apply_assignment_rebuild(
+            self.assignments.ids,
+            neuron_map,
+            from_session_id=0,
+            component_id_map=component_map,
+        )
+
+        self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
+        return True
+
+    def can_use_working_assignments(self):
+        working = self._assignments.get("local")
+
+        return (
+            working is not None
+            and working.ids.shape[0] == 0
+            and not working.path
+            and not working.manipulations
+        )
+
+    def assignment_comparison(self, source_name, target_name):
+        source = self._assignments[source_name]
+        target = self._assignments[target_name]
+
+        version = self.state.data_version
+
+        if getattr(self, "_comparison_cache_version", None) != version:
+            self._comparison_cache = {}
+            self._comparison_cache_version = version
+
+        key = (
+            source_name,
+            target_name,
+            id(source),
+            id(target),
+        )
+
+        comparison = self._comparison_cache.get(key)
+
+        if comparison is None:
+            comparison = AssignmentComparison(
+                source,
+                target,
+                self.sessions,
+            )
+            self._comparison_cache[key] = comparison
+
+        return comparison
+
+    def map_assignment_components(
+        self,
+        components,
+        source_name,
+        target_name,
+        *,
+        whole_neurons=False,
+    ):
+        if components is None:
+            return []
+
+        if isinstance(components, NeuronComponent):
+            components = [components]
+
+        if source_name not in self._assignments or target_name not in self._assignments:
+            return []
+
+        if source_name == target_name:
+            return list(dict.fromkeys(components))
+
+        comparison = self.assignment_comparison(source_name, target_name)
+        result = []
+
+        for component in components:
+            if whole_neurons:
+                # Preserve all partners, including split/merge counterparts.
+                result.extend(
+                    NeuronComponent(partner.neuron_id, None)
+                    for partner in comparison.partners(component.neuron_id)
+                )
+            else:
+                mapped = comparison.translate(
+                    component.neuron_id,
+                    component.session_id,
+                )
+                if mapped is not None:
+                    result.append(NeuronComponent(*mapped))
+
+        return list(dict.fromkeys(result))
 
     @after_display_tasks
     def queue_process_assignments(
@@ -1900,6 +2538,90 @@ class Data(Tracking):
             self.build_assignment_update,
             session_ids=plan["session_ids"],
             mode=mode,
+            on_result=publish,
+        )
+
+    def queue_copy_assignments(self, name, *, on_copied=None):
+        name = str(name).strip()
+        source_name = self.current_assignments
+        source = self.assignments
+        tasks = self.state.tasks
+
+        if not name or name in self._assignments:
+            self.state.issue(
+                "warning",
+                "Assignments not copied",
+                "Choose a non-empty name that is not already in use.",
+            )
+            return
+
+        if source is None or source.ids.shape[0] == 0:
+            self.state.issue(
+                "info",
+                "Assignments not copied",
+                "Load or register assignments before creating a copy.",
+            )
+            return
+
+        if self.state.current_request is not None or tasks.processing_busy():
+            self.state.issue(
+                "info",
+                "Assignments not copied",
+                "Finish the current manipulation or processing operation first.",
+            )
+            return
+
+        version = self.state.data_version
+        sessions = tuple(self.sessions)
+        stale = set(self._stale_assignments.get(source_name, ()))
+
+        def run():
+            ctx = current_task_context()
+            ctx.check_cancelled()
+
+            candidate = source.copy()
+            included = np.asarray(source.union.included, dtype=bool).copy()
+
+            worker = copy(self)
+            worker._assignments = {name: candidate}
+            worker._current_assignments = name
+            worker.sessions = list(sessions)
+
+            worker.rebuild_union(ctx=ctx)
+
+            if candidate.union.included.shape != included.shape:
+                raise ValueError("The rebuilt copy has a different number of neurons.")
+
+            candidate.union.included = included
+            ctx.check_cancelled()
+            return candidate
+
+        def publish(candidate):
+            if (
+                self.state.data_version != version
+                or self._assignments.get(source_name) is not source
+                or name in self._assignments
+            ):
+                self.state.issue(
+                    "warning",
+                    "Assignments copy discarded",
+                    "The data changed while copying. Create the copy again.",
+                )
+                return
+
+            self._assignments[name] = candidate
+            self._stale_assignments[name] = stale
+
+            # Do not change the active assignments or selection.
+            self.notify_change(C.ASSIGNMENT_SET)
+
+            if on_copied is not None:
+                on_copied()
+
+        return tasks.start(
+            "calculating",
+            f"Copy assignments: {name}",
+            run,
             on_result=publish,
         )
 
@@ -2080,7 +2802,9 @@ class Data(Tracking):
                         and not self._model_fit_requested
                         and all(
                             self.state.tasks.current_task(group) is None
-                            and not self.state.tasks.queued_tasks(group)
+                            and not self.state.tasks.queued_tasks(
+                                group, include_deferred=False
+                            )
                             for group in ("loading", "model update")
                         )
                     )

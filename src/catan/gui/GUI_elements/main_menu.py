@@ -1,5 +1,6 @@
 from typing import Dict, Optional, Tuple, List
 import importlib
+import numpy as np
 
 from PySide6.QtWidgets import (
     QInputDialog,
@@ -18,7 +19,11 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QWidgetAction,
     QCheckBox,
+    QDialogButtonBox,
+    QDialog,
+    QMessageBox,
 )
+
 from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal, QSignalBlocker, QSize
 from PySide6.QtGui import QAction
 from shiboken6 import isValid
@@ -29,7 +34,10 @@ from catan.core.changes import DataChange
 from catan.gui.structures import data, state
 from catan.gui.background_tasks.TaskManager import TaskBatch
 from catan.gui.resources.get_icon import get_fa_icon
+from catan.gui.data.assignment_colors import assignment_label
+from catan.core.changes import ChangeKind as C
 
+from catan.tracking.structures import ReviewStatus
 from .resource_monitor import ResourceMonitor
 from .fragments import (
     FieldConfigConstructor,
@@ -41,8 +49,16 @@ from .fragments import (
 from . import session_overview
 
 selector_options = {
-    "model": ["Load ..."],
-    "assignments": ["Create new", "Load ..."],
+    "model": [
+        "Load ...",
+        "Remove current…",
+    ],
+    "assignments": [
+        "Create new",
+        "Create named copy…",
+        "Load ...",
+        "Remove current…",
+    ],
 }
 
 
@@ -141,6 +157,8 @@ class MainMenu(QFrame):
         ## to avoid path inconsistencies
         sessions_loaded = len(self.data.sessions) > 0
 
+        self._update_review_counts()
+
         self.button_root_path.setEnabled(not sessions_loaded)
         self.edit_root_path.setEnabled(not sessions_loaded)
 
@@ -162,6 +180,9 @@ class MainMenu(QFrame):
         any_assigned = any(self.data.assignments.matched_status)
         self.loader["assignments"]["button_save"].setEnabled(any_assigned)
         self.update_buttons()
+
+        if event.has(C.ASSIGNMENT_SET):
+            self._refresh_source_selector("assignments")
 
     def build_app_mode_menu(self):
         paths_menu = QWidget()
@@ -209,6 +230,16 @@ class MainMenu(QFrame):
                 add_widgets=[self.config_constructor.toggle_config_options],
             ),
         )
+
+        self.review_counts_label = QLabel()
+        self.review_counts_label.setWordWrap(True)
+        self.review_counts_label.setToolTip(
+            "Review status of included neurons in the active assignments."
+        )
+        self.review_counts_label.setStyleSheet("font-size: 11px; padding: 2px 0;")
+
+        form.addRow("", self.review_counts_label)
+        self._update_review_counts()
 
         # Configuration content belongs to its popup, not this form.
         self.paths_layout.addWidget(frame)
@@ -368,9 +399,16 @@ class MainMenu(QFrame):
             add_options=add_options,
         )
 
-        selector.currentTextChanged.connect(
-            lambda text: self._on_load_option_changed(key, text)
+        selector.currentIndexChanged.connect(
+            lambda index: self._on_load_option_changed(
+                key,
+                selector.itemData(index),
+            )
         )
+
+        # selector.currentTextChanged.connect(
+        #     lambda text: self._on_load_option_changed(key, text)
+        # )
         selector.currentTextChanged.connect(selector.setToolTip)
         selector.setToolTip(selector.currentText())
 
@@ -436,6 +474,85 @@ class MainMenu(QFrame):
 
         return layout
 
+    def _update_review_counts(self):
+        label = getattr(self, "review_counts_label", None)
+
+        if label is None:
+            return
+
+        assignments = self.data.assignments
+
+        if assignments is None:
+            statuses = np.empty(0, dtype=np.uint8)
+        else:
+            statuses = np.asarray(assignments.review_status).reshape(-1)
+            included = getattr(assignments.union, "included", None)
+
+            if included is not None:
+                included = np.asarray(included, dtype=bool)
+
+                if included.shape == statuses.shape:
+                    statuses = statuses[included]
+
+        counts = {
+            status: int(np.count_nonzero(statuses == status))
+            for status in (
+                ReviewStatus.REVIEWED,
+                ReviewStatus.UNCERTAIN,
+                ReviewStatus.PENDING,
+            )
+        }
+
+        manipulation_counts = {
+            "split": 0,
+            "merge": 0,
+            "reassign": 0,
+        }
+
+        category_for_type = {
+            "split": "split",
+            "merge": "merge",
+            "neuron_merge": "merge",
+            "reassign": "reassign",
+        }
+
+        if assignments is not None:
+            for record in assignments.manipulations.values():
+                category = category_for_type.get(record["type"])
+
+                if category is not None:
+                    manipulation_counts[category] += 1
+
+        excluded_footprints = 0
+
+        for session in self.data.sessions:
+            included = getattr(session, "included", None)
+
+            if included is not None:
+                included = np.asarray(included, dtype=bool)
+                excluded_footprints += int(np.count_nonzero(~included))
+
+        label.setText(
+            f"Reviewed: {counts[ReviewStatus.REVIEWED]} · "
+            f"Uncertain: {counts[ReviewStatus.UNCERTAIN]} · "
+            f"Pending: {counts[ReviewStatus.PENDING]}\n"
+            f"Splits: {manipulation_counts['split']} · "
+            f"Merges: {manipulation_counts['merge']} · "
+            f"Reassignments: {manipulation_counts['reassign']} · "
+            f"Excluded footprints: {excluded_footprints}"
+        )
+
+        label.setToolTip(
+            "Review counts refer to included neurons in the active "
+            "assignments.\n\n"
+            "Manipulation counts refer to recorded operations in the "
+            "active assignments, including loaded history. Each operation "
+            "counts once. Merges include footprint and neuron merges.\n\n"
+            "Excluded footprints counts all currently excluded footprints "
+            "across the loaded sessions, including original footprints "
+            "replaced by splitting or merging."
+        )
+
     def save_data(self, key):
         if key not in {"model", "assignments"}:
             raise ValueError(f"Unsupported result type: {key}")
@@ -463,6 +580,67 @@ class MainMenu(QFrame):
         if not opt:
             return
 
+        if opt == "Remove current…":
+            name = (
+                self.data.current_model_name
+                if key == "model"
+                else self.data.current_assignments
+            )
+            source = getattr(self.data, key)
+
+            self._refresh_source_selector(key)
+
+            if source is None or name is None:
+                return
+
+            explanation = (
+                "Its contents will be cleared, leaving an empty Working entry."
+                if name == "local"
+                else "It will be removed from the current CATAN workspace."
+            )
+
+            answer = QMessageBox.question(
+                self.window(),
+                f"Remove {key}?",
+                f"Remove {assignment_label(name)}?\n\n"
+                f"{explanation}\n"
+                "Files on disk will not be deleted.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+
+            if answer == QMessageBox.StandardButton.Yes:
+                self.data.remove_loaded_source(
+                    key,
+                    name,
+                    expected_source=source,
+                    on_removed=lambda: self._refresh_source_selector(key),
+                )
+
+            return
+
+        use_working = False
+        replace_empty_model = False
+
+        if key == "assignments" and opt == "Create named copy…":
+            source_name = self.data.current_assignments
+            self._refresh_source_selector(key)
+
+            name, accepted = QInputDialog.getText(
+                self,
+                "Copy assignments",
+                "Name for the independent assignments copy:",
+                text=f"{source_name} copy",
+            )
+
+            if accepted:
+                self.data.queue_copy_assignments(
+                    name,
+                    on_copied=lambda: self._refresh_source_selector("assignments"),
+                )
+
+            return
+
         name = None
         ok = False
         if opt in selector_options[key]:
@@ -479,17 +657,25 @@ class MainMenu(QFrame):
                     self._refresh_source_selector(key)
                     return
 
-            name, ok = QInputDialog.getText(
-                self,
-                f"{key.capitalize()} name",
-                f"Enter a name for the {key}:",
-                text=Path(load_path).stem if load_path else "",
-            )
+            if key == "assignments" and load_path is not None:
+                name, ok, use_working = self._ask_assignments_import_name(load_path)
+
+            elif key == "model" and load_path is not None:
+                name, ok, replace_empty_model = self._ask_model_import_name(load_path)
+
+            else:
+                name, ok = QInputDialog.getText(
+                    self,
+                    f"{key.capitalize()} name",
+                    f"Enter a name for the {key}:",
+                    text=Path(load_path).stem if load_path else "",
+                )
         else:
             if key == "model":
                 self.data.change_model(opt)
             elif key == "assignments":
                 self.data.change_assignments(opt)
+                self._refresh_source_selector(key)
 
             return
 
@@ -510,6 +696,8 @@ class MainMenu(QFrame):
                 key,
                 load_path,
                 name,
+                use_as_working=use_working,
+                replace_empty_model=replace_empty_model,
                 on_loaded=lambda: self._on_source_registered(key),
             )
             return
@@ -546,6 +734,41 @@ class MainMenu(QFrame):
 
         self.update_buttons()
 
+    def _ask_model_import_name(self, path):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Load model")
+
+        layout = QVBoxLayout(dialog)
+
+        name_edit = QLineEdit(Path(path).stem)
+        layout.addWidget(QLabel("Model name"))
+        layout.addWidget(name_edit)
+
+        target_name = self.data.current_model_name
+
+        replace_current = QCheckBox("Replace current empty model")
+        replace_current.setEnabled(self.data.can_replace_empty_model(target_name))
+        replace_current.setToolTip(
+            "Replace the current model only if it has no loaded model, "
+            "fit, or accumulated counts."
+        )
+        replace_current.toggled.connect(name_edit.setDisabled)
+        replace_current.setChecked(replace_current.isEnabled())
+        layout.addWidget(replace_current)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        replace = replace_current.isChecked()
+
+        name = target_name if replace else name_edit.text().strip()
+        return name, accepted, replace
+
     def _show_assignments_configuration(self):
         constructor = self.config_constructor
         constructor.update_source(self.data.assignments)
@@ -558,6 +781,54 @@ class MainMenu(QFrame):
             on_config_required=self._show_assignments_configuration,
         )
 
+    def _ask_assignments_import_name(self, path):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Load assignments")
+
+        layout = QVBoxLayout(dialog)
+
+        name_edit = QLineEdit(Path(path).stem)
+        layout.addWidget(QLabel("Assignments name"))
+        layout.addWidget(name_edit)
+
+        use_working = QCheckBox("Replace empty Working assignments")
+        use_working.setEnabled(self.data.can_use_working_assignments())
+        use_working.setToolTip(
+            "Replace the empty Working assignments after successful "
+            "loading. Uncheck to load a separate named dataset."
+        )
+        use_working.toggled.connect(name_edit.setDisabled)
+        use_working.setChecked(use_working.isEnabled())
+
+        layout.addWidget(use_working)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+
+        replace_working = use_working.isChecked()
+        name = name_edit.text().strip()
+
+        if accepted and replace_working:
+            # Loading first registers a temporary named dataset.
+            # It becomes Working only after successful validation.
+            base = Path(path).stem or "Imported assignments"
+            name = base
+            number = 2
+
+            existing = set(self.data.available_assignments)
+
+            while name in existing:
+                name = f"{base} ({number})"
+                number += 1
+
+        return name, accepted, replace_working
+
     def _on_source_registered(self, key):
         self._refresh_source_selector(key)
 
@@ -569,7 +840,6 @@ class MainMenu(QFrame):
 
         if problems:
             source.status["loading_possible"] = False
-            self._show_assignments_configuration()
 
             self.state.issue(
                 "info",
@@ -579,6 +849,12 @@ class MainMenu(QFrame):
                 "Then click the assignments open-folder button to load.",
                 parent=self.window(),
             )
+
+            # Open AFTER the message box closes.
+            # Its nested event loop may have changed the active source.
+            if isValid(self) and self.data.assignments is source:
+                self._show_assignments_configuration()
+
             return
 
         self._load_assignments_from_source()
@@ -625,7 +901,8 @@ class MainMenu(QFrame):
             for add_opt in add_options:
                 options.append(add_opt)
 
-        selector.addItems([opt for opt in options])
+        for option in options:
+            selector.addItem(assignment_label(option), option)
         selector.blockSignals(False)
 
     def _refresh_source_selector(self, key):
@@ -648,10 +925,11 @@ class MainMenu(QFrame):
         selector = self.loader[key]["selector"]
 
         with QSignalBlocker(selector):
-            index = selector.findText(current) if current is not None else -1
+            index = selector.findData(current) if current is not None else -1
             selector.setCurrentIndex(index)
 
         if key == "assignments":
+            self._update_review_counts()
             self.config_constructor.update_source(self.data.assignments)
 
         self.update_buttons()

@@ -80,10 +80,10 @@ class MainWindow(QMainWindow):
             reload_action.triggered.connect(self.reload_logic)
             self.menuBar().addAction(reload_action)
 
-        # print_debug = QAction("Print debug info", self)
-        # print_debug.setShortcut("Ctrl+D")
-        # print_debug.triggered.connect(self.print_debug_info)
-        # self.menuBar().addAction(print_debug)
+        print_debug = QAction("Print debug info", self)
+        print_debug.setShortcut("Ctrl+D")
+        print_debug.triggered.connect(self.print_debug_info)
+        self.menuBar().addAction(print_debug)
 
         app = QApplication.instance()
         if app is None:
@@ -131,6 +131,7 @@ class MainWindow(QMainWindow):
             return
 
         self._reload_model_logic()
+        self._reload_statistics_logic()
 
         display_area = self.gui_elements["display_area"]
 
@@ -142,7 +143,6 @@ class MainWindow(QMainWindow):
 
         display_area.rebuild(
             reload_alignment=True,
-            reload_statistics=True,
         )
         self.gui_elements["main_menu"].rebuild()
         self.reset_stylesheet()
@@ -176,6 +176,40 @@ class MainWindow(QMainWindow):
         module.Model = existing_class
 
         # print(f"Reloaded model logic from {module.__file__}")
+
+    def _reload_statistics_logic(self):
+        engine = self.data.statistic_engine
+
+        factory_module_name = engine.registry_factory.__module__
+        factory_name = engine.registry_factory.__name__
+
+        module_names = (
+            "catan.core.image_correlation",
+            "catan.gui.data.statistics.footprint_pairs",
+            "catan.gui.data.statistics.overlap_statistics",
+            "catan.gui.data.statistics.calculations",
+            "catan.gui.data.statistics.definitions",
+            factory_module_name,
+        )
+
+        importlib.invalidate_caches()
+
+        # Preserve order and avoid reloading the same module twice.
+        for name in dict.fromkeys(module_names):
+            module = importlib.import_module(name)
+            importlib.reload(module)
+
+        factory_module = importlib.import_module(factory_module_name)
+        engine.registry_factory = getattr(factory_module, factory_name)
+
+        # Keep the existing engine and its signal connections.
+        engine.refresh_registry(emit=False)
+
+        # Invalidate even when the definition's metadata stayed identical:
+        # a helper function's implementation may have changed.
+        engine._invalidate(tuple(engine.registry))
+
+        print("[statistics reload] functions refreshed; caches invalidated", flush=True)
 
     def reset_stylesheet(self):
 

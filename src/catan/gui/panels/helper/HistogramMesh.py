@@ -50,16 +50,31 @@ class HistogramMeshLayer:
         self.faces = None
         self.colors = None
         self.edge_vertices = None
+        self.bar_bounds = None
 
-    def build_from_counts(self, bin_edges, counts, bin_colors):
+    def build_from_counts(
+        self,
+        bin_edges,
+        counts,
+        bin_colors,
+        *,
+        bar_bounds=None,
+    ):
         bin_edges = np.asarray(bin_edges, dtype=np.float32)
         counts = np.asarray(counts, dtype=np.float32)
 
         self.bin_edges = bin_edges
         self.n_bins = len(counts)
 
-        x0 = bin_edges[:-1]
-        x1 = bin_edges[1:]
+        if bar_bounds is None:
+            bar_bounds = np.column_stack((bin_edges[:-1], bin_edges[1:]))
+
+        self.bar_bounds = np.asarray(bar_bounds, dtype=np.float32)
+
+        if self.bar_bounds.shape != (self.n_bins, 2):
+            raise ValueError("Bar bounds must have shape (number of bars, 2).")
+
+        x0, x1 = self.bar_bounds.T
         y0 = np.zeros_like(counts)
         y1 = counts
 
@@ -106,8 +121,7 @@ class HistogramMeshLayer:
     def _build_edge_vertices(self, counts):
         counts = np.asarray(counts, dtype=np.float32)
 
-        x0 = self.bin_edges[:-1]
-        x1 = self.bin_edges[1:]
+        x0, x1 = self.bar_bounds.T
         y0 = np.zeros_like(counts)
         y1 = counts
 
@@ -202,4 +216,5 @@ class HistogramMeshLayer:
         self.colors = None
         self.edge_vertices = None
         self.bin_edges = None
+        self.bar_bounds = None
         self.n_bins = 0

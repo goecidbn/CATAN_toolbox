@@ -10,10 +10,12 @@ from PySide6.QtWidgets import (
     QWidget,
     QCheckBox,
     QDoubleSpinBox,
+    QComboBox,
 )
 
 from catan.core.structures import NeuronComponent
 from catan.tracking.structures import ReviewStatus
+from catan.gui.data.assignment_colors import assignment_label
 
 
 class NeuronNavigationBar(QWidget):
@@ -30,6 +32,18 @@ class NeuronNavigationBar(QWidget):
         self.current_id = 0
 
         selector_layout = QHBoxLayout(self)
+        self.assignments_selector = QComboBox()
+        self.assignments_selector.setMinimumWidth(140)
+        self.assignments_selector.setToolTip(
+            "Active assignments used for navigation and global selection."
+        )
+
+        selector_layout.addWidget(QLabel("Assignments:"))
+        selector_layout.addWidget(self.assignments_selector)
+
+        self.assignments_selector.currentIndexChanged.connect(
+            self._on_assignments_selected
+        )
 
         self.neuron_count_label = QLabel()
         selector_layout.addWidget(self.neuron_count_label)
@@ -81,12 +95,39 @@ class NeuronNavigationBar(QWidget):
         self.state.selected_components_changed.connect(self._on_selection_changed)
 
         self.update_setup()
-        print("updated navbar")
         # self.footprint_edit.editingFinished.connect(self.on_neuron_edit_return)
 
         # selector_layout = self.controls.build_footprint_selector()
         # self.section.x_options_layout.addLayout(selector_layout)
         # return selector_layout
+
+    def _refresh_assignments_selector(self):
+        selector = self.assignments_selector
+        names = self.data.available_assignments
+
+        blocked = selector.blockSignals(True)
+        try:
+            displayed = [selector.itemData(index) for index in range(selector.count())]
+
+            if displayed != names:
+                selector.clear()
+                for name in names:
+                    selector.addItem(assignment_label(name), name)
+
+            selector.setCurrentIndex(selector.findData(self.data.current_assignments))
+        finally:
+            selector.blockSignals(blocked)
+
+    def _on_assignments_selected(self, index):
+        name = self.assignments_selector.itemData(index)
+
+        if name is None or name == self.data.current_assignments:
+            return
+
+        self.data.change_assignments(name)
+
+        # Also restore the actual value when switching was blocked.
+        self.update_setup()
 
     def update_adj_radius(self, value: float):
         self.state.adjacency_radius = value
@@ -102,20 +143,29 @@ class NeuronNavigationBar(QWidget):
         self.update_setup()
 
     def update_neuron_count_label(self):
-        if (
-            self.state.selected_components is None
-            or len(self.state.selected_components) <= 1
-        ):
-            self.neuron_count_label.setText(
-                f"Iterating {self.data.assignments.union.included.sum()} neurons"
-            )
+        assignments = self.data.assignments
+
+        if assignments is None:
+            total = 0
         else:
-            neuron_ids = self.navigation_neuron_ids()
-            self.neuron_count_label.setText(
-                f"Selected {len(neuron_ids)} / {self.data.assignments.union.included.sum()} neurons"
+            included = getattr(assignments.union, "included", None)
+            total = (
+                assignments.ids.shape[0]
+                if included is None
+                else int(np.count_nonzero(included))
             )
 
+        selected = self.state.selected_components
+
+        if not selected or len(selected) <= 1:
+            text = f"Iterating {total} neurons"
+        else:
+            text = f"Selected {len(self.navigation_neuron_ids())} " f"/ {total} neurons"
+
+        self.neuron_count_label.setText(text)
+
     def update_setup(self):
+        self._refresh_assignments_selector()
         self.update_neuron_count_label()
         self.set_id_range()
         self.adjust_id()

@@ -1,0 +1,3043 @@
+--- a/catan/gui/data/statistics/blockwise.py
++++ b/catan/gui/data/statistics/blockwise.py
+@@ -7,9 +7,12 @@
+ 
+ from .types import StatisticArray
+ from .queries import ReductionSpec
+-from catan.gui.background_tasks.runtime import current_task_context
+-
+-
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
++
++
++@reports_progress("Evaluating statistic blocks")
+ def evaluate_blockwise(
+     dimensions,
+     read_block,
+@@ -83,6 +86,7 @@
+ 
+     ctx = current_task_context()
+ 
++    @reports_progress(None)
+     def calculate(level, selected):
+         if ctx is not None:
+             ctx.check_cancelled()
+@@ -109,31 +113,36 @@
+ 
+             result = None
+ 
+-            for start in range(0, len(coords), length):
+-                stop = min(start + length, len(coords))
+-
+-                part = dict(selected)
+-                part[split] = coords[start:stop]
+-                chunk = calculate(level, part)
+-
+-                if result is None:
+-                    result = chunk
+-                    result.dimensions = deepcopy(chunk.dimensions)
+-                    result.dimensions[split].coords = coords
+-
+-                    arrays = {}
+-                    for name in ("values", "errors_low", "errors_high", "n"):
+-                        value = getattr(chunk, name)
+-                        arrays[name] = (
+-                            None if value is None else np.empty(shape, value.dtype)
+-                        )
+-
+-                index = [slice(None)] * len(dims)
+-                index[axis] = slice(start, stop)
+-
+-                for name, array in arrays.items():
+-                    if array is not None:
+-                        array[tuple(index)] = getattr(chunk, name)
++            for progress_index, (start) in enumerate(range(0, len(coords), length)):
++                with progress_step(
++                    progress_index, (len(coords) + length - 1) // length, start=0, stop=100,
++                ):
++                    stop = min(start + length, len(coords))
++
++                    part = dict(selected)
++                    part[split] = coords[start:stop]
++                    with progress_scope(0, 90):
++                        chunk = calculate(level, part)
++
++                    with progress_scope(90, 100, "Assembling result blocks"):
++                        if result is None:
++                            result = chunk
++                            result.dimensions = deepcopy(chunk.dimensions)
++                            result.dimensions[split].coords = coords
++
++                            arrays = {}
++                            for name in ("values", "errors_low", "errors_high", "n"):
++                                value = getattr(chunk, name)
++                                arrays[name] = (
++                                    None if value is None else np.empty(shape, value.dtype)
++                                )
++
++                        index = [slice(None)] * len(dims)
++                        index[axis] = slice(start, stop)
++
++                        for name, array in arrays.items():
++                            if array is not None:
++                                array[tuple(index)] = getattr(chunk, name)
+ 
+             for name, array in arrays.items():
+                 setattr(result, name, array)
+@@ -144,27 +153,29 @@
+             expanded_selection = dict(selected)
+             expanded_selection[axis_name] = dimensions[axis_name].coords
+ 
+-            result = calculate(level - 1, expanded_selection)
+-
+-            if result.values.shape[result.axis(axis_name)] == 0:
+-                result.values = np.full(
+-                    shape,
+-                    0.0 if spec.method == "sum" else np.nan,
+-                )
+-
+-                if result.has_errors or spec.error_method != "none":
+-                    result.errors_low = np.full(shape, np.nan)
+-                    result.errors_high = np.full(shape, np.nan)
+-                    result.n = np.zeros(shape, dtype=int)
+-
+-                info = result.dimensions[axis_name]
+-                info.mode = "reduced"
+-                info.parameter = {
+-                    "method": spec.method,
+-                    "error_method": spec.error_method,
+-                }
+-            else:
+-                result.reduce_dimension(axis_name, spec)
++            with progress_scope(0, 85):
++                result = calculate(level - 1, expanded_selection)
++
++            with progress_scope(85, 100, f"Reducing {axis_name}: {spec.method}"):
++                if result.values.shape[result.axis(axis_name)] == 0:
++                    result.values = np.full(
++                        shape,
++                        0.0 if spec.method == "sum" else np.nan,
++                    )
++
++                    if result.has_errors or spec.error_method != "none":
++                        result.errors_low = np.full(shape, np.nan)
++                        result.errors_high = np.full(shape, np.nan)
++                        result.n = np.zeros(shape, dtype=int)
++
++                    info = result.dimensions[axis_name]
++                    info.mode = "reduced"
++                    info.parameter = {
++                        "method": spec.method,
++                        "error_method": spec.error_method,
++                    }
++                else:
++                    result.reduce_dimension(axis_name, spec)
+ 
+             return result
+ 
+@@ -173,7 +184,8 @@
+         for dim in base_dims:
+             metadata[dim].coords = selected[dim]
+ 
+-        values = np.asarray(read_block(selected), dtype=np.float32)
++        with progress_scope(0, 100, "Calculating statistic block"):
++            values = np.asarray(read_block(selected), dtype=np.float32)
+ 
+         if values.shape != shape:
+             raise ValueError(f"Block shape {values.shape} does not match {shape}.")
+@@ -215,53 +227,60 @@
+         position_parts = []
+         metadata = None
+ 
++        completed_values = 0
+         for selected, offsets in output_blocks(
+             {d: dimensions[d].coords for d in output_dims},
+             {d: 0 for d in output_dims},
+         ):
+             # Complete all requested reductions before selecting rows.
+-            chunk = calculate(len(operations), selected)
+-            chunk.validate()
+-
+-            if metadata is None:
+-                metadata = deepcopy(chunk.dimensions)
+-
+-                # Preserve the complete coordinate domains.
+-                for dim in output_dims:
+-                    metadata[dim].coords = dimensions[dim].coords
+-
+-            values = np.asarray(chunk.values).reshape(-1)
+-            mask = select_values(values)
+-
+-            if mask is None:
+-                raise ValueError("The value selector returned no mask.")
+-
+-            mask = np.asarray(mask, dtype=bool)
+-
+-            if mask.shape != values.shape:
+-                raise ValueError("The value selector returned an invalid mask shape.")
+-
+-            rows = np.flatnonzero(mask & ~np.isnan(values))
+-
+-            if not rows.size:
+-                continue
+-
+-            if output_dims:
+-                positions = np.column_stack(np.unravel_index(rows, chunk.values.shape))
+-                positions += np.array([offsets[d] for d in output_dims])
+-            else:
+-                positions = np.empty(
+-                    (rows.size, 0),
+-                    dtype=np.int64,
+-                )
+-
+-            position_parts.append(positions)
+-
+-            for name in names:
+-                array = getattr(chunk, name)
+-
+-                if array is not None:
+-                    parts[name].append(np.asarray(array).reshape(-1)[rows])
++            block_count = prod(len(selected[d]) for d in output_dims)
++            block_start = 95 * completed_values / max(1, count)
++            completed_values += block_count
++            with progress_scope(block_start, 95 * completed_values / max(1, count)):
++                with progress_scope(0, 85):
++                    chunk = calculate(len(operations), selected)
++                with progress_scope(85, 100, "Filtering statistic block"):
++                    chunk.validate()
++
++                    if metadata is None:
++                        metadata = deepcopy(chunk.dimensions)
++
++                        # Preserve the complete coordinate domains.
++                        for dim in output_dims:
++                            metadata[dim].coords = dimensions[dim].coords
++
++                    values = np.asarray(chunk.values).reshape(-1)
++                    mask = select_values(values)
++
++                    if mask is None:
++                        raise ValueError("The value selector returned no mask.")
++
++                    mask = np.asarray(mask, dtype=bool)
++
++                    if mask.shape != values.shape:
++                        raise ValueError("The value selector returned an invalid mask shape.")
++
++                    rows = np.flatnonzero(mask & ~np.isnan(values))
++
++                    if not rows.size:
++                        continue
++
++                    if output_dims:
++                        positions = np.column_stack(np.unravel_index(rows, chunk.values.shape))
++                        positions += np.array([offsets[d] for d in output_dims])
++                    else:
++                        positions = np.empty(
++                            (rows.size, 0),
++                            dtype=np.int64,
++                        )
++
++                    position_parts.append(positions)
++
++                    for name in names:
++                        array = getattr(chunk, name)
++
++                        if array is not None:
++                            parts[name].append(np.asarray(array).reshape(-1)[rows])
+ 
+         def joined(name):
+             if parts[name]:
+@@ -271,34 +290,36 @@
+ 
+             return None if array is None else np.empty(0, dtype=array.dtype)
+ 
+-        result = SparseStatisticArray(
+-            name="",
+-            title="",
+-            dimensions=metadata,
+-            values=joined("values"),
+-            positions=(
+-                np.concatenate(position_parts, axis=0)
+-                if position_parts
+-                else np.empty(
+-                    (0, len(output_dims)),
+-                    dtype=np.int64,
+-                )
+-            ),
+-            errors_low=joined("errors_low"),
+-            errors_high=joined("errors_high"),
+-            n=joined("n"),
+-            reduction_aliases=dict(aliases),
+-            reference_aliases=dict(reference_aliases or {}),
+-            applied_pair_filters=tuple(applied_filters),
++        with progress_scope(95, 100, "Assembling filtered statistic"):
++            result = SparseStatisticArray(
++                name="",
++                title="",
++                dimensions=metadata,
++                values=joined("values"),
++                positions=(
++                    np.concatenate(position_parts, axis=0)
++                    if position_parts
++                    else np.empty(
++                        (0, len(output_dims)),
++                        dtype=np.int64,
++                    )
++                ),
++                errors_low=joined("errors_low"),
++                errors_high=joined("errors_high"),
++                n=joined("n"),
++                reduction_aliases=dict(aliases),
++                reference_aliases=dict(reference_aliases or {}),
++                applied_pair_filters=tuple(applied_filters),
++            )
++
++            result.validate()
++        return result
++
++    with progress_scope(0, 98):
++        result = calculate(
++            len(operations),
++            {d: dimensions[d].coords for d in output_dims},
+         )
+-
+-        result.validate()
+-        return result
+-
+-    result = calculate(
+-        len(operations),
+-        {d: dimensions[d].coords for d in output_dims},
+-    )
+ 
+     result.validate()
+     return result
+--- a/catan/gui/data/curation_filter.py
++++ b/catan/gui/data/curation_filter.py
+@@ -1,3 +1,6 @@
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
+ from dataclasses import dataclass, field, replace, asdict
+ from typing import List, Literal, ClassVar
+ from uuid import uuid4
+@@ -396,6 +399,7 @@
+     ):
+         self.engine = engine
+ 
++    @reports_progress("Evaluating curator preset")
+     def evaluate(
+         self,
+         root: CurationFilterGroup,
+@@ -431,12 +435,14 @@
+                 np.flatnonzero(np.isin(statuses, root.review_statuses))
+             )
+ 
+-        self._prepare_count_domains(root)
+-        root_result = self._evaluate_group(root, condition_results, group_results)
++        with progress_scope(0, 3, "Preparing curator domains"):
++            self._prepare_count_domains(root)
++        with progress_scope(3, 97):
++            root_result = self._evaluate_group(root, condition_results, group_results)
+ 
+         neurons = set()
+ 
+-        for match in root_result.matches:
++        for match in progress_iter(root_result.matches, start=97, stop=99):
+             neurons.update(match_neurons(match))
+ 
+         return CurationFilterResult(
+@@ -447,6 +453,7 @@
+             bound_inspections=self._bound_inspections,
+         )
+ 
++    @reports_progress(None)
+     def _evaluate_condition(
+         self,
+         condition: CurationFilterCondition,
+@@ -463,11 +470,12 @@
+         except ValueError as exc:
+             raise CurationFilterError(str(exc)) from exc
+ 
+-        table = self.engine.evaluate_matching_table(
+-            condition.query,
+-            condition.threshold.mask,
+-            requested_pairs=requested_pairs,
+-        )
++        with progress_scope(0, 85, f"Statistic: {condition.query.statistic_key}"):
++            table = self.engine.evaluate_matching_table(
++                condition.query,
++                condition.threshold.mask,
++                requested_pairs=requested_pairs,
++            )
+ 
+         if table is None:
+             raise CurationFilterError("No statistic is available for this condition.")
+@@ -477,12 +485,13 @@
+             table.n_rows,
+             dtype=np.intp,
+         )
+-        (
+-            neurons,
+-            components,
+-            rows_by_neuron,
+-            rows_by_component,
+-        ) = self._project_rows(table, matching_rows)
++        with progress_scope(85, 100, "Projecting matching rows"):
++            (
++                neurons,
++                components,
++                rows_by_neuron,
++                rows_by_component,
++            ) = self._project_rows(table, matching_rows)
+ 
+         return CurationFilterConditionResult(
+             condition=condition,
+@@ -602,6 +611,7 @@
+ 
+         visit(group)
+ 
++    @reports_progress('Evaluating partner requirements')
+     def _apply_support_groups(
+         self,
+         group,
+@@ -633,7 +643,8 @@
+                 "per actual anchor type."
+             )
+ 
+-        buckets = self._relationship_buckets(result, spec)
++        with progress_scope(0, 5):
++            buckets = self._relationship_buckets(result, spec)
+ 
+         partner_sets = [
+             {pair.target if spec.anchor == "source" else pair.source for pair in pairs}
+@@ -647,7 +658,7 @@
+         # Only compare supports belonging to a common outer target.
+         candidates = set()
+ 
+-        for sources in partner_sets:
++        for sources in progress_iter(partner_sets, start=5, stop=15, every=1):
+             if ctx is not None:
+                 ctx.check_cancelled()
+ 
+@@ -663,46 +674,49 @@
+ 
+         compatible = set(candidates)
+ 
+-        for child in support_groups:
+-            if (
+-                child.operator != "and"
+-                or child.match_level != "relationship"
+-                or child.count is not None
+-                or any(not is_filter_condition(c) for c in child.children)
++        for progress_index, (child) in enumerate(support_groups):
++            with progress_step(
++                progress_index, len(support_groups), start=15, stop=65,
+             ):
+-                raise CurationFilterError(
+-                    "Use an AND source-target group with conditions "
+-                    "and no count for comparisons between partners.",
+-                    node_id=child.id,
+-                    node_type="group",
++                if (
++                    child.operator != "and"
++                    or child.match_level != "relationship"
++                    or child.count is not None
++                    or any(not is_filter_condition(c) for c in child.children)
++                ):
++                    raise CurationFilterError(
++                        "Use an AND source-target group with conditions "
++                        "and no count for comparisons between partners.",
++                        node_id=child.id,
++                        node_type="group",
++                    )
++
++                for condition in child.children:
++                    if not self.engine.supports_requested_pairs(condition.query):
++                        raise CurationFilterError(
++                            "This between-partner condition needs a statistic "
++                            "supporting requested footprint pairs, with all "
++                            "identities kept or fixed.",
++                            node_id=condition.id,
++                            node_type="condition",
++                        )
++
++                child_result = self._evaluate_group(
++                    child,
++                    condition_results,
++                    group_results,
++                    initial_pairs=compatible,
++                    initial_kinds=(
++                        result.endpoint_kinds[1 if spec.anchor == "source" else 0],
++                    )
++                    * 2,
+                 )
+ 
+-            for condition in child.children:
+-                if not self.engine.supports_requested_pairs(condition.query):
+-                    raise CurationFilterError(
+-                        "This between-partner condition needs a statistic "
+-                        "supporting requested footprint pairs, with all "
+-                        "identities kept or fixed.",
+-                        node_id=condition.id,
+-                        node_type="condition",
+-                    )
+-
+-            child_result = self._evaluate_group(
+-                child,
+-                condition_results,
+-                group_results,
+-                initial_pairs=compatible,
+-                initial_kinds=(
+-                    result.endpoint_kinds[1 if spec.anchor == "source" else 0],
+-                )
+-                * 2,
+-            )
+-
+-            compatible.intersection_update(child_result.matches)
++                compatible.intersection_update(child_result.matches)
+ 
+         selected_pairs = set()
+ 
+-        for pairs, sources in zip(buckets.values(), partner_sets):
++        for pairs, sources in progress_iter(zip(buckets.values(), partner_sets), total=len(partner_sets), start=65, stop=95, every=1):
+             if ctx is not None:
+                 ctx.check_cancelled()
+ 
+@@ -780,6 +794,7 @@
+             for child in group.children:
+                 self._bound_inspections[child.id] = mapping
+ 
++    @reports_progress("Evaluating curator group")
+     def _evaluate_group(
+         self,
+         group: CurationFilterGroup,
+@@ -845,120 +860,128 @@
+ 
+         progressive = group.operator == "and" and group.match_level == "relationship"
+ 
+-        for child in ordinary_children:
+-
+-            # -------------------------------------
+-            # Condition
+-            # -------------------------------------
+-
+-            if is_filter_condition(child):
+-
+-                try:
+-                    requested_pairs = None
+-
++        for progress_index, (child) in enumerate(ordinary_children):
++            with progress_step(
++                progress_index, len(ordinary_children), start=0, stop=70,
++            ):
++
++                # -------------------------------------
++                # Condition
++                # -------------------------------------
++
++                if is_filter_condition(child):
++
++                    try:
++                        requested_pairs = None
++
++                        if (
++                            progressive
++                            and remaining_pairs is not None
++                            and self.engine.supports_requested_pairs(child.query)
++                        ):
++                            requested_pairs = np.fromiter(
++                                (
++                                    value
++                                    for pair in remaining_pairs
++                                    for value in (
++                                        pair.source.neuron_id,
++                                        pair.target.neuron_id,
++                                        (
++                                            -1
++                                            if pair.source.session_id is None
++                                            else pair.source.session_id
++                                        ),
++                                        (
++                                            -1
++                                            if pair.target.session_id is None
++                                            else pair.target.session_id
++                                        ),
++                                    )
++                                ),
++                                dtype=np.int64,
++                                count=4 * len(remaining_pairs),
++                            ).reshape(-1, 4)
++
++                        with progress_scope(0, 85):
++                            condition_result = self._evaluate_condition(
++                                child,
++                                requested_pairs=requested_pairs,
++                            )
++
++                        condition_results[child.id] = condition_result
++
++                        with progress_scope(85, 95, "Constructing condition matches"):
++                            child_result = self._condition_result_for_level(
++                                condition_result, group.match_level
++                            )
++                        if group.match_level == "relationship":
++                            kinds = child_result.endpoint_kinds
++
++                            if endpoint_kinds is not None and kinds != endpoint_kinds:
++                                raise CurationFilterError(
++                                    "Pair types differ after reduction: "
++                                    f"expected {endpoint_kinds}, received {kinds}. "
++                                    "Keep/fix a session for a footprint endpoint, "
++                                    "or reduce it for a neuron endpoint."
++                                )
++
++                            endpoint_kinds = kinds
++
++                        with progress_scope(95, 100, "Preparing condition domains"):
++                            self._set_count_domains(
++                                child_result,
++                                condition_result.table,
++                            )
++
++                    except CurationFilterError as exc:
++                        exc.attach_node(child.id, "condition")
++                        raise
++
++                # -------------------------------------
++                # Nested group
++                # -------------------------------------
++
++                elif is_filter_group(child):
++
++                    try:
++                        with progress_scope(0, 85):
++                            child_result = self._evaluate_group(
++                                child, condition_results, group_results
++                            )
++
++                        with progress_scope(85, 100, "Projecting subgroup matches"):
++                            child_result = self._project_group_result(
++                                child_result, group.match_level
++                            )
++
++                    except CurationFilterError as exc:
++                        exc.attach_node(child.id, "group")
++                        raise
++
++                else:
++                    raise TypeError(f"Unknown curation filter node: " f"{type(child)!r}")
++
++                if group.match_level == "relationship":
+                     if (
+-                        progressive
+-                        and remaining_pairs is not None
+-                        and self.engine.supports_requested_pairs(child.query)
++                        endpoint_kinds is not None
++                        and child_result.endpoint_kinds != endpoint_kinds
+                     ):
+-                        requested_pairs = np.fromiter(
+-                            (
+-                                value
+-                                for pair in remaining_pairs
+-                                for value in (
+-                                    pair.source.neuron_id,
+-                                    pair.target.neuron_id,
+-                                    (
+-                                        -1
+-                                        if pair.source.session_id is None
+-                                        else pair.source.session_id
+-                                    ),
+-                                    (
+-                                        -1
+-                                        if pair.target.session_id is None
+-                                        else pair.target.session_id
+-                                    ),
+-                                )
+-                            ),
+-                            dtype=np.int64,
+-                            count=4 * len(remaining_pairs),
+-                        ).reshape(-1, 4)
+-
+-                    condition_result = self._evaluate_condition(
+-                        child,
+-                        requested_pairs=requested_pairs,
+-                    )
+-
+-                    condition_results[child.id] = condition_result
+-
+-                    child_result = self._condition_result_for_level(
+-                        condition_result, group.match_level
+-                    )
+-                    if group.match_level == "relationship":
+-                        kinds = child_result.endpoint_kinds
+-
+-                        if endpoint_kinds is not None and kinds != endpoint_kinds:
+-                            raise CurationFilterError(
+-                                "Pair types differ after reduction: "
+-                                f"expected {endpoint_kinds}, received {kinds}. "
+-                                "Keep/fix a session for a footprint endpoint, "
+-                                "or reduce it for a neuron endpoint."
+-                            )
+-
+-                        endpoint_kinds = kinds
+-
+-                    self._set_count_domains(
+-                        child_result,
+-                        condition_result.table,
+-                    )
+-
+-                except CurationFilterError as exc:
+-                    exc.attach_node(child.id, "condition")
+-                    raise
+-
+-            # -------------------------------------
+-            # Nested group
+-            # -------------------------------------
+-
+-            elif is_filter_group(child):
+-
+-                try:
+-                    child_result = self._evaluate_group(
+-                        child, condition_results, group_results
+-                    )
+-
+-                    child_result = self._project_group_result(
+-                        child_result, group.match_level
+-                    )
+-
+-                except CurationFilterError as exc:
+-                    exc.attach_node(child.id, "group")
+-                    raise
+-
+-            else:
+-                raise TypeError(f"Unknown curation filter node: " f"{type(child)!r}")
+-
+-            if group.match_level == "relationship":
+-                if (
+-                    endpoint_kinds is not None
+-                    and child_result.endpoint_kinds != endpoint_kinds
+-                ):
+-                    raise CurationFilterError(
+-                        "Combined relationship groups must "
+-                        "have the same endpoint types.",
+-                        node_id=child.id,
+-                        node_type=child.node_type,
+-                    )
+-
+-                endpoint_kinds = child_result.endpoint_kinds
+-
+-            child_results.append(child_result)
+-
+-            if progressive:
+-                if remaining_pairs is None:
+-                    remaining_pairs = set(child_result.matches)
+-                else:
+-                    remaining_pairs.intersection_update(child_result.matches)
++                        raise CurationFilterError(
++                            "Combined relationship groups must "
++                            "have the same endpoint types.",
++                            node_id=child.id,
++                            node_type=child.node_type,
++                        )
++
++                    endpoint_kinds = child_result.endpoint_kinds
++
++                child_results.append(child_result)
++
++                if progressive:
++                    if remaining_pairs is None:
++                        remaining_pairs = set(child_result.matches)
++                    else:
++                        remaining_pairs.intersection_update(child_result.matches)
+ 
+         # -----------------------------------------
+         # Empty group
+@@ -981,62 +1004,64 @@
+         # Boolean operation
+         # -----------------------------------------
+ 
+-        if group.operator == "and":
+-
+-            matches = set(child_results[0].matches)
+-
+-            for child_result in child_results[1:]:
+-                matches.intersection_update(child_result.matches)
+-
+-        elif group.operator == "or":
+-
+-            matches = set()
+-
+-            for child_result in child_results:
+-                matches.update(child_result.matches)
+-
+-        else:
+-            raise ValueError(group.operator)
++        with progress_scope(70, 73, "Combining curator conditions"):
++            if group.operator == "and":
++
++                matches = set(child_results[0].matches)
++
++                for child_result in child_results[1:]:
++                    matches.intersection_update(child_result.matches)
++
++            elif group.operator == "or":
++
++                matches = set()
++
++                for child_result in child_results:
++                    matches.update(child_result.matches)
++
++            else:
++                raise ValueError(group.operator)
+ 
+         # -----------------------------------------
+         # Evidence only for identities which
+         # survived this group's Boolean operation.
+         # -----------------------------------------
+ 
+-        evidence_by_match = {}
+-
+-        for match in matches:
+-
+-            evidence = set()
+-
+-            for child_result in child_results:
+-
+-                # With OR, only contributing children matter.
+-                # With AND, every child contains the match anyway.
+-                if match not in child_result.matches:
+-                    continue
+-
+-                evidence.update(child_result.evidence_by_match.get(match, set()))
+-
+-            evidence_by_match[match] = evidence
+-
+-        result = CurationFilterGroupResult(
+-            group_id=group.id,
+-            match_level=group.match_level,
+-            matches=matches,
+-            evidence_by_match=evidence_by_match,
+-            target_evidence=combined_targets(
+-                child_results,
+-                matches,
+-                group.match_level,
+-            ),
+-        )
+-
+-        result.endpoint_kinds = endpoint_kinds
+-        combine = set.intersection if group.operator == "and" else set.union
+-
+-        result.neuron_domain = combine(*(r.neuron_domain for r in child_results))
+-        result.footprint_domain = combine(*(r.footprint_domain for r in child_results))
++        with progress_scope(73, 80, "Combining match evidence"):
++            evidence_by_match = {}
++
++            for match in progress_iter(matches):
++
++                evidence = set()
++
++                for child_result in child_results:
++
++                    # With OR, only contributing children matter.
++                    # With AND, every child contains the match anyway.
++                    if match not in child_result.matches:
++                        continue
++
++                    evidence.update(child_result.evidence_by_match.get(match, set()))
++
++                evidence_by_match[match] = evidence
++
++            result = CurationFilterGroupResult(
++                group_id=group.id,
++                match_level=group.match_level,
++                matches=matches,
++                evidence_by_match=evidence_by_match,
++                target_evidence=combined_targets(
++                    child_results,
++                    matches,
++                    group.match_level,
++                ),
++            )
++
++            result.endpoint_kinds = endpoint_kinds
++            combine = set.intersection if group.operator == "and" else set.union
++
++            result.neuron_domain = combine(*(r.neuron_domain for r in child_results))
++            result.footprint_domain = combine(*(r.footprint_domain for r in child_results))
+ 
+         if group is self._review_root and self._review_allowed is not None:
+             allowed = self._review_allowed
+@@ -1064,124 +1089,134 @@
+                 },
+             )
+ 
+-        for child in endpoint_groups:
+-            try:
+-                child_result = self._evaluate_group(
+-                    child,
++        for progress_index, (child) in enumerate(endpoint_groups):
++            with progress_step(
++                progress_index, len(endpoint_groups), start=80, stop=86,
++            ):
++                try:
++                    child_result = self._evaluate_group(
++                        child,
++                        condition_results,
++                        group_results,
++                    )
++
++                    result = self._apply_endpoint_group(
++                        result,
++                        child_result,
++                        child.apply_to,
++                    )
++
++                except CurationFilterError as exc:
++                    exc.attach_node(child.id, "group")
++                    raise
++
++        with progress_scope(86, 92, "Evaluating partner requirements"):
++            if support_groups:
++                result = self._apply_support_groups(
++                    group,
++                    result,
++                    support_groups,
+                     condition_results,
+                     group_results,
+                 )
+ 
+-                result = self._apply_endpoint_group(
+-                    result,
+-                    child_result,
+-                    child.apply_to,
+-                )
+-
+-            except CurationFilterError as exc:
+-                exc.attach_node(child.id, "group")
+-                raise
+-
+-        if support_groups:
+-            result = self._apply_support_groups(
+-                group,
+-                result,
+-                support_groups,
+-                condition_results,
+-                group_results,
+-            )
+-
+         # Subsequent counting and condition projection must use the
+         # relationships that survived all source/target requirements.
+         matches = result.matches
+ 
+-        if group.count is not None:
+-            try:
+-                result = self._apply_count(group, result)
+-            except CurationFilterError as exc:
+-                exc.attach_node(group.id, "group")
+-                raise
+-
+-        for child, child_result in zip(ordinary_children, child_results):
+-            if not is_filter_condition(child):
+-                continue
+-
+-            surviving = child_result.matches & matches
+-
+-            projected = replace(
+-                child_result,
+-                matches=surviving,
+-                evidence_by_match={
+-                    match: child_result.evidence_by_match[match] for match in surviving
+-                },
+-                target_evidence=restrict_targets(
+-                    child_result.target_evidence,
+-                    surviving,
+-                    child_result.match_level,
+-                ),
+-            )
+-
+-            if group.count is not None and result.match_level == "relationship":
+-                kept = projected.matches & result.matches
++        with progress_scope(92, 95, "Counting surviving matches"):
++            if group.count is not None:
++                try:
++                    result = self._apply_count(group, result)
++                except CurationFilterError as exc:
++                    exc.attach_node(group.id, "group")
++                    raise
++
++        for progress_index, (child, child_result) in enumerate(zip(ordinary_children, child_results)):
++            with progress_step(
++                progress_index, len(ordinary_children), start=95, stop=98, message="Projecting surviving conditions",
++            ):
++                if not is_filter_condition(child):
++                    continue
++
++                surviving = child_result.matches & matches
+ 
+                 projected = replace(
+-                    projected,
+-                    matches=kept,
++                    child_result,
++                    matches=surviving,
+                     evidence_by_match={
+-                        pair: projected.evidence_by_match[pair] for pair in kept
+-                    },
+-                    target_evidence=pair_target_evidence(kept),
+-                )
+-
+-            elif group.count is not None:
+-                _, evidence = self._count_buckets(
+-                    projected,
+-                    group.count.target,
+-                    group.count.unit,
+-                )
+-
+-                projected = replace(
+-                    result,
+-                    evidence_by_match={
+-                        subject: evidence.get(subject, set())
+-                        for subject in result.matches
++                        match: child_result.evidence_by_match[match] for match in surviving
+                     },
+                     target_evidence=restrict_targets(
+-                        projected.target_evidence,
+-                        result.matches,
+-                        result.match_level,
++                        child_result.target_evidence,
++                        surviving,
++                        child_result.match_level,
+                     ),
+                 )
+ 
+-            condition_results[child.id].projected_result = projected
+-
+-        if bound_children:
+-            surviving_pairs = {
+-                pair
+-                for pair in matches
+-                if (
+-                    pair in result.matches
+-                    if result.match_level == "relationship"
+-                    else self._endpoint_matches(result, pair.target)
++                if group.count is not None and result.match_level == "relationship":
++                    kept = projected.matches & result.matches
++
++                    projected = replace(
++                        projected,
++                        matches=kept,
++                        evidence_by_match={
++                            pair: projected.evidence_by_match[pair] for pair in kept
++                        },
++                        target_evidence=pair_target_evidence(kept),
++                    )
++
++                elif group.count is not None:
++                    _, evidence = self._count_buckets(
++                        projected,
++                        group.count.target,
++                        group.count.unit,
++                    )
++
++                    projected = replace(
++                        result,
++                        evidence_by_match={
++                            subject: evidence.get(subject, set())
++                            for subject in result.matches
++                        },
++                        target_evidence=restrict_targets(
++                            projected.target_evidence,
++                            result.matches,
++                            result.match_level,
++                        ),
++                    )
++
++                condition_results[child.id].projected_result = projected
++
++        with progress_scope(98, 99, "Constructing bound inspections"):
++            if bound_children:
++                surviving_pairs = {
++                    pair
++                    for pair in matches
++                    if (
++                        pair in result.matches
++                        if result.match_level == "relationship"
++                        else self._endpoint_matches(result, pair.target)
++                    )
++                }
++
++                self._record_support_inspection(
++                    support_groups,
++                    surviving_pairs,
+                 )
+-            }
+-
+-            self._record_support_inspection(
+-                support_groups,
+-                surviving_pairs,
+-            )
+-
+-            for child in endpoint_groups:
+-                self._record_bound_inspection(
+-                    child,
+-                    child.apply_to,
+-                    surviving_pairs,
+-                    condition_results,
+-                    group_results,
+-                )
++
++                for child in endpoint_groups:
++                    self._record_bound_inspection(
++                        child,
++                        child.apply_to,
++                        surviving_pairs,
++                        condition_results,
++                        group_results,
++                    )
+         group_results[group.id] = result
+         return result
+ 
++    @reports_progress('Preparing count domains')
+     def _prepare_count_domains(self, root):
+         def enabled(group):
+             return group.count is not None or any(
+@@ -1206,7 +1241,7 @@
+             if included.shape != (ids.shape[0],):
+                 raise CurationFilterError("Union inclusion mask has the wrong length.")
+ 
+-        for sid, session in enumerate(self.engine.data.sessions[: ids.shape[1]]):
++        for sid, session in enumerate(progress_iter(self.engine.data.sessions[: ids.shape[1]], stop=95, every=1)):
+             if session is None:
+                 continue
+ 
+@@ -1230,6 +1265,7 @@
+ 
+         self._count_neurons = {c.neuron_id for c in self._count_components}
+ 
++    @reports_progress('Preparing condition domains')
+     def _set_count_domains(self, result, table):
+         if not self._counting:
+             return
+@@ -1321,6 +1357,7 @@
+                 *(coords(n) or set() for n in ("neuron", "neuron_i", "neuron_j"))
+             )
+ 
++    @reports_progress('Grouping counts')
+     def _count_buckets(self, result, target, unit="footprint"):
+         if target == "footprint" and result.match_level not in (
+             "footprint",
+@@ -1345,7 +1382,7 @@
+         buckets = {}
+         evidence = {}
+ 
+-        for match in result.matches:
++        for match in progress_iter(result.matches, stop=95):
+             if isinstance(match, RelationshipMatch):
+                 subject = (
+                     match.target if target == "footprint" else match.target.neuron_id
+@@ -1398,6 +1435,7 @@
+ 
+         return buckets, evidence
+ 
++    @reports_progress('Grouping relationships')
+     def _relationship_buckets(self, result, spec):
+         if result.match_level != "relationship":
+             raise CurationFilterError(
+@@ -1425,7 +1463,7 @@
+ 
+         buckets = {}
+ 
+-        for pair in result.matches:
++        for pair in progress_iter(result.matches, stop=95):
+             anchor, partner = (
+                 (pair.source, pair.target)
+                 if spec.anchor == "source"
+@@ -1444,6 +1482,7 @@
+ 
+         return buckets
+ 
++    @reports_progress("Counting relationship partners")
+     def _filter_relationship_count(self, result, spec):
+         if spec.accepts(0):
+             raise CurationFilterError(
+@@ -1453,11 +1492,12 @@
+                 "zero matches."
+             )
+ 
+-        buckets = self._relationship_buckets(result, spec)
++        with progress_scope(0, 30):
++            buckets = self._relationship_buckets(result, spec)
+         counts = {}
+         kept = set()
+ 
+-        for key, pairs in buckets.items():
++        for key, pairs in progress_iter(buckets.items(), start=30, stop=90):
+             partners = {
+                 pair.target if spec.anchor == "source" else pair.source
+                 for pair in pairs
+@@ -1482,6 +1522,7 @@
+             target_evidence=pair_target_evidence(kept),
+         )
+ 
++    @reports_progress('Counting matches')
+     def _apply_count(self, group, result):
+         spec = group.count
+         if spec.anchor == "source" or spec.separate_partner_sessions:
+@@ -1493,19 +1534,22 @@
+                 "each. Use source-target matching to count distinct partners."
+             )
+ 
+-        buckets, evidence = self._count_buckets(
+-            result,
+-            spec.target,
+-            spec.unit,
+-        )
++        with progress_scope(0, 65):
++            buckets, evidence = self._count_buckets(
++                result,
++                spec.target,
++                spec.unit,
++            )
+ 
+         domain = (
+             result.neuron_domain if spec.target == "neuron" else result.footprint_domain
+         )
+ 
+-        counts = {subject: len(buckets.get(subject, ())) for subject in domain}
+-
+-        matches = {subject for subject, value in counts.items() if spec.accepts(value)}
++        with progress_scope(65, 85, "Counting matched subjects"):
++            counts = {subject: len(buckets.get(subject, ())) for subject in domain}
++
++        with progress_scope(85, 95, "Applying count threshold"):
++            matches = {subject for subject, value in counts.items() if spec.accepts(value)}
+ 
+         return CurationFilterGroupResult(
+             group_id=result.group_id,
+@@ -1528,6 +1572,7 @@
+             ),
+         )
+ 
++    @reports_progress("Constructing candidate matches")
+     def _candidate_result(self, result, match_level):
+         table = result.table
+         refs = table.refs_for_rows(
+@@ -1598,7 +1643,7 @@
+ 
+         evidence = {}
+ 
+-        for index in range(len(result.matching_rows)):
++        for index in progress_iter(range(len(result.matching_rows)), start=5, stop=90):
+             a = int(refs["neuron_i"][index])
+             b = int(refs["neuron_j"][index])
+ 
+@@ -1686,6 +1731,7 @@
+ 
+         return tuple(effective)
+ 
++    @reports_progress('Constructing relationships')
+     def _relationship_result(self, result):
+         table = result.table
+         axes = self._relationship_axes_for_stat(table.stat)
+@@ -1723,7 +1769,7 @@
+ 
+         evidence = {}
+ 
+-        for index in range(len(result.matching_rows)):
++        for index in progress_iter(range(len(result.matching_rows)), start=5, stop=90):
+             source = endpoint(axes[0], index)
+             target = endpoint(axes[1], index)
+ 
+@@ -1741,6 +1787,7 @@
+             ),
+         )
+ 
++    @reports_progress('Projecting matching rows')
+     def _project_rows(self, table, rows):
+         rows = np.asarray(rows, dtype=int)
+ 
+@@ -1752,7 +1799,7 @@
+         rows_by_neuron = {}
+         rows_by_component = {}
+ 
+-        for index, table_row in enumerate(rows):
++        for index, table_row in enumerate(progress_iter(rows, start=5, stop=90)):
+             neurons = {
+                 int(refs[key][index])
+                 for key in ("neuron", "neuron_i", "neuron_j")
+@@ -1787,6 +1834,7 @@
+             rows_by_component,
+         )
+ 
++    @reports_progress("Constructing condition evidence")
+     def _condition_result_for_level(
+         self,
+         result: CurationFilterConditionResult,
+@@ -1803,7 +1851,7 @@
+ 
+             evidence_by_match = {
+                 neuron_id: result.components_for_neuron(neuron_id)
+-                for neuron_id in matches
++                for neuron_id in progress_iter(matches, stop=95)
+             }
+ 
+         elif match_level == "footprint":
+@@ -1828,7 +1876,7 @@
+ 
+             evidence_by_match = {
+                 component: result.components_for_component(component)
+-                for component in matches
++                for component in progress_iter(matches, stop=95)
+             }
+ 
+         else:
+@@ -1841,6 +1889,7 @@
+             evidence_by_match=evidence_by_match,
+         )
+ 
++    @reports_progress("Projecting subgroup evidence")
+     def _project_group_result(self, result, match_level):
+         if result.match_level == match_level:
+             return result
+@@ -1848,7 +1897,7 @@
+         if match_level == "neuron":
+             evidence = {}
+ 
+-            for match in result.matches:
++            for match in progress_iter(result.matches, stop=95):
+                 for neuron_id in match_neurons(match):
+                     evidence.setdefault(neuron_id, set()).update(
+                         result.evidence_by_match.get(match, set())
+--- a/catan/gui/data/statistics/engine.py
++++ b/catan/gui/data/statistics/engine.py
+@@ -1,3 +1,6 @@
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
+ from dataclasses import dataclass, fields, is_dataclass, replace
+ from typing import Optional
+ from collections.abc import Callable
+@@ -337,6 +340,7 @@
+             self._cache.clear()
+ 
+     @trace_statistic_request
++    @reports_progress("Evaluating statistic")
+     def evaluate(
+         self,
+         query: Optional[StatisticQuery],
+@@ -383,9 +387,11 @@
+                 return result
+ 
+         # Calculation happens outside the cache lock.
+-        result = self._evaluate_uncached(query, definition)
+-        if definition.compact_values:
+-            _compact_statistic_values(result)
++        with progress_scope(0, 90):
++            result = self._evaluate_uncached(query, definition)
++        with progress_scope(90, 95, "Compacting statistic values"):
++            if definition.compact_values:
++                _compact_statistic_values(result)
+ 
+         with self._cache_lock:
+             # A relevant change during calculation must not repopulate
+@@ -408,6 +414,7 @@
+         return result
+ 
+     @trace_statistic_request
++    @reports_progress("Evaluating statistic")
+     def _evaluate_uncached(
+         self,
+         query: StatisticQuery,
+@@ -453,13 +460,14 @@
+             if requested_pairs is not None:
+                 execution_options["requested_pairs"] = requested_pairs
+ 
+-            stat = stat_def.query_getter(
+-                data,
+-                state,
+-                prepared_query,
+-                **parameters,
+-                **execution_options,
+-            )
++            with progress_scope(0, 98, f"Calculating {stat_def.key}"):
++                stat = stat_def.query_getter(
++                    data,
++                    state,
++                    prepared_query,
++                    **parameters,
++                    **execution_options,
++                )
+ 
+             stat.name = stat_def.key
+             stat.title = stat_def.title_with_parameters(parameters)
+@@ -477,13 +485,14 @@
+             if spec.method == "single"
+         }
+ 
+-        stat = stat_def.get_values(
+-            data=data,
+-            state=state,
+-            indexers=indexers,
+-            filters=query.filters,
+-            parameters=dict(query.parameters),
+-        )
++        with progress_scope(0, 70, f"Calculating {stat_def.key}"):
++            stat = stat_def.get_values(
++                data=data,
++                state=state,
++                indexers=indexers,
++                filters=query.filters,
++                parameters=dict(query.parameters),
++            )
+ 
+         requested_order = tuple(query.reduction_order or ())
+         reduction_order = requested_order + tuple(
+@@ -517,12 +526,16 @@
+ 
+             planned_reductions[target] = spec
+ 
+-        for target, spec in planned_reductions.items():
+-            stat.reduce_dimension(target, spec)
++        for progress_index, (target, spec) in enumerate(planned_reductions.items()):
++            with progress_step(
++                progress_index, len(planned_reductions), start=70, stop=100, message=f"Reducing {target}: {spec.method}",
++            ):
++                stat.reduce_dimension(target, spec)
+ 
+         return stat
+ 
+     @trace_statistic_request
++    @reports_progress("Building statistic table")
+     def evaluate_table(self, query: Optional[StatisticQuery]) -> Optional[PickTable]:
+ 
+         if query is None:
+@@ -531,11 +544,13 @@
+         if query.statistic_key == "none":
+             return None
+ 
+-        stat = self.evaluate(query)
++        with progress_scope(0, 85):
++            stat = self.evaluate(query)
+         if stat is None:
+             return None
+ 
+-        table = PickTable.from_stat(stat)
++        with progress_scope(88, 95, "Constructing statistic table"):
++            table = PickTable.from_stat(stat)
+ 
+         remaining_filters = tuple(
+             f
+@@ -544,10 +559,12 @@
+         )
+ 
+         if remaining_filters:
+-            table = table.filtered(remaining_filters)
++            with progress_scope(95, 99, "Filtering statistic table"):
++                table = table.filtered(remaining_filters)
+ 
+         return table
+ 
++    @reports_progress("Building statistic table")
+     def evaluate_assignment_table(
+         self,
+         query: StatisticQuery,
+@@ -599,17 +616,20 @@
+             parameters=tuple(sorted(parameters.items())),
+         )
+ 
+-        stat = self._evaluate_uncached(
+-            prepared_query,
+-            definition,
+-            data=bound_data,
+-            state=bound_state,
+-        )
++        with progress_scope(0, 85):
++            stat = self._evaluate_uncached(
++                prepared_query,
++                definition,
++                data=bound_data,
++                state=bound_state,
++            )
+ 
+         if definition.compact_values:
+-            _compact_statistic_values(stat)
+-
+-        table = PickTable.from_stat(stat)
++            with progress_scope(85, 88, "Compacting statistic values"):
++                _compact_statistic_values(stat)
++
++        with progress_scope(88, 95, "Constructing statistic table"):
++            table = PickTable.from_stat(stat)
+ 
+         remaining_filters = tuple(
+             item
+@@ -618,10 +638,12 @@
+         )
+ 
+         if remaining_filters:
+-            table = table.filtered(remaining_filters)
++            with progress_scope(95, 99, "Filtering statistic table"):
++                table = table.filtered(remaining_filters)
+ 
+         return table
+ 
++    @reports_progress("Building statistic table")
+     def evaluate_matching_table(
+         self,
+         query,
+@@ -664,17 +686,20 @@
+             getter = getter.func
+ 
+         if getattr(getter, "supports_value_selection", False):
+-            stat = self._evaluate_uncached(
+-                query,
+-                definition,
+-                select_values=select,
+-                requested_pairs=requested_pairs,
+-            )
++            with progress_scope(0, 85):
++                stat = self._evaluate_uncached(
++                    query,
++                    definition,
++                    select_values=select,
++                    requested_pairs=requested_pairs,
++                )
+ 
+             if definition.compact_values:
+-                _compact_statistic_values(stat)
+-
+-            table = PickTable.from_stat(stat)
++                with progress_scope(85, 88, "Compacting statistic values"):
++                    _compact_statistic_values(stat)
++
++            with progress_scope(88, 95, "Constructing statistic table"):
++                table = PickTable.from_stat(stat)
+ 
+             remaining = tuple(
+                 f
+@@ -683,15 +708,18 @@
+             )
+ 
+             if remaining:
+-                table = table.filtered(remaining)
++                with progress_scope(95, 99, "Filtering statistic table"):
++                    table = table.filtered(remaining)
+ 
+         else:
+             # Existing getters, including sparse footprint similarity,
+             # retain their current calculation and reduction paths.
+-            table = self.evaluate_table(query)
++            with progress_scope(0, 85):
++                table = self.evaluate_table(query)
+ 
+             if table is not None:
+-                table = table.subset_rows(np.flatnonzero(select(table.values)))
++                with progress_scope(95, 99, "Filtering statistic table"):
++                    table = table.subset_rows(np.flatnonzero(select(table.values)))
+ 
+         with self._cache_lock:
+             if self._revisions.get(query.statistic_key, 0) != revision:
+@@ -737,6 +765,7 @@
+         )
+ 
+ 
++@reports_progress("Compacting statistic values")
+ def _compact_statistic_values(stat):
+     if stat is None:
+         return
+@@ -746,7 +775,7 @@
+     peak = 0.0
+ 
+     # Inspect in blocks, avoiding a full-size temporary array.
+-    for start in range(0, flat.size, 65_536):
++    for start in progress_iter(range(0, flat.size, 65_536), every=1):
+         block = flat[start : start + 65_536]
+         finite = block[np.isfinite(block)]
+ 
+--- a/catan/gui/data/statistics/footprint_pairs.py
++++ b/catan/gui/data/statistics/footprint_pairs.py
+@@ -9,7 +9,9 @@
+     compact_positive_footprint,
+     footprint_similarity_peak,
+ )
+-from catan.gui.background_tasks.runtime import current_task_context
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
+ 
+ from .dimensions import Dimension
+ from .sparse_values import SparseStatisticArray
+@@ -20,6 +22,7 @@
+ TRACE_FOOTPRINT_PAIRS = False
+ 
+ 
++@reports_progress("Calculating footprint similarity")
+ def calculate_footprint_pairs(
+     data,
+     state,
+@@ -201,142 +204,149 @@
+     score_cache_sessions = None
+ 
+     ctx = current_task_context()
+-    for step, (si, sj) in enumerate(pairs):
+-
+-        session_key = (min(si, sj), max(si, sj))
+-
+-        if session_key != score_cache_sessions:
+-            score_cache.clear()
+-            score_cache_sessions = session_key
+-
+-        if ctx is not None:
+-            ctx.check_cancelled()
+-            ctx.progress(int(100 * step / max(1, len(pairs))))
+-        source, reference = data.sessions[si], data.sessions[sj]
+-        if any(
+-            session is None or session.centroids is None or session.footprints is None
+-            for session in (source, reference)
++    for progress_index, (step, (si, sj)) in enumerate(enumerate(pairs)):
++        with progress_step(
++            progress_index, len(pairs), start=0, stop=95, message=f"Similarity: sessions {si + 1} / {sj + 1}",
+         ):
+-            continue
+-
+-        if tuple(source.dims) != tuple(reference.dims):
+-            raise ValueError(
+-                "Footprint similarity requires the same aligned pixel grid; "
+-                f"received {source.dims} and {reference.dims}."
+-            )
+-
+-        fi = state.assignments[ni_ids, si]
+-        fj = state.assignments[nj_ids, sj]
+-
+-        if nr == "same":
+-            if si == sj:  # Existing self-comparison policy.
++
++            session_key = (min(si, sj), max(si, sj))
++
++            if session_key != score_cache_sessions:
++                score_cache.clear()
++                score_cache_sessions = session_key
++
++            if ctx is not None:
++                ctx.check_cancelled()
++            source, reference = data.sessions[si], data.sessions[sj]
++            if any(
++                session is None or session.centroids is None or session.footprints is None
++                for session in (source, reference)
++            ):
+                 continue
+-            valid = np.flatnonzero((fi >= 0) & (fj >= 0))
+-            delta = source.centroids[fi[valid]] - reference.centroids[fj[valid]]
+-            distance = np.linalg.norm(delta, axis=1)
+-            valid = valid[np.isfinite(distance) & (distance < neighborhood_thr)]
+-            candidates = ((int(k), int(k)) for k in valid)
+-        else:
+-            vi, vj = np.flatnonzero(fi >= 0), np.flatnonzero(fj >= 0)
+-            ci, cj = source.centroids[fi[vi]], reference.centroids[fj[vj]]
+-            good_i, good_j = np.all(np.isfinite(ci), axis=1), np.all(
+-                np.isfinite(cj), axis=1
+-            )
+-            vi, ci, vj, cj = vi[good_i], ci[good_i], vj[good_j], cj[good_j]
+-            if not len(vj):
+-                continue
+-            tree = cKDTree(cj)
+-
+-            def nearby_pairs():
+-                for count, (i, center) in enumerate(zip(vi, ci)):
+-                    if count % 64 == 0 and ctx is not None:
+-                        ctx.check_cancelled()
+-                    for local_j in tree.query_ball_point(center, neighborhood_thr):
+-                        j = vj[local_j]
+-                        if (nr == "different" or si == sj) and ni_ids[i] == nj_ids[j]:
+-                            continue
+-                        if np.linalg.norm(center - cj[local_j]) < neighborhood_thr:
+-                            yield int(i), int(j)
+-
+-            candidates = nearby_pairs()
+-
+-        for count, (i, j) in enumerate(candidates):
+-            if count % 64 == 0 and ctx is not None:
+-                ctx.check_cancelled()
+-
+-            if TRACE_FOOTPRINT_PAIRS:
+-                trace_count += 1
+-                trace_neurons_i.add(int(ni_ids[i]))
+-                trace_neurons_j.add(int(nj_ids[j]))
+-                trace_sessions[(int(si), int(sj))] += 1
+-
+-                if len(trace_examples) < 8:
+-                    trace_examples.append(
+-                        (
+-                            (int(ni_ids[i]), int(si), int(fi[i])),
+-                            (int(nj_ids[j]), int(sj), int(fj[j])),
++
++            if tuple(source.dims) != tuple(reference.dims):
++                raise ValueError(
++                    "Footprint similarity requires the same aligned pixel grid; "
++                    f"received {source.dims} and {reference.dims}."
++                )
++
++            fi = state.assignments[ni_ids, si]
++            fj = state.assignments[nj_ids, sj]
++
++            if nr == "same":
++                if si == sj:  # Existing self-comparison policy.
++                    continue
++                valid = np.flatnonzero((fi >= 0) & (fj >= 0))
++                delta = source.centroids[fi[valid]] - reference.centroids[fj[valid]]
++                distance = np.linalg.norm(delta, axis=1)
++                valid = valid[np.isfinite(distance) & (distance < neighborhood_thr)]
++                candidates = ((int(k), int(k)) for k in progress_iter(valid, stop=98, every=16))
++            else:
++                vi, vj = np.flatnonzero(fi >= 0), np.flatnonzero(fj >= 0)
++                ci, cj = source.centroids[fi[vi]], reference.centroids[fj[vj]]
++                good_i, good_j = np.all(np.isfinite(ci), axis=1), np.all(
++                    np.isfinite(cj), axis=1
++                )
++                vi, ci, vj, cj = vi[good_i], ci[good_i], vj[good_j], cj[good_j]
++                if not len(vj):
++                    continue
++                tree = cKDTree(cj)
++
++                def nearby_pairs():
++                    for count, (i, center) in enumerate(progress_iter(zip(vi, ci), total=len(vi), stop=98, every=1)):
++                        if count % 64 == 0 and ctx is not None:
++                            ctx.check_cancelled()
++                        for local_j in progress_iter(
++                            tree.query_ball_point(center, neighborhood_thr),
++                            start=98 * count / max(1, len(vi)),
++                            stop=98 * (count + 1) / max(1, len(vi)), every=16,
++                        ):
++                            j = vj[local_j]
++                            if (nr == "different" or si == sj) and ni_ids[i] == nj_ids[j]:
++                                continue
++                            if np.linalg.norm(center - cj[local_j]) < neighborhood_thr:
++                                yield int(i), int(j)
++
++                candidates = nearby_pairs()
++
++            for count, (i, j) in enumerate(candidates):
++                if count % 64 == 0 and ctx is not None:
++                    ctx.check_cancelled()
++
++                if TRACE_FOOTPRINT_PAIRS:
++                    trace_count += 1
++                    trace_neurons_i.add(int(ni_ids[i]))
++                    trace_neurons_j.add(int(nj_ids[j]))
++                    trace_sessions[(int(si), int(sj))] += 1
++
++                    if len(trace_examples) < 8:
++                        trace_examples.append(
++                            (
++                                (int(ni_ids[i]), int(si), int(fi[i])),
++                                (int(nj_ids[j]), int(sj), int(fj[j])),
++                            )
+                         )
++
++                if TRACE_FOOTPRINT_PAIRS:
++                    score_started = perf_counter()
++
++                left_key = (int(si), int(fi[i]))
++                right_key = (int(sj), int(fj[j]))
++                pair_key = tuple(sorted((left_key, right_key)))
++
++                if pair_key not in score_cache:
++                    if trace:
++                        trace_score_evaluations += 1
++
++                    score_cache[pair_key] = footprint_similarity_peak(
++                        prepared_patch(*left_key),
++                        prepared_patch(*right_key),
++                        gamma=gamma,
+                     )
+ 
+-            if TRACE_FOOTPRINT_PAIRS:
+-                score_started = perf_counter()
+-
+-            left_key = (int(si), int(fi[i]))
+-            right_key = (int(sj), int(fj[j]))
+-            pair_key = tuple(sorted((left_key, right_key)))
+-
+-            if pair_key not in score_cache:
+-                if trace:
+-                    trace_score_evaluations += 1
+-
+-                score_cache[pair_key] = footprint_similarity_peak(
+-                    prepared_patch(*left_key),
+-                    prepared_patch(*right_key),
+-                    gamma=gamma,
+-                )
+-
+-            similarity = score_cache[pair_key]
+-
+-            if TRACE_FOOTPRINT_PAIRS:
+-                trace_score_seconds += perf_counter() - score_started
+-
+-            if not np.isfinite(similarity):
+-                continue
+-            refs = {
+-                "neuron_i": int(ni_ids[i]),
+-                "neuron_j": int(nj_ids[j]),
+-                "session_i": si,
+-                "session_j": sj,
+-                "neuron": int(ni_ids[i]),
+-                "session": si,
+-            }
+-            positions.append(tuple(lookups[d][refs[d]] for d in dims))
+-            values.append(float(similarity))
+-            if len(values) == 4096:
+-                flush()
+-        flush()
+-
+-    stat = SparseStatisticArray(
+-        name="footprint_similarity",
+-        title="Footprint similarity",
+-        category="pair",
+-        values=np.concatenate(value_blocks) if value_blocks else np.empty(0),
+-        positions=(
+-            np.concatenate(position_blocks)
+-            if position_blocks
+-            else np.empty((0, len(dims)), dtype=np.int64)
+-        ),
+-        dimensions=dimensions,
+-        reduction_aliases=aliases,
+-        applied_pair_filters=tuple(f.target for f in filters),
+-        reference_aliases={
+-            original: (
+-                compact,
+-                -1 if original == "session_j" and sr == "with previous" else 0,
+-            )
+-            for original, compact in aliases.items()
+-        },
+-    )
++                similarity = score_cache[pair_key]
++
++                if TRACE_FOOTPRINT_PAIRS:
++                    trace_score_seconds += perf_counter() - score_started
++
++                if not np.isfinite(similarity):
++                    continue
++                refs = {
++                    "neuron_i": int(ni_ids[i]),
++                    "neuron_j": int(nj_ids[j]),
++                    "session_i": si,
++                    "session_j": sj,
++                    "neuron": int(ni_ids[i]),
++                    "session": si,
++                }
++                positions.append(tuple(lookups[d][refs[d]] for d in dims))
++                values.append(float(similarity))
++                if len(values) == 4096:
++                    flush()
++            flush()
++
++    with progress_scope(95, 99, "Assembling similarity results"):
++        stat = SparseStatisticArray(
++            name="footprint_similarity",
++            title="Footprint similarity",
++            category="pair",
++            values=np.concatenate(value_blocks) if value_blocks else np.empty(0),
++            positions=(
++                np.concatenate(position_blocks)
++                if position_blocks
++                else np.empty((0, len(dims)), dtype=np.int64)
++            ),
++            dimensions=dimensions,
++            reduction_aliases=aliases,
++            applied_pair_filters=tuple(f.target for f in filters),
++            reference_aliases={
++                original: (
++                    compact,
++                    -1 if original == "session_j" and sr == "with previous" else 0,
++                )
++                for original, compact in aliases.items()
++            },
++        )
+ 
+     if TRACE_FOOTPRINT_PAIRS:
+ 
+@@ -374,6 +384,6 @@
+ 
+     if ctx is not None:
+         ctx.check_cancelled()
+-        ctx.progress(100)
++        current_task_context().progress(100)
+ 
+     return stat
+--- a/catan/gui/data/statistics/overlap_statistics.py
++++ b/catan/gui/data/statistics/overlap_statistics.py
+@@ -6,12 +6,15 @@
+ import numpy as np
+ from scipy import sparse
+ 
+-from catan.gui.background_tasks.runtime import current_task_context
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
+ 
+ from .blockwise import evaluate_blockwise
+ from .distance_statistics import pair_plan
+ 
+ 
++@reports_progress("Calculating footprint overlap")
+ def overlap_query(
+     data,
+     state,
+@@ -56,6 +59,7 @@
+             raise ValueError("Union inclusion mask does not match assignments.")
+ 
+     @lru_cache(maxsize=16)
++    @reports_progress("Preparing overlap supports")
+     def prepare(sid, columns):
+         session = data.sessions[sid]
+ 
+@@ -101,7 +105,7 @@
+ 
+             keep = session_included[columns]
+ 
+-        for col in range(a.shape[1]):
++        for col in progress_iter(range(a.shape[1]), start=10, stop=90):
+             if col % 128 == 0 and ctx is not None:
+                 ctx.check_cancelled()
+ 
+@@ -121,12 +125,13 @@
+                 if not weighted:
+                     values[:] = values > 0
+ 
+-        a.eliminate_zeros()
+-
+-        support = a.copy()
+-        support.data.fill(1)
+-
+-        mass = np.asarray(a.sum(axis=0)).ravel()
++        with progress_scope(90, 100, "Measuring footprint support"):
++            a.eliminate_zeros()
++
++            support = a.copy()
++            support.data.fill(1)
++
++            mass = np.asarray(a.sum(axis=0)).ravel()
+ 
+         return a, support, mass, shape
+ 
+@@ -144,6 +149,7 @@
+         if pairs.ndim != 2 or pairs.shape[1] != 4:
+             raise ValueError("Requested pairs must have four coordinate columns.")
+ 
++        @reports_progress("Calculating requested overlap")
+         def read_rows(refs):
+             ni, nj, si, sj = (refs[name] for name in names)
+ 
+@@ -168,73 +174,79 @@
+                 axis=0,
+             )
+ 
+-            for source, target in session_pairs:
+-                rows = np.flatnonzero(permitted & (si == source) & (sj == target))
+-
+-                if not rows.size:
+-                    continue
+-
+-                if ctx is not None:
+-                    ctx.check_cancelled()
+-
+-                fi = ids[ni[rows], source]
+-                fj = ids[nj[rows], target]
+-
+-                present = (fi >= 0) & (fj >= 0)
+-                rows = rows[present]
+-                fi = fi[present]
+-                fj = fj[present]
+-
+-                if not rows.size:
+-                    continue
+-
+-                columns_i = np.unique(fi)
+-                columns_j = np.unique(fj)
+-
+-                left = prepare(
+-                    int(source),
+-                    tuple(int(value) for value in columns_i),
+-                )
+-                right = prepare(
+-                    int(target),
+-                    tuple(int(value) for value in columns_j),
+-                )
+-
+-                if left is None or right is None:
+-                    continue
+-
+-                a, _, ma, shape_a = left
+-                b, _, mb, shape_b = right
+-
+-                if shape_a != shape_b:
+-                    raise ValueError("Overlap requires the same registered pixel grid.")
+-
+-                fi = np.searchsorted(columns_i, fi)
+-                fj = np.searchsorted(columns_j, fj)
+-
+-                # Compare corresponding columns, not their Cartesian product.
+-                # Binary supports and weighted footprints both use min().
+-                intersection = np.asarray(
+-                    a[:, fi].minimum(b[:, fj]).sum(axis=0)
+-                ).ravel()
+-
+-                if directional:
+-                    denominator = mb[fj] if normalize_by_target else ma[fi]
+-                elif containment:
+-                    denominator = np.minimum(ma[fi], mb[fj])
+-                else:
+-                    denominator = ma[fi] + mb[fj] - intersection
+-
+-                valid = (ma[fi] > 0) & (mb[fj] > 0) & (denominator > 0)
+-
+-                values = np.full(len(rows), np.nan, dtype=np.float32)
+-                np.divide(
+-                    intersection,
+-                    denominator,
+-                    out=values,
+-                    where=valid,
+-                )
+-                out[rows] = np.clip(values, 0, 1)
++            for progress_index, (source, target) in enumerate(session_pairs):
++                with progress_step(
++                    progress_index, len(session_pairs), start=0, stop=100,
++                ):
++                    rows = np.flatnonzero(permitted & (si == source) & (sj == target))
++
++                    if not rows.size:
++                        continue
++
++                    if ctx is not None:
++                        ctx.check_cancelled()
++
++                    fi = ids[ni[rows], source]
++                    fj = ids[nj[rows], target]
++
++                    present = (fi >= 0) & (fj >= 0)
++                    rows = rows[present]
++                    fi = fi[present]
++                    fj = fj[present]
++
++                    if not rows.size:
++                        continue
++
++                    columns_i = np.unique(fi)
++                    columns_j = np.unique(fj)
++
++                    with progress_scope(0, 20):
++                        left = prepare(
++                            int(source),
++                            tuple(int(value) for value in columns_i),
++                        )
++                    with progress_scope(20, 40):
++                        right = prepare(
++                            int(target),
++                            tuple(int(value) for value in columns_j),
++                        )
++
++                    if left is None or right is None:
++                        continue
++
++                    a, _, ma, shape_a = left
++                    b, _, mb, shape_b = right
++
++                    if shape_a != shape_b:
++                        raise ValueError("Overlap requires the same registered pixel grid.")
++
++                    fi = np.searchsorted(columns_i, fi)
++                    fj = np.searchsorted(columns_j, fj)
++
++                    # Compare corresponding columns, not their Cartesian product.
++                    # Binary supports and weighted footprints both use min().
++                    with progress_scope(40, 90, "Intersecting requested footprints"):
++                        intersection = np.asarray(
++                            a[:, fi].minimum(b[:, fj]).sum(axis=0)
++                        ).ravel()
++
++                    if directional:
++                        denominator = mb[fj] if normalize_by_target else ma[fi]
++                    elif containment:
++                        denominator = np.minimum(ma[fi], mb[fj])
++                    else:
++                        denominator = ma[fi] + mb[fj] - intersection
++
++                    valid = (ma[fi] > 0) & (mb[fj] > 0) & (denominator > 0)
++
++                    values = np.full(len(rows), np.nan, dtype=np.float32)
++                    np.divide(
++                        intersection,
++                        denominator,
++                        out=values,
++                        where=valid,
++                    )
++                    out[rows] = np.clip(values, 0, 1)
+ 
+             return out
+ 
+@@ -254,6 +266,7 @@
+     cache_bytes = 0
+     cache_budget = 64 * 1024**2
+ 
++    @reports_progress("Calculating overlap pairs")
+     def pair_scores(si, sj, columns_i, columns_j):
+         nonlocal cache_bytes
+ 
+@@ -269,8 +282,10 @@
+             cache[key] = result
+             return result
+ 
+-        left = prepare(si, columns_i)
+-        right = prepare(sj, columns_j)
++        with progress_scope(0, 15):
++            left = prepare(si, columns_i)
++        with progress_scope(15, 30):
++            right = prepare(sj, columns_j)
+ 
+         if left is None or right is None:
+             return None
+@@ -281,94 +296,96 @@
+         if shape_a != shape_b:
+             raise ValueError("Overlap requires the same registered pixel grid.")
+ 
+-        if a.shape[1] * b.shape[1] <= 64:
+-            # Small queries: intersect sparse pixel indices directly.
+-            intersection = np.zeros(
+-                (a.shape[1], b.shape[1]),
+-                dtype=np.float32,
+-            )
+-
+-            for i in range(a.shape[1]):
+-                if ctx is not None:
+-                    ctx.check_cancelled()
+-
+-                ia, ib = a.indptr[i : i + 2]
+-
+-                for j in range(b.shape[1]):
+-                    ja, jb = b.indptr[j : j + 2]
+-
+-                    shared, ai, bi = np.intersect1d(
+-                        a.indices[ia:ib],
+-                        b.indices[ja:jb],
+-                        assume_unique=True,
+-                        return_indices=True,
++        with progress_scope(30, 85, "Intersecting overlap supports"):
++            if a.shape[1] * b.shape[1] <= 64:
++                # Small queries: intersect sparse pixel indices directly.
++                intersection = np.zeros(
++                    (a.shape[1], b.shape[1]),
++                    dtype=np.float32,
++                )
++
++                for i in progress_iter(range(a.shape[1]), every=1):
++                    if ctx is not None:
++                        ctx.check_cancelled()
++
++                    ia, ib = a.indptr[i : i + 2]
++
++                    for j in range(b.shape[1]):
++                        ja, jb = b.indptr[j : j + 2]
++
++                        shared, ai, bi = np.intersect1d(
++                            a.indices[ia:ib],
++                            b.indices[ja:jb],
++                            assume_unique=True,
++                            return_indices=True,
++                        )
++
++                        if weighted:
++                            intersection[i, j] = np.minimum(
++                                a.data[ia:ib][ai],
++                                b.data[ja:jb][bi],
++                            ).sum(dtype=np.float64)
++                        else:
++                            intersection[i, j] = shared.size
++
++            else:
++                # Larger queries retain the efficient sparse matrix approach.
++                intersections = (sa.T @ sb).tocoo()
++
++                if weighted:
++                    intersection = np.zeros(
++                        (a.shape[1], b.shape[1]),
++                        dtype=np.float32,
+                     )
+ 
+-                    if weighted:
++                    for k, (i, j) in enumerate(progress_iter(zip(intersections.row, intersections.col), total=intersections.nnz, start=20)):
++                        if k % 128 == 0 and ctx is not None:
++                            ctx.check_cancelled()
++
++                        ia, ib = a.indptr[i : i + 2]
++                        ja, jb = b.indptr[j : j + 2]
++
++                        _, ai, bi = np.intersect1d(
++                            a.indices[ia:ib],
++                            b.indices[ja:jb],
++                            assume_unique=True,
++                            return_indices=True,
++                        )
++
+                         intersection[i, j] = np.minimum(
+                             a.data[ia:ib][ai],
+                             b.data[ja:jb][bi],
+                         ).sum(dtype=np.float64)
+-                    else:
+-                        intersection[i, j] = shared.size
+-
+-        else:
+-            # Larger queries retain the efficient sparse matrix approach.
+-            intersections = (sa.T @ sb).tocoo()
+-
+-            if weighted:
+-                intersection = np.zeros(
+-                    (a.shape[1], b.shape[1]),
+-                    dtype=np.float32,
+-                )
+-
+-                for k, (i, j) in enumerate(zip(intersections.row, intersections.col)):
+-                    if k % 128 == 0 and ctx is not None:
+-                        ctx.check_cancelled()
+-
+-                    ia, ib = a.indptr[i : i + 2]
+-                    ja, jb = b.indptr[j : j + 2]
+-
+-                    _, ai, bi = np.intersect1d(
+-                        a.indices[ia:ib],
+-                        b.indices[ja:jb],
+-                        assume_unique=True,
+-                        return_indices=True,
+-                    )
+-
+-                    intersection[i, j] = np.minimum(
+-                        a.data[ia:ib][ai],
+-                        b.data[ja:jb][bi],
+-                    ).sum(dtype=np.float64)
+-
++
++                else:
++                    intersection = intersections.toarray()
++
++        with progress_scope(85, 100, "Normalizing overlap scores"):
++            if directional:
++                # Rows: source footprints (neuron_i, session_i).
++                # Columns: target footprints (neuron_j, session_j).
++                denominator = mb[None, :] if normalize_by_target else ma[:, None]
++            elif containment:
++                denominator = np.minimum(ma[:, None], mb[None, :])
+             else:
+-                intersection = intersections.toarray()
+-
+-        if directional:
+-            # Rows: source footprints (neuron_i, session_i).
+-            # Columns: target footprints (neuron_j, session_j).
+-            denominator = mb[None, :] if normalize_by_target else ma[:, None]
+-        elif containment:
+-            denominator = np.minimum(ma[:, None], mb[None, :])
+-        else:
+-            denominator = ma[:, None] + mb[None, :] - intersection
+-
+-        valid = (ma[:, None] > 0) & (mb[None, :] > 0) & (denominator > 0)
+-
+-        scores = np.full(
+-            intersection.shape,
+-            np.nan,
+-            dtype=np.float32,
+-        )
+-
+-        np.divide(
+-            intersection,
+-            denominator,
+-            out=scores,
+-            where=valid,
+-        )
+-
+-        np.clip(scores, 0, 1, out=scores)
++                denominator = ma[:, None] + mb[None, :] - intersection
++
++            valid = (ma[:, None] > 0) & (mb[None, :] > 0) & (denominator > 0)
++
++            scores = np.full(
++                intersection.shape,
++                np.nan,
++                dtype=np.float32,
++            )
++
++            np.divide(
++                intersection,
++                denominator,
++                out=scores,
++                where=valid,
++            )
++
++            np.clip(scores, 0, 1, out=scores)
+ 
+         if scores.nbytes <= cache_budget:
+             while cache and cache_bytes + scores.nbytes > cache_budget:
+@@ -380,6 +397,7 @@
+ 
+         return scores
+ 
++    @reports_progress("Calculating overlap block")
+     def read(selected):
+         ni, nj, si, sj = np.broadcast_arrays(*(coord(name, selected) for name in names))
+ 
+@@ -393,45 +411,52 @@
+             allowed(selected) & included[ni] & included[nj] & ~((ni == nj) & (si == sj))
+         )
+ 
+-        for source in np.unique(si):
+-            for reference in np.unique(sj):
+-                if ctx is not None:
+-                    ctx.check_cancelled()
+-
+-                mask = permitted & (si == source) & (sj == reference)
+-
+-                if not np.any(mask):
+-                    continue
+-
+-                fi = ids[ni[mask], source]
+-                fj = ids[nj[mask], reference]
+-
+-                present = (fi >= 0) & (fj >= 0)
+-
+-                values = np.full(
+-                    fi.shape,
+-                    np.nan,
+-                    dtype=np.float32,
+-                )
+-
+-                if np.any(present):
+-                    columns_i = np.unique(fi[present])
+-                    columns_j = np.unique(fj[present])
+-
+-                    scores = pair_scores(
+-                        int(source),
+-                        int(reference),
+-                        tuple(int(value) for value in columns_i),
+-                        tuple(int(value) for value in columns_j),
+-                    )
+-
+-                    if scores is not None:
+-                        local_i = np.searchsorted(columns_i, fi[present])
+-                        local_j = np.searchsorted(columns_j, fj[present])
+-
+-                        values[present] = scores[local_i, local_j]
+-
+-                out[mask] = values
++        for progress_index, (source) in enumerate(np.unique(si)):
++            with progress_step(
++                progress_index, len(np.unique(si)), start=0, stop=100,
++            ):
++                for progress_index, (reference) in enumerate(np.unique(sj)):
++                    with progress_step(
++                        progress_index, len(np.unique(sj)), start=0, stop=100,
++                    ):
++                        if ctx is not None:
++                            ctx.check_cancelled()
++
++                        mask = permitted & (si == source) & (sj == reference)
++
++                        if not np.any(mask):
++                            continue
++
++                        fi = ids[ni[mask], source]
++                        fj = ids[nj[mask], reference]
++
++                        present = (fi >= 0) & (fj >= 0)
++
++                        values = np.full(
++                            fi.shape,
++                            np.nan,
++                            dtype=np.float32,
++                        )
++
++                        if np.any(present):
++                            columns_i = np.unique(fi[present])
++                            columns_j = np.unique(fj[present])
++
++                            with progress_scope(0, 95):
++                                scores = pair_scores(
++                                    int(source),
++                                    int(reference),
++                                    tuple(int(value) for value in columns_i),
++                                    tuple(int(value) for value in columns_j),
++                                )
++
++                            if scores is not None:
++                                local_i = np.searchsorted(columns_i, fi[present])
++                                local_j = np.searchsorted(columns_j, fj[present])
++
++                                values[present] = scores[local_i, local_j]
++
++                        out[mask] = values
+ 
+         return out
+ 
+--- a/catan/gui/data/statistics/requested_rows.py
++++ b/catan/gui/data/statistics/requested_rows.py
+@@ -2,11 +2,14 @@
+ 
+ import numpy as np
+ 
+-from catan.gui.background_tasks.runtime import current_task_context
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
+ 
+ from .sparse_values import SparseStatisticArray
+ 
+ 
++@reports_progress("Evaluating requested rows")
+ def evaluate_requested_rows(
+     dimensions,
+     read_rows,
+@@ -19,6 +22,8 @@
+     block_rows=1024,
+ ):
+     """Evaluate exact rows while preserving complete coordinate domains."""
++    if block_rows < 1:
++        raise ValueError("block_rows must be positive")
+     reference_aliases = reference_aliases or {}
+ 
+     refs = {
+@@ -44,104 +49,110 @@
+     position_parts = []
+     ctx = current_task_context()
+ 
+-    for start in range(0, next(iter(lengths)), block_rows):
+-        if ctx is not None:
+-            ctx.check_cancelled()
++    for progress_index, (start) in enumerate(range(0, next(iter(lengths)), block_rows)):
++        with progress_step(
++            progress_index, (next(iter(lengths)) + block_rows - 1) // block_rows, start=0, stop=95,
++        ):
++            if ctx is not None:
++                ctx.check_cancelled()
+ 
+-        block = {
+-            name: values[start : start + block_rows] for name, values in refs.items()
+-        }
+-
+-        valid = np.ones(len(next(iter(block.values()))), dtype=bool)
+-        logical = {}
+-
+-        # Resolve linked coordinates, including "with previous".
+-        for name, values in block.items():
+-            base, offset = reference_aliases.get(name, (name, 0))
+-
+-            if base not in dimensions:
+-                raise ValueError(f"Unknown requested coordinate: {name}")
+-
+-            coords = values - offset
+-
+-            if base in logical:
+-                valid &= logical[base] == coords
+-            else:
+-                logical[base] = coords
+-
+-            info = dimensions[base]
+-            if info.mode == "fixed":
+-                valid &= coords == info.parameter
+-
+-        columns = []
+-
+-        for name in output_dims:
+-            if name not in logical:
+-                raise ValueError(f"Missing requested coordinate: {name}")
+-
+-            lookup = {
+-                int(value): index for index, value in enumerate(dimensions[name].coords)
++            block = {
++                name: values[start : start + block_rows] for name, values in refs.items()
+             }
+ 
+-            positions = np.fromiter(
+-                (lookup.get(int(value), -1) for value in logical[name]),
+-                dtype=np.int64,
+-                count=len(valid),
++            valid = np.ones(len(next(iter(block.values()))), dtype=bool)
++            logical = {}
++
++            # Resolve linked coordinates, including "with previous".
++            for name, values in block.items():
++                base, offset = reference_aliases.get(name, (name, 0))
++
++                if base not in dimensions:
++                    raise ValueError(f"Unknown requested coordinate: {name}")
++
++                coords = values - offset
++
++                if base in logical:
++                    valid &= logical[base] == coords
++                else:
++                    logical[base] = coords
++
++                info = dimensions[base]
++                if info.mode == "fixed":
++                    valid &= coords == info.parameter
++
++            columns = []
++
++            for name in output_dims:
++                if name not in logical:
++                    raise ValueError(f"Missing requested coordinate: {name}")
++
++                lookup = {
++                    int(value): index for index, value in enumerate(dimensions[name].coords)
++                }
++
++                positions = np.fromiter(
++                    (lookup.get(int(value), -1) for value in logical[name]),
++                    dtype=np.int64,
++                    count=len(valid),
++                )
++
++                valid &= positions >= 0
++                columns.append(positions)
++
++            positions = (
++                np.column_stack(columns)
++                if columns
++                else np.empty((len(valid), 0), dtype=np.int64)
+             )
+ 
+-            valid &= positions >= 0
+-            columns.append(positions)
++            if not np.any(valid):
++                continue
+ 
+-        positions = (
+-            np.column_stack(columns)
+-            if columns
+-            else np.empty((len(valid), 0), dtype=np.int64)
++            block = {name: values[valid] for name, values in block.items()}
++            positions = positions[valid]
++
++            with progress_scope(15, 85, "Calculating requested rows"):
++                values = np.asarray(read_rows(block), dtype=np.float32)
++
++            if values.shape != (len(positions),):
++                raise ValueError("Requested-row reader returned an invalid shape.")
++
++            with progress_scope(85, 100, "Filtering requested rows"):
++                mask = (
++                    np.ones(values.shape, dtype=bool)
++                    if select_values is None
++                    else np.asarray(select_values(values), dtype=bool)
++                )
++
++                if mask.shape != values.shape:
++                    raise ValueError("Value selector returned an invalid shape.")
++
++                mask &= ~np.isnan(values)
++
++                if np.any(mask):
++                    values_parts.append(values[mask])
++                    position_parts.append(positions[mask])
++
++    with progress_scope(95, 100, "Assembling requested rows"):
++        result = SparseStatisticArray(
++            name="",
++            title="",
++            dimensions=deepcopy(dimensions),
++            values=(
++                np.concatenate(values_parts)
++                if values_parts
++                else np.empty(0, dtype=np.float32)
++            ),
++            positions=(
++                np.concatenate(position_parts)
++                if position_parts
++                else np.empty((0, len(output_dims)), dtype=np.int64)
++            ),
++            reference_aliases=dict(reference_aliases),
++            reduction_aliases=dict(reduction_aliases or {}),
++            applied_pair_filters=tuple(applied_filters),
+         )
+ 
+-        if not np.any(valid):
+-            continue
+-
+-        block = {name: values[valid] for name, values in block.items()}
+-        positions = positions[valid]
+-
+-        values = np.asarray(read_rows(block), dtype=np.float32)
+-
+-        if values.shape != (len(positions),):
+-            raise ValueError("Requested-row reader returned an invalid shape.")
+-
+-        mask = (
+-            np.ones(values.shape, dtype=bool)
+-            if select_values is None
+-            else np.asarray(select_values(values), dtype=bool)
+-        )
+-
+-        if mask.shape != values.shape:
+-            raise ValueError("Value selector returned an invalid shape.")
+-
+-        mask &= ~np.isnan(values)
+-
+-        if np.any(mask):
+-            values_parts.append(values[mask])
+-            position_parts.append(positions[mask])
+-
+-    result = SparseStatisticArray(
+-        name="",
+-        title="",
+-        dimensions=deepcopy(dimensions),
+-        values=(
+-            np.concatenate(values_parts)
+-            if values_parts
+-            else np.empty(0, dtype=np.float32)
+-        ),
+-        positions=(
+-            np.concatenate(position_parts)
+-            if position_parts
+-            else np.empty((0, len(output_dims)), dtype=np.int64)
+-        ),
+-        reference_aliases=dict(reference_aliases),
+-        reduction_aliases=dict(reduction_aliases or {}),
+-        applied_pair_filters=tuple(applied_filters),
+-    )
+-
+-    result.validate()
++        result.validate()
+     return result
+--- a/catan/gui/background_tasks/runtime.py
++++ b/catan/gui/background_tasks/runtime.py
+@@ -3,6 +3,8 @@
+ from dataclasses import dataclass, field
+ from time import monotonic
+ from contextvars import ContextVar, Token
++from contextlib import contextmanager
++from functools import wraps
+ from typing import Protocol
+ from collections.abc import Callable
+ 
+@@ -28,6 +30,10 @@
+         repr=False,
+     )
+ 
++    _last_message: str | None = field(default=None, init=False, repr=False)
++    _pending_message: str | None = field(default=None, init=False, repr=False)
++    _last_message_time: float = field(default=0.0, init=False, repr=False)
++
+     def cancelled(self) -> bool:
+         return self.cancel_check()
+ 
+@@ -36,6 +42,7 @@
+             raise TaskCancelled()
+ 
+     def progress(self, value: int) -> None:
++        self._flush_message(force=value >= 100)
+         value = max(0, min(100, int(value)))
+         previous = self._last_progress_value
+ 
+@@ -56,10 +63,25 @@
+         self.progress_callback(value)
+ 
+     def message(self, text: str) -> None:
++        self._pending_message = text
++        self._flush_message()
++
++    def _flush_message(self, *, force=False) -> None:
++        text = self._pending_message
++        if text is None or text == self._last_message:
++            return
++        now = monotonic()
++        if not force and self._last_message is not None and now - self._last_message_time < 0.5:
++            return
++        self._last_message = text
++        self._last_message_time = now
++        self._pending_message = None
+         self.message_callback(text)
+ 
+ 
+ class TaskRuntime(Protocol):
++
++    def cancelled(self) -> bool: ...
+ 
+     def check_cancelled(self) -> None: ...
+ 
+@@ -84,14 +106,14 @@
+ 
+ _null_context = NullTaskContext()
+ 
+-_current_task_context: ContextVar[TaskContext | None] = ContextVar(
++_current_task_context: ContextVar[TaskRuntime | None] = ContextVar(
+     "current_task_context",
+     default=None,
+ )
+ 
+ 
+ def bind_task_context(
+-    ctx: TaskContext,
++    ctx: TaskRuntime,
+ ) -> Token:
+     return _current_task_context.set(ctx)
+ 
+@@ -102,5 +124,95 @@
+     _current_task_context.reset(token)
+ 
+ 
+-def current_task_context() -> TaskContext | NullTaskContext:
++def current_task_context() -> TaskRuntime:
+     return _current_task_context.get() or _null_context
++
++
++# Percentages below describe work, not elapsed time. Each child reports in its
++# own 0..100 range; only its successful exit completes the parent's allocation.
++class _ProgressScope:
++    def __init__(self, parent, start, stop):
++        self.parent = parent
++        self.start = start
++        self.stop = stop
++        self.high_water = 0.0
++
++    def cancelled(self):
++        return self.parent.cancelled()
++
++    def check_cancelled(self):
++        self.parent.check_cancelled()
++
++    def progress(self, value):
++        # Keep completion for __exit__, including validation/cancellation checks.
++        self.high_water = max(self.high_water, min(99.999, max(0.0, float(value))))
++        self.parent.progress(self.start + (self.stop - self.start) * self.high_water / 100)
++
++    def message(self, text):
++        self.parent.message(text)
++
++
++@contextmanager
++def progress_scope(start=0, stop=100, message=None):
++    """Map nested reports into an allocation; never complete a failed stage."""
++    parent = current_task_context()
++    if isinstance(parent, NullTaskContext):
++        yield parent
++        return
++    if not 0 <= start <= stop <= 100:
++        raise ValueError("Progress bounds must satisfy 0 <= start <= stop <= 100")
++    parent.check_cancelled()
++    scope = _ProgressScope(parent, start, stop)
++    token = _current_task_context.set(scope)
++    try:
++        if message:
++            scope.message(message)
++        scope.progress(0)
++        yield scope
++        scope.check_cancelled()
++        parent.progress(stop)
++    finally:
++        _current_task_context.reset(token)
++
++
++def reports_progress(message=None):
++    """Give a calculation its own local range, preserving its public signature."""
++    def decorate(function):
++        @wraps(function)
++        def wrapped(*args, **kwargs):
++            with progress_scope(message=message):
++                return function(*args, **kwargs)
++        return wrapped
++    return decorate
++
++
++def progress_step(index, total, *, start=0, stop=100, message=None):
++    """Allocate one item in a sized block/group loop."""
++    width = (stop - start) / max(1, total)
++    return progress_scope(start + width * index,
++                          min(stop, start + width * (index + 1)), message)
++
++
++def progress_iter(iterable, *, total=None, start=0, stop=100, every=128):
++    """Report a loop without materializing it or binding context across yields.
++
++    Use for leaf loops. For loops that call other reporting calculations, use
++    an explicit progress_scope per block so the child's percentage is mapped.
++    """
++    ctx = current_task_context()
++    if isinstance(ctx, NullTaskContext):
++        yield from iterable
++        return
++    if total is None:
++        total = len(iterable)
++    if every < 1 or total < 0:
++        raise ValueError("Invalid progress iteration parameters")
++    ctx.check_cancelled()
++    ctx.progress(start)
++    for index, item in enumerate(iterable):
++        if index % every == 0:
++            ctx.check_cancelled()
++            ctx.progress(start + (stop - start) * index / max(1, total))
++        yield item
++    ctx.check_cancelled()
++    ctx.progress(stop)
+--- a/catan/gui/data/statistics/sparse_values.py
++++ b/catan/gui/data/statistics/sparse_values.py
+@@ -4,6 +4,10 @@
+ sum is zero (NumPy's existing behaviour), including in later reductions.
+ No Cartesian array is constructed during calculation or reduction.
+ """
++
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
+ from dataclasses import dataclass, field
+ from copy import deepcopy
+ from math import prod
+@@ -88,6 +92,7 @@
+         self.validate()
+         return self
+ 
++    @reports_progress("Reducing sparse statistic")
+     def reduce_dimension(self, dim_name, spec):
+         from catan.gui.background_tasks.runtime import current_task_context
+ 
+@@ -114,25 +119,26 @@
+         else:
+             new_error_fill = (np.nan, np.nan, 0)
+ 
+-        remaining = np.delete(self.positions, axis, axis=1)
+-        if len(remaining):
+-            if remaining.shape[1]:
+-                order = np.lexsort(remaining.T[::-1])
+-                sorted_positions = remaining[order]
+-                starts = np.r_[0, 1 + np.flatnonzero(np.any(
+-                    sorted_positions[1:] != sorted_positions[:-1], axis=1))]
++        with progress_scope(0, 15, "Grouping sparse reduction rows"):
++            remaining = np.delete(self.positions, axis, axis=1)
++            if len(remaining):
++                if remaining.shape[1]:
++                    order = np.lexsort(remaining.T[::-1])
++                    sorted_positions = remaining[order]
++                    starts = np.r_[0, 1 + np.flatnonzero(np.any(
++                        sorted_positions[1:] != sorted_positions[:-1], axis=1))]
++                else:
++                    order = np.arange(len(remaining))
++                    starts = np.array([0])
++                stops = np.r_[starts[1:], len(order)]
+             else:
+-                order = np.arange(len(remaining))
+-                starts = np.array([0])
+-            stops = np.r_[starts[1:], len(order)]
+-        else:
+-            order = starts = stops = np.empty(0, dtype=int)
++                order = starts = stops = np.empty(0, dtype=int)
+ 
+         out = np.empty(len(starts), dtype=float)
+         positions = np.empty((len(starts), self.ndim - 1), dtype=np.int64)
+         auxiliary = np.empty((3, len(starts))) if had_errors or spec.error_method != "none" else None
+         ctx = current_task_context()
+-        for group, (start, stop) in enumerate(zip(starts, stops)):
++        for group, (start, stop) in enumerate(progress_iter(zip(starts, stops), total=len(starts), start=15, stop=95)):
+             if group % 256 == 0 and ctx is not None:
+                 ctx.check_cancelled()
+             rows = order[start:stop]
+@@ -165,38 +171,41 @@
+         self.validate()
+         return self
+ 
++    @reports_progress("Constructing sparse statistic table")
+     def to_pick_table(self):
+         from .table import PickTable
+ 
+         self.validate()
+         positions, values = self.positions, self.values
+         low, high, counts = self.errors_low, self.errors_high, self.n
+-        if np.isfinite(self.fill_value):
+-            # Empty sums are valid zero results, so they must be shown too.
+-            shape = tuple(len(self.dimensions[d].coords) for d in self.dims)
+-            rows = prod(shape)
+-            if rows > 2_000_000:
+-                raise ValueError(
+-                    f"The result contains {rows:,} finite rows (including empty-sum zeros). "
+-                    "Reduce another axis or select a session before displaying it."
+-                )
+-            linear = np.arange(rows, dtype=np.int64)
+-            positions = (np.column_stack(np.unravel_index(linear, shape))
+-                         if shape else np.empty((1, 0), dtype=np.int64))
+-            stored = (np.ravel_multi_index(self.positions.T, shape)
+-                      if shape else np.zeros(len(self.values), dtype=int))
+-            values = np.full(rows, self.fill_value)
+-            values[stored] = self.values
+-            if self.has_errors:
+-                arrays = []
+-                for source, fill in zip((low, high, counts), self.error_fill):
+-                    target = np.full(rows, fill, dtype=float)
+-                    target[stored] = source
+-                    arrays.append(target)
+-                low, high, counts = arrays
++        with progress_scope(0, 80, "Expanding finite sparse values"):
++            if np.isfinite(self.fill_value):
++                # Empty sums are valid zero results, so they must be shown too.
++                shape = tuple(len(self.dimensions[d].coords) for d in self.dims)
++                rows = prod(shape)
++                if rows > 2_000_000:
++                    raise ValueError(
++                        f"The result contains {rows:,} finite rows (including empty-sum zeros). "
++                        "Reduce another axis or select a session before displaying it."
++                    )
++                linear = np.arange(rows, dtype=np.int64)
++                positions = (np.column_stack(np.unravel_index(linear, shape))
++                             if shape else np.empty((1, 0), dtype=np.int64))
++                stored = (np.ravel_multi_index(self.positions.T, shape)
++                          if shape else np.zeros(len(self.values), dtype=int))
++                values = np.full(rows, self.fill_value)
++                values[stored] = self.values
++                if self.has_errors:
++                    arrays = []
++                    for source, fill in zip((low, high, counts), self.error_fill):
++                        target = np.full(rows, fill, dtype=float)
++                        target[stored] = source
++                        arrays.append(target)
++                    low, high, counts = arrays
+         # Unstored NaNs need no pickable rows; all coordinate domains remain
+         # in stat.dimensions. Finite zeros, however, are retained.
+-        refs = {name: np.asarray(self.dimensions[name].coords)[positions[:, axis]]
+-                for axis, name in enumerate(self.dims)}
++        with progress_scope(80, 100, "Constructing table coordinates"):
++            refs = {name: np.asarray(self.dimensions[name].coords)[positions[:, axis]]
++                    for axis, name in enumerate(self.dims)}
+         return PickTable(stat=self, values=values, dims=self.dims, refs=refs,
+                          errors_low=low, errors_high=high, n=counts)
+--- a/catan/gui/data/statistics/table.py
++++ b/catan/gui/data/statistics/table.py
+@@ -1,3 +1,6 @@
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
+ from dataclasses import dataclass, replace
+ from math import prod
+ 
+@@ -143,6 +146,7 @@
+         return self.errors_low is not None and self.errors_high is not None
+ 
+     @classmethod
++    @reports_progress("Constructing statistic table")
+     def from_stat(cls, stat: StatisticArray) -> "PickTable":
+         from .sparse_values import SparseStatisticArray
+ 
+@@ -156,7 +160,7 @@
+         refs = {}
+         grid_shape = np.asarray(stat.values).shape
+ 
+-        for axis, dim_name in enumerate(dims):
++        for axis, dim_name in enumerate(progress_iter(dims, stop=85, every=1)):
+             coords = stat.dimensions[dim_name].coords
+ 
+             if coords is None:
+@@ -211,11 +215,15 @@
+ 
+         return result
+ 
++    @reports_progress("Filtering statistic table")
+     def filtered(self, filters: tuple[PairFilter, ...]) -> "PickTable":
+         table = self
+ 
+-        for f in filters:
+-            table = table._apply_pair_filter(f)
++        for progress_index, (f) in enumerate(filters):
++            with progress_step(
++                progress_index, len(filters), start=0, stop=100,
++            ):
++                table = table._apply_pair_filter(f)
+ 
+         return table
+ 
+@@ -310,11 +318,12 @@
+             n=None if self.n is None else self.n[rows],
+         )
+ 
++    @reports_progress("Filtering statistic table")
+     def _collect_rows(self, select):
+         """Collect selected row indices from bounded table blocks."""
+         parts = []
+ 
+-        for start, block in self.iter_row_blocks():
++        for start, block in progress_iter(self.iter_row_blocks(), total=(self.n_rows + ROW_BLOCK_SIZE - 1) // ROW_BLOCK_SIZE, stop=95, every=1):
+             rows = select(block)
+ 
+             if rows.size:
+@@ -328,13 +337,14 @@
+ 
+         return np.concatenate(parts)
+ 
++    @reports_progress("Filtering statistic table")
+     def subset_rows(self, rows) -> "PickTable":
+         rows = np.atleast_1d(np.asarray(rows, dtype=np.intp))
+ 
+         refs = {}
+         row_maps = {}
+ 
+-        for name, column in self.refs.items():
++        for name, column in progress_iter(self.refs.items(), stop=85, every=1):
+             if isinstance(column, GridRef):
+                 # Coordinate columns using the same original row mapping
+                 # share their new mapping too.
+--- a/catan/gui/data/statistics/types.py
++++ b/catan/gui/data/statistics/types.py
+@@ -1,3 +1,6 @@
++from catan.gui.background_tasks.runtime import (
++    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
++)
+ from dataclasses import dataclass, field
+ from typing import Literal, Any, Optional
+ from collections.abc import Callable
+@@ -230,6 +233,7 @@
+         # self.validate()
+         return self
+ 
++    @reports_progress("Reducing statistic")
+     def reduce_dimension(self, dim_name: str, spec: ReductionSpec):
+         axis = self.axis(dim_name)
+ 
+@@ -245,26 +249,28 @@
+ 
+         values = np.asarray(self.values, dtype=float)
+ 
+-        center = self._compute_center(values, axis, spec.method)
++        with progress_scope(0, 65, f"Reducing {dim_name}: {spec.method}"):
++            center = self._compute_center(values, axis, spec.method)
+         self.values = center
+ 
+-        if spec.error_method != "none":
+-
+-            self.errors_low, self.errors_high, self.n = self._compute_error(
+-                values,
+-                axis=axis,
+-                center=center,
+-                method=spec.error_method,
+-            )
+-        else:
+-            # If errors already exist and we now reduce another dimension normally,
+-            # reduce the auxiliary arrays consistently.
+-            if self.has_errors:
+-                self._reduce_existing_errors(axis=axis, method=spec.method)
++        with progress_scope(65, 95, "Reducing uncertainty arrays"):
++            if spec.error_method != "none":
++
++                self.errors_low, self.errors_high, self.n = self._compute_error(
++                    values,
++                    axis=axis,
++                    center=center,
++                    method=spec.error_method,
++                )
+             else:
+-                self.errors_low = None
+-                self.errors_high = None
+-                self.n = None
++                # If errors already exist and we now reduce another dimension normally,
++                # reduce the auxiliary arrays consistently.
++                if self.has_errors:
++                    self._reduce_existing_errors(axis=axis, method=spec.method)
++                else:
++                    self.errors_low = None
++                    self.errors_high = None
++                    self.n = None
+ 
+         # if errors_low is not None:
+         #     self.errors_low = errors_low

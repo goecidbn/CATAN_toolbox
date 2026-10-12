@@ -5,8 +5,14 @@ from dataclasses import dataclass
 from itertools import count
 from typing import Callable
 
-from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
-
+from PySide6.QtCore import (
+    QObject,
+    QThreadPool,
+    QTimer,
+    Signal,
+    Slot,
+    Qt,
+)
 from .Worker import Worker
 
 
@@ -26,6 +32,56 @@ class QueuedTask:
     ready: Callable[[], bool] | None = None
     background: bool = False
     batch: TaskBatch | None = None
+    after_processing: bool = False
+
+
+class _TaskSignalRelay(QObject):
+    """Receive worker notifications in the TaskManager's thread."""
+
+    def __init__(self, manager, task):
+        super().__init__(manager)
+        self.manager = manager
+        self.task = task
+
+    @Slot(int)
+    def progress(self, value):
+        task = self.task
+
+        if task.id in self.manager.tasks:
+            self.manager.task_progress.emit(
+                task.group,
+                task.id,
+                value,
+            )
+
+    @Slot(str)
+    def message(self, text):
+        task = self.task
+
+        if task.id in self.manager.tasks:
+            self.manager.task_message.emit(
+                task.group,
+                task.id,
+                text,
+            )
+
+    @Slot(str)
+    def error(self, traceback_text):
+        task = self.task
+
+        self.manager._on_worker_error(
+            task.group,
+            task.id,
+            traceback_text,
+        )
+
+    @Slot(object)
+    def finished(self, result):
+        try:
+            self.manager._on_worker_finished(self.task, result)
+        finally:
+            self.manager._worker_relays.pop(self.task.id, None)
+            self.deleteLater()
 
 
 class TaskManager(QObject):
@@ -65,6 +121,7 @@ class TaskManager(QObject):
         }
 
         self.tasks: dict[str, QueuedTask] = {}
+        self._worker_relays = {}
 
         self._id_counter = count(1)
 
@@ -103,10 +160,54 @@ class TaskManager(QObject):
         return bool(self._processing_holds)
 
     def processing_busy(self):
-        """Processing tasks or an outstanding interactive loading check."""
+        """Active/queued processing, excluding requests waiting for its end."""
         return bool(self._processing_holds) or any(
-            not task.background for task in self.tasks.values()
+            not task.background
+            and (not task.after_processing or self.current[task.group] is task)
+            for task in self.tasks.values()
         )
+
+    def has_deferred_processing(self):
+        return any(task.after_processing for task in self.tasks.values())
+
+    def _deferred_is_ready(self, task):
+        if self._pending_processing is not None or self._processing_holds:
+            return False
+
+        # Preserve the submission order of deferred requests.
+        for other in self.tasks.values():
+            if other is task:
+                break
+            if other.after_processing:
+                return False
+
+        # Wait for all ordinary processing, including continuations that
+        # session-loading callbacks added after this request was submitted.
+        return not any(
+            other is not task
+            and not other.background
+            and (not other.after_processing or self.current[other.group] is other)
+            for other in self.tasks.values()
+        )
+
+    def queue_after_processing(self, name, callback, *, ready=None):
+        # The tiny worker gives this request the existing task lifecycle:
+        # it is visible, reorderable and cancellable.
+        # callback itself runs on the GUI thread through on_result.
+        task_id = self.start(
+            "loading",
+            name,
+            lambda: None,
+            on_result=lambda _: callback(),
+            ready=ready,
+            after_processing=True,
+        )
+
+        for task in tuple(self.current.values()):
+            if task is not None and task.background:
+                self.cancel(task.id)
+
+        return task_id
 
     def pause_processing(self, group, *, batch, on_cancel):
         """Prevent new workers from starting while a GUI check is pending."""
@@ -185,6 +286,7 @@ class TaskManager(QObject):
         background=False,
         batch=None,
         prepend=False,
+        after_processing=False,
         **kwargs,
     ) -> str | None:
 
@@ -217,6 +319,7 @@ class TaskManager(QObject):
             ready=ready,
             background=background,
             batch=batch,
+            after_processing=after_processing,
         )
 
         self.tasks[task.id] = task
@@ -267,6 +370,9 @@ class TaskManager(QObject):
     ) -> bool:
 
         if task.batch is not None and task.batch.cancelled:
+            return False
+
+        if task.after_processing and not self._deferred_is_ready(task):
             return False
 
         if task.ready is None:
@@ -321,6 +427,7 @@ class TaskManager(QObject):
                 self._finishing_depth
                 or self._pending_processing is not None
                 or self.processing_busy()
+                or self.has_deferred_processing()
             ):
                 continue
 
@@ -348,41 +455,17 @@ class TaskManager(QObject):
         # Forward worker signals
         # --------------------------------------------------------------
 
-        worker.signals.progress.connect(
-            lambda progress, g=group, tid=task.id: self.task_progress.emit(
-                g,
-                tid,
-                progress,
-            )
-        )
+        relay = _TaskSignalRelay(self, task)
+        self._worker_relays[task.id] = relay
 
-        worker.signals.message.connect(
-            lambda message, g=group, tid=task.id: self.task_message.emit(
-                g,
-                tid,
-                message,
-            )
-        )
+        queued = Qt.ConnectionType.QueuedConnection
 
-        worker.signals.error.connect(
-            lambda error, g=group, tid=task.id: self._on_worker_error(
-                g,
-                tid,
-                error,
-            )
-        )
+        worker.signals.progress.connect(relay.progress, queued)
+        worker.signals.message.connect(relay.message, queued)
+        worker.signals.error.connect(relay.error, queued)
+        worker.signals.finished.connect(relay.finished, queued)
 
-        worker.signals.finished.connect(
-            lambda result, t=task: self._on_worker_finished(
-                t,
-                result,
-            )
-        )
-
-        self.task_started.emit(
-            group,
-            task.id,
-        )
+        self.task_started.emit(group, task.id)
 
         self.queue_changed.emit(group)
 
@@ -592,9 +675,14 @@ class TaskManager(QObject):
     def queued_tasks(
         self,
         group: str,
+        *,
+        include_deferred=True,
     ) -> list[QueuedTask]:
-
-        return [task for task in self.queues[group] if task.id in self.tasks]
+        return [
+            task
+            for task in self.queues[group]
+            if task.id in self.tasks and (include_deferred or not task.after_processing)
+        ]
 
     def current_task(
         self,

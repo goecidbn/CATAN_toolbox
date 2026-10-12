@@ -48,6 +48,7 @@ from catan.gui.panels.helper.ReviewStatusFilter import (
 from catan.gui.GUI_elements.fragments.curator_interaction_guard import (
     CuratorInteractionGuard,
 )
+from catan.gui.background_tasks.runtime import TaskCancelled
 
 from catan.gui.panels import BasePlot
 
@@ -553,6 +554,13 @@ class Display(QWidget):
         inspection_layout.setContentsMargins(0, 0, 0, 0)
 
         self.target_selector = QComboBox()
+        self.target_selector.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.target_selector.setSizePolicy(
+            QSizePolicy.Policy.Minimum,
+            QSizePolicy.Policy.Fixed,
+        )
         self.target_selector.setToolTip(
             "Choose the specific target footprint to inspect."
         )
@@ -1049,6 +1057,10 @@ class Display(QWidget):
         finally:
             self.target_selector.blockSignals(blocked)
 
+        # Recalculate after populating the target descriptions.
+        self.target_selector.setMinimumWidth(0)
+        self.target_selector.setMinimumWidth(self.target_selector.sizeHint().width())
+        self.target_selector.updateGeometry()
         self.inspection_row.setVisible(bool(targets))
 
         return self.target_selector.currentData() if targets else None
@@ -1169,6 +1181,8 @@ class Controller(BasePlot.ControlsController):
         self.current_result = None
         self._results_note = ""
         self._filter_generation = 0
+        self._evaluation_task_id = None
+        self._evaluation_token = None
 
         self._evidence_source = ("group", self.root_filter.id)
 
@@ -1219,6 +1233,15 @@ class Controller(BasePlot.ControlsController):
         self._rerender()
 
         self.state.data_changed.connect(self._on_statistic_availability_changed)
+
+        self.connect_signal(
+            self.state.tasks.task_cancelled,
+            self._on_evaluation_cancelled,
+            controls=True,
+        )
+        self.connect_signal(
+            self.state.tasks.task_failed, self._on_evaluation_failed, controls=True
+        )
 
     def _set_group_binding(self, group_id: str, binding: str):
         if binding not in (
@@ -1432,40 +1455,114 @@ class Controller(BasePlot.ControlsController):
         self._mark_dirty()
 
     def _evaluate_filter(self):
+        if self._evaluation_token is not None or self.actions.queue is not None:
+            return
+
+        if not self._update_filter_validity():
+            return
 
         generation = self._filter_generation
         version = self.state.data_version
-        generation = self._filter_generation
         snapshot = deepcopy(self.root_filter)
 
+        token = object()
+        self._evaluation_token = token
         self.menu.set_evaluating()
 
         def evaluate():
-
             try:
                 result = CurationFilterEvaluator(self.data.statistic_engine).evaluate(
                     snapshot
                 )
+
                 return result, None
+
+            except TaskCancelled:
+                # Cancellation must reach Worker, not become a normal result.
+                raise
 
             except CurationFilterError as exc:
                 return None, (str(exc), exc.node_type, exc.node_id)
 
             except Exception as exc:
-                return None, (f"{type(exc).__name__}: {exc}", None, None)
+                return None, (
+                    f"{type(exc).__name__}: {exc}",
+                    None,
+                    None,
+                )
 
-        self.state.tasks.start(
-            "calculating",
-            "Evaluate curation filter",
-            evaluate,
-            on_result=lambda result: (
+        def accept_result(result):
+            if self._evaluation_token is not token:
+                return
+
+            self._evaluation_task_id = None
+            self._evaluation_token = None
+
+            if self._deactivated:
+                return
+
+            try:
                 self._on_filter_evaluated(
                     result,
                     generation=generation,
                     version=version,
                 )
-            ),
+            finally:
+                self._update_filter_validity(preserve_status=True)
+
+        try:
+            self._evaluation_task_id = self.state.tasks.start(
+                "calculating",
+                "Evaluate curation filter",
+                evaluate,
+                on_result=accept_result,
+            )
+        except Exception:
+            self._evaluation_task_id = None
+            self._evaluation_token = None
+            self._update_filter_validity()
+            raise
+
+    def _finish_stopped_evaluation(self, group, task_id, message):
+        if group != "calculating" or task_id != self._evaluation_task_id:
+            return
+
+        self._evaluation_task_id = None
+        self._evaluation_token = None
+
+        if self._deactivated:
+            return
+
+        self._update_filter_validity(preserve_status=True)
+
+        if self.current_result is not None:
+            message += " Previous results remain available."
+
+        self.menu.status_label.setText(message)
+
+    def _on_evaluation_cancelled(self, group, task_id):
+        self._finish_stopped_evaluation(
+            group,
+            task_id,
+            "Evaluation cancelled.",
         )
+
+    def _on_evaluation_failed(self, group, task_id):
+        self._finish_stopped_evaluation(
+            group,
+            task_id,
+            "Evaluation failed; see the task error details.",
+        )
+
+    def deactivate(self):
+        task_id = self._evaluation_task_id
+        self._evaluation_task_id = None
+        self._evaluation_token = None
+
+        if task_id is not None:
+            self.state.tasks.cancel(task_id)
+
+        super().deactivate()
 
     def _on_filter_evaluated(
         self,
@@ -1483,7 +1580,7 @@ class Controller(BasePlot.ControlsController):
                 True,
                 "Data or filter changed — evaluate again",
             )
-            self._update_filter_validity()
+            self._update_filter_validity(preserve_status=True)
             return
 
         if error is not None:
@@ -1855,36 +1952,46 @@ class Controller(BasePlot.ControlsController):
     def _on_statistic_availability_changed(self, *args):
         self._update_filter_validity()
 
-    def _update_filter_validity(self):
+    def _update_filter_validity(self, *, preserve_status=False):
         invalid_groups = empty_filter_group_ids(self.root_filter)
         self.menu.set_invalid_groups(invalid_groups)
 
         invalid_conditions = self.menu.refresh_condition_availability()
 
         problems = []
+
         if invalid_groups:
             problems.append(f"{len(invalid_groups)} empty group(s)")
+
         if invalid_conditions:
             problems.append(
                 f"{len(invalid_conditions)} condition(s) " "with unavailable statistics"
             )
 
         valid = not problems
+        evaluating = self._evaluation_token is not None
 
-        if problems:
-            self.menu.set_dirty(
-                True,
-                "Filter incomplete — " + "; ".join(problems),
-            )
-        elif self.current_result is not None:
-            self.menu.set_dirty(
-                bool(self._results_note),
-                self._results_note,
-            )
-        else:
-            self.menu.set_dirty(True, "Evaluate to obtain results.")
+        if not preserve_status:
+            if evaluating:
+                self.menu.status_label.setText(
+                    "Evaluating… Previous results remain available."
+                )
+            elif problems:
+                self.menu.set_dirty(
+                    True,
+                    "Filter incomplete — " + "; ".join(problems),
+                )
+            elif self.current_result is not None:
+                self.menu.set_dirty(
+                    bool(self._results_note),
+                    self._results_note,
+                )
+            else:
+                self.menu.set_dirty(True, "Evaluate to obtain results.")
 
-        self.menu.evaluate_button.setEnabled(valid and self.actions.queue is None)
+        self.menu.evaluate_button.setEnabled(
+            valid and not evaluating and self.actions.queue is None
+        )
 
         self._refresh_results()
         return valid

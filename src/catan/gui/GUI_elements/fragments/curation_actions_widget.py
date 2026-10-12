@@ -85,7 +85,7 @@ class CuratorActions(QGroupBox):
 
         self.current = QPushButton("Apply current")
         self.all = QPushButton("Apply all selected")
-        self.next = QPushButton(r"Apply \& next")
+        self.next = QPushButton("Apply && next")
         self.skip = QPushButton("Skip")
         self.stop = QPushButton("Stop")
 

@@ -361,13 +361,19 @@ def normalize_footprint_pair_reductions(
         if spec.method == "single":
             previous = target == "session" and relations.get(target) == "with previous"
 
-            index = max(int(previous), int(spec.index or 0))
+            index = int(spec.index) if spec.index is not None else 0
 
             out[left] = ReductionSpec("single", index=index)
-            out[right] = ReductionSpec(
-                "single",
-                index=index - int(previous),
-            )
+
+            if previous and index == 0:
+                # Session 0 has no predecessor. Let the pair filter
+                # produce an empty result without using index -1.
+                out[right] = ReductionSpec("keep")
+            else:
+                out[right] = ReductionSpec(
+                    "single",
+                    index=index - int(previous),
+                )
         else:
             out[right] = spec
 
@@ -545,17 +551,19 @@ def normalize_generic_session_pair_reductions(
     if source.method == "single":
         index = int(source.index) if source.index is not None else 0
 
-        if relation == "with previous":
-            index = max(1, index)
-            reference_index = index - 1
-        else:
-            reference_index = index
+        previous = relation == "with previous"
 
         out["session_i"] = ReductionSpec("single", index=index)
-        out["session_j"] = ReductionSpec(
-            "single",
-            index=reference_index,
-        )
+
+        if previous and index == 0:
+            # Preserve the requested source session; no valid
+            # predecessor will satisfy the pair filter.
+            out["session_j"] = ReductionSpec("keep")
+        else:
+            out["session_j"] = ReductionSpec(
+                "single",
+                index=index - int(previous),
+            )
     else:
         # Retain both axes until the pair filter selects and collapses
         # the linked pairs into one session dimension.
@@ -565,11 +573,40 @@ def normalize_generic_session_pair_reductions(
     return out
 
 
+def linked_pair_axes(stat_def, filters=()):
+    """Map dependent axes to their controlling axes."""
+    if not stat_def.independent_pairs:
+        return {}
+
+    relations = {item.target: item for item in filters}
+    linked = {}
+
+    for target in ("neuron", "session"):
+        relation = relations.get(target)
+
+        if relation is None or not relation.collapse_same:
+            continue
+
+        is_linked = relation.relation == "same" or (
+            target == "session" and relation.relation == "with previous"
+        )
+
+        left = f"{target}_i"
+        right = f"{target}_j"
+
+        if is_linked and {left, right}.issubset(stat_def.dims):
+            linked[right] = left
+
+    return linked
+
+
 def normalize_neuron_bound_reductions(
     stat_def,
     reductions,
+    filters=(),
 ):
     out = dict(reductions)
+    linked = linked_pair_axes(stat_def, filters)
 
     output_dim = neuron_bound_dim(stat_def.dims)
 
@@ -577,6 +614,11 @@ def normalize_neuron_bound_reductions(
         raise ValueError(f"{stat_def.key!r} cannot produce neuron-bound data.")
 
     for dim in stat_def.dims:
+
+        if dim in linked:
+            # Its actual setting is derived from the controlling axis below.
+            out[dim] = ReductionSpec("keep")
+            continue
 
         if dim == output_dim:
             out[dim] = ReductionSpec("keep")
@@ -616,12 +658,20 @@ def normalize_neuron_bound_reductions(
                 f"Dimension {dim!r} cannot be reduced " "for neuron-bound output."
             )
 
+    if stat_def.independent_pairs:
+        return normalize_footprint_pair_reductions(
+            stat_def,
+            out,
+            filters,
+        )
+
     return out
 
 
 def normalize_component_bound_reductions(
     stat_def,
     reductions,
+    filters=(),
 ):
     """
     Normalize a query so its output remains bound to one component.
@@ -635,6 +685,7 @@ def normalize_component_bound_reductions(
     """
 
     out = dict(reductions)
+    linked = linked_pair_axes(stat_def, filters)
 
     bound = component_bound_dims(stat_def.dims)
 
@@ -649,6 +700,11 @@ def normalize_component_bound_reductions(
         keep_dims.add(session_dim)
 
     for dim in stat_def.dims:
+
+        if dim in linked:
+            # Its actual setting is derived from the controlling axis below.
+            out[dim] = ReductionSpec("keep")
+            continue
 
         allowed = stat_def.get_allowed_reductions(dim)
         spec = out.get(dim)
@@ -705,6 +761,13 @@ def normalize_component_bound_reductions(
             raise ValueError(
                 f"Dimension {dim!r} cannot be reduced " "for component-bound output."
             )
+
+    if stat_def.independent_pairs:
+        return normalize_footprint_pair_reductions(
+            stat_def,
+            out,
+            filters,
+        )
 
     return out
 

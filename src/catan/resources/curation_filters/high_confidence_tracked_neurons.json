@@ -63,7 +63,7 @@
           "parameters": {}
         },
         "threshold": {
-          "value": 3.0,
+          "value": 4.0,
           "direction": "less",
           "active": true
         }
@@ -85,12 +85,12 @@
               "error_method": "none"
             },
             "session_i": {
-              "method": "min",
+              "method": "median",
               "index": null,
               "error_method": "none"
             },
             "session_j": {
-              "method": "min",
+              "method": "median",
               "index": null,
               "error_method": "none"
             }

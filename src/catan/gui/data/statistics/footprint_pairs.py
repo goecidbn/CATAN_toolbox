@@ -3,11 +3,21 @@
 import numpy as np
 from scipy.spatial import cKDTree
 
-from catan.core.image_correlation import calculate_img_correlation
+from collections import OrderedDict
+
+from catan.core.image_correlation import (
+    compact_positive_footprint,
+    footprint_similarity_peak,
+)
 from catan.gui.background_tasks.runtime import current_task_context
 
 from .dimensions import Dimension
 from .sparse_values import SparseStatisticArray
+
+from collections import Counter
+from time import perf_counter
+
+TRACE_FOOTPRINT_PAIRS = False
 
 
 def calculate_footprint_pairs(
@@ -19,6 +29,21 @@ def calculate_footprint_pairs(
     gamma=0.1,
 ):
     indexers = indexers or {}
+
+    trace = TRACE_FOOTPRINT_PAIRS
+
+    if trace:
+        trace_started = perf_counter()
+        trace_count = 0
+        trace_score_evaluations = 0
+        trace_neurons_i = set()
+        trace_neurons_j = set()
+        trace_sessions = Counter()
+        trace_examples = []
+        trace_score_seconds = 0.0
+        trace_patch_examples = []
+        trace_largest_patch = 0
+
     n, s = state.assignments.shape
     sizes = {"neuron_i": n, "neuron_j": n, "session_i": s, "session_j": s}
     requested = {}
@@ -118,8 +143,72 @@ def calculate_footprint_pairs(
             values.clear()
             positions.clear()
 
+    patch_cache = OrderedDict()
+
+    patch_cache_bytes = 0
+    patch_cache_budget = 16 * 1024**2
+
+    def prepared_patch(session_id, footprint_id):
+        nonlocal patch_cache_bytes, trace_largest_patch
+
+        key = (int(session_id), int(footprint_id))
+
+        if key in patch_cache:
+            patch_cache.move_to_end(key)
+            return patch_cache[key]
+
+        session = data.sessions[key[0]]
+        patch = compact_positive_footprint(
+            session.footprints[:, key[1]],
+            tuple(session.dims),
+        )
+        if TRACE_FOOTPRINT_PAIRS and patch is not None:
+            trace_largest_patch = max(trace_largest_patch, patch.size)
+
+            if len(trace_patch_examples) < 8:
+                trace_patch_examples.append(
+                    (
+                        key,  # (session, footprint)
+                        patch.shape,
+                        int(np.count_nonzero(patch)),
+                    )
+                )
+
+        size = 0 if patch is None else patch.nbytes
+
+        if size <= patch_cache_budget:
+            while patch_cache and (
+                patch_cache_bytes + size > patch_cache_budget or len(patch_cache) >= 512
+            ):
+                _, old = patch_cache.popitem(last=False)
+                if old is not None:
+                    patch_cache_bytes -= old.nbytes
+
+            patch_cache[key] = patch
+            patch_cache_bytes += size
+
+        return patch
+
+    # Keep opposite directions adjacent; retain both requested directions.
+    pairs.sort(
+        key=lambda pair: (
+            min(pair),
+            max(pair),
+        )
+    )
+
+    score_cache = {}
+    score_cache_sessions = None
+
     ctx = current_task_context()
     for step, (si, sj) in enumerate(pairs):
+
+        session_key = (min(si, sj), max(si, sj))
+
+        if session_key != score_cache_sessions:
+            score_cache.clear()
+            score_cache_sessions = session_key
+
         if ctx is not None:
             ctx.check_cancelled()
             ctx.progress(int(100 * step / max(1, len(pairs))))
@@ -174,16 +263,43 @@ def calculate_footprint_pairs(
         for count, (i, j) in enumerate(candidates):
             if count % 64 == 0 and ctx is not None:
                 ctx.check_cancelled()
-            similarity, _, _ = calculate_img_correlation(
-                source.footprints[:, fi[i]],
-                reference.footprints[:, fj[j]],
-                dims=tuple(source.dims),
-                crop=True,
-                shift=True,
-                mode="cosine_union",
-                gamma=gamma,
-                shift_optimized=True,
-            )
+
+            if TRACE_FOOTPRINT_PAIRS:
+                trace_count += 1
+                trace_neurons_i.add(int(ni_ids[i]))
+                trace_neurons_j.add(int(nj_ids[j]))
+                trace_sessions[(int(si), int(sj))] += 1
+
+                if len(trace_examples) < 8:
+                    trace_examples.append(
+                        (
+                            (int(ni_ids[i]), int(si), int(fi[i])),
+                            (int(nj_ids[j]), int(sj), int(fj[j])),
+                        )
+                    )
+
+            if TRACE_FOOTPRINT_PAIRS:
+                score_started = perf_counter()
+
+            left_key = (int(si), int(fi[i]))
+            right_key = (int(sj), int(fj[j]))
+            pair_key = tuple(sorted((left_key, right_key)))
+
+            if pair_key not in score_cache:
+                if trace:
+                    trace_score_evaluations += 1
+
+                score_cache[pair_key] = footprint_similarity_peak(
+                    prepared_patch(*left_key),
+                    prepared_patch(*right_key),
+                    gamma=gamma,
+                )
+
+            similarity = score_cache[pair_key]
+
+            if TRACE_FOOTPRINT_PAIRS:
+                trace_score_seconds += perf_counter() - score_started
+
             if not np.isfinite(similarity):
                 continue
             refs = {
@@ -221,5 +337,43 @@ def calculate_footprint_pairs(
             for original, compact in aliases.items()
         },
     )
+
+    if TRACE_FOOTPRINT_PAIRS:
+
+        def brief(values):
+            values = sorted(values)
+            suffix = " …" if len(values) > 12 else ""
+            return f"{values[:12]}{suffix} ({len(values)} distinct)"
+
+        elapsed_ms = 1000 * (perf_counter() - trace_started)
+
+        print(
+            "\n[similarity pairs]\n"
+            f"  requested indexers: {indexers}\n"
+            f"  relations: neuron={nr}, session={sr}\n"
+            f"  ordered candidate pairs: {trace_count}\n"
+            f"  numerical score evaluations: {trace_score_evaluations}\n"
+            f"  symmetric score-cache hits: "
+            f"{trace_count - trace_score_evaluations}\n"
+            f"  neuron_i: {brief(trace_neurons_i)}\n"
+            f"  neuron_j: {brief(trace_neurons_j)}\n"
+            f"  session-pair counts, first 12: "
+            f"{list(trace_sessions.items())[:12]}\n"
+            f"  example pairs ((neuron, session, footprint), ...): "
+            f"{trace_examples}\n"
+            f"  scoring incl. patch lookup/preparation: "
+            f"{1000 * trace_score_seconds:.3f} ms\n"
+            f"  pair calculation total: {elapsed_ms:.3f} ms\n"
+            f"  patch examples ((session, footprint), shape, positive pixels): "
+            f"{trace_patch_examples}\n"
+            f"  largest patch: {trace_largest_patch} pixels\n",
+            flush=True,
+        )
+
     stat.validate()
+
+    if ctx is not None:
+        ctx.check_cancelled()
+        ctx.progress(100)
+
     return stat

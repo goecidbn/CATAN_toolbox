@@ -7,7 +7,7 @@ from vispy.scene import visuals, cameras
 from vispy.color import Colormap
 from vispy.scene.visuals import Mesh
 
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QSignalBlocker
 
 from PySide6.QtGui import (
     QCursor,
@@ -27,6 +27,9 @@ from PySide6.QtWidgets import (
     QSlider,
     QComboBox,
     QStyle,
+    QToolTip,
+    QApplication,
+    QToolButton,
 )
 
 import importlib
@@ -37,10 +40,11 @@ from catan.core.changes import (
     SESSION_STRUCTURE_CHANGES,
 )
 from catan.core.structures import NeuronComponent, sessiondata_type
+from catan.core.redetection import infer_aligned_footprint
 from catan.gui.panels import BasePlot
 from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
-
 from catan.gui.interaction import click_events
+from catan.gui.data.assignment_colors import assignment_label
 
 from catan.gui.structures import request_handler
 from catan.gui.GUI_elements.utils.menu_creation import (
@@ -55,6 +59,11 @@ from catan.core.image_correlation import calculate_img_correlation
 importlib.reload(request_handler)
 
 CAMERA_PADDING_PX = 25.0
+
+INFERRED_RGBA = np.array(
+    [0.0, 166 / 255, 178 / 255, 1.0],
+    dtype=np.float32,
+)
 
 # Good → intermediate → bad; bright throughout for dark menus.
 MATCH_QUALITY_CMAP = Colormap(
@@ -77,6 +86,7 @@ class FootprintRecord:
 
     pick_points: np.ndarray  # (K, 3), usually same as vertices or downsampled
     center_xyz: np.ndarray  # (3,)
+    inferred: bool = False
 
 
 @dataclass
@@ -93,13 +103,24 @@ class Display(BasePlot.BaseCanvas):
     main_visual = Mesh
     main_visual_name = "mesh"
 
-    overlays = ["focused", "highlighted", "hovered"]
+    overlays = [
+        "selected",
+        "focused",
+        "highlighted",
+        "highlighted_source",
+        "highlighted_target",
+        "hovered",
+    ]
 
     def __init__(self, display_section, controls, config=None):
         super().__init__(display_section, controls, config)
 
         ## should be cleaned up / tested if necessary here (grid needed if no axis, ...?)
         self.unfreeze()
+
+        # None means follow the globally active assignments.
+        self._assignment_name = (config or {}).get("assignments_name")
+
         self.grid = self.central_widget.add_grid(spacing=0)
         self.view = self.grid.add_view(row=0, col=0)
         self.view.stretch = (1, 1)  # expand a lot
@@ -117,9 +138,11 @@ class Display(BasePlot.BaseCanvas):
 
         self.parameter_overlay = None
         self.request_display = RequestDisplay(self.native)
-        self.state.current_request = None
 
         self.events.resize.connect(self._on_canvas_resize)
+
+        self._mesh_context = None
+        self._inference_errors = set()
 
         self.clear()
         self.camera_set = False
@@ -157,31 +180,33 @@ class Display(BasePlot.BaseCanvas):
         self.review_status_label.hide()
 
     def _position_review_status_tag(self):
-
         if not self.review_status_label.isVisible():
             return
 
         margin = 8
+        reset_rect = self.reset_view_button.geometry()
 
-        self.review_status_label.move(margin, margin)
-
+        self.review_status_label.move(
+            margin,
+            reset_rect.bottom() + margin,
+        )
         self.review_status_label.raise_()
 
     def update_review_status_tag(self):
 
-        component = self.state.focused_component
+        component = self.display_focused_component
 
-        if component is None or self.data is None or self.data.assignments is None:
+        if component is None or self.data is None or self.display_assignments is None:
             self.review_status_label.hide()
             return
 
         neuron_id = int(component.neuron_id)
 
-        if neuron_id >= len(self.data.assignments.review_status):
+        if neuron_id >= len(self.display_assignments.review_status):
             self.review_status_label.hide()
             return
 
-        status = ReviewStatus(self.data.assignments.review_status[neuron_id])
+        status = ReviewStatus(self.display_assignments.review_status[neuron_id])
 
         if status == ReviewStatus.REVIEWED:
             background = "#357a4f"
@@ -195,7 +220,9 @@ class Display(BasePlot.BaseCanvas):
             background = "#555b63"
             border = "#747b85"
 
-        self.review_status_label.setText(status.label)
+        self.review_status_label.setText(
+            f"{assignment_label(self.assignment_name)} · {status.label}"
+        )
 
         self.review_status_label.setStyleSheet(f"""
             QLabel#reviewStatusTag {{
@@ -276,10 +303,7 @@ class Display(BasePlot.BaseCanvas):
         self.clear_visuals()
         self.plotting["data"] = {}
 
-        # # reset root to clear properly (needed?)
-        # old_root = self.plot_root
-        # old_root.parent = None
-        # self.plot_root = scene.Node(parent=self.view.scene)
+        self._inference_errors.clear()
 
     def clear_visuals(self):
         for key, footprint_visual in self.plotting["visuals"].items():
@@ -298,6 +322,88 @@ class Display(BasePlot.BaseCanvas):
                     continue
                 visual.visible = False
 
+    @property
+    def assignment_name(self):
+        name = self._assignment_name
+
+        if name is None or name not in self.data.available_assignments:
+            return self.data.current_assignments
+
+        return name
+
+    @property
+    def display_assignments(self):
+        return self.data._assignments.get(self.assignment_name)
+
+    @property
+    def displays_active_assignments(self):
+        return self.assignment_name == self.data.current_assignments
+
+    def components_from_active(self, components, *, whole_neurons=False):
+        return self.data.map_assignment_components(
+            components,
+            self.data.current_assignments,
+            self.assignment_name,
+            whole_neurons=whole_neurons,
+        )
+
+    def component_to_active(self, component):
+
+        if self.is_inferred_component(component):
+            component = NeuronComponent(
+                component.neuron_id,
+                None,
+            )
+
+        mapped = self.data.map_assignment_components(
+            component,
+            self.assignment_name,
+            self.data.current_assignments,
+        )
+        return mapped[0] if mapped else None
+
+    @property
+    def display_focused_component(self):
+        matches = self.components_from_active(
+            self.state.focused_component,
+            whole_neurons=True,
+        )
+        # Partners are ordered by shared assignments, overlap and distance.
+        return matches[0] if matches else None
+
+    @property
+    def display_selected_components(self):
+        return self.components_from_active(
+            self.state.selected_components,
+            whole_neurons=True,
+        )
+
+    def display_footprint_id(self, component):
+        assignments = self.display_assignments
+
+        if assignments is None or component is None:
+            return None
+
+        neuron = component.neuron_id
+        session = component.session_id
+
+        if (
+            session is None
+            or not 0 <= neuron < assignments.ids.shape[0]
+            or not 0 <= session < assignments.ids.shape[1]
+        ):
+            return None
+
+        footprint = int(assignments.ids[neuron, session])
+        return footprint if footprint >= 0 else None
+
+    def is_inferred_component(self, component):
+        if component is None:
+            return False
+
+        record = self.plotting["data"].get(component.id)
+        return bool(getattr(record, "inferred", False))
+
     def plot_neurons(self, reset=False):
 
         # self.state.logger.debug(
@@ -306,33 +412,57 @@ class Display(BasePlot.BaseCanvas):
 
         self.state.timeit()
 
+        parameters = self.controls["parameter"]
+
+        infer = (
+            parameters.checkbox_session_only.isChecked()
+            and parameters.checkbox_show_inferred.isChecked()
+        )
+
+        filter_focused = parameters.checkbox_filter_focused.isChecked()
+
+        focused = (
+            self.display_focused_component if infer and not filter_focused else None
+        )
+
+        context = (
+            self.assignment_name,
+            id(self.display_assignments),
+            infer,
+            (int(self.controls["session_filter"].slider.value()) if infer else None),
+            filter_focused if infer else False,
+            None if focused is None else focused.neuron_id,
+            parameters.threshold_spin.value(),
+            parameters.z_stretch_spin.value(),
+        )
+
+        if context != self._mesh_context:
+            reset = True
+            self._mesh_context = context
+
         if reset:
             self.clear()
         else:
             self.clear_visuals()
 
-        if (
-            self.data is None
-            or self.data.assignments is None
-            or self.data.assignments.union is None
-            or self.state.selected_components is None
-            or self.state.focused_component is None
-        ):
+        assignments = self.display_assignments
+        focused = self.display_focused_component
+        selected = self.display_selected_components
+
+        if assignments is None or assignments.union is None or focused is None:
             return
 
         self.state.timeit("Initial setup")
 
-        ## identify the neurons thata should be plotted
-        this_neuron = self.state.focused_component.neuron_id
-
-        n_neurons = self.data.assignments.ids.shape[0]
+        this_neuron = focused.neuron_id
+        n_neurons = assignments.ids.shape[0]
 
         if not 0 <= this_neuron < n_neurons:
             return
 
         selected_neurons = {
             int(component.neuron_id)
-            for component in (self.state.selected_components or [])
+            for component in selected
             if 0 <= component.neuron_id < n_neurons
         }
 
@@ -340,7 +470,7 @@ class Display(BasePlot.BaseCanvas):
         if display_scope == "adjacent":
 
             ## find closeby neurons
-            union_centroids = self.data.assignments.union.centroids
+            union_centroids = self.display_assignments.union.centroids
             distances = np.linalg.norm(
                 union_centroids - union_centroids[this_neuron], axis=1
             )
@@ -354,17 +484,36 @@ class Display(BasePlot.BaseCanvas):
         show_excluded = self.controls["parameter"].checkbox_show_excluded.isChecked()
 
         if not show_excluded:
-            included = self.data.assignments.union.included
+            included = self.display_assignments.union.included
             to_plot_neurons = [neuron for neuron in to_plot_neurons if included[neuron]]
 
         to_plot_neurons = np.asarray(to_plot_neurons, dtype=int)
 
         review_mask = ReviewStatusFilter.neuron_mask(
             to_plot_neurons,
-            self.data.assignments.review_status,
+            self.display_assignments.review_status,
             (self.controls["parameter"].review_filter.visible_statuses),
             focused_neuron_id=this_neuron,
             keep_focused=True,
+        )
+
+        # Explicit inspection/manipulation takes precedence over
+        # the review-status visibility filter.
+        required_components = list(self.state.highlighted_components or ())
+
+        request = self.state.current_request
+        if request is not None:
+            required_components.extend(request.components)
+
+        required_display_components = self.components_from_active(required_components)
+
+        required_neurons = {
+            component.neuron_id for component in required_display_components
+        }
+
+        review_mask |= np.isin(
+            to_plot_neurons,
+            list(required_neurons),
         )
 
         to_plot_neurons = to_plot_neurons[review_mask]
@@ -378,7 +527,7 @@ class Display(BasePlot.BaseCanvas):
 
         ## iterate through each neuron that should be plotted
         for neuron in to_plot_neurons:
-            included = bool(self.data.assignments.union.included[neuron])
+            included = bool(self.display_assignments.union.included[neuron])
 
             if not included:
                 key = "default"
@@ -443,6 +592,16 @@ class Display(BasePlot.BaseCanvas):
                 key, "mesh", verts[:, 2], alpha=alpha, colors=cols
             )
 
+            if (
+                session_filter
+                and (neuron != this_neuron or filter_focused)
+                and rec.inferred
+            ):
+                # Preserve cyan even for selected/focused neurons.
+                inferred_colors = np.array(cols, copy=True)
+                inferred_colors[:, 3] = alpha
+                plot_options["vertex_colors"] = inferred_colors
+
             ## plot the actual data
             mesh = Mesh(
                 vertices=verts,
@@ -475,7 +634,9 @@ class Display(BasePlot.BaseCanvas):
         # union_centroids = np.nanmean(
         #     self.data.neurons.centroids[displayed_neurons, ...], axis=1
         # )
-        union_centroids = self.data.assignments.union.centroids[displayed_neurons, ...]
+        union_centroids = self.display_assignments.union.centroids[
+            displayed_neurons, ...
+        ]
 
         centroid_min = np.nanmin(union_centroids, axis=0)
         centroid_max = np.nanmax(union_centroids, axis=0)
@@ -520,82 +681,182 @@ class Display(BasePlot.BaseCanvas):
 
         self.update()
 
-    def add_footprint_data(self, neuron: int, alpha=0.7, z_stretch=5.0):
+    def style_records(self, selection, style):
+        if selection is None:
+            return []
 
-        thr = self.controls["parameter"].threshold_spin.value()
+        if isinstance(selection, NeuronComponent):
+            selection = [selection]
 
-        self.state.timeit()
+        parameters = self.controls["parameter"]
+        session_only = parameters.checkbox_session_only.isChecked()
+        filter_focused = parameters.checkbox_filter_focused.isChecked()
+        selected_session = int(self.controls["session_filter"].slider.value())
 
-        self.state.logger.debug(
-            f"Plotting neuron {neuron} with threshold {thr} and alpha {alpha}"
+        focused = self.display_focused_component
+        focused_neuron = None if focused is None else focused.neuron_id
+
+        records = []
+        seen = set()
+
+        for component in selection:
+
+            # Whole-neuron selection determines which stacks are displayed.
+            # Only concrete footprint references receive these overlays.
+
+            for key, record in self.plotting["data"].items():
+                if not isinstance(key, tuple):
+                    continue
+
+                if (
+                    style in {"selected", "focused", "hovered"}
+                    and component.session_id is None
+                    and not record.inferred
+                ):
+                    continue
+
+                neuron, session = key
+
+                if neuron != component.neuron_id:
+                    continue
+
+                if component.session_id is not None and session != component.session_id:
+                    continue
+
+                if neuron not in self.plotting["visuals"]:
+                    continue
+
+                if (
+                    session_only
+                    and session != selected_session
+                    and not (neuron == focused_neuron and not filter_focused)
+                ):
+                    continue
+
+                if key not in seen:
+                    seen.add(key)
+                    records.append(record)
+
+        return records
+
+    def add_footprint_data(
+        self,
+        neuron: int,
+        alpha=0.7,
+        z_stretch=5.0,
+    ):
+        parameters = self.controls["parameter"]
+        threshold = parameters.threshold_spin.value()
+
+        assignments = self.display_assignments
+        selected_session = int(self.controls["session_filter"].slider.value())
+
+        focused = self.display_focused_component
+        focused_neuron = None if focused is None else focused.neuron_id
+
+        infer_here = (
+            parameters.checkbox_session_only.isChecked()
+            and parameters.checkbox_show_inferred.isChecked()
+            and (
+                neuron != focused_neuron
+                or parameters.checkbox_filter_focused.isChecked()
+            )
         )
-        # print(f"Adding footprint data for neuron {neuron}")
 
-        vertex_offset = 0
-        face_offset = 0
-
-        # or self.plotting["data"][neuron].mesh_vertices is None
         vertices_all = []
         faces_all = []
         colors_all = []
-        for session in self.data.sessions:
+        vertex_offset = 0
+        face_offset = 0
 
-            if not self.data.session_assigned(session.id):
+        for session in self.data.sessions:
+            if (
+                session.id >= assignments.ids.shape[1]
+                or not session.status["spatial_loaded"]
+            ):
                 continue
 
             component = NeuronComponent(neuron, session.id)
+            footprint_id = self.display_footprint_id(component)
+            inferred = footprint_id is None
 
-            fp_id = self.state.get_footprint_from_component(component)
+            if inferred:
+                if not infer_here or session.id != selected_session:
+                    continue
 
-            if fp_id is None or fp_id < 0:
-                continue
+                try:
+                    footprint = infer_aligned_footprint(
+                        self.data.sessions,
+                        assignments.ids,
+                        assignments.union,
+                        session.id,
+                        neuron,
+                    )
+                except ValueError as exc:
+                    error_key = (neuron, session.id)
 
-            rgba = np.array(
-                self.state.session_colors[session.id],
-                dtype=np.float32,
-                copy=True,
-            )
+                    if error_key not in self._inference_errors:
+                        self._inference_errors.add(error_key)
+                        self.state.logger.warning(
+                            f"Cannot infer neuron {neuron} in "
+                            f"session {session.id}: {exc}"
+                        )
+                    continue
 
-            rgba[3] = 1.0
+                if footprint is None:
+                    continue
 
-            z_offset = float(session.id) * z_stretch
+                rgba = INFERRED_RGBA.copy()
 
-            v, f, c, pick_points = footprint_to_mesh(
-                session.footprints[:, fp_id],
+            else:
+                if (
+                    not parameters.checkbox_show_excluded.isChecked()
+                    and not session.included[footprint_id]
+                ):
+                    continue
+
+                footprint = session.footprints[:, footprint_id]
+                rgba = np.array(
+                    self.state.session_colors[session.id],
+                    dtype=np.float32,
+                    copy=True,
+                )
+                rgba[3] = 1.0
+
+            vertices, faces, colors, pick_points = footprint_to_mesh(
+                footprint,
                 session.dims,
-                z_offset=z_offset,
+                z_offset=float(session.id) * z_stretch,
                 z_scale=z_stretch,
-                z_thr=thr,
+                z_thr=threshold,
                 rgba=rgba,
                 base_vertex_offset=vertex_offset,
             )
-            if v.shape[0] == 0 or f.shape[0] == 0:
+
+            if not len(vertices) or not len(faces):
                 continue
 
-            v0 = vertex_offset
-            v1 = vertex_offset + v.shape[0]
-
-            f0 = face_offset
-            f1 = face_offset + f.shape[0]
+            vertex_stop = vertex_offset + len(vertices)
+            face_stop = face_offset + len(faces)
 
             self.plotting["data"][component.id] = FootprintRecord(
                 key=component.id,
                 neuron=neuron,
-                vertex_start=v0,
-                vertex_stop=v1,
-                face_start=f0,
-                face_stop=f1,
-                pick_points=pick_points,  # local/world coords, same as vertices
-                center_xyz=np.nanmean(v, axis=0),
+                vertex_start=vertex_offset,
+                vertex_stop=vertex_stop,
+                face_start=face_offset,
+                face_stop=face_stop,
+                pick_points=pick_points,
+                center_xyz=np.nanmean(vertices, axis=0),
+                inferred=inferred,
             )
 
-            vertex_offset += v.shape[0]
-            vertices_all.append(v)
-            faces_all.append(f)
-            colors_all.append(c)
+            vertices_all.append(vertices)
+            faces_all.append(faces)
+            colors_all.append(colors)
 
-            vertex_offset = v1
-            face_offset = f1
+            vertex_offset = vertex_stop
+            face_offset = face_stop
 
         if not vertices_all:
             return
@@ -604,10 +865,8 @@ class Display(BasePlot.BaseCanvas):
             mesh_vertices=np.vstack(vertices_all),
             mesh_faces=np.vstack(faces_all),
             mesh_colors_default=np.vstack(colors_all),
-            thr=thr,
+            thr=threshold,
         )
-
-        self.state.timeit("Added surfaces")
 
     def find_closest_component(self, mouse_pos) -> Optional[NeuronComponent]:
 
@@ -622,7 +881,7 @@ class Display(BasePlot.BaseCanvas):
         filter_focused = parameters.checkbox_filter_focused.isChecked()
         session_id = int(self.controls["session_filter"].slider.value())
 
-        focused = self.state.focused_component
+        focused = self.display_focused_component
         focused_neuron = None if focused is None else focused.neuron_id
 
         keys = [
@@ -684,7 +943,7 @@ class Display(BasePlot.BaseCanvas):
         self, component: NeuronComponent
     ) -> tuple[np.ndarray, np.ndarray]:
         # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
-        union_centroids = self.data.assignments.union.centroids
+        union_centroids = self.display_assignments.union.centroids
         neuron_id = component.neuron_id
         d = np.linalg.norm(union_centroids - union_centroids[neuron_id], axis=1)
 
@@ -704,9 +963,92 @@ class Display(BasePlot.BaseCanvas):
         verts = neuron_rec.mesh_vertices[rec.vertex_start : rec.vertex_stop]
         faces = neuron_rec.mesh_faces[rec.face_start : rec.face_stop] - rec.vertex_start
         cols = self.styles.get_color_array(style, verts[:, 2], alpha=0.6)
+
+        if rec.inferred:
+            rgba = INFERRED_RGBA.copy()
+
+            # Highlight through brightness while retaining cyan.
+            lightening = 0.35 if style == "hovered" else 0.15
+            rgba[:3] += lightening * (1.0 - rgba[:3])
+
+            # Keep the existing overlay opacity.
+            rgba[3] = 0.6
+            cols = np.tile(rgba, (len(verts), 1))
+
         return {"vertices": verts, "faces": faces, "vertex_colors": cols}
 
     def on_mouse_release(self, event):
+
+        component = (
+            self.find_closest_component(event.pos) if event.pos is not None else None
+        )
+
+        if self.is_inferred_component(component):
+            event.handled = True
+
+            # No real session footprint exists to manipulate.
+            if self.state.current_request is not None:
+                return
+
+            if event.button == 2:
+                self.open_footprint_context_menu(component)
+
+            elif event.button == 1 and not self.is_drag(event.pos):
+                mapped = self.component_to_active(component)
+
+                if mapped is None:
+                    return
+
+                if self.changes_on_click == "selected":
+                    self.state.update_selected_components(mapped, event.modifiers)
+                elif self.changes_on_click == "focused":
+                    self.state.focused_component = mapped
+                else:
+                    self.state.update_highlighted_components(
+                        mapped,
+                        event.modifiers,
+                        max_components=3,
+                    )
+
+            return
+
+        if not self.displays_active_assignments:
+            if event.pos is None:
+                return
+
+            # A pending manipulation owns global interaction state.
+            if self.state.current_request is not None:
+                event.handled = True
+                return
+
+            component = self.find_closest_component(event.pos)
+
+            if event.button == 2:
+                if component is not None:
+                    self.open_footprint_context_menu(component)
+
+            elif event.button == 1 and not self.is_drag(event.pos):
+                mapped = self.component_to_active(component)
+
+                if component is not None and mapped is None:
+                    self.handle_tooltip(component)
+                elif self.changes_on_click == "highlighted":
+                    self.state.update_highlighted_components(
+                        mapped,
+                        event.modifiers,
+                        max_components=3,
+                    )
+                elif self.changes_on_click == "selected":
+                    self.state.update_selected_components(
+                        mapped,
+                        event.modifiers,
+                    )
+                elif self.changes_on_click == "focused":
+                    self.state.focused_component = mapped
+
+            event.handled = True
+            return
+
         request = self.state.current_request
 
         # Allow inspection and conflict resolution during neuron merging.
@@ -737,14 +1079,73 @@ class Display(BasePlot.BaseCanvas):
 
         super().on_mouse_release(event)
 
+    def on_mouse_press(self, event):
+        self.native.setFocus(Qt.FocusReason.MouseFocusReason)
+        super().on_mouse_press(event)
+
+    def update_hover(self, component):
+        self.handle_tooltip(component)
+        self.state.update_hovered_components(self.component_to_active(component))
+
+    def handle_tooltip(self, component=None):
+        if isinstance(component, list):
+            component = component[0] if component else None
+
+        if component is None:
+            self._tooltip_statistics.clear()
+            QToolTip.hideText()
+            return
+
+        inferred = self.is_inferred_component(component)
+
+        if self.displays_active_assignments and not inferred:
+            return super().handle_tooltip(component)
+        self._tooltip_statistics.clear()
+
+        lines = [
+            f"Assignments: {assignment_label(self.assignment_name)}",
+            f"Neuron ID: {component.neuron_id}",
+        ]
+
+        if component.session_id is not None:
+            session = self.data.sessions[component.session_id]
+            lines.append(f"Session: {session.name}")
+
+            if inferred:
+                lines.extend(
+                    [
+                        "Inferred footprint — not detected in this session",
+                        "Union shape at an interpolated centroid",
+                    ]
+                )
+            else:
+                lines.append(
+                    f"Footprint ID: " f"{self.display_footprint_id(component)}"
+                )
+
+        if not self.displays_active_assignments:
+            counterpart = self.component_to_active(component)
+
+            lines.append(
+                "No corresponding neuron in active assignments."
+                if counterpart is None
+                else f"Active counterpart: neuron {counterpart.neuron_id}"
+            )
+
+        QToolTip.showText(
+            QCursor.pos(),
+            "\n".join(lines),
+            self.native,
+        )
+
     def calculate_tracking_statistics(
         self, this_component: NeuronComponent, ref_neuron: int, with_session: str | int
     ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[int]]:
 
-        this_fp_id = self.state.get_footprint_from_component(this_component)
+        this_fp_id = self.display_footprint_id(this_component)
 
         ## find, where compared neuron has footprints
-        fp_ids = self.state.assignments[ref_neuron, :]
+        fp_ids = self.display_assignments.ids[ref_neuron, :]
         sessions_detected = np.where(fp_ids >= 0)[0]
         if len(sessions_detected) == 0:
             self.state.logger.debug(
@@ -785,7 +1186,7 @@ class Display(BasePlot.BaseCanvas):
 
         ## decided on the reference component to compare with
         ref_component = NeuronComponent(ref_neuron, ref_session_id)
-        ref_fp_id = self.state.get_footprint_from_component(ref_component)
+        ref_fp_id = self.display_footprint_id(ref_component)
 
         ## calculate the statistics
         if self.data.model is not None and self.data.model.fitted:
@@ -864,7 +1265,68 @@ class Display(BasePlot.BaseCanvas):
             enabled=False,
         )
 
+    def _activate_display_assignments(self, component):
+        if self.data.change_assignments(self.assignment_name):
+            self.state.focused_component = component
+
     def open_footprint_context_menu(self, this_component: NeuronComponent):
+
+        if self.is_inferred_component(this_component):
+            menu = QMenu(self.native)
+            menu.addSection(
+                f"Inferred footprint — neuron " f"{this_component.neuron_id}"
+            )
+
+            mapped = self.component_to_active(this_component)
+
+            focus = menu.addAction("Focus corresponding neuron")
+            focus.setEnabled(mapped is not None)
+            focus.triggered.connect(
+                lambda checked=False: self.set_focused_footprint(this_component)
+            )
+
+            if not self.displays_active_assignments:
+                activate = menu.addAction(
+                    "Make these assignments active and focus neuron"
+                )
+                activate.triggered.connect(
+                    lambda checked=False: self._activate_display_assignments(
+                        NeuronComponent(
+                            this_component.neuron_id,
+                            None,
+                        )
+                    )
+                )
+
+            menu.exec(QCursor.pos())
+            return
+
+        if not self.displays_active_assignments:
+            menu = QMenu(self.native)
+            menu.addSection(
+                f"{assignment_label(self.assignment_name)}: "
+                f"neuron {this_component.neuron_id}"
+            )
+
+            counterpart = self.component_to_active(this_component)
+
+            focus_action = menu.addAction(
+                "Focus corresponding neuron in active assignments"
+            )
+            focus_action.setEnabled(counterpart is not None)
+            focus_action.triggered.connect(
+                lambda checked=False: self.set_focused_footprint(this_component)
+            )
+
+            activate_action = menu.addAction(
+                "Make these assignments active and focus this footprint"
+            )
+            activate_action.triggered.connect(
+                lambda checked=False: self._activate_display_assignments(this_component)
+            )
+
+            menu.exec(QCursor.pos())
+            return
 
         if this_component.session_id is None:
             return
@@ -1019,7 +1481,7 @@ class Display(BasePlot.BaseCanvas):
             lambda: self.start_split(component)
         )
 
-        fp_id = self.state.get_footprint_from_component(component)
+        fp_id = self.display_footprint_id(component)
         self.register_actions["toggle_included"] = QAction(
             f"... as {"excluded" if self.data.is_included(component) else "included"}",
             submenu,
@@ -1048,9 +1510,14 @@ class Display(BasePlot.BaseCanvas):
 
     def sync_request_display(self):
 
+        if not self.displays_active_assignments:
+            self.request_display.set_request(None)
+            self._position_request_display()
+            return
+
         request = self.state.current_request
         if request is not None and request.type == "neuron_merge":
-            if request.assignments is not self.data.assignments:
+            if request.assignments is not self.display_assignments:
                 self.cancel_request()
                 return
             request.refresh()
@@ -1067,7 +1534,7 @@ class Display(BasePlot.BaseCanvas):
             return
 
         self.state.current_request = request_handler.NeuronMergeRequest(
-            self.data.assignments,
+            self.display_assignments,
             source_id,
             target_id,
         )
@@ -1151,7 +1618,7 @@ class Display(BasePlot.BaseCanvas):
 
         component = self.find_closest_component(event.pos)
 
-        if component is None:
+        if component is None or self.is_inferred_component(component):
             return
 
         current_components = (
@@ -1209,8 +1676,11 @@ class Display(BasePlot.BaseCanvas):
         )
         self.plot_neurons(reset=True)
 
-    def set_focused_footprint(self, component: NeuronComponent):
-        self.state.focused_component = component
+    def set_focused_footprint(self, component):
+        mapped = self.component_to_active(component)
+
+        if mapped is not None:
+            self.state.focused_component = mapped
 
     def change_review_status(self, neuron_id: int, status: ReviewStatus):
         self.data.change_review_status(neuron_id, status)
@@ -1227,6 +1697,18 @@ class Controller(BasePlot.CanvasController):
         self.controls["parameter"] = FootprintParametersController(self.section)
         self.canvas.attach_parameter_overlay()
 
+        self.assignments_selector = QComboBox()
+        self.assignments_selector.setMinimumWidth(160)
+        self.assignments_selector.setToolTip(
+            "Assignments displayed by this footprint panel."
+        )
+        self.section.x_options_layout.addWidget(self.assignments_selector)
+
+        self.assignments_selector.currentIndexChanged.connect(
+            self._on_display_assignments_changed
+        )
+        self._refresh_assignments_selector()
+
         self.controls["parameter"].data_parameter_changed.connect(
             lambda: self.replot_neurons()
         )
@@ -1235,6 +1717,8 @@ class Controller(BasePlot.CanvasController):
         )
 
         self.controls["session_filter"] = SessionFilterControl(self.section)
+        self.canvas.native.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.canvas.native.installEventFilter(self.controls["session_filter"])
 
         self.controls["session_filter"].hide()
 
@@ -1275,6 +1759,9 @@ class Controller(BasePlot.CanvasController):
         self._on_request_status_changed()
 
     def _on_data_changed(self, event: DataChange):
+
+        self._refresh_assignments_selector()
+
         if event.has(*SESSION_STRUCTURE_CHANGES, C.ASSIGNMENT_SET):
             self.initialize_display()
 
@@ -1302,8 +1789,49 @@ class Controller(BasePlot.CanvasController):
             self.canvas.sync_request_display()
 
     def initialize_display(self):
+
+        self._refresh_assignments_selector()
+
         self._setup_session_filter()
         super().initialize_display()
+        self.canvas.update_review_status_tag()
+
+    def _refresh_assignments_selector(self):
+        selector = self.assignments_selector
+        chosen = self.canvas._assignment_name
+
+        if chosen is not None and chosen not in self.data.available_assignments:
+            self.canvas._assignment_name = None
+            chosen = None
+
+        blocked = selector.blockSignals(True)
+        try:
+            selector.clear()
+            selector.addItem("Follow active assignments", None)
+
+            names = self.data.available_assignments
+            for name in names:
+                selector.addItem(assignment_label(name), name)
+
+            if chosen is not None and chosen not in names:
+                selector.addItem(f"{assignment_label(chosen)} — unavailable", chosen)
+
+            selector.setCurrentIndex(0 if chosen is None else selector.findData(chosen))
+        finally:
+            selector.blockSignals(blocked)
+
+    def _on_display_assignments_changed(self, index):
+        name = self.assignments_selector.itemData(index)
+
+        if name == self.canvas._assignment_name:
+            return
+
+        self.canvas._assignment_name = name
+        self.config["assignments_name"] = name
+        self.canvas.camera_set = False
+
+        self.canvas.sync_request_display()
+        self.replot_neurons()
         self.canvas.update_review_status_tag()
 
     def _on_session_changed(self):
@@ -1316,10 +1844,8 @@ class Controller(BasePlot.CanvasController):
         self.update_neuron_selection()
 
     def _on_session_filter_toggled(self, active: bool):
-
         self.controls["session_filter"].setVisible(active)
-        self.controls["session_filter"]._on_value_changed(self.state.current_session_id)
-
+        self._setup_session_filter()
         self.update_neuron_selection()
 
     def _setup_session_filter(self):
@@ -1348,6 +1874,44 @@ class Controller(BasePlot.CanvasController):
         self.canvas.plot_neurons()
         self.update_styles()
 
+    def update_styles(self):
+        canvas = self.canvas
+
+        canvas.update_style(
+            canvas.components_from_active(self.state.hovered_components) or None,
+            "hovered",
+        )
+        canvas.update_style(
+            canvas.components_from_active(
+                self.state.selected_components,
+            )
+            or None,
+            "selected",
+        )
+        canvas.update_style(
+            canvas.components_from_active(
+                self.state.focused_component,
+            )
+            or None,
+            "focused",
+        )
+
+        highlighted = self.state.highlighted_components or ()
+        roles = self.state.highlight_roles
+
+        for role, style in (
+            (None, "highlighted"),
+            ("source", "highlighted_source"),
+            ("target", "highlighted_target"),
+        ):
+            components = [
+                component for component in highlighted if roles.get(component) == role
+            ]
+            canvas.update_style(
+                canvas.components_from_active(components) or None,
+                style,
+            )
+
     def replot_neurons(self):
         self.canvas.plot_neurons(reset=True)
         self.update_styles()
@@ -1357,13 +1921,13 @@ class Controller(BasePlot.CanvasController):
 
 
 class SessionFilterControl(QWidget):
-
     valueChanged = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self.data = parent.data
+        self._session_count = 0
 
         self.setFixedWidth(50)
 
@@ -1377,49 +1941,129 @@ class SessionFilterControl(QWidget):
 
         self.value_label = QLabel("")
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.value_label)
+
+        self.up_button = QToolButton()
+        self.up_button.setArrowType(Qt.ArrowType.UpArrow)
+        self.up_button.setToolTip("Next session — Up")
+        self.up_button.setAutoRepeat(True)
+        self.up_button.clicked.connect(lambda checked=False: self.step(1))
+        layout.addWidget(
+            self.up_button,
+            alignment=Qt.AlignmentFlag.AlignHCenter,
+        )
 
         self.slider = QSlider(Qt.Orientation.Vertical)
-
         self.slider.setRange(0, 0)
         self.slider.setSingleStep(1)
         self.slider.setPageStep(1)
-
-        # Important:
-        # session 0 at the BOTTOM,
-        # increasing session IDs upward.
         self.slider.setInvertedAppearance(False)
         self.slider.setInvertedControls(False)
+        layout.addWidget(self.slider, stretch=1)
+
+        self.down_button = QToolButton()
+        self.down_button.setArrowType(Qt.ArrowType.DownArrow)
+        self.down_button.setToolTip("Previous session — Down")
+        self.down_button.setAutoRepeat(True)
+        self.down_button.clicked.connect(lambda checked=False: self.step(-1))
+        layout.addWidget(
+            self.down_button,
+            alignment=Qt.AlignmentFlag.AlignHCenter,
+        )
 
         self.zero_label = QLabel("0")
         self.zero_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        layout.addWidget(self.value_label)
-        layout.addWidget(
-            self.slider,
-            stretch=1,
-        )
         layout.addWidget(self.zero_label)
 
         self.slider.valueChanged.connect(self._on_value_changed)
 
-    def _on_value_changed(self, value: int):
-        self.value_label.setText(f"{value:d} / {len(self.data.sessions)}")
-        self.value_label.setToolTip(f"{self.data.sessions[value].name}")
-        self.valueChanged.emit(value)
+        for widget in (
+            self.slider,
+            self.up_button,
+            self.down_button,
+        ):
+            widget.installEventFilter(self)
 
-    def set_sessions(
-        self,
-        n_sessions: int,
-        current_session: int | None = None,
-    ):
-        if n_sessions <= 0:
-            self.slider.setRange(0, 0)
+        self._refresh_labels()
+
+    def step(self, direction):
+        if not self.isVisible() or self._session_count <= 0:
             return
 
-        self.slider.setRange(0, n_sessions - 1)
+        value = self.slider.value() + int(direction)
+        value = max(
+            self.slider.minimum(),
+            min(self.slider.maximum(), value),
+        )
+        self.slider.setValue(value)
 
-        if current_session is not None:
-            self.slider.setValue(int(current_session))
+    def eventFilter(self, watched, event):
+        if (
+            self.isVisible()
+            and self._session_count > 0
+            and QApplication.activePopupWidget() is None
+            and event.type()
+            in (
+                QEvent.Type.ShortcutOverride,
+                QEvent.Type.KeyPress,
+            )
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and event.key()
+            in (
+                Qt.Key.Key_Up,
+                Qt.Key.Key_Down,
+            )
+        ):
+            event.accept()
+
+            if event.type() == QEvent.Type.KeyPress:
+                self.step(1 if event.key() == Qt.Key.Key_Up else -1)
+
+            return True
+
+        return super().eventFilter(watched, event)
+
+    def _refresh_labels(self):
+        value = self.slider.value()
+        available = self._session_count > 0
+
+        self.slider.setEnabled(available)
+        self.up_button.setEnabled(available and value < self.slider.maximum())
+        self.down_button.setEnabled(available and value > self.slider.minimum())
+
+        if not available:
+            self.value_label.setText("—")
+            self.value_label.setToolTip("")
+            return
+
+        self.value_label.setText(f"{value} / {self._session_count}")
+        self.value_label.setToolTip(self.data.sessions[value].name)
+
+    def _on_value_changed(self, value):
+        self._refresh_labels()
+
+        if self._session_count > 0:
+            self.valueChanged.emit(value)
+
+    def set_sessions(self, n_sessions, current_session=None):
+        previous = self.slider.value()
+        self._session_count = max(
+            0,
+            min(int(n_sessions), len(self.data.sessions)),
+        )
+        maximum = max(0, self._session_count - 1)
+
+        value = previous if current_session is None else int(current_session)
+        value = max(0, min(maximum, value))
+
+        with QSignalBlocker(self.slider):
+            self.slider.setRange(0, maximum)
+            self.slider.setValue(value)
+
+        self._refresh_labels()
+
+        if self._session_count > 0 and value != previous:
+            self.valueChanged.emit(value)
 
 
 class RequestDisplay(QFrame):
@@ -1791,6 +2435,18 @@ class FootprintParametersController(ControlPanel.ControlPanel):
         )
         self.form.addRow(self.checkbox_filter_focused)
 
+        self.checkbox_show_inferred = QCheckBox("Show inferred footprints — cyan")
+        self.checkbox_show_inferred.setEnabled(False)
+        self.checkbox_show_inferred.setToolTip(
+            "For neurons missing from the selected session, show "
+            "the union footprint at its interpolated position.\n"
+            "Cyan footprints are inferred, not detected components."
+        )
+        self.checkbox_show_inferred.toggled.connect(
+            lambda: self.data_parameter_changed.emit()
+        )
+        self.form.addRow(self.checkbox_show_inferred)
+
         self.checkbox_show_excluded = QCheckBox("Show excluded")
         self.checkbox_show_excluded.setChecked(True)
         self.checkbox_show_excluded.toggled.connect(
@@ -1803,6 +2459,7 @@ class FootprintParametersController(ControlPanel.ControlPanel):
         active = self.checkbox_session_only.isChecked()
 
         self.checkbox_filter_focused.setEnabled(active)
+        self.checkbox_show_inferred.setEnabled(active)
         self.session_only_changed.emit(active)
 
         super()._on_session_only_changed()
@@ -1867,12 +2524,39 @@ def footprint_to_mesh(
         faces:    (2*N, 3)
         colors:   (4*N, 4)
     """
-    y, x = np.unravel_index(footprint.indices, dim)
-    z = np.asarray(footprint.data / footprint.data.max(), dtype=np.float32)
+    empty = (
+        np.empty((0, 3), dtype=np.float32),
+        np.empty((0, 3), dtype=np.uint32),
+        np.empty((0, 4), dtype=np.float32),
+        np.empty((0, 3), dtype=np.float32),
+    )
 
-    x = x[z > z_thr]
-    y = y[z > z_thr]
-    z = z[z > z_thr]
+    footprint = sparse.csc_matrix(footprint, copy=True)
+    footprint.sum_duplicates()
+    footprint.eliminate_zeros()
+
+    if footprint.nnz == 0:
+        return empty
+
+    maximum = footprint.data.max()
+
+    if not np.isfinite(maximum) or maximum <= 0:
+        return empty
+
+    y, x = np.unravel_index(footprint.indices, dim)
+    z = np.asarray(
+        footprint.data / maximum,
+        dtype=np.float32,
+    )
+
+    keep = np.isfinite(z) & (z > z_thr)
+
+    if not np.any(keep):
+        return empty
+
+    x = x[keep]
+    y = y[keep]
+    z = z[keep]
     peak_points = z > 0.5
 
     # Crop to local bounding box
