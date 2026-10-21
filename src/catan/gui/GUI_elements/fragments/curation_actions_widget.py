@@ -20,10 +20,12 @@ from PySide6.QtWidgets import (
 )
 
 from catan.gui.data.curation_actions import (
+    BATCH_ACTIONS,
     ManipulationSpec,
     ManipulationPlan,
     OccupiedDestination,
 )
+from catan.tracking.structures import ReviewStatus
 
 
 class CuratorActions(QGroupBox):
@@ -54,9 +56,15 @@ class CuratorActions(QGroupBox):
             ("Split footprint", "split"),
             ("Merge footprints", "merge"),
             ("Merge neurons", "neuron_merge"),
-            ("Reassign footprint", "reassign"),
+            ("Mark reviewed", "mark_reviewed"),
+            ("Mark uncertain", "mark_uncertain"),
+            ("Exclude neurons", "exclude_neuron"),
+            ("Exclude footprints", "exclude_footprint"),
         ):
             self.kind.addItem(label, value)
+
+        # Separate per-candidate manipulations from batch actions.
+        self.kind.insertSeparator(self.kind.findData("mark_reviewed"))
 
         self.kind.setSizePolicy(
             QSizePolicy.Policy.Fixed,
@@ -231,7 +239,7 @@ class CuratorActions(QGroupBox):
         result = self.controller.current_result
 
         kind = self.kind.currentData()
-        if result is None or kind == "none":
+        if result is None or kind == "none" or kind in BATCH_ACTIONS:
             return []
 
         mapping = result.root_targets()
@@ -390,6 +398,12 @@ class CuratorActions(QGroupBox):
     def _buttons(self):
         running = self.queue is not None
 
+        batch = self.kind.currentData() in BATCH_ACTIONS
+
+        # Batch actions have no candidate list and no per-item review.
+        self.candidate.setVisible(not batch)
+        self.confirm.setVisible(not batch)
+
         if running:
             self.controller.menu.evaluate_button.setEnabled(False)
 
@@ -404,7 +418,12 @@ class CuratorActions(QGroupBox):
         self.all.setVisible(not running)
 
         self.current.setEnabled(
-            not running and self.candidate.currentData() is not None
+            not running
+            and (
+                self._focused_result_neuron() is not None
+                if batch
+                else self.candidate.currentData() is not None
+            )
         )
         self.all.setEnabled(
             not running
@@ -436,8 +455,113 @@ class CuratorActions(QGroupBox):
 
         return list(unique.values())
 
+    def _focused_result_neuron(self):
+        result = self.controller.current_result
+        focused = self.state.focused_component
+
+        if result is None or focused is None:
+            return None
+
+        return focused.neuron_id if focused.neuron_id in result.neurons else None
+
+    def _batch_targets(self, all_selected):
+        result = self.controller.current_result
+
+        if result is None:
+            raise ValueError("Evaluate the filter first.")
+
+        if all_selected:
+            neurons = {
+                component.neuron_id
+                for component in self.state.selected_components or []
+            } & result.neurons
+        else:
+            focused = self._focused_result_neuron()
+            neurons = set() if focused is None else {focused}
+
+        # Results may contain neurons excluded after (or before) evaluation.
+        neurons = {neuron for neuron in neurons if self.data.is_included(neuron)}
+
+        if not neurons:
+            raise ValueError(
+                "No matching neurons selected. Use 'Select matching "
+                "neurons' or focus a matching neuron."
+            )
+
+        if self.kind.currentData() != "exclude_footprint":
+            return sorted(neurons)
+
+        components = {
+            component
+            for component in result.target_components()
+            if component.neuron_id in neurons
+        }
+
+        if any(component.session_id is None for component in components):
+            raise ValueError(
+                "This preset matches whole neurons. Use 'Exclude neurons', "
+                "or evaluate footprints (by footprint or with footprint "
+                "endpoints)."
+            )
+
+        return sorted(components, key=lambda c: (c.neuron_id, c.session_id))
+
+    def _apply_batch(self, all_selected):
+        kind = self.kind.currentData()
+
+        try:
+            if self.state.tasks.processing_busy():
+                raise ValueError("Other processing is running. Try again afterwards.")
+
+            targets = self._batch_targets(all_selected)
+
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return
+
+        if kind in ("exclude_neuron", "exclude_footprint"):
+            noun = "neurons" if kind == "exclude_neuron" else "footprints"
+
+            answer = QMessageBox.question(
+                self.window(),
+                f"Exclude {noun}",
+                f"Exclude {len(targets)} {noun} matched by this preset?\n\n"
+                "Excluded items remain in the data and can be re-included.",
+            )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                self.status.setText("Exclusion cancelled.")
+                return
+
+        try:
+            if kind == "mark_reviewed":
+                self.data.set_review_status(targets, ReviewStatus.REVIEWED)
+                done = f"Marked {len(targets)} neurons as reviewed."
+
+            elif kind == "mark_uncertain":
+                self.data.set_review_status(targets, ReviewStatus.UNCERTAIN)
+                done = f"Marked {len(targets)} neurons as uncertain."
+
+            elif kind == "exclude_neuron":
+                excluded = self.data.exclude_neurons(targets)
+                done = f"Excluded {len(excluded)} neurons."
+
+            else:
+                retired = self.data.exclude_components(targets)
+                done = f"Excluded {len(retired)} footprints."
+
+        except Exception as exc:
+            QMessageBox.warning(self.window(), "Action failed", str(exc))
+            return
+
+        self.status.setText(done)
+
     def _start(self, all_selected):
         if self.queue is not None:
+            return
+
+        if self.kind.currentData() in BATCH_ACTIONS:
+            self._apply_batch(all_selected)
             return
 
         try:

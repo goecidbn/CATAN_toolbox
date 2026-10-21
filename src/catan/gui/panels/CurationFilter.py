@@ -3,6 +3,8 @@ from copy import deepcopy
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
+    QGridLayout,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -49,10 +51,13 @@ from catan.gui.GUI_elements.fragments.curator_interaction_guard import (
     CuratorInteractionGuard,
 )
 from catan.gui.background_tasks.runtime import TaskCancelled
+from catan.gui.data.statistics.sampling import SUGGESTION_PERCENTILES
 
 from catan.gui.panels import BasePlot
 
 importlib.reload(StatisticsData)
+
+SUGGESTION_SAMPLES = 4000
 
 
 class CurationFilterConditionPopup(QDialog):
@@ -64,6 +69,7 @@ class CurationFilterConditionPopup(QDialog):
         *,
         engine,
         condition: CurationFilterCondition | None = None,
+        tasks=None,
         parent=None,
     ):
         super().__init__(
@@ -73,6 +79,11 @@ class CurationFilterConditionPopup(QDialog):
 
         self.engine = engine
         self.condition = condition
+        self.tasks = tasks
+
+        self._suggestion_token = None
+        self._suggestion_task_id = None
+        self._closed = False
 
         self.setWindowTitle(
             "Edit filter condition" if condition is not None else "Add filter condition"
@@ -207,6 +218,8 @@ class CurationFilterConditionPopup(QDialog):
         self.threshold_error.hide()
         layout.addWidget(self.threshold_error)
 
+        self._build_suggestions(layout)
+
         # ---------------------------------------------
         # Buttons
         # ---------------------------------------------
@@ -243,7 +256,244 @@ class CurationFilterConditionPopup(QDialog):
 
         self._update_threshold_controls()
 
+    def _build_suggestions(self, layout):
+        row = QHBoxLayout()
+
+        self.suggest_button = QPushButton("Suggest")
+        self.suggest_button.setAutoDefault(False)
+        self.suggest_button.setToolTip(
+            "Sample this statistic's values (about 2 s) and show percentiles. "
+            "Pair statistics show same-neuron and nearest-other-neuron pairs. "
+            "Click a value to use it as threshold."
+        )
+
+        self.suggest_more_button = QPushButton("Sample more")
+        self.suggest_more_button.setAutoDefault(False)
+        self.suggest_more_button.hide()
+
+        self.suggest_status = QLabel()
+        self.suggest_status.setWordWrap(True)
+        self.suggest_status.setObjectName("curationConditionDescription")
+
+        row.addWidget(self.suggest_button)
+        row.addWidget(self.suggest_more_button)
+        row.addWidget(self.suggest_status, stretch=1)
+        layout.addLayout(row)
+
+        self.suggestion_panel = QWidget()
+        self.suggestion_grid = QGridLayout(self.suggestion_panel)
+        self.suggestion_grid.setContentsMargins(0, 0, 0, 0)
+        self.suggestion_grid.setHorizontalSpacing(4)
+        self.suggestion_grid.setVerticalSpacing(2)
+        self.suggestion_panel.hide()
+        layout.addWidget(self.suggestion_panel)
+
+        self.suggest_button.clicked.connect(lambda: self._request_suggestions())
+        self.suggest_more_button.clicked.connect(self._request_more_suggestions)
+
+        if self.tasks is not None:
+            self.tasks.task_cancelled.connect(self._on_suggestion_stopped)
+            self.tasks.task_failed.connect(self._on_suggestion_stopped)
+        else:
+            self.suggest_button.setEnabled(False)
+            self.suggest_button.setToolTip("Suggestions need the task manager.")
+
+    def _clear_suggestions(self, status=""):
+        while self.suggestion_grid.count():
+            item = self.suggestion_grid.takeAt(0)
+
+            if item.widget() is not None:
+                item.widget().deleteLater()
+
+        self.suggestion_panel.hide()
+        self.suggest_more_button.hide()
+        self.suggest_status.setText(status)
+
+    def _cancel_suggestions(self):
+        task_id = self._suggestion_task_id
+
+        self._suggestion_token = None
+        self._suggestion_task_id = None
+
+        if task_id is not None and self.tasks is not None:
+            self.tasks.cancel(task_id)
+
+    def _request_more_suggestions(self):
+        self._request_suggestions(**self._more_request)
+
+    def _request_suggestions(self, *, budget=2.0, allow_full=False):
+        query = self.query_selector.effective_query()
+
+        if self.tasks is None or query is None or query.statistic_key == "none":
+            return
+
+        self._cancel_suggestions()
+        self._clear_suggestions("Sampling values…")
+
+        engine = self.engine
+        token = object()
+        self._suggestion_token = token
+
+        def sample():
+            try:
+                return (
+                    engine.sample_values(
+                        query,
+                        SUGGESTION_SAMPLES,
+                        budget=budget,
+                        allow_full=allow_full,
+                    ),
+                    None,
+                )
+            except TaskCancelled:
+                raise
+            except Exception as exc:
+                return None, f"{type(exc).__name__}: {exc}"
+
+        def accept(result):
+            if self._suggestion_token is not token or self._closed:
+                return
+
+            self._suggestion_token = None
+            self._suggestion_task_id = None
+
+            if self.query_selector.effective_query() != query:
+                self._clear_suggestions()
+                return
+
+            self._show_suggestions(*result, budget=budget, allow_full=allow_full)
+
+        self._suggestion_task_id = self.tasks.start(
+            "calculating",
+            "Suggest thresholds",
+            sample,
+            on_result=accept,
+        )
+
+    def _on_suggestion_stopped(self, group, task_id):
+        if self._closed or task_id != self._suggestion_task_id:
+            return
+
+        self._suggestion_token = None
+        self._suggestion_task_id = None
+        self._clear_suggestions("Sampling stopped; see the task details.")
+
+    def _show_suggestions(self, result, error, *, budget, allow_full):
+        self._clear_suggestions()
+
+        if error is not None:
+            self.suggest_status.setText(error)
+            return
+
+        if result is None:
+            self.suggest_status.setText("No data loaded.")
+            return
+
+        if result.method == "unsupported":
+            self.suggest_status.setText(result.note)
+            self._more_request = {"budget": budget, "allow_full": True}
+            self.suggest_more_button.setText("Calculate all")
+            self.suggest_more_button.setVisible(not allow_full)
+            return
+
+        if not result.samples:
+            self.suggest_status.setText(result.note or "No values to suggest from.")
+            return
+
+        grid = self.suggestion_grid
+
+        for column, level in enumerate(SUGGESTION_PERCENTILES, start=2):
+            header = QLabel("median" if level == 50 else f"p{level}")
+            header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(header, 0, column)
+
+        for row, sample in enumerate(result.samples, start=1):
+            grid.addWidget(QLabel(sample.label), row, 0)
+
+            count = QLabel(f"n={len(sample.values):,}")
+            count.setToolTip(
+                f"All {sample.available:,} {sample.unit}"
+                if sample.exact
+                else f"Sampled {sample.sampled:,}"
+                + (
+                    f" of {sample.available:,}"
+                    if sample.available is not None
+                    else ""
+                )
+                + f" {sample.unit}"
+            )
+            grid.addWidget(count, row, 1)
+
+            percentiles = sample.percentiles()
+
+            if percentiles is None:
+                grid.addWidget(QLabel("no values"), row, 2, 1, -1)
+                continue
+
+            for column, (level, value) in enumerate(
+                zip(SUGGESTION_PERCENTILES, percentiles), start=2
+            ):
+                button = QPushButton(f"{value:.4g}")
+                button.setAutoDefault(False)
+                button.setFlat(True)
+                button.setToolTip(
+                    f"{sample.label}, p{level}: {value:.6g}\n"
+                    "Click: set threshold. Shift+click: set upper bound."
+                )
+                button.clicked.connect(
+                    lambda _=False, value=float(value): self._apply_suggestion(value)
+                )
+                grid.addWidget(button, row, column)
+
+        self.suggestion_panel.show()
+
+        complete = all(sample.exact for sample in result.samples)
+        self.suggest_status.setText(
+            ("All values" if complete else "Sampled")
+            + f" in {result.elapsed:.1f} s."
+            + (f" {result.note}" if result.note else "")
+        )
+
+        self._more_request = {"budget": 5 * budget, "allow_full": False}
+        self.suggest_more_button.setText("Sample more")
+        self.suggest_more_button.setVisible(
+            result.method in ("neurons", "pairs")
+            and budget < 10
+            and any(
+                not sample.exact and len(sample.values) < SUGGESTION_SAMPLES
+                for sample in result.samples
+            )
+        )
+
+    def _apply_suggestion(self, value):
+        shift = bool(
+            QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
+        )
+
+        if shift:
+            index = self.direction_selector.findData("between")
+            self.direction_selector.setCurrentIndex(index)
+            self.threshold_upper.setValue(value)
+        else:
+            self.threshold_value.setValue(value)
+
+    def done(self, result):
+        self._closed = True
+        self._cancel_suggestions()
+
+        if self.tasks is not None:
+            self.tasks.task_cancelled.disconnect(self._on_suggestion_stopped)
+            self.tasks.task_failed.disconnect(self._on_suggestion_stopped)
+            self.tasks = None
+
+        super().done(result)
+
     def _on_query_changed(self, query):
+        if getattr(self, "_shown_query", None) != query:
+            self._shown_query = query
+            self._cancel_suggestions()
+            self._clear_suggestions()
+
         error = ""
 
         try:
@@ -1663,6 +1913,7 @@ class Controller(BasePlot.ControlsController):
 
         popup = CurationFilterConditionPopup(
             engine=self.data.statistic_engine,
+            tasks=self.state.tasks,
             parent=self.menu,
         )
 
@@ -1721,6 +1972,7 @@ class Controller(BasePlot.ControlsController):
         popup = CurationFilterConditionPopup(
             engine=self.data.statistic_engine,
             condition=condition,
+            tasks=self.state.tasks,
             parent=self.menu,
         )
 

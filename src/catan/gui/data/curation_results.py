@@ -60,6 +60,26 @@ class RetainedResults:
                 )
         return mapping
 
+    def target_components(self):
+        """Current components matched by the root group.
+
+        Relationship roots return their targets, footprint roots their
+        footprints and neuron roots whole neurons (session None).
+        """
+        if self.remaining is not None:
+            return set(self.root_targets())
+
+        root = self.snapshot.root_result
+
+        if root.match_level == "footprint":
+            return {
+                component
+                for match in root.matches
+                if (component := self.positions.get(match)) is not None
+            }
+
+        return {Component(neuron, None) for neuron in self.neurons}
+
     def inspection_targets(self, neuron_id, source_type, source_id):
         if source_type == "group" and source_id == self.root_id:
             if self.remaining is None:
@@ -221,6 +241,14 @@ class RetainedResults:
                         )
                     except ValueError:
                         pass
+
+                    # Excluded neurons leave the results.
+                    if (
+                        replacement is not None
+                        and not data.assignments.union.included[replacement.neuron_id]
+                    ):
+                        replacement = None
+
                 else:
                     sid = current.session_id
                     fp = int(self.ids[current.neuron_id, sid])

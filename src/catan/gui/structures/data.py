@@ -690,6 +690,7 @@ class Data(Tracking):
                     session_ids=plan["session_ids"],
                     mode=mode,
                     session_distances=plan["session_distances"],
+                    ctx=current_task_context(),
                 )
             finally:
                 # Also expose any completed records if a later step fails.
@@ -750,6 +751,7 @@ class Data(Tracking):
         super().update_counts_with_data(
             from_session_index=session_id,
             align_to_reference=True,
+            ctx=current_task_context(),
         )
         self.notify_change(
             C.MODEL_COUNTS,
@@ -2465,13 +2467,27 @@ class Data(Tracking):
         tasks = self.state.tasks
 
         if tasks.processing_busy():
-            self.state.issue(
-                "warning",
-                "Assignment update not started",
-                "Wait for existing tasks to finish, or cancel "
-                "queued tasks before starting this rebuild.",
+            # Run once current processing (e.g. count registration and the
+            # final fit) has finished; the plan is rebuilt at that point.
+            # If a model update is in progress, it counts as the attempt,
+            # so a cancelled/insufficient update does not restart itself.
+            model_busy = tasks.current_task("model update") is not None or bool(
+                tasks.queued_tasks("model update")
             )
-            return
+
+            return tasks.queue_after_processing(
+                "Process neuron registrations (after current processing)",
+                lambda: self.queue_process_assignments(
+                    session_ids=session_ids,
+                    from_session_id=from_session_id,
+                    mode=mode,
+                    _model_attempted=_model_attempted or model_busy,
+                ),
+                ready=lambda: (
+                    not self._model_fit_requested
+                    and self.state.current_request is None
+                ),
+            )
 
         try:
             plan = self.plan_assignment_update(
@@ -2575,12 +2591,17 @@ class Data(Tracking):
             )
             self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
+        def run():
+            return self.build_assignment_update(
+                session_ids=plan["session_ids"],
+                mode=mode,
+                ctx=current_task_context(),
+            )
+
         return tasks.start(
             "calculating",
             "Process pending neuron registrations",
-            self.build_assignment_update,
-            session_ids=plan["session_ids"],
-            mode=mode,
+            run,
             on_result=publish,
         )
 
@@ -2822,9 +2843,11 @@ class Data(Tracking):
         session = self.sessions[session_id]
 
         if to_present:
-            ctx = current_task_context()
+            # The task context exists only inside the running worker.
             fn = lambda: self.assign_neurons(
-                from_session_index=session_id, clean_traces=False, ctx=ctx
+                from_session_index=session_id,
+                clean_traces=False,
+                ctx=current_task_context(),
             )
         else:
             fn = lambda: self.unassign_neurons(session_id)
@@ -2866,6 +2889,7 @@ class Data(Tracking):
         clean_traces: bool = False,
         force_registration: bool = False,
         p_thr=[0.3, 0.3],
+        ctx=None,
         **kwargs,
     ):
         """ """
@@ -2877,6 +2901,7 @@ class Data(Tracking):
             clean_traces=clean_traces,
             force_registration=force_registration,
             p_thr=p_thr,
+            ctx=ctx,
         )
         self.state.assignments = self.assignments.ids
         self.notify_change(
@@ -3010,6 +3035,53 @@ class Data(Tracking):
             neuron_ids={neuron_id},
         )
         return NeuronComponent(neuron_id=neuron_id, session_id=None)
+
+    def exclude_neurons(self, neuron_ids) -> list[int]:
+        """Exclude several neurons with a single change notification."""
+        if self.assignments is None:
+            raise ValueError("No assignments are available.")
+
+        excluded = []
+
+        for neuron_id in sorted({int(n) for n in neuron_ids}):
+            if not self.assignments.union.included[neuron_id]:
+                continue
+
+            self.assignments.union.included[neuron_id] = False
+
+            for session_id, fp_id in enumerate(self.assignments.ids[neuron_id]):
+                if fp_id >= 0:
+                    self.sessions[session_id].included[int(fp_id)] = False
+
+            excluded.append(neuron_id)
+
+        if excluded:
+            self.notify_change(C.INCLUSION, neuron_ids=set(excluded))
+
+        return excluded
+
+    def exclude_components(self, components) -> list[NeuronComponent]:
+        """Exclude several footprints with a single change notification.
+
+        Each footprint is retired to its own excluded singleton neuron,
+        as in exclude_component().
+        """
+        retired = []
+
+        for component in sorted(
+            {c for c in components if c.session_id is not None},
+            key=lambda c: (c.neuron_id, c.session_id),
+        ):
+            # Skip missing and already excluded footprints.
+            if not self.is_included(component):
+                continue
+
+            retired.append(self.exclude_component(component, notify=False))
+
+        if retired:
+            self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
+
+        return retired
 
     def reinclude_component(self, component: NeuronComponent | int) -> None:
 

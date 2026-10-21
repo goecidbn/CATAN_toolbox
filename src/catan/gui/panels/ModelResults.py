@@ -14,6 +14,9 @@ from catan.gui.GUI_elements.fragments.toggle_option import ToggleOption
 from vispy.visuals.transforms import STTransform
 from catan.core.changes import ChangeKind as C
 from catan.gui.panels import BasePlot
+from catan.gui.background_tasks.runtime import (
+    TaskCancelled, current_task_context, progress_step,
+)
 
 PARAMETERS = (
     ("p_same", "Same-neuron fraction", 0.000001, 0.999999, 0.01),
@@ -730,15 +733,35 @@ class Controller(BasePlot.BaseDisplayController):
         def calculate():
             try:
                 results = []
-                for kind, key, i, j in requests:
-                    result = self.data.calculate_model_counts(sessions[j],
-                        ref_data=sessions[i] if kind == "cross" else None, mode=kind)
+                for index, (kind, key, i, j) in enumerate(requests):
+                    label = (sessions[j].name if kind == "same"
+                             else f"{sessions[i].name} → {sessions[j].name}")
+                    with progress_step(index, len(requests),
+                                       message=f"Evidence {index + 1}/{len(requests)}: {label}"):
+                        result = self.data.calculate_model_counts(sessions[j],
+                            ref_data=sessions[i] if kind == "cross" else None, mode=kind,
+                            ctx=current_task_context())
                     results.append((kind, key, i, j, result.counts))
                 return results, None
+            except TaskCancelled:
+                raise
             except Exception as exc:
                 return None, str(exc)
-        def ready(result):
+        task = {}
+        def release():
+            if task.pop("connected", False):
+                tasks.task_cancelled.disconnect(stopped)
+                tasks.task_failed.disconnect(stopped)
             self._counts_running = False
+        def stopped(group, task_id):
+            if task_id != task.get("id"):
+                return
+            release()
+            if not self._deactivated:
+                self.display_widget.calculate_evidence.setEnabled(True)
+                self.display_widget.status.setText("Evidence calculation stopped.")
+        def ready(result):
+            release()
             if self._deactivated:
                 return
             self.display_widget.calculate_evidence.setEnabled(True)
@@ -757,8 +780,11 @@ class Controller(BasePlot.BaseDisplayController):
             self._evidence_key = None
             self.data.notify_change(C.MODEL_COUNTS, C.PROCESSING_STATUS)
             self._redraw()
-        tasks.start("calculating", "Calculate model evidence", calculate,
-                    on_result=ready, background=True)
+        tasks.task_cancelled.connect(stopped)
+        tasks.task_failed.connect(stopped)
+        task["connected"] = True
+        task["id"] = tasks.start("calculating", "Calculate model evidence", calculate,
+                                 on_result=ready, background=True)
 
     def _apply(self):
         if self._candidate is None:

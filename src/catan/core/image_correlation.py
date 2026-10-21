@@ -573,3 +573,149 @@ def footprint_similarity_peak(left, right, *, gamma=0.1):
     peak = float(np.max(cosine * np.power(overlap, gamma)))
 
     return peak if np.isfinite(peak) and peak != 0 else np.nan
+
+
+def footprint_similarity_peaks(
+    lefts,
+    rights,
+    *,
+    gamma=0.1,
+    max_batch_bytes=8 * 1024**2,
+    workers=None,
+):
+    """Batched footprint_similarity_peak() for many patch pairs.
+
+    Pairs sharing an FFT shape are transformed together, using exactly the
+    transform sizes of the single-pair function, so results are identical.
+    Batches run on a thread pool (NumPy/SciPy release the GIL).
+    Returns one peak per pair (NaN where the single-pair function does).
+    """
+    if len(lefts) != len(rights):
+        raise ValueError("Expected the same number of left and right patches.")
+
+    peaks = np.full(len(lefts), np.nan, dtype=np.float64)
+    groups = {}
+
+    for index, (left, right) in enumerate(zip(lefts, rights)):
+        if left is None or right is None:
+            continue
+
+        full_shape = tuple(x + y - 1 for x, y in zip(np.shape(left), np.shape(right)))
+        fft_shape = tuple(fft.next_fast_len(size, real=True) for size in full_shape)
+        groups.setdefault(fft_shape, []).append(index)
+
+    chunks = []
+
+    for fft_shape, members in groups.items():
+        # Roughly 16 real-valued arrays of the FFT shape per pair.
+        step = max(1, int(max_batch_bytes // (16 * 8 * fft_shape[0] * fft_shape[1])))
+
+        for start in range(0, len(members), step):
+            chunks.append((fft_shape, members[start : start + step]))
+
+    def run(chunk):
+        fft_shape, members = chunk
+        peaks[members] = _footprint_similarity_peak_batch(
+            [lefts[index] for index in members],
+            [rights[index] for index in members],
+            fft_shape,
+            gamma,
+        )
+
+    workers = _fft_workers() if workers is None else max(1, int(workers))
+
+    if workers == 1 or len(chunks) == 1:
+        for chunk in chunks:
+            run(chunk)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(chunks))) as pool:
+            for _ in pool.map(run, chunks):
+                pass
+
+    return peaks
+
+
+def _fft_workers():
+    """Threads for batched FFTs; leave one core for the GUI."""
+    import os
+
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available = os.cpu_count() or 1
+
+    return max(1, available - 1)
+
+
+def _footprint_similarity_peak_batch(lefts, rights, fft_shape, gamma):
+    count = len(lefts)
+    shape = (count, *fft_shape)
+    axes = (1, 2)
+    eps = 1e-12
+
+    a_values, a_squares, a_support = (np.zeros(shape) for _ in range(3))
+    b_values, b_squares, b_support = (np.zeros(shape) for _ in range(3))
+    full_shapes = np.empty((count, 2), dtype=np.int64)
+    support_mass = np.empty(count, dtype=np.float64)
+
+    for k, (left, right) in enumerate(zip(lefts, rights)):
+        a = np.asarray(left, dtype=np.float64)
+        b = np.asarray(right, dtype=np.float64)
+
+        ma = (a > 0).astype(np.float64)
+        mb = (b > 0).astype(np.float64)
+        a = a * ma
+        b = b * mb
+
+        ha, wa = a.shape
+        hb, wb = b.shape
+
+        a_values[k, :ha, :wa] = a
+        a_squares[k, :ha, :wa] = a * a
+        a_support[k, :ha, :wa] = ma
+
+        # Reversal converts convolution into full linear correlation.
+        b_values[k, :hb, :wb] = b[::-1, ::-1]
+        b_squares[k, :hb, :wb] = (b * b)[::-1, ::-1]
+        b_support[k, :hb, :wb] = mb[::-1, ::-1]
+
+        full_shapes[k] = (ha + hb - 1, wa + wb - 1)
+        support_mass[k] = max(min(ma.sum(), mb.sum()), eps)
+
+    workers = 1  # Parallelized across batches instead.
+
+    fa = fft.rfftn(a_values, axes=axes, workers=workers)
+    fa2 = fft.rfftn(a_squares, axes=axes, workers=workers)
+    fma = fft.rfftn(a_support, axes=axes, workers=workers)
+    fb = fft.rfftn(b_values, axes=axes, workers=workers)
+    fb2 = fft.rfftn(b_squares, axes=axes, workers=workers)
+    fmb = fft.rfftn(b_support, axes=axes, workers=workers)
+
+    def inverse_product(x, y):
+        return fft.irfftn(x * y, s=fft_shape, axes=axes, workers=workers)
+
+    numerator = inverse_product(fa, fb)
+    s1 = inverse_product(fa2, fmb)
+    s2 = inverse_product(fma, fb2)
+    intersection = inverse_product(fma, fmb)
+
+    denominator = np.sqrt(np.maximum(s1, 0.0) * np.maximum(s2, 0.0))
+
+    cosine = np.zeros_like(numerator)
+    valid = denominator > eps
+    cosine[valid] = np.clip(numerator[valid] / denominator[valid], 0.0, 1.0)
+
+    overlap = np.clip(intersection / support_mass[:, None, None], 0.0, 1.0)
+    score = cosine * np.power(overlap, gamma)
+
+    # Restrict each pair to its own full correlation range.
+    inside = (
+        np.arange(fft_shape[0])[None, :, None] < full_shapes[:, 0, None, None]
+    ) & (np.arange(fft_shape[1])[None, None, :] < full_shapes[:, 1, None, None])
+    score[~inside] = -np.inf
+
+    peaks = score.reshape(count, -1).max(axis=1)
+
+    return np.where(np.isfinite(peaks) & (peaks != 0), peaks, np.nan)

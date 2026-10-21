@@ -13,6 +13,15 @@ from catan.core.changes import (
 )
 from catan.tracking.structures import ReviewStatus
 
+# Actions applied to all selected results at once, without per-candidate
+# preparation: review status changes and exclusion.
+BATCH_ACTIONS = (
+    "mark_reviewed",
+    "mark_uncertain",
+    "exclude_neuron",
+    "exclude_footprint",
+)
+
 
 @dataclass(frozen=True)
 class ManipulationSpec:
@@ -30,6 +39,7 @@ class ManipulationSpec:
             "merge",
             "neuron_merge",
             "reassign",
+            *BATCH_ACTIONS,
         ):
             raise ValueError(f"Unknown manipulation: {self.kind}")
 

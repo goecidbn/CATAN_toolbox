@@ -26,6 +26,7 @@ from catan.core.structures.session_snapshot import (
     write_session_snapshot,
 )
 from catan.core.analysis import calculate_statistics, calculate_p
+from catan.core.progress import ProgressRange
 from catan.core.alignment import _shift_sparse_bilinear
 
 from .structures import Model, Assignments
@@ -569,6 +570,7 @@ class Tracking:
         *,
         session_distances=(1,),
         apply_removals=True,
+        ctx=None,
     ):
 
         this_data = self.get_session(
@@ -589,6 +591,7 @@ class Tracking:
             session_id,
             session_distances=(session_distances),
             apply_removals=(apply_removals),
+            ctx=ctx,
         )
 
     def calculate_model_counts(
@@ -597,6 +600,7 @@ class Tracking:
         *,
         ref_data: SessionData | None = None,
         mode: Literal["same", "cross"] = "cross",
+        ctx=None,
     ) -> ModelCountCalculation:
         """
         Calculate one model-count contribution.
@@ -633,6 +637,7 @@ class Tracking:
             distance_threshold=self.params.get("neighbor_distance", 25.0),
             nP=12,
             params=self.params,
+            ctx=ctx,
         )
 
         idx_remove = np.asarray(idx_remove, dtype=int).reshape(-1)
@@ -727,7 +732,9 @@ class Tracking:
             counts=counts, idx_remove=idx_remove, remove_info=remove_info
         )
 
-    def update_model_pair_counts(self, reference_session_id: int, session_id: int):
+    def update_model_pair_counts(
+        self, reference_session_id: int, session_id: int, *, ctx=None
+    ):
 
         if self.model is None:
             raise ValueError("No current model available.")
@@ -749,7 +756,9 @@ class Tracking:
                 "Both sessions require paths for model count registration."
             )
 
-        result = self.calculate_model_counts(session, ref_data=reference, mode="cross")
+        result = self.calculate_model_counts(
+            session, ref_data=reference, mode="cross", ctx=ctx
+        )
 
         self.model.set_cross_counts(
             str(reference.path),
@@ -763,7 +772,9 @@ class Tracking:
 
         return result
 
-    def update_model_same_counts(self, session_id: int, *, apply_removals=True):
+    def update_model_same_counts(
+        self, session_id: int, *, apply_removals=True, ctx=None
+    ):
 
         if self.model is None:
             raise ValueError("No current model available.")
@@ -775,7 +786,7 @@ class Tracking:
         if session.path is None:
             raise ValueError(f"Session {session_id} has no path.")
 
-        result = self.calculate_model_counts(session, mode="same")
+        result = self.calculate_model_counts(session, mode="same", ctx=ctx)
 
         if apply_removals and result.idx_remove.size:
             session.included[result.idx_remove] = False
@@ -789,7 +800,12 @@ class Tracking:
         return result
 
     def update_model_counts(
-        self, session_id: int, *, session_distances=(1,), apply_removals: bool = True
+        self,
+        session_id: int,
+        *,
+        session_distances=(1,),
+        apply_removals: bool = True,
+        ctx=None,
     ):
 
         if self.model is None:
@@ -806,31 +822,47 @@ class Tracking:
 
         results = {"same": None, "cross": {}}
 
+        # The pair is structurally requested, but
+        # cannot currently be calculated if the reference is unaligned.
+        reference_ids = [
+            session_id - distance
+            for distance in distances
+            if session_id - distance >= 0
+            and self.sessions[session_id - distance].status["aligned"]
+        ]
+
+        progress = ProgressRange(ctx)
+        total = 1 + len(reference_ids)
+
         # ============================================
         # Same-session evidence
         # ============================================
         results["same"] = self.update_model_same_counts(
-            session_id, apply_removals=apply_removals
+            session_id,
+            apply_removals=apply_removals,
+            ctx=progress.step(
+                0, total, message=f"Same-session evidence: {session.name}"
+            ),
         )
 
         # ============================================
         # Cross-session evidence
         # ============================================
-        for distance in distances:
-
-            reference_session_id = session_id - distance
-
-            if reference_session_id < 0:
-                continue
+        for index, reference_session_id in enumerate(reference_ids, start=1):
 
             reference = self.sessions[reference_session_id]
 
-            # The pair is structurally requested, but
-            # cannot currently be calculated.
-            if not reference.status["aligned"]:
-                continue
-
-            result = self.update_model_pair_counts(reference_session_id, session_id)
+            result = self.update_model_pair_counts(
+                reference_session_id,
+                session_id,
+                ctx=progress.step(
+                    index,
+                    total,
+                    message=(
+                        f"Cross-session evidence: {reference.name} → {session.name}"
+                    ),
+                ),
+            )
 
             results["cross"][(reference_session_id, session_id)] = result
 
@@ -1013,6 +1045,7 @@ class Tracking:
         from_session_id=None,
         mode="pending",
         session_distances=(1,),
+        ctx=None,
     ):
         plan = self.plan_model_update(
             session_ids=session_ids,
@@ -1036,14 +1069,44 @@ class Tracking:
         for session_id in sorted(required):
             self.require_current_alignment(session_id)
 
-        for session_id in plan["same_sessions"]:
+        # Count records take nearly all of the time; the fit gets the rest.
+        progress = ProgressRange(ctx)
+        total = len(plan["same_sessions"]) + len(plan["cross_pairs"])
+
+        for index, session_id in enumerate(plan["same_sessions"]):
             self.update_model_same_counts(
                 session_id,
                 apply_removals=False,
+                ctx=progress.step(
+                    index,
+                    total,
+                    stop=95,
+                    message=(
+                        f"Same-session evidence {index + 1}/{total}: "
+                        f"{self.sessions[session_id].name}"
+                    ),
+                ),
             )
 
-        for reference_id, target_id in plan["cross_pairs"]:
-            self.update_model_pair_counts(reference_id, target_id)
+        for index, (reference_id, target_id) in enumerate(
+            plan["cross_pairs"], start=len(plan["same_sessions"])
+        ):
+            self.update_model_pair_counts(
+                reference_id,
+                target_id,
+                ctx=progress.step(
+                    index,
+                    total,
+                    stop=95,
+                    message=(
+                        f"Cross-session evidence {index + 1}/{total}: "
+                        f"{self.sessions[reference_id].name} → "
+                        f"{self.sessions[target_id].name}"
+                    ),
+                ),
+            )
+
+        progress.range(95, 100, "Fitting model")
 
         # Refresh the existing GUI flag from actual record completeness.
         for session_id in sorted(required | set(plan["session_ids"])):
@@ -1272,6 +1335,7 @@ class Tracking:
         session_ids=None,
         from_session_id=None,
         mode="pending",
+        ctx=None,
     ):
         plan = self.plan_assignment_update(
             session_ids=session_ids,
@@ -1314,15 +1378,31 @@ class Tracking:
             name: set(self._stale_assignments.get(name, set()))
         }
 
-        Tracking.rebuild_union(worker)
+        progress = ProgressRange(ctx)
 
-        for session_id in plan["register_sessions"]:
+        Tracking.rebuild_union(
+            worker, ctx=progress.range(0, 10, "Rebuilding union footprints")
+        )
+
+        register = plan["register_sessions"]
+
+        for index, session_id in enumerate(register):
             # Use the core implementation, bypassing GUI notifications.
             Tracking.assign_neurons(
                 worker,
                 from_session_index=session_id,
                 align_to_reference=False,
                 clean_traces=False,
+                ctx=progress.step(
+                    index,
+                    len(register),
+                    start=10,
+                    stop=100,
+                    message=(
+                        f"Registering neurons {index + 1}/{len(register)}: "
+                        f"{self.sessions[session_id].name}"
+                    ),
+                ),
             )
 
             if not worker.session_assigned(session_id):
@@ -1374,7 +1454,10 @@ class Tracking:
         clean_traces=True,
         force_registration=False,
         p_thr=[0.3, 0.3],
+        ctx=None,
     ):
+        progress = ProgressRange(ctx)
+
         if self.assignments is None:
             ## or just directly initialize "local"?
             raise ValueError(
@@ -1424,6 +1507,8 @@ class Tracking:
                 ## first session to be registered, just add all neurons to union and assignments
                 self.rebuild_union()
                 footprints = this_data.footprints[:, this_data.included]
+                # A fresh union has no grid yet; it shares this session's.
+                self.assignments.union.dims = tuple(this_data.dims)
                 self.assignments.union.update_footprints(
                     footprints=footprints,
                     mode="replace",
@@ -1461,8 +1546,10 @@ class Tracking:
                     distance_threshold=self.model.distance_cutoff,
                     nP=12,
                     # params=self.params,
+                    ctx=progress.range(0, 85, "Comparing footprints with union"),
                 )
             )
+            progress.range(85, 90, "Matching neurons")
             p_same = calculate_p(
                 footprint_distances,
                 footprint_correlations,
@@ -1573,6 +1660,7 @@ class Tracking:
                     :, non_matched
                 ].max(axis=0, initial=0.0)
 
+            progress.range(90, 100, "Updating union footprints")
             self.update_union_footprints(
                 this_data.footprints,
                 self.assignments.ids[:, this_data.id],
@@ -1914,10 +2002,13 @@ class Tracking:
 
         self.assignments.union = SessionData(name="union")
 
+        n_sessions = self.assignments.ids.shape[1]
+
         for session_id, assignment_ids in enumerate(self.assignments.ids.T):
 
             if ctx is not None:
                 ctx.check_cancelled()
+                ctx.progress(100 * session_id / max(1, n_sessions))
             # A registered session may deliberately have an
             # empty assignments column:
             #

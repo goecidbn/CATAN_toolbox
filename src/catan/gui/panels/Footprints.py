@@ -1119,9 +1119,7 @@ class Display(BasePlot.BaseCanvas):
                     ]
                 )
             else:
-                lines.append(
-                    f"Footprint ID: " f"{self.display_footprint_id(component)}"
-                )
+                lines.append(f"Footprint ID: {self.display_footprint_id(component)}")
 
         if not self.displays_active_assignments:
             counterpart = self.component_to_active(component)
@@ -1273,9 +1271,7 @@ class Display(BasePlot.BaseCanvas):
 
         if self.is_inferred_component(this_component):
             menu = QMenu(self.native)
-            menu.addSection(
-                f"Inferred footprint — neuron " f"{this_component.neuron_id}"
-            )
+            menu.addSection(f"Inferred footprint — neuron {this_component.neuron_id}")
 
             mapped = self.component_to_active(this_component)
 

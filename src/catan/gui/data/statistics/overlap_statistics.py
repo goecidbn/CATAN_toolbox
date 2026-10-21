@@ -17,6 +17,167 @@ from catan.gui.background_tasks.runtime import (
 from .blockwise import evaluate_blockwise
 from .distance_statistics import pair_plan
 
+# ---------------------------------------------------------------------
+# Sparse selection path
+#
+# Overlap is exactly zero unless two supports share a pixel. When a value
+# selection rejects zero (e.g. "overlap ≥ 0.7") and no axis is reduced,
+# only intersecting footprint pairs can pass. These are enumerated directly
+# per session pair instead of scanning the neuron × neuron × session ×
+# session grid in blocks.
+# ---------------------------------------------------------------------
+
+
+def _sparse_selection_applies(query, select_values):
+    if select_values is None:
+        return False
+
+    if any(
+        spec.method not in ("keep", "single")
+        for spec in query.reduction_dict().values()
+    ):
+        return False
+
+    try:
+        zero = np.asarray(select_values(np.zeros(1, dtype=np.float32)), dtype=bool)
+    except Exception:
+        return False
+
+    # Present, non-intersecting pairs have value 0 and are not enumerated.
+    return zero.shape == (1,) and not bool(zero[0])
+
+
+def _prepare_session_supports(
+    session,
+    sid,
+    rows,
+    ids,
+    *,
+    weighted,
+    support_threshold,
+):
+    """Processed supports with one column per tracked neuron row."""
+    shape = tuple(session.dims)
+    source = session.footprints
+
+    if source.shape[0] != int(np.prod(shape)):
+        raise ValueError(f"Session {sid}: footprint shape does not match dimensions.")
+
+    columns = ids[rows, sid]
+
+    if np.any(columns >= source.shape[1]):
+        raise ValueError("Assignments reference missing footprints.")
+
+    a = sparse.csc_matrix(source[:, columns], dtype=np.float32, copy=True)
+    a.sum_duplicates()
+    a.sort_indices()
+
+    n_columns = a.shape[1]
+    column_of = np.repeat(np.arange(n_columns), np.diff(a.indptr))
+    values = a.data
+
+    usable = np.ones(n_columns, dtype=bool)
+
+    if session.included is not None:
+        session_included = np.asarray(session.included, dtype=bool)
+
+        if session_included.shape != (source.shape[1],):
+            raise ValueError(f"Session {sid}: invalid inclusion mask.")
+
+        usable &= session_included[columns]
+
+    nonfinite = ~np.isfinite(values)
+    usable[column_of[nonfinite]] = False
+    values[nonfinite] = 0
+    np.maximum(values, 0, out=values)
+
+    peak = np.zeros(n_columns, dtype=np.float32)
+    np.maximum.at(peak, column_of, values)
+    usable &= peak > 0
+
+    keep = usable[column_of]
+    values[~keep] = 0
+    values[keep] /= peak[column_of[keep]]
+    values[values < support_threshold] = 0
+
+    if not weighted:
+        values[values > 0] = 1
+
+    a.eliminate_zeros()
+
+    mass = np.asarray(a.sum(axis=0), dtype=np.float32).ravel()
+
+    if weighted:
+        # Pixel-major copy for the pixelwise-minimum join.
+        partner = a.tocsr()
+        partner.sort_indices()
+    else:
+        # Binary supports: intersections are a sparse product.
+        partner = a.T.tocsr()
+
+    return a, partner, mass, shape
+
+
+def _intersect_supports(left, right, *, weighted):
+    """Nonzero intersections between columns of two processed supports.
+
+    Returns local column indices (i, j) and the summed pixelwise minimum.
+    Binary supports yield the number of shared pixels.
+    """
+    empty = (
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.float64),
+    )
+
+    if left[0].nnz == 0 or right[0].nnz == 0:
+        return empty
+
+    if not weighted:
+        product = (left[1] @ right[0]).tocoo()
+        product.sum_duplicates()
+        keep = product.data > 0
+
+        return (
+            product.row[keep].astype(np.int64),
+            product.col[keep].astype(np.int64),
+            product.data[keep].astype(np.float64),
+        )
+
+    a = left[0]
+    b = right[1]
+    n_right = b.shape[1]
+
+    pixels = a.indices
+    column = np.repeat(np.arange(a.shape[1], dtype=np.int64), np.diff(a.indptr))
+    value = a.data
+
+    counts = b.indptr[pixels + 1] - b.indptr[pixels]
+    shared = counts > 0
+
+    if not np.any(shared):
+        return empty
+
+    pixels, column, value, counts = (
+        pixels[shared],
+        column[shared],
+        value[shared],
+        counts[shared],
+    )
+
+    total = int(counts.sum())
+    starts = b.indptr[pixels] - (np.cumsum(counts) - counts)
+    entries = np.repeat(starts, counts) + np.arange(total)
+
+    partner = b.indices[entries].astype(np.int64)
+    contribution = np.minimum(np.repeat(value, counts), b.data[entries])
+
+    keys = np.repeat(column, counts) * n_right + partner
+    unique, inverse = np.unique(keys, return_inverse=True)
+    intersection = np.bincount(inverse, weights=contribution)
+
+    return unique // n_right, unique % n_right, intersection
+
 
 @reports_progress("Calculating footprint overlap")
 def overlap_query(
@@ -267,6 +428,24 @@ def overlap_query(
             reduction_aliases=aliases,
             applied_filters=tuple(f.target for f in query.filters),
             select_values=select_values,
+        )
+
+    if _sparse_selection_applies(query, select_values):
+        return _sparse_overlap_selection(
+            data,
+            query,
+            ids,
+            included,
+            names,
+            dims,
+            aliases,
+            references,
+            select_values,
+            weighted=weighted,
+            containment=containment,
+            directional=directional,
+            normalize_by_target=normalize_by_target,
+            support_threshold=support_threshold,
         )
 
     # Cache physical-footprint pair matrices, rather than the full
@@ -624,3 +803,174 @@ def overlap_query(
 
 overlap_query.supports_value_selection = True
 overlap_query.supports_requested_pairs = True
+
+
+@reports_progress("Calculating intersecting footprint overlaps")
+def _sparse_overlap_selection(
+    data,
+    query,
+    ids,
+    included,
+    names,
+    dims,
+    aliases,
+    references,
+    select_values,
+    *,
+    weighted,
+    containment,
+    directional,
+    normalize_by_target,
+    support_threshold,
+):
+    """Selected overlap values, enumerating only intersecting footprints.
+
+    Equivalent to the blockwise path for selections rejecting zero,
+    returning the same coordinates, values and dimension metadata.
+    """
+    from .sparse_pairs import SparsePairCollector
+
+    n, s = ids.shape
+    ctx = current_task_context()
+
+    collector = SparsePairCollector(
+        names, dims, aliases, references, n, s, query, select_values
+    )
+
+    sources = set(collector.domain("session_i").tolist())
+    targets = set(collector.domain("session_j").tolist())
+
+    def session_allowed(si, sj):
+        return (
+            si in sources
+            and sj in targets
+            and bool(collector.related("session", si, sj))
+        )
+
+    source_rows = collector.mask("neuron_i")
+    target_rows = collector.mask("neuron_j")
+
+    # Unordered session pairs; the intersection is symmetric, so each is
+    # computed once and emitted in both requested directions.
+    unordered = sorted(
+        {
+            (min(si, sj), max(si, sj))
+            for si in sources
+            for sj in targets
+            if session_allowed(si, sj)
+        }
+    )
+
+    prepared = {}
+
+    def supports(sid):
+        if sid not in prepared:
+            session = data.sessions[sid]
+
+            if (
+                session is None
+                or session.footprints is None
+                or not session.status.get("spatial_loaded", False)
+                or not session.status.get("aligned", False)
+                or data.alignment_is_stale(sid)
+            ):
+                prepared[sid] = None
+            else:
+                rows = np.flatnonzero((ids[:, sid] >= 0) & included)
+                prepared[sid] = (
+                    rows,
+                    _prepare_session_supports(
+                        session,
+                        sid,
+                        rows,
+                        ids,
+                        weighted=weighted,
+                        support_threshold=support_threshold,
+                    ),
+                )
+
+        return prepared[sid]
+
+    def emit(si, sj, rows_i, rows_j, local_i, local_j, intersection, mass_i, mass_j):
+        ni = rows_i[local_i]
+        nj = rows_j[local_j]
+
+        keep = source_rows[ni] & target_rows[nj] & ~((ni == nj) & (si == sj))
+
+        if not np.any(keep):
+            return
+
+        ni, nj = ni[keep], nj[keep]
+        intersection = intersection[keep].astype(np.float32)
+        ma = mass_i[local_i[keep]]
+        mb = mass_j[local_j[keep]]
+
+        if directional:
+            denominator = mb if normalize_by_target else ma
+        elif containment:
+            denominator = np.minimum(ma, mb)
+        else:
+            denominator = ma + mb - intersection
+
+        valid = (ma > 0) & (mb > 0) & (denominator > 0)
+        values = np.full(len(ni), np.nan, dtype=np.float32)
+        np.divide(intersection, denominator, out=values, where=valid)
+        np.clip(values, 0, 1, out=values)
+
+        collector.emit(
+            {"neuron_i": ni, "neuron_j": nj, "session_i": si, "session_j": sj},
+            values,
+        )
+
+    with progress_scope(0, 95, "Intersecting footprint supports"):
+        for index, (a, b) in enumerate(unordered):
+            with progress_step(index, len(unordered)):
+                if ctx is not None:
+                    ctx.check_cancelled()
+
+                left, right = supports(a), supports(b)
+
+                if left is None or right is None:
+                    continue
+
+                rows_a, (_, _, mass_a, shape_a) = left
+                rows_b, (_, _, mass_b, shape_b) = right
+
+                if shape_a != shape_b:
+                    raise ValueError("Overlap requires the same registered pixel grid.")
+
+                local_a, local_b, intersection = _intersect_supports(
+                    left[1], right[1], weighted=weighted
+                )
+
+                if not intersection.size:
+                    continue
+
+                if session_allowed(a, b):
+                    emit(
+                        a,
+                        b,
+                        rows_a,
+                        rows_b,
+                        local_a,
+                        local_b,
+                        intersection,
+                        mass_a,
+                        mass_b,
+                    )
+
+                if a != b and session_allowed(b, a):
+                    emit(
+                        b,
+                        a,
+                        rows_b,
+                        rows_a,
+                        local_b,
+                        local_a,
+                        intersection,
+                        mass_b,
+                        mass_a,
+                    )
+
+    with progress_scope(95, 100, "Assembling filtered statistic"):
+        return collector.result()

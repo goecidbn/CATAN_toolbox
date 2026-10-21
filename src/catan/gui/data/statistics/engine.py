@@ -175,6 +175,10 @@ class StatisticEngine(QObject):
         self.cache_max_bytes = 128 * 1024**2
         self.cache_max_entries = 8
 
+        # Threshold suggestions; keys include the statistic revisions.
+        self._sample_cache = {}
+        self.sample_cache_max_entries = 32
+
         self._revisions = {}
         self._cache_lock = RLock()
 
@@ -281,6 +285,7 @@ class StatisticEngine(QObject):
             definition.query_getter,
             definition.compact_values,
             definition.foreground_safe,
+            definition.neuron_local,
             definition.component_axes,
             definition.curation_kind,
             definition.relationship_axes,
@@ -339,6 +344,7 @@ class StatisticEngine(QObject):
     def clear_cache(self):
         with self._cache_lock:
             self._cache.clear()
+            self._sample_cache.clear()
 
     def _query_cache_key(self, query):
         """Normalize cache identity. Caller must hold _cache_lock."""
@@ -756,6 +762,80 @@ class StatisticEngine(QObject):
                 raise RuntimeError("The data changed during filtering. Evaluate again.")
 
         return table
+
+    def _sample_revisions(self, definition):
+        """Revisions a sample depends on. Caller must hold _cache_lock."""
+        keys = [definition.key]
+
+        # Nearest-neighbour partners are chosen from aligned centroids.
+        if definition.relationship_axes is not None:
+            keys.append("cross_session_distances")
+
+        return tuple(self._revisions.get(key, 0) for key in keys)
+
+    @reports_progress("Sampling statistic values")
+    def sample_values(
+        self,
+        query: Optional[StatisticQuery],
+        max_samples: int = 4000,
+        *,
+        budget: float = 2.0,
+        seed: int = 0,
+        allow_full: bool = False,
+    ):
+        """Value distributions of a query for threshold suggestions.
+
+        Returns a sampling.StatisticSample (see sampling.py for the
+        strategies), cached per statistic revision. ``budget`` bounds the
+        sampling time in seconds; a cached sample taken with at least this
+        budget is reused. ``allow_full`` permits a complete evaluation when
+        no sampling strategy applies.
+        """
+        from .sampling import sample_statistic
+
+        if (
+            self.data is None
+            or not self.data.sessions
+            or query is None
+            or query.statistic_key == "none"
+        ):
+            return None
+
+        with self._cache_lock:
+            definition, query, _, _ = self._query_cache_key(query)
+            revisions = self._sample_revisions(definition)
+            key = (query, revisions, int(max_samples), seed)
+
+            for full in (allow_full, True):
+                cached_budget, result = self._sample_cache.get(
+                    key + (full,), (None, None)
+                )
+                if result is not None and (
+                    cached_budget >= budget
+                    or result.method in ("full", "unsupported")
+                    or (result.samples and all(s.exact for s in result.samples))
+                ):
+                    return result
+
+        result = sample_statistic(
+            self,
+            query,
+            definition,
+            max_samples=max_samples,
+            budget=budget,
+            seed=seed,
+            allow_full=allow_full,
+        )
+
+        with self._cache_lock:
+            if self._sample_revisions(definition) == revisions:
+                self._sample_cache.pop(key + (allow_full,), None)
+                self._sample_cache[key + (allow_full,)] = (budget, result)
+
+                while len(self._sample_cache) > self.sample_cache_max_entries:
+                    self._sample_cache.pop(next(iter(self._sample_cache)))
+
+        return result
 
     def _validate_filters_possible(self, query: StatisticQuery, stat: StatisticArray):
         remaining = set(stat.dims)

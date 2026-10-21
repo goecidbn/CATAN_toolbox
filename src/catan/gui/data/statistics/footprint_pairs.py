@@ -7,10 +7,13 @@ from collections import OrderedDict
 
 from catan.core.image_correlation import (
     compact_positive_footprint,
-    footprint_similarity_peak,
+    footprint_similarity_peaks,
 )
 from catan.gui.background_tasks.runtime import (
-    current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
+    current_task_context,
+    progress_scope,
+    progress_step,
+    reports_progress,
 )
 
 from .dimensions import Dimension
@@ -128,28 +131,26 @@ def calculate_footprint_pairs(
                     )
 
     dims = tuple(d for d, info in dimensions.items() if info.mode == "remaining")
-    lookups = {
-        d: {int(value): i for i, value in enumerate(dimensions[d].coords)} for d in dims
-    }
+    position_maps = {}
+
+    for d in dims:
+        coords = np.asarray(dimensions[d].coords, dtype=np.int64)
+        position_map = np.full(
+            int(coords.max()) + 1 if len(coords) else 0, -1, dtype=np.int64
+        )
+        position_map[coords] = np.arange(len(coords))
+        position_maps[d] = position_map
+
     ni_ids, nj_ids = requested["neuron_i"], requested["neuron_j"]
     if nr == "same":
         ni_ids = nj_ids = np.intersect1d(ni_ids, nj_ids)
 
-    value_blocks, position_blocks, values, positions = [], [], [], []
-
-    def flush():
-        if values:
-            value_blocks.append(np.asarray(values, dtype=float))
-            position_blocks.append(
-                np.asarray(positions, dtype=np.int64).reshape(len(values), len(dims))
-            )
-            values.clear()
-            positions.clear()
+    value_blocks, position_blocks = [], []
 
     patch_cache = OrderedDict()
 
     patch_cache_bytes = 0
-    patch_cache_budget = 16 * 1024**2
+    patch_cache_budget = 128 * 1024**2
 
     def prepared_patch(session_id, footprint_id):
         nonlocal patch_cache_bytes, trace_largest_patch
@@ -181,7 +182,8 @@ def calculate_footprint_pairs(
 
         if size <= patch_cache_budget:
             while patch_cache and (
-                patch_cache_bytes + size > patch_cache_budget or len(patch_cache) >= 512
+                patch_cache_bytes + size
+                > patch_cache_budget  # or len(patch_cache) >= 512
             ):
                 _, old = patch_cache.popitem(last=False)
                 if old is not None:
@@ -206,7 +208,11 @@ def calculate_footprint_pairs(
     ctx = current_task_context()
     for progress_index, (step, (si, sj)) in enumerate(enumerate(pairs)):
         with progress_step(
-            progress_index, len(pairs), start=0, stop=95, message=f"Similarity: sessions {si + 1} / {sj + 1}",
+            progress_index,
+            len(pairs),
+            start=0,
+            stop=95,
+            message=f"Similarity: sessions {si + 1} / {sj + 1}",
         ):
 
             session_key = (min(si, sj), max(si, sj))
@@ -219,7 +225,9 @@ def calculate_footprint_pairs(
                 ctx.check_cancelled()
             source, reference = data.sessions[si], data.sessions[sj]
             if any(
-                session is None or session.centroids is None or session.footprints is None
+                session is None
+                or session.centroids is None
+                or session.footprints is None
                 for session in (source, reference)
             ):
                 continue
@@ -240,7 +248,7 @@ def calculate_footprint_pairs(
                 delta = source.centroids[fi[valid]] - reference.centroids[fj[valid]]
                 distance = np.linalg.norm(delta, axis=1)
                 valid = valid[np.isfinite(distance) & (distance < neighborhood_thr)]
-                candidates = ((int(k), int(k)) for k in progress_iter(valid, stop=98, every=16))
+                cand_i = cand_j = valid.astype(np.int64)
             else:
                 vi, vj = np.flatnonzero(fi >= 0), np.flatnonzero(fj >= 0)
                 ci, cj = source.centroids[fi[vi]], reference.centroids[fj[vj]]
@@ -248,82 +256,112 @@ def calculate_footprint_pairs(
                     np.isfinite(cj), axis=1
                 )
                 vi, ci, vj, cj = vi[good_i], ci[good_i], vj[good_j], cj[good_j]
-                if not len(vj):
+                if not len(vj) or not len(vi):
                     continue
-                tree = cKDTree(cj)
 
-                def nearby_pairs():
-                    for count, (i, center) in enumerate(progress_iter(zip(vi, ci), total=len(vi), stop=98, every=1)):
-                        if count % 64 == 0 and ctx is not None:
-                            ctx.check_cancelled()
-                        for local_j in progress_iter(
-                            tree.query_ball_point(center, neighborhood_thr),
-                            start=98 * count / max(1, len(vi)),
-                            stop=98 * (count + 1) / max(1, len(vi)), every=16,
-                        ):
-                            j = vj[local_j]
-                            if (nr == "different" or si == sj) and ni_ids[i] == nj_ids[j]:
-                                continue
-                            if np.linalg.norm(center - cj[local_j]) < neighborhood_thr:
-                                yield int(i), int(j)
+                # All neighbours in one call; exact distance check below.
+                found = cKDTree(cj).query_ball_point(ci, neighborhood_thr)
+                lengths = np.fromiter(
+                    (len(f) for f in found), dtype=np.int64, count=len(found)
+                )
+                local_i = np.repeat(np.arange(len(vi)), lengths)
+                local_j = (
+                    np.concatenate(
+                        [np.asarray(f, dtype=np.int64) for f in found if len(f)]
+                    )
+                    if lengths.sum()
+                    else np.empty(0, dtype=np.int64)
+                )
+                order = np.lexsort((local_j, local_i))
+                local_i, local_j = local_i[order], local_j[order]
 
-                candidates = nearby_pairs()
+                keep = (
+                    np.linalg.norm(ci[local_i] - cj[local_j], axis=1) < neighborhood_thr
+                )
+                cand_i, cand_j = vi[local_i[keep]], vj[local_j[keep]]
 
-            for count, (i, j) in enumerate(candidates):
-                if count % 64 == 0 and ctx is not None:
+                if nr == "different" or si == sj:
+                    distinct = ni_ids[cand_i] != nj_ids[cand_j]
+                    cand_i, cand_j = cand_i[distinct], cand_j[distinct]
+
+            if not len(cand_i):
+                continue
+
+            if ctx is not None:
+                ctx.check_cancelled()
+
+            if TRACE_FOOTPRINT_PAIRS:
+                trace_count += len(cand_i)
+                trace_neurons_i.update(ni_ids[cand_i].tolist())
+                trace_neurons_j.update(nj_ids[cand_j].tolist())
+                trace_sessions[(int(si), int(sj))] += len(cand_i)
+                score_started = perf_counter()
+
+            # Symmetric cache: score each footprint pair once, in the
+            # orientation of its first appearance.
+            pair_keys = []
+            pending = {}
+
+            for left_fp, right_fp in zip(fi[cand_i].tolist(), fj[cand_j].tolist()):
+                left_key = (int(si), left_fp)
+                right_key = (int(sj), right_fp)
+                pair_key = (
+                    (left_key, right_key)
+                    if left_key <= right_key
+                    else (right_key, left_key)
+                )
+                pair_keys.append(pair_key)
+
+                if pair_key not in score_cache and pair_key not in pending:
+                    pending[pair_key] = (left_key, right_key)
+
+            if pending:
+                if trace:
+                    trace_score_evaluations += len(pending)
+
+                lefts = [prepared_patch(*left) for left, _ in pending.values()]
+                rights = [prepared_patch(*right) for _, right in pending.values()]
+
+                if ctx is not None:
                     ctx.check_cancelled()
 
-                if TRACE_FOOTPRINT_PAIRS:
-                    trace_count += 1
-                    trace_neurons_i.add(int(ni_ids[i]))
-                    trace_neurons_j.add(int(nj_ids[j]))
-                    trace_sessions[(int(si), int(sj))] += 1
+                scores = footprint_similarity_peaks(lefts, rights, gamma=gamma)
+                score_cache.update(zip(pending.keys(), scores.tolist()))
 
-                    if len(trace_examples) < 8:
-                        trace_examples.append(
-                            (
-                                (int(ni_ids[i]), int(si), int(fi[i])),
-                                (int(nj_ids[j]), int(sj), int(fj[j])),
-                            )
-                        )
+            similarity = np.fromiter(
+                (score_cache[key] for key in pair_keys),
+                dtype=float,
+                count=len(pair_keys),
+            )
 
-                if TRACE_FOOTPRINT_PAIRS:
-                    score_started = perf_counter()
+            if TRACE_FOOTPRINT_PAIRS:
+                trace_score_seconds += perf_counter() - score_started
 
-                left_key = (int(si), int(fi[i]))
-                right_key = (int(sj), int(fj[j]))
-                pair_key = tuple(sorted((left_key, right_key)))
+            finite = np.isfinite(similarity)
 
-                if pair_key not in score_cache:
-                    if trace:
-                        trace_score_evaluations += 1
+            if not np.any(finite):
+                continue
 
-                    score_cache[pair_key] = footprint_similarity_peak(
-                        prepared_patch(*left_key),
-                        prepared_patch(*right_key),
-                        gamma=gamma,
-                    )
+            refs = {
+                "neuron_i": ni_ids[cand_i[finite]],
+                "neuron_j": nj_ids[cand_j[finite]],
+                "session_i": si,
+                "session_j": sj,
+                "neuron": ni_ids[cand_i[finite]],
+                "session": si,
+            }
 
-                similarity = score_cache[pair_key]
-
-                if TRACE_FOOTPRINT_PAIRS:
-                    trace_score_seconds += perf_counter() - score_started
-
-                if not np.isfinite(similarity):
-                    continue
-                refs = {
-                    "neuron_i": int(ni_ids[i]),
-                    "neuron_j": int(nj_ids[j]),
-                    "session_i": si,
-                    "session_j": sj,
-                    "neuron": int(ni_ids[i]),
-                    "session": si,
-                }
-                positions.append(tuple(lookups[d][refs[d]] for d in dims))
-                values.append(float(similarity))
-                if len(values) == 4096:
-                    flush()
-            flush()
+            value_blocks.append(similarity[finite])
+            position_blocks.append(
+                np.column_stack(
+                    [
+                        np.broadcast_to(position_maps[d][refs[d]], (int(finite.sum()),))
+                        for d in dims
+                    ]
+                ).astype(np.int64)
+                if dims
+                else np.empty((int(finite.sum()), 0), dtype=np.int64)
+            )
 
     with progress_scope(95, 99, "Assembling similarity results"):
         stat = SparseStatisticArray(
@@ -387,3 +425,82 @@ def calculate_footprint_pairs(
         current_task_context().progress(100)
 
     return stat
+
+
+@reports_progress("Calculating requested footprint similarity")
+def footprint_similarity_for_pairs(
+    data,
+    state,
+    pairs,
+    *,
+    neighborhood_thr=10,
+    gamma=0.1,
+):
+    """Similarity of explicit (neuron_i, neuron_j, session_i, session_j) rows.
+
+    Applies the candidate rules of calculate_footprint_pairs(): both
+    footprints present, raw centroids closer than ``neighborhood_thr`` and
+    no self-comparison. Other rows are NaN.
+    """
+    pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 4)
+    values = np.full(len(pairs), np.nan, dtype=np.float64)
+
+    if not len(pairs):
+        return values
+
+    ids = state.assignments
+    ni, nj, si, sj = pairs.T
+
+    valid = (si >= 0) & (sj >= 0) & ~((ni == nj) & (si == sj))
+    rows = np.flatnonzero(valid)
+    fi = np.full(len(pairs), -1, dtype=np.int64)
+    fj = np.full(len(pairs), -1, dtype=np.int64)
+    fi[rows] = ids[ni[rows], si[rows]]
+    fj[rows] = ids[nj[rows], sj[rows]]
+    valid &= (fi >= 0) & (fj >= 0)
+
+    ctx = current_task_context()
+    lefts, rights, targets = [], [], []
+
+    for source_id, reference_id in np.unique(pairs[valid][:, 2:], axis=0):
+        if ctx is not None:
+            ctx.check_cancelled()
+
+        source = data.sessions[source_id]
+        reference = data.sessions[reference_id]
+
+        if any(
+            session is None or session.centroids is None or session.footprints is None
+            for session in (source, reference)
+        ):
+            continue
+
+        if tuple(source.dims) != tuple(reference.dims):
+            raise ValueError(
+                "Footprint similarity requires the same aligned pixel grid; "
+                f"received {source.dims} and {reference.dims}."
+            )
+
+        rows = np.flatnonzero(valid & (si == source_id) & (sj == reference_id))
+        distance = np.linalg.norm(
+            source.centroids[fi[rows]] - reference.centroids[fj[rows]], axis=1
+        )
+        rows = rows[np.isfinite(distance) & (distance < neighborhood_thr)]
+
+        for row in rows:
+            lefts.append(
+                compact_positive_footprint(
+                    source.footprints[:, fi[row]], tuple(source.dims)
+                )
+            )
+            rights.append(
+                compact_positive_footprint(
+                    reference.footprints[:, fj[row]], tuple(reference.dims)
+                )
+            )
+            targets.append(row)
+
+    if targets:
+        values[targets] = footprint_similarity_peaks(lefts, rights, gamma=gamma)
+
+    return values

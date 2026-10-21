@@ -487,6 +487,18 @@ CALCULATED_STATISTICS["union_distances"].relationship_axes = (
     ("neuron_j", None),
 )
 
+# Footprint-derived values without persisted side effects; threshold
+# suggestions may sample them on a subset of neurons.
+for key in (
+    "footprint_size",
+    "border_proximity",
+    "centroid_shift",
+    "footprint_similarity",
+    "footprint_overlap",
+    "cross_session_distances",
+):
+    CALCULATED_STATISTICS[key].neuron_local = True
+
 distance_keys = (
     "distances",
     "centroid_shift",

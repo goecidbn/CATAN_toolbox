@@ -2,9 +2,16 @@
 
 import numpy as np
 
+from catan.gui.background_tasks.runtime import (
+    current_task_context,
+    progress_step,
+    reports_progress,
+)
+
 from .dimensions import Dimension
 from .queries import ReductionSpec
 from .blockwise import evaluate_blockwise
+from .sparse_pairs import SparsePairCollector, only_kept_axes, selection_upper_bound
 
 
 def geometry(data, state):
@@ -342,6 +349,29 @@ def distance_query(
             select_values=select_values,
         )
 
+    if (
+        select_values is not None
+        and mode in ("cross", "within", "to_union", "union")
+        and only_kept_axes(query)
+    ):
+        result = _sparse_distance_selection(
+            mode,
+            names,
+            n,
+            s,
+            positions,
+            union,
+            dims,
+            aliases,
+            references,
+            query,
+            select_values,
+            exclude_self=exclude_self,
+        )
+
+        if result is not None:
+            return result
+
     def read(selected):
         if mode == "displacement":
             ni = nj = coord("neuron", selected)
@@ -389,6 +419,192 @@ def distance_query(
         applied_filters=tuple(f.target for f in query.filters),
         select_values=select_values,
     )
+
+
+@reports_progress("Finding nearby footprint pairs")
+def _sparse_distance_selection(
+    mode,
+    names,
+    n,
+    s,
+    positions,
+    union,
+    dims,
+    aliases,
+    references,
+    query,
+    select_values,
+    *,
+    exclude_self,
+):
+    """Selected distances, enumerating only pairs within the selection radius.
+
+    Returns None if the selection has no finite upper bound, in which case
+    the blockwise path is used.
+    """
+    from scipy.spatial import cKDTree
+
+    collector = SparsePairCollector(
+        names, dims, aliases, references, n, s, query, select_values
+    )
+
+    clouds = [p.reshape(-1, 2) for p in (positions, union) if p is not None]
+    points = np.concatenate(clouds, axis=0)
+    points = points[np.all(np.isfinite(points), axis=1)]
+
+    if not len(points):
+        return collector.result()
+
+    extent = np.ptp(points, axis=0)
+    radius = selection_upper_bound(select_values, float(np.hypot(*extent)) + 1.0)
+
+    if radius is None:
+        return None
+
+    if radius == 0.0:
+        return collector.result()
+
+    # Candidates only; values are recomputed exactly as in the grid path.
+    search = radius * (1 + 1e-5) + 1e-4
+
+    ctx = current_task_context()
+    source_rows = collector.mask("neuron_i")
+    target_rows = collector.mask("neuron_j")
+    trees = {}
+
+    def cloud(key, rows_mask):
+        if key not in trees:
+            coords = union if key[0] == "union" else positions[:, key[1]]
+            rows = np.flatnonzero(rows_mask & np.all(np.isfinite(coords), axis=1))
+            trees[key] = (rows, cKDTree(coords[rows]) if len(rows) else None)
+
+        return trees[key]
+
+    def nearby(left, right):
+        rows_a, tree_a = left
+        rows_b, tree_b = right
+
+        if tree_a is None or tree_b is None:
+            return None
+
+        found = tree_a.sparse_distance_matrix(tree_b, search, output_type="ndarray")
+
+        if not len(found):
+            return None
+
+        return rows_a[found["i"]], rows_b[found["j"]]
+
+    def emit(physical, a, b, identical):
+        delta = a - b
+        values = np.hypot(delta[..., 0], delta[..., 1])
+
+        if exclude_self:
+            values = np.where(identical, np.nan, values)
+
+        collector.emit(physical, values)
+
+    if mode in ("cross", "within"):
+        session_names = ("session_i", "session_j") if mode == "cross" else ("session",)
+        sources = set(collector.domain(session_names[0]).tolist())
+        targets = set(collector.domain(session_names[-1]).tolist())
+
+        if mode == "cross":
+
+            def allowed(si, sj):
+                return (
+                    si in sources
+                    and sj in targets
+                    and bool(collector.related("session", si, sj))
+                )
+
+            pairs = sorted(
+                {
+                    (min(i, j), max(i, j))
+                    for i in sources
+                    for j in targets
+                    if allowed(i, j)
+                }
+            )
+        else:
+            pairs = [(sid, sid) for sid in sorted(sources)]
+
+            def allowed(si, sj):
+                return si == sj
+
+        both = source_rows | target_rows
+
+        for index, (a, b) in enumerate(pairs):
+            with progress_step(index, len(pairs)):
+                if ctx is not None and index % 16 == 0:
+                    ctx.check_cancelled()
+
+                found = nearby(cloud(("session", a), both), cloud(("session", b), both))
+
+                if found is None:
+                    continue
+
+                rows_a, rows_b = found
+
+                directions = [(a, b, rows_a, rows_b)]
+
+                if a != b:
+                    directions.append((b, a, rows_b, rows_a))
+
+                for si, sj, ni, nj in directions:
+
+                    if not allowed(si, sj):
+                        continue
+
+                    keep = source_rows[ni] & target_rows[nj]
+                    ni, nj = ni[keep], nj[keep]
+
+                    if mode == "cross":
+                        physical = {
+                            "neuron_i": ni,
+                            "neuron_j": nj,
+                            "session_i": si,
+                            "session_j": sj,
+                        }
+                        identical = (ni == nj) & (si == sj)
+                    else:
+                        physical = {"neuron_i": ni, "neuron_j": nj, "session": si}
+                        identical = ni == nj
+
+                    emit(physical, positions[ni, si], positions[nj, sj], identical)
+
+    elif mode == "to_union":
+        sessions = collector.domain("session")
+        union_cloud = cloud(("union", None), target_rows)
+
+        for index, sid in enumerate(sessions):
+            with progress_step(index, len(sessions)):
+                if ctx is not None and index % 16 == 0:
+                    ctx.check_cancelled()
+
+                found = nearby(cloud(("session", int(sid)), source_rows), union_cloud)
+
+                if found is None:
+                    continue
+
+                ni, nj = found
+                emit(
+                    {"neuron_i": ni, "neuron_j": nj, "session": int(sid)},
+                    positions[ni, sid],
+                    union[nj],
+                    False,
+                )
+
+    else:
+        found = nearby(
+            cloud(("union", "i"), source_rows),
+            cloud(("union", "j"), target_rows),
+        )
+
+        if found is not None:
+            ni, nj = found
+            emit({"neuron_i": ni, "neuron_j": nj}, union[ni], union[nj], ni == nj)
+
+    return collector.result()
 
 
 distance_query.supports_value_selection = True

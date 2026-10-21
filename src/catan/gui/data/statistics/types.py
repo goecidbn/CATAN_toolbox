@@ -517,6 +517,11 @@ class StatisticDefinition:
     # Loaded-data lookups and explicitly cheap statistics may run immediately.
     foreground_safe: bool = False
 
+    # Values of a neuron's own rows (neuron, or neuron_i == neuron_j) depend
+    # only on that neuron's footprints and the getter has no side effects.
+    # Such statistics may be sampled by masking all other assignment rows.
+    neuron_local: bool = False
+
     def is_affected_by(self, event: DataChange) -> bool:
         if self.dependencies is None:
             return True

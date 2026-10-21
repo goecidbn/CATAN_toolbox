@@ -15,6 +15,8 @@ def calculate_statistics(
     this_session: SessionData,
     reference_session: SessionData,
     distance_threshold: float = 25.0,
+    *,
+    ctx=None,
     **kwargs,
     # mode: str = "cross",
 ):
@@ -25,6 +27,9 @@ def calculate_statistics(
 
     footprint correlations are calculated as shifted and non-shifted (depending on model used)
 
+    ``ctx`` (optional, see catan.core.progress) receives progress per
+    processed reference neuron and is checked for cancellation.
+
     this method is used both for comparing statistics
       - referencing previous session (used for matching)
       - referencing itself (used for removal of duplicated footprints and kernel calculation)
@@ -34,6 +39,14 @@ def calculate_statistics(
     if this_session.footprints is None or reference_session.footprints is None:
         raise ValueError(
             "Both this_session and reference_session must have A attribute set."
+        )
+
+    dims = tuple(int(size) for size in this_session.dims)
+
+    if dims != tuple(int(size) for size in reference_session.dims):
+        raise ValueError(
+            "Footprint statistics require one common image grid; received "
+            f"{this_session.dims} and {reference_session.dims}."
         )
 
     if (
@@ -87,6 +100,7 @@ def calculate_statistics(
             local_correlations[j], _, local_shifts[j, :] = calculate_img_correlation(
                 this_session.footprints[:, j],  # .toarray(),
                 A_ref,
+                dims=dims,
                 crop=True,
                 shift=True,  # (key == "shifted"),
                 # binary=params.get("binary", False),
@@ -137,6 +151,13 @@ def calculate_statistics(
     idx_remove = []  # only gets populated, when 'same' is True
     remove_info = {}  # only gets populated, when 'same' is True
 
+    n_reference = reference_session.n_neurons
+
+    def report(done):
+        if ctx is not None and (done % 16 == 0 or done == n_reference):
+            ctx.check_cancelled()
+            ctx.progress(100 * done / max(1, n_reference))
+
     # Execute in parallel with progress bar
     max_workers = kwargs.get("nP", 12)
     if max_workers > 1:
@@ -147,13 +168,23 @@ def calculate_statistics(
                 for i in range(reference_session.n_neurons)
             }
 
-            for future in tqdm(
-                as_completed(futures),
-                total=reference_session.n_neurons,
-                desc="calculating footprint correlation of %d neurons"
-                % reference_session.included.sum(),
-                leave=False,
+            for done, future in enumerate(
+                tqdm(
+                    as_completed(futures),
+                    total=reference_session.n_neurons,
+                    desc="calculating footprint correlation of %d neurons"
+                    % reference_session.included.sum(),
+                    leave=False,
+                ),
+                start=1,
             ):
+                try:
+                    report(done)
+                except BaseException:
+                    # Do not wait for queued neurons of a cancelled task.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+
                 (
                     i,
                     local_shifts,
@@ -178,6 +209,7 @@ def calculate_statistics(
             % reference_session.included.sum(),
             leave=False,
         ):
+            report(i)
             (
                 _,
                 local_shifts,
