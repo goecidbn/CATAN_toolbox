@@ -1449,10 +1449,9 @@ class Controller(BasePlot.CanvasController):
             return
         values = self._dense_neuron_values(table)
 
-        self.canvas.set_neuron_statistic_values(
-            values,
-            title=table.stat.title,
-        )
+        definition = self.data.statistic_engine.registry[query.statistic_key]
+
+        self.canvas.set_neuron_statistic_values(values, title=definition.title)
 
     def _dense_neuron_values(self, table):
 

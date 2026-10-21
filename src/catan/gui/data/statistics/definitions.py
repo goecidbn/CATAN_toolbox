@@ -6,6 +6,7 @@ from .parameters import StatisticParameter
 from .distance_statistics import distance_query
 from .overlap_statistics import overlap_query
 from .cooccurrence_statistics import cooccurrence_query
+from .event_rate import calculate_event_rate, trace_keys
 from . import calculations
 
 from catan.core.changes import (
@@ -69,6 +70,73 @@ CALCULATED_STATISTICS = {
             "session": ReductionSpec("sum"),
         },
         foreground_safe=True,
+    ),
+    "event_rate": StatisticDefinition(
+        key="event_rate",
+        title="Event rate",
+        description=(
+            "Rate of inferred events (e.g., spikes) for each neuron within sessions."
+        ),
+        dims=("neuron", "session"),
+        category="neuron",
+        getter=calculate_event_rate,
+        foreground_safe=False,
+        parameters=(
+            StatisticParameter(
+                key="key",
+                label="Trace Key",
+                kind=str,
+                default="S_dff",
+                tooltip=("Key of the trace to use for event rate calculation."),
+                choices=trace_keys,
+            ),
+            StatisticParameter(
+                key="prctile",
+                label="Percentile",
+                kind=float,
+                default=20,
+                minimum=0.0,
+                maximum=100.0,
+                step=1.0,
+                decimals=0,
+                tooltip=(
+                    "Percentile of raw deconvolved event amplitude to consider as baseline. "
+                    "Lower values potentially yield more spikes per events."
+                ),
+            ),
+            StatisticParameter(
+                key="frequency",
+                label="Sampling frequency (Hz)",
+                kind=float,
+                default=15.0,
+                minimum=0.001,
+                step=1.0,
+                decimals=3,
+                tooltip="Sampling frequency of the selected traces.",
+            ),
+            StatisticParameter(
+                key="load_all",
+                label="Load all traces",
+                kind=bool,
+                default=False,
+                tooltip=(
+                    "Load trace data from all configured sessions before "
+                    "calculating. Otherwise load only sessions needed "
+                    "for missing results."
+                ),
+            ),
+            StatisticParameter(
+                key="save_results",
+                label="Save results",
+                kind=bool,
+                default=True,
+                tooltip=(
+                    "Retain calculated rates after unloading traces and "
+                    "include them when saving the CATAN session. "
+                    "Existing saved results are reused either way."
+                ),
+            ),
+        ),
     ),
     "centroid_shift": StatisticDefinition(
         key="centroid_shift",

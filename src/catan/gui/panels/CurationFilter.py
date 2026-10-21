@@ -932,8 +932,10 @@ class Display(QWidget):
                     value_text = "Yes" if value else "No"
                 elif parameter.kind is int:
                     value_text = str(int(value))
-                else:
+                elif parameter.kind is float:
                     value_text = f"{float(value):.6g}"
+                else:
+                    value_text = str(value)
 
                 lines.append(f"  {parameter.label}: {value_text}")
 

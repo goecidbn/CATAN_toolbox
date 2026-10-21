@@ -30,6 +30,9 @@ SESSION_FIELDS = (
     "status",
     "alignment_issue",
     "alignment_metrics",
+    "derived_statistics",
+    "known_trace_keys",
+    "trace_revision",
 )
 REMAP_FIELDS = (
     "shift",
@@ -172,8 +175,18 @@ def read_session_snapshot(backend, ref, *, root="/"):
 
     # Empty construction: no footprint processing or alignment.
     session = SessionData()
+    optional_fields = {
+        "derived_statistics",
+        "known_trace_keys",
+        "trace_revision",
+    }
+
     for key in SESSION_FIELDS:
-        setattr(session, key, payload["session"][key])
+        if key in payload["session"]:
+            setattr(session, key, payload["session"][key])
+        elif key not in optional_fields:
+            raise ValueError(f"Session snapshot is missing {key!r}.")
+
     session.dims = tuple(session.dims)
     session.source_config = (
         None

@@ -320,6 +320,26 @@ class ReductionPopup(QDialog):
                     editor.setValue(values[spec.key])
                     changed = editor.valueChanged
 
+                elif spec.kind is str:
+                    editor = QComboBox()
+
+                    choices = (
+                        list(spec.choices(self.selector.engine.data))
+                        if spec.choices is not None
+                        else []
+                    )
+                    current = values[spec.key]
+
+                    # Preserve saved settings even when their source is
+                    # temporarily unavailable.
+                    if current not in choices:
+                        choices.append(current)
+
+                    editor.addItems(choices)
+                    editor.setCurrentText(current)
+                    editor.setEditable(spec.choices is None)
+                    changed = editor.currentTextChanged
+
                 else:
                     raise TypeError(f"Unsupported parameter type: {spec.kind}")
 
@@ -1106,7 +1126,7 @@ class StatisticQuerySelector(QWidget):
         stat_def = self.current_stat_def()
         title = stat_def.title_with_parameters(self.current_parameters())
 
-        self.stat_button.setText(title)
+        self.stat_button.setText(stat_def.title)
         self.stat_button.setToolTip(f"{title}\n\n{stat_def.description}")
 
     def _update_filter_visibility(self):

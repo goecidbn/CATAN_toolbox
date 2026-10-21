@@ -831,6 +831,49 @@ class Data(Tracking):
         )
         return counts
 
+    def apply_model_preview(
+        self,
+        source,
+        candidate,
+        expected_version,
+    ):
+        if self.model is not source or self.state.data_version != expected_version:
+            raise ValueError(
+                "The model or data changed. " "Generate a new preview first."
+            )
+
+        if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
+            raise ValueError("Wait for current processing to finish before applying.")
+
+        fields = (
+            "parameters",
+            "distributions",
+            "p_same",
+            "distance_cutoff",
+            "fitted",
+            "fit_stale",
+            "fit_used_fallback",
+            "use_cdf",
+        )
+
+        source.__dict__.update({key: getattr(candidate, key) for key in fields})
+
+        # Bind the interpolator to the live model, not its preview copy.
+        source.set_f_same("joint")
+
+        paths = {
+            str(session.path) for session in self.sessions if session.path is not None
+        }
+
+        # Conservatively invalidate all assignment sets.
+        for name in self._assignments:
+            self._stale_assignments.setdefault(name, set()).update(paths)
+
+        self.notify_change(
+            C.MODEL_PARAMETERS,
+            C.PROCESSING_STATUS,
+        )
+
     def _source_loading_ready(self):
         tasks = self.state.tasks
 
@@ -2822,7 +2865,7 @@ class Data(Tracking):
         align_to_reference: bool = False,
         clean_traces: bool = False,
         force_registration: bool = False,
-        p_thr=[0.5, 0.3],
+        p_thr=[0.3, 0.3],
         **kwargs,
     ):
         """ """

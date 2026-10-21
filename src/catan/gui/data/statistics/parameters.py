@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from numbers import Integral, Real
 import math
@@ -8,14 +9,21 @@ class StatisticParameter:
     key: str
     label: str
     kind: type
-    default: float | int | bool
+    default: float | int | bool | str
     minimum: float | int | None = None
     maximum: float | int | None = None
     step: float = 0.1
     decimals: int = 3
     tooltip: str = ""
+    choices: Callable | None = None
 
     def validate(self, value):
+
+        if self.kind is str:
+            if not isinstance(value, str):
+                raise ValueError(f"{self.label} must be a string.")
+            return value
+
         if self.kind is bool:
             if type(value) is not bool:
                 raise ValueError(f"{self.label} must be true or false.")

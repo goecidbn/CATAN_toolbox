@@ -1373,7 +1373,7 @@ class Tracking:
         align_to_reference=True,
         clean_traces=True,
         force_registration=False,
-        p_thr=[0.5, 0.3],
+        p_thr=[0.3, 0.3],
     ):
         if self.assignments is None:
             ## or just directly initialize "local"?
@@ -1572,23 +1572,6 @@ class Tracking:
                 self.assignments.stats["p_matched"][new_rows, this_data.id, 1] = p_all[
                     :, non_matched
                 ].max(axis=0, initial=0.0)
-            # p_all = p_same.toarray()
-            # self.assignments.stats["p_matched"][matched_ref, this_data.id, 1] = [
-            #     max(
-            #         p_all[
-            #             c,
-            #             np.where(
-            #                 p_all[c, :]
-            #                 != self.assignments.stats["p_matched"][c, this_data.id, 0]
-            #             )[0],
-            #         ]
-            #     )
-            #     for c in matched_ref
-            # ]
-
-            # self.assignments.stats["p_matched"][non_matched, this_data.id, 1] = np.max(
-            #     p_all[non_matched, :], axis=1
-            # )
 
             self.update_union_footprints(
                 this_data.footprints,

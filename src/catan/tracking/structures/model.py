@@ -389,7 +389,7 @@ class Model:
         p_init = {
             "p_same": 0.2,
             "h": 8.0,
-            "sigma_eff": 1.0,
+            "sigma_eff": 2.0,
         }
 
         idx_min = np.argmin(gaussian_filter(H.sum(axis=1), sigma=2))
@@ -459,7 +459,7 @@ class Model:
         defaults = {
             "p_same": 0.2,
             "h": 8.0,
-            "sigma_eff": 1.0,
+            "sigma_eff": 2.0,
             "c_diff_mean": 0.5,
             "c_diff_sd": 0.15,
             "c_same_mean": 0.8,
@@ -479,6 +479,7 @@ class Model:
                 "Model parameters must be calculated before building the model."
             )
 
+        self.use_cdf = bool(use_cdf)
         p_fit = self.parameters
 
         self.distributions["pdf"] = match_model(
@@ -543,21 +544,89 @@ class Model:
 
         p_same = self.f_same(self.arrays["distance_bounds"], 1.0)
 
-        p_thr = 0.05
-        found = False
-        while not found:
-            idx_low_prob = np.where(p_same < p_thr)[0]
-            if len(idx_low_prob) > 0:
-                idx_cutoff = idx_low_prob[0]
-                found = True
+        finite = np.isfinite(p_same)
 
-            p_thr += 0.05
+        if not np.any(finite):
+            raise ValueError("The model has no finite cutoff probabilities.")
+
+        for p_thr in np.arange(0.05, 1.051, 0.05):
+            indices = np.flatnonzero(finite & (p_same < p_thr))
+
+            if indices.size:
+                idx_cutoff = int(indices[0])
+                break
+        else:
+            raise ValueError("The model has no usable distance cutoff.")
 
         self.distance_cutoff = max(
             10, self.arrays["distance_bounds"][idx_cutoff] * 1.5
         )  ## make sure, also half-detected ones have a chance!
         self.fitted = True
         self.fit_stale = False
+
+    def parameter_preview(self, parameters):
+        from copy import copy
+
+        names = (
+            "p_same",
+            "h",
+            "sigma_eff",
+            "c_diff_mean",
+            "c_diff_sd",
+            "c_same_mean",
+            "c_same_sd",
+        )
+
+        if set(parameters) != set(names):
+            raise ValueError("Supply exactly the seven fitted model parameters.")
+
+        # Explicit ordering is required by match_model().
+        values = {name: float(parameters[name]) for name in names}
+
+        if not all(np.isfinite(v) for v in values.values()):
+            raise ValueError("Parameters must be finite.")
+
+        for name in ("p_same", "c_same_mean"):
+            if not 0 < values[name] < 1:
+                raise ValueError(f"{name} must lie strictly between 0 and 1.")
+
+        if not 0 <= values["c_diff_mean"] <= 1:
+            raise ValueError("c_diff_mean must lie between 0 and 1.")
+
+        for name in ("h", "sigma_eff", "c_diff_sd", "c_same_sd"):
+            if values[name] <= 0:
+                raise ValueError(f"{name} must be positive.")
+
+        area = np.prod(
+            self.params.get(
+                "window_dims",
+                (self.params["L"],) * 2,
+            )
+        )
+
+        if values["h"] >= self.params["neighbor_distance"]:
+            raise ValueError("h must be smaller than the neighbour radius.")
+
+        if (300 / area) * np.pi * values["h"] ** 2 >= 1 / np.e:
+            raise ValueError("h is too large for the model's hard-core density.")
+
+        candidate = copy(self)
+        candidate.params = dict(self.params)
+        candidate.parameters = values
+        candidate.distributions = {"pdf": {}, "cdf": {}}
+        candidate.p_same = {}
+
+        candidate.build_from_parameters(use_cdf=getattr(self, "use_cdf", True))
+
+        for name, array in candidate.p_same.items():
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"Invalid probability distribution: {name}.")
+
+        # Manual editing does not refresh stale count evidence.
+        candidate.fit_stale = self.fit_stale
+        candidate.fit_used_fallback = False
+
+        return candidate
 
     def set_f_same(self, model: str = "joint"):
 

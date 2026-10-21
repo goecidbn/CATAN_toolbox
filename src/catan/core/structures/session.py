@@ -104,6 +104,10 @@ class SessionData:
             "correlation_zscore": None,
         }
 
+        self.derived_statistics = {}
+        self.known_trace_keys = []
+        self.trace_revision = 0
+
         self.set_parameters(**kwargs)
 
         ## if some elements are provided in kwargs, which fit
@@ -410,6 +414,12 @@ class SessionData:
 
         if not data:
             return
+
+        self.known_trace_keys = sorted(set(self.known_trace_keys) | set(data))
+
+        # Replacing traces invalidates calculations based on the old data.
+        self.trace_revision += 1
+        self.derived_statistics = {}
 
         self._traces = data if data else {}
 

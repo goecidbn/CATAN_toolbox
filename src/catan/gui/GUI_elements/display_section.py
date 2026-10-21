@@ -26,6 +26,7 @@ from catan.gui.panels import (
     Traces,
     CurationFilter,
     SessionAlignment,
+    ModelResults,
 )
 
 display_modes = {
@@ -61,7 +62,13 @@ display_modes = {
         "title": "Curation",
         "options": {
             "match_curator": "Statistics Filter",
-            "session_alignment": "Session alignment"
+            "session_alignment": "Session alignment",
+        },
+    },
+    "model": {
+        "title": "Tracking model",
+        "options": {
+            "model_results": "Model results",
         },
     },
 }
@@ -70,12 +77,12 @@ DISPLAY_CONTROLLERS = {
     "session_overview": Overview,
     "tracked_overview": Overview,
     "footprints": Footprints,
-    # "multi_footprint": Footprints,
     "traces": Traces,
     "statistics": Statistics,
     "selection_display": SelectionDisplay,
     "match_curator": CurationFilter,
     "session_alignment": SessionAlignment,
+    "model_results": ModelResults,
 }
 
 

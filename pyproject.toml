@@ -54,6 +54,7 @@ dependencies = [
     "scikit-image",
     "typing_extensions",
     "platformdirs",
+    "event-estimator",
 ]
 
 [project.optional-dependencies]

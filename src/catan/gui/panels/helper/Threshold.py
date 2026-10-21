@@ -299,27 +299,40 @@ class ThresholdOverlay:
         self.canvas.update()
 
     def line_distance_px(self, event_pos):
-        """
-        something seems to go wrong here: hover on y-threshold disappears quickly on hover
-        """
-        xmin, xmax, ymin, ymax = self.view_bounds()
-        cx = 0.5 * (xmin + xmax)
-        cy = 0.5 * (ymin + ymax)
+        if not hasattr(self, "_last_line_pos"):
+            return np.inf
 
-        if self.spec.axis == "x":
-            pts = np.asarray([[self.spec.value, cy]], dtype=np.float32)
-            pts_canvas = click_events.visual_to_canvas(self.visuals["line"], pts)
-            return abs(pts_canvas[0, 0] - event_pos[0])
+        points = np.asarray(
+            click_events.visual_to_canvas(
+                self.visuals["line"],
+                self._last_line_pos,
+            ),
+            dtype=float,
+        )[:, :2]
 
-        if self.spec.axis == "y":
-            pts = np.asarray([[cx, self.spec.value]], dtype=np.float32)
-            pts_canvas = click_events.visual_to_canvas(self.visuals["line"], pts)
-            return abs(pts_canvas[0, 1] - event_pos[1])
+        a, b = points
+        point = np.asarray(event_pos, dtype=float)[:2]
+        segment = b - a
+        length_squared = np.dot(segment, segment)
 
-        raise ValueError(self.spec.axis)
+        if not np.isfinite(points).all():
+            return np.inf
+
+        if length_squared == 0:
+            return float(np.linalg.norm(point - a))
+
+        fraction = np.clip(
+            np.dot(point - a, segment) / length_squared,
+            0.0,
+            1.0,
+        )
+        return float(np.linalg.norm(point - (a + fraction * segment)))
 
     def is_near_line(self, event_pos) -> bool:
-        return self.line_distance_px(event_pos) <= self.pick_px
+        return (
+            self.visuals["line"].visible
+            and self.line_distance_px(event_pos) <= self.pick_px
+        )
 
     def update_hover(self, event_pos):
         old_hovered = self.hovered
@@ -352,86 +365,91 @@ class ThresholdOverlay:
 
         return (
             f"<b>{self.label}</b> {direction_symbol} {value}{unit}<br>"
-            f"<span style='color: gray;'>· Click: toggle direction<br>· Drag: move threshold</span>"
+            f"<span style='color: gray;'>"
+            f"· Click: activate / flip direction<br>"
+            f"· Drag: move threshold<br>"
+            f"· Intersection: control both thresholds<br>"
+            f"· Shift: pick markers underneath"
+            f"</span>"
         )
 
-    def handle_mouse_press(self, event) -> bool:
-        if event.button != 1:
-            return False
+    # def handle_mouse_press(self, event) -> bool:
+    #     if event.button != 1:
+    #         return False
 
-        if not self.is_near_line(event.pos):
-            self.set_active_visual_state(False, emit=False)
-            return False
+    #     if not self.is_near_line(event.pos):
+    #         self.set_active_visual_state(False, emit=False)
+    #         return False
 
-        self.set_active_visual_state(True, emit=False)
+    #     self.set_active_visual_state(True, emit=False)
 
-        self.dragging = True
-        self.hovered = True
-        self.start_drag_value = self.spec.value
-        self.start_drag_pos = np.asarray(event.pos, dtype=float)
-        self.start_drag_time = time()
+    #     self.dragging = True
+    #     self.hovered = True
+    #     self.start_drag_value = self.spec.value
+    #     self.start_drag_pos = np.asarray(event.pos, dtype=float)
+    #     self.start_drag_time = time()
 
-        self.update_visuals()
+    #     self.update_visuals()
 
-        event.handled = True
-        return True
+    #     event.handled = True
+    #     return True
 
-    def handle_mouse_move(self, event) -> bool:
-        if not self.dragging:
-            # self.update_hover(event.pos)
-            return False
+    # def handle_mouse_move(self, event) -> bool:
+    #     if not self.dragging:
+    #         # self.update_hover(event.pos)
+    #         return False
 
-        xy = click_events.canvas_to_visual(self.visuals["line"], event.pos)
+    #     xy = click_events.canvas_to_visual(self.visuals["line"], event.pos)
 
-        if self.spec.axis == "x":
-            value = xy[0]
-        else:
-            value = xy[1]
+    #     if self.spec.axis == "x":
+    #         value = xy[0]
+    #     else:
+    #         value = xy[1]
 
-        self.set_value(value, emit=True)
+    #     self.set_value(value, emit=True)
 
-        QToolTip.showText(
-            QCursor.pos(),
-            self.tooltip_text(),
-            self.canvas.native,
-        )
+    #     QToolTip.showText(
+    #         QCursor.pos(),
+    #         self.tooltip_text(),
+    #         self.canvas.native,
+    #     )
 
-        event.handled = True
-        return True
+    #     event.handled = True
+    #     return True
 
-    def handle_mouse_release(self, event) -> bool:
-        if not self.dragging:
-            return False
+    # def handle_mouse_release(self, event) -> bool:
+    #     if not self.dragging:
+    #         return False
 
-        self.dragging = False
+    #     self.dragging = False
 
-        moved_px = np.linalg.norm(
-            np.asarray(event.pos, dtype=float) - self.start_drag_pos
-        )
-        spent_time = time() - self.start_drag_time
+    #     moved_px = np.linalg.norm(
+    #         np.asarray(event.pos, dtype=float) - self.start_drag_pos
+    #     )
+    #     spent_time = time() - self.start_drag_time
 
-        if moved_px < self.pick_px and spent_time < 0.2:
-            self.toggle_direction(emit=True)
-        else:
-            self._emit_changed()
+    #     if moved_px < self.pick_px and spent_time < 0.2:
+    #         self.toggle_direction(emit=True)
+    #     else:
+    #         self._emit_changed()
 
-        self.start_drag_value = None
-        self.start_drag_pos = None
+    #     self.start_drag_value = None
+    #     self.start_drag_pos = None
 
-        self.hovered = self.is_near_line(event.pos)
-        if self.hovered:
-            QToolTip.showText(
-                QCursor.pos(),
-                self.tooltip_text(),
-                self.canvas.native,
-            )
-        else:
-            QToolTip.hideText()
+    #     self.hovered = self.is_near_line(event.pos)
+    #     if self.hovered:
+    #         QToolTip.showText(
+    #             QCursor.pos(),
+    #             self.tooltip_text(),
+    #             self.canvas.native,
+    #         )
+    #     else:
+    #         QToolTip.hideText()
 
-        self.update_visuals()
+    #     self.update_visuals()
 
-        event.handled = True
-        return True
+    #     event.handled = True
+    #     return True
 
     def destroy(self):
         self.dragging = False

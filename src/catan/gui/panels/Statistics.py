@@ -9,6 +9,8 @@ from vispy import scene
 from vispy.scene import visuals
 from vispy.scene.visuals import Rectangle, Text, Markers
 from typing import Optional, Tuple, Callable
+from types import SimpleNamespace
+
 from catan.gui.interaction import click_events
 
 from PySide6.QtCore import Qt, QEvent, Signal, QObject
@@ -172,6 +174,9 @@ class Display(BasePlot.BaseCanvas):
 
         self._on_threshold_changed: Optional[Callable] = None
         self.thresholds: dict[str, Threshold.ThresholdOverlay] = {}
+
+        self._threshold_gesture = None
+        self._last_threshold_mouse_pos = None
 
         ## build overlay for displaying messages
         self._build_error_overlay()
@@ -1019,6 +1024,187 @@ class Display(BasePlot.BaseCanvas):
             if threshold is not None:
                 threshold.update_visuals()
 
+    def _threshold_hits(self, event):
+        if "Shift" in (event.modifiers or ()):
+            return ()
+
+        return tuple(
+            threshold
+            for threshold in self.thresholds.values()
+            if threshold.is_near_line(event.pos)
+        )
+
+    def _hover_thresholds(self, event):
+        had_hover = any(threshold.hovered for threshold in self.thresholds.values())
+        hits = self._threshold_hits(event)
+
+        for threshold in self.thresholds.values():
+            hovered = threshold in hits
+
+            if threshold.hovered != hovered:
+                threshold.hovered = hovered
+                threshold.update_visuals()
+
+        if hits:
+            QToolTip.showText(
+                QCursor.pos(),
+                "<br><br>".join(t.tooltip_text() for t in hits),
+                self.native,
+            )
+        elif had_hover:
+            QToolTip.hideText()
+
+        self._set_camera_interactive(not hits)
+        return bool(hits)
+
+    def _notify_thresholds(self):
+        if self._on_threshold_changed is not None and self.thresholds:
+            self._on_threshold_changed(next(iter(self.thresholds.values())).spec)
+
+    def _press_thresholds(self, event):
+        if "Shift" in (event.modifiers or ()):
+            self._hover_thresholds(event)
+            return False
+
+        hits = self._threshold_hits(event)
+
+        if not hits:
+            changed = any(
+                threshold.spec.active for threshold in self.thresholds.values()
+            )
+
+            for threshold in self.thresholds.values():
+                threshold.set_active_visual_state(False, emit=False)
+
+            if changed:
+                self._notify_thresholds()
+
+            return False
+
+        self._threshold_gesture = {
+            "pos": np.asarray(event.pos, dtype=float),
+            "targets": hits,
+            "values": [t.spec.value for t in hits],
+            "origins": [
+                np.asarray(
+                    click_events.canvas_to_visual(
+                        t.visuals["line"],
+                        event.pos,
+                    )
+                )[:2].copy()
+                for t in hits
+            ],
+            "was_active": [t.spec.active for t in hits],
+            "moved": False,
+        }
+
+        self._set_camera_interactive(False)
+        event.handled = True
+        return True
+
+    def _move_thresholds(self, event):
+        gesture = self._threshold_gesture
+
+        if gesture is None:
+            return False
+
+        distance = np.linalg.norm(np.asarray(event.pos) - gesture["pos"])
+
+        if distance >= 3:
+            gesture["moved"] = True
+
+        if gesture["moved"]:
+            for threshold, value, origin in zip(
+                gesture["targets"],
+                gesture["values"],
+                gesture["origins"],
+            ):
+                xy = click_events.canvas_to_visual(
+                    threshold.visuals["line"],
+                    event.pos,
+                )
+                axis = 0 if threshold.spec.axis == "x" else 1
+
+                threshold.dragging = True
+                threshold.set_active_visual_state(True, emit=False)
+                threshold.set_value(
+                    value + xy[axis] - origin[axis],
+                    emit=False,
+                )
+
+            self._notify_thresholds()
+
+        event.handled = True
+        return True
+
+    def _release_thresholds(self, event):
+        gesture = self._threshold_gesture
+
+        if gesture is None:
+            return False
+
+        self._move_thresholds(event)
+        self._threshold_gesture = None
+
+        for threshold, was_active in zip(
+            gesture["targets"],
+            gesture["was_active"],
+        ):
+            threshold.dragging = False
+
+            if not gesture["moved"]:
+                threshold.set_active_visual_state(True, emit=False)
+
+                if was_active:
+                    threshold.toggle_direction(emit=False)
+
+            threshold.update_visuals()
+
+        if not gesture["moved"]:
+            self._notify_thresholds()
+
+        self._hover_thresholds(event)
+        event.handled = True
+        return True
+
+    def _refresh_threshold_modifier(self, event, shift_down):
+        if (
+            self._last_threshold_mouse_pos is None
+            or self._threshold_gesture is not None
+        ):
+            return
+
+        modifiers = tuple(
+            modifier for modifier in (event.modifiers or ()) if modifier != "Shift"
+        )
+
+        if shift_down:
+            modifiers += ("Shift",)
+
+        self.on_mouse_move(
+            SimpleNamespace(
+                pos=self._last_threshold_mouse_pos,
+                modifiers=modifiers,
+                handled=False,
+            )
+        )
+
+    def on_key_press(self, event):
+        parent_handler = getattr(super(), "on_key_press", None)
+        if parent_handler is not None:
+            parent_handler(event)
+
+        if event.key == "Shift":
+            self._refresh_threshold_modifier(event, True)
+
+    def on_key_release(self, event):
+        parent_handler = getattr(super(), "on_key_release", None)
+        if parent_handler is not None:
+            parent_handler(event)
+
+        if event.key == "Shift":
+            self._refresh_threshold_modifier(event, False)
+
     ### ======================================================= ###
     ### ---------------- INTERACTION FUNCTIONS ---------------- ###
     ### ------------------------------------------------------- ###
@@ -1038,38 +1224,14 @@ class Display(BasePlot.BaseCanvas):
         ):
             return
 
-        # 1. Threshold dragging has priority
-        threshold_consumed = False
-        for threshold in self.thresholds.values():
-            threshold_consumed |= threshold.handle_mouse_move(event)
+        self._last_threshold_mouse_pos = tuple(event.pos)
 
-        if threshold_consumed:
-            self._set_camera_interactive(False)
-            event.handled = True
+        if self._move_thresholds(event):
             return
 
-        # 2. Hover thresholds, but only one owns the tooltip
-        hovered_overlay = None
-        hovered_distance = np.inf
-
-        for threshold in self.thresholds.values():
-
-            if threshold.update_hover(event.pos):
-                dist = threshold.line_distance_px(event.pos)
-                if dist < hovered_distance:
-                    hovered_overlay = threshold
-                    hovered_distance = dist
-
-        if hovered_overlay is not None:
-            self._set_camera_interactive(False)
-            hovered_overlay.show_tooltip()
+        if self._hover_thresholds(event):
             event.handled = True
             return
-
-        # for threshold in self.thresholds.values():
-        #     if threshold.update_hover(event.pos):
-        #         # event.handled = True
-        #         return
 
         idx = self.find_closest_visual(event.pos, requires_transform=True)
 
@@ -1101,14 +1263,7 @@ class Display(BasePlot.BaseCanvas):
         ):
             return
 
-        threshold_consumed = False
-        for threshold in self.thresholds.values():
-            if threshold.handle_mouse_release(event):
-                threshold_consumed = True
-
-        if threshold_consumed:
-            self._set_camera_interactive(True)
-            event.handled = True
+        if self._release_thresholds(event):
             return
 
         idx = self.find_closest_visual(event.pos, requires_transform=True)
@@ -1129,21 +1284,10 @@ class Display(BasePlot.BaseCanvas):
         ):
             return
 
-        threshold_consumed = False
+        self._last_threshold_mouse_pos = tuple(event.pos)
 
-        for threshold in self.thresholds.values():
-            if threshold.handle_mouse_press(event):
-                threshold_consumed = True
-                # return
-
-        if threshold_consumed:
-            self._set_camera_interactive(False)
-            event.handled = True
+        if self._press_thresholds(event):
             return
-
-        # Click was away from all threshold lines.
-        for threshold in self.thresholds.values():
-            threshold.deactivate_visuals()
 
         super().on_mouse_press(event)
 
@@ -1764,6 +1908,10 @@ class Display(BasePlot.BaseCanvas):
     #         overlay.visible = False
 
     def _destroy_threshold_overlays(self):
+
+        self._threshold_gesture = None
+        self._last_threshold_mouse_pos = None
+        self._set_camera_interactive(True)
 
         for key, threshold in self.thresholds.items():
             if threshold is not None:
