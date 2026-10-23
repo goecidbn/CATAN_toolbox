@@ -10,6 +10,15 @@ class RetainedResults:
         self.root_id = result.root_result.group_id
 
         root = result.root_result.target_evidence
+
+        if root is None and result.root_result.match_level == "reassignment":
+            # Destination neuron -> footprints proposed for it.
+            root = {}
+            for match in result.root_result.matches:
+                root.setdefault(Component(match.destination_neuron, None), set()).add(
+                    Component(match.source_neuron, match.source_session)
+                )
+
         self.remaining = (
             None
             if root is None
@@ -166,6 +175,21 @@ class RetainedResults:
 
     def applied(self, kind, sources, targets, prepared, data):
         # Consume the completed result before remapping assignment IDs.
+        self._consume(kind, sources, targets)
+        self._remap(prepared, data)
+
+    def applied_batch(self, entries, prepared, data):
+        """Several manipulations committed at once.
+
+        ``entries``: (kind, sources, targets), endpoints as resolved in the
+        data before the batch, i.e. in the current position coordinates.
+        """
+        for kind, sources, targets in entries:
+            self._consume(kind, sources, targets)
+
+        self._remap(prepared, data)
+
+    def _consume(self, kind, sources, targets):
         if self.remaining is not None:
             for old_target, old_sources in list(self.remaining.items()):
                 target = self.positions.get(old_target)
@@ -195,6 +219,7 @@ class RetainedResults:
                 else:
                     self.remaining[old_target] = kept
 
+    def _remap(self, prepared, data):
         for old, current in self.positions.items():
             if current is None:
                 continue

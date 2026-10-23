@@ -55,6 +55,7 @@ class CurationFilterGroupWidget(QFrame):
     count_changed = Signal(str, object)
     comment_changed = Signal(str, str)
     binding_changed = Signal(str, str)
+    summary_changed = Signal(str, object)
 
     def __init__(
         self,
@@ -243,6 +244,9 @@ class CurationFilterGroupWidget(QFrame):
             self.binding_selector.addItem(
                 "Apply to: between targets", "between_targets"
             )
+            self.binding_selector.addItem(
+                "Apply to: between sources and targets", "between_sources_targets"
+            )
 
             self.binding_selector.setCurrentIndex(
                 self.binding_selector.findData(self.group.apply_to)
@@ -262,14 +266,36 @@ class CurationFilterGroupWidget(QFrame):
                 "compatible source set.\n"
                 "Between targets: compare partners sharing a source. "
                 "The parent count must use the opposite side as anchor. "
-                "One largest mutually compatible partner set is retained."
+                "One largest mutually compatible partner set is retained.\n"
+                "Between sources and targets: compare every source with "
+                "every target (needs a pair summary).\n"
+                "With a pair summary (median, mean, min, max), each condition "
+                "is evaluated on all such pairs of a target neuron, combined, "
+                "and thresholded once; target neurons failing it are dropped."
             )
             header_layout.addWidget(self.binding_selector)
 
+            self.summary_selector = QComboBox()
+            self.summary_selector.addItem("Pairs: largest compatible set", None)
+            for summary in ("median", "mean", "min", "max"):
+                self.summary_selector.addItem(f"Pairs: {summary}", summary)
+            self.summary_selector.setToolTip(
+                "How the between-partner pairs of a target neuron are combined "
+                "before the condition thresholds apply."
+            )
+            self.summary_selector.setCurrentIndex(
+                max(0, self.summary_selector.findData(self.group.summary))
+            )
+            header_layout.addWidget(self.summary_selector)
+            self._update_summary_selector(self.group.apply_to)
+
             self.binding_selector.currentIndexChanged.connect(
-                lambda _: self.binding_changed.emit(
+                lambda _: self._on_binding_selected(self.binding_selector.currentData())
+            )
+            self.summary_selector.currentIndexChanged.connect(
+                lambda _: self.summary_changed.emit(
                     self.group.id,
-                    self.binding_selector.currentData(),
+                    self.summary_selector.currentData(),
                 )
             )
 
@@ -314,6 +340,33 @@ class CurationFilterGroupWidget(QFrame):
                 self.match_level_selector.currentData(),
             )
         )
+
+    def _update_summary_selector(self, binding):
+        """Pair summaries apply to between-partner bindings only; between
+        sources and targets has no compatible-set mode."""
+        between = binding in (
+            "between_sources",
+            "between_targets",
+            "between_sources_targets",
+        )
+        self.summary_selector.setVisible(between)
+
+        model = self.summary_selector.model()
+        model.item(0).setEnabled(binding != "between_sources_targets")
+
+    def _on_binding_selected(self, binding):
+        self._update_summary_selector(binding)
+
+        if (
+            binding == "between_sources_targets"
+            and self.summary_selector.currentData() is None
+        ):
+            # Emits summary_changed.
+            self.summary_selector.setCurrentIndex(
+                self.summary_selector.findData("median")
+            )
+
+        self.binding_changed.emit(self.group.id, binding)
 
     def _build_count_controls(self):
         layout = QHBoxLayout()
@@ -527,6 +580,7 @@ class CurationFilterGroupWidget(QFrame):
         widget.count_changed.connect(self.count_changed)
         widget.comment_changed.connect(self.comment_changed)
         widget.binding_changed.connect(self.binding_changed)
+        widget.summary_changed.connect(self.summary_changed)
 
     def _build_footer(self):
 

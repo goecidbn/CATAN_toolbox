@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 from functools import wraps
 from copy import copy, deepcopy
-import json, os, tempfile
+import hashlib, json, os, re, tempfile
 
 from catan import Tracking
 from . import AppState, StatisticDisplayConfig
@@ -39,7 +39,7 @@ from catan.tracking.realignment import build_realignment_update
 from catan.gui.panels.colors import CyclicColorMap
 from catan.gui.data.statistics.engine import StatisticEngine
 from catan.gui.data.statistics.registry import build_statistics_registry
-from catan.gui.background_tasks.runtime import current_task_context
+from catan.gui.background_tasks.runtime import TaskCancelled, current_task_context
 from catan.gui.background_tasks.file_writes import (
     save_bytes_task,
     save_session_snapshots_task,
@@ -47,6 +47,90 @@ from catan.gui.background_tasks.file_writes import (
 )
 
 from catan.gui.data.assignment_comparison import AssignmentComparison
+
+
+def read_assignments_provenance(path, *, ctx=None):
+    """Sessions and model stored with saved assignments, or None.
+
+    {"recipe": loading recipe document or None, "model_path": str or None,
+    "sessions_file": CATAN session file or None}.
+    Call from a background worker.
+    """
+    from catan.tracking.structures.assignments import PROVENANCE_PATHS
+
+    fields = {
+        "provenance": {
+            key: FieldSpec(path=field_path, required=False, exposed=False)
+            for key, field_path in PROVENANCE_PATHS.items()
+        }
+    }
+
+    try:
+        result = read_fields(path, fields, ctx=ctx, timeout=120.0)
+        values = (result or {}).get("provenance") or {}
+    except TaskCancelled:
+        raise
+    except Exception:
+        # Older or foreign files carry no provenance.
+        return None
+
+    def text(value):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if isinstance(value, np.ndarray) and value.size == 1:
+            value = value.item()
+        return value if isinstance(value, str) and value else None
+
+    recipe = text(values.get("loading_recipe"))
+    model_path = text(values.get("model_path"))
+    sessions_file = text(values.get("sessions_file"))
+
+    try:
+        recipe = None if recipe is None else json.loads(recipe)
+    except ValueError:
+        recipe = None
+
+    if recipe is None and model_path is None and sessions_file is None:
+        return None
+
+    return {"recipe": recipe, "model_path": model_path, "sessions_file": sessions_file}
+
+
+def read_overview_background(path, *, ctx=None):
+    """Overview background stored with saved assignments
+    (background-only SessionData), or None. Call from a background worker."""
+    from catan.tracking.structures.assignments import OVERVIEW_BACKGROUND_PATH
+    from catan.core.structures.session_snapshot import restore_background_snapshot
+
+    def spec(key):
+        return FieldSpec(
+            path=f"{OVERVIEW_BACKGROUND_PATH}/{key}", required=False, exposed=False
+        )
+
+    try:
+        result = read_fields(
+            path, {"background": {"document": spec("document")}}, ctx=ctx
+        )
+        document = ((result or {}).get("background") or {}).get("document")
+    except TaskCancelled:
+        raise
+    except Exception:
+        return None
+
+    if isinstance(document, np.ndarray) and document.size == 1:
+        document = document.item()
+    if isinstance(document, bytes):
+        document = document.decode("utf-8")
+    if not isinstance(document, str) or not document:
+        return None
+
+    # Array keys referenced by the document ({"__array__": "a0000"}).
+    keys = sorted(set(re.findall(r'"__array__": "(a\d{4})"', document)))
+    arrays = read_fields(
+        path, {"arrays": {key: spec(key) for key in keys}}, ctx=ctx
+    )["arrays"]
+
+    return restore_background_snapshot(document, arrays)
 
 
 def after_display_tasks(method):
@@ -62,7 +146,16 @@ def after_display_tasks(method):
 
 class Data(Tracking):
 
-    root: str
+    @property
+    def root(self) -> str:
+        return getattr(self, "_root", "")
+
+    @root.setter
+    def root(self, value):
+        from catan.gui.GUI_elements.utils.paths import set_display_root
+
+        self._root = value
+        set_display_root(value)
 
     def __init__(self, state: AppState):
 
@@ -70,8 +163,15 @@ class Data(Tracking):
         self.correct_rotation = state.settings.value(
             "alignment/correct_rotation", False, type=bool
         )
+        # Shared border: sessions a pixel may lie outside of (common_spatial_coverage).
+        self.border_tolerance = max(
+            0, state.settings.value("alignment/border_tolerance", 0, type=int)
+        )
 
         super().__init__()
+
+        # Display-only overview background (queue_load_overview_background).
+        self.overview_background = None
 
         self.statistic_engine = StatisticEngine(
             data=self,
@@ -512,7 +612,33 @@ class Data(Tracking):
             self.queue_assign_neurons(session_id, batch=batch)
 
     @after_display_tasks
-    def queue_process_alignments(self, *, session_ids, finished=None):
+    def queue_realign_all(self, *, replace_manual=False):
+        """Realign all sessions after the first (reference) in session order.
+        ``replace_manual``: recompute manually set alignments too (otherwise
+        they keep their transform; only dependent geometry is refreshed)."""
+        if len(self.sessions) < 2:
+            return
+
+        if self.state.tasks.processing_busy():
+            self.state.issue(
+                "warning",
+                "Realignment not started",
+                "Finish or cancel existing tasks first.",
+            )
+            return
+
+        # Marks all later sessions outdated (and notifies).
+        self.mark_geometry_changed(0)
+
+        return self.queue_process_alignments(
+            session_ids=list(range(1, len(self.sessions))),
+            replace_manual=replace_manual,
+        )
+
+    @after_display_tasks
+    def queue_process_alignments(
+        self, *, session_ids, finished=None, replace_manual=False
+    ):
         """Repair required alignments and stale predecessors in session order."""
         tasks = self.state.tasks
 
@@ -571,7 +697,11 @@ class Data(Tracking):
             session = self.sessions[session_id]
             template = session.background_template.copy()
 
-            if session.remap is not None and session.remap.method == "manual":
+            if (
+                not replace_manual
+                and session.remap is not None
+                and session.remap.method == "manual"
+            ):
                 # Manual transforms are specified in the common/global frame.
                 # Refresh dependent geometry without replacing the chosen transform.
                 remap = session.remap
@@ -582,12 +712,18 @@ class Data(Tracking):
                 )
 
             if not remap.report.success:
+                message = (
+                    f"Automatic alignment of {session.name!r} needs confirmation.\n"
+                    f"{remap.confirmation}\n"
+                    "Check the proposal, then use it, adjust it or remove the session."
+                    if remap.confirmation
+                    else f"Automatic alignment failed for {session.name!r}.\n"
+                    f"Reason: {remap.report.reason or 'unknown'}."
+                )
                 return {
                     "alignment_failure": (
                         session,
-                        f"Automatic alignment failed for {session.name!r}.\n"
-                        f"Reason: {remap.report.reason or 'unknown'}.\n"
-                        "Dependent processing stopped.",
+                        message + "\nDependent processing stopped.",
                         remap,
                     )
                 }
@@ -613,6 +749,7 @@ class Data(Tracking):
                 self.queue_process_alignments(
                     session_ids=required,
                     finished=finished,
+                    replace_manual=replace_manual,
                 )
 
         return tasks.start(
@@ -998,6 +1135,7 @@ class Data(Tracking):
                 # Build and validate a separate candidate. Its settings
                 # must not mutate the live Tracking.params dictionary.
                 candidate = Model._from_dict(data, params=params)
+                candidate.path = path
 
             else:
                 config = self.state.config_manager.suggest_config_for(
@@ -1020,6 +1158,7 @@ class Data(Tracking):
                 candidate.path = path
                 candidate.source_config = config
                 candidate._load_config_problems = check["problems"]
+                candidate.provenance = read_assignments_provenance(path, ctx=ctx)
 
             if ctx is not None:
                 ctx.check_cancelled()
@@ -1087,6 +1226,161 @@ class Data(Tracking):
             use_optical_flow=True,
             correct_rotation=self.correct_rotation,
         )
+
+    # ------------------------------------------------------------------
+    # Overview background from another source (display only)
+    # ------------------------------------------------------------------
+
+    def queue_load_overview_background(self, source_path, selection):
+        """Load an image (file + field) as overview background, oriented
+        like the sessions' backgrounds and aligned to their reference frame.
+
+        The result is an unregistered SessionData holding only the
+        background (template, remap, aligned background); it takes no part
+        in tracking. Its alignment can be edited like a session's.
+        """
+        reference = next(
+            (
+                session
+                for session in self.sessions
+                if session.status["spatial_loaded"]
+                and session.background_template is not None
+            ),
+            None,
+        )
+
+        if reference is None:
+            self.state.issue(
+                "info",
+                "Overview background",
+                "Load a session's spatial data first: the background is "
+                "aligned to the sessions' reference frame.",
+            )
+            return None
+
+        source_path = os.path.abspath(os.path.expanduser(os.fspath(source_path)))
+        orientation = getattr(self, "background_orientation", "auto")
+        spec = FieldSpec(
+            path=selection.path,
+            source=selection.source,
+            attribute=selection.attribute,
+            required=True,
+        )
+
+        def run():
+            values = read_fields(
+                source_path,
+                {"spatial": {"background": spec}},
+                ctx=current_task_context(),
+            )
+            image = values["spatial"]["background"]
+
+            background = SessionData(
+                name=f"Overview background ({Path(source_path).name})",
+                path=source_path,
+            )
+            background.dims = tuple(reference.dims)
+            background.params = deepcopy(reference.params)
+            background.background_template = reference.prepare_background_template(
+                image, background_orientation=orientation
+            )
+
+            # Any time point: align to the most similar sessions, not the
+            # most recent ones.
+            references = self.alignment_references_by_similarity(
+                background.background_template
+            )
+            # No session order: deviations are only reported (warning).
+            remap = background.propose_remapping(
+                references, require_confirmation=False
+            )
+            self._set_overview_background_geometry(
+                background, background.background_template, remap
+            )
+            return background
+
+        def publish(background):
+            self.overview_background = background
+            self.notify_change(C.OVERVIEW_BACKGROUND)
+
+            if not background.status["aligned"]:
+                self.state.issue(
+                    "warning",
+                    "Overview background not aligned",
+                    "Automatic alignment failed. Adjust it in Session alignment "
+                    "(target: overview background).",
+                )
+
+        return self.state.tasks.start(
+            "loading",
+            f"Load overview background: {Path(source_path).name}",
+            run,
+            on_result=publish,
+        )
+
+    def _apply_stored_overview_background(self, background):
+        """Use the overview background saved with loaded assignments."""
+        if background is None:
+            return
+
+        if isinstance(background, Exception):
+            self.state.issue(
+                "warning",
+                "Stored overview background not loaded",
+                f"The assignments file contains an overview background that "
+                f"cannot be read: {background}",
+            )
+            return
+
+        if self.sessions and tuple(background.dims) != tuple(self.sessions[0].dims):
+            self.state.issue(
+                "warning",
+                "Stored overview background not loaded",
+                f"Its size {tuple(background.dims)} differs from the sessions' "
+                f"{tuple(self.sessions[0].dims)}.",
+            )
+            return
+
+        self.overview_background = background
+        self.notify_change(C.OVERVIEW_BACKGROUND)
+
+    @staticmethod
+    def _set_overview_background_geometry(background, template, remap):
+        background.background_template = np.asarray(template, dtype=np.float32)
+        background.remap = remap
+        background.background = remap.apply_remap(
+            background.background_template, use_optical_flow=True
+        )
+        background.status["spatial_loaded"] = True
+        background.status["aligned"] = bool(remap.report.success)
+
+    def set_overview_background_alignment(self, template, remap):
+        """Apply an edited alignment to the overview background."""
+        background = getattr(self, "overview_background", None)
+
+        if background is None:
+            return
+
+        self._set_overview_background_geometry(background, template, remap)
+        # Accepted explicitly by the user.
+        background.status["aligned"] = True
+        self.notify_change(C.OVERVIEW_BACKGROUND)
+
+    def set_border_tolerance(self, value):
+        """Number of sessions a pixel may lie outside of and still count as
+        within the shared imaging border (overlay and border statistic)."""
+        value = max(0, int(value))
+        if value == self.border_tolerance:
+            return
+
+        self.border_tolerance = value
+        self.state.settings.setValue("alignment/border_tolerance", value)
+        self.notify_change(C.BORDER_SETTINGS)
+
+    def clear_overview_background(self):
+        if getattr(self, "overview_background", None) is not None:
+            self.overview_background = None
+            self.notify_change(C.OVERVIEW_BACKGROUND)
 
     def propose_background_remapping(
         self,
@@ -1309,6 +1603,12 @@ class Data(Tracking):
 
             if restored_from_catan:
                 sessions = result["sessions"]
+
+                # Remember the CATAN session file (see catan_sessions_file).
+                for index, session in enumerate(sessions):
+                    session._catan_file = source_path
+                    session._catan_file_index = index
+                    session._catan_file_revision = None
             else:
                 sessions = [SessionData(path=source_path)]
 
@@ -1395,6 +1695,15 @@ class Data(Tracking):
                 if self.state.current_session_id is None:
                     self.state.current_session_id = added_ids[0]
 
+            # Restored sessions match their file at this geometry revision.
+            for index in added_ids:
+                session = self.sessions[index]
+                if (
+                    getattr(session, "_catan_file", None) is not None
+                    and getattr(session, "_catan_file_revision", 0) is None
+                ):
+                    session._catan_file_revision = self.geometry_revision(index)
+
         return registered_ids
 
     @after_display_tasks
@@ -1417,6 +1726,17 @@ class Data(Tracking):
                 "Register a session before saving.",
             )
             return
+
+        saved_sessions = tuple(self.sessions)
+        revisions = tuple(self.geometry_revision(i) for i in range(len(saved_sessions)))
+        target = os.path.abspath(os.path.expanduser(os.fspath(path)))
+
+        def saved():
+            # These sessions can be restored from this file (as saved).
+            for index, (session, revision) in enumerate(zip(saved_sessions, revisions)):
+                session._catan_file = target
+                session._catan_file_index = index
+                session._catan_file_revision = revision
 
         try:
             snapshots = []
@@ -1450,7 +1770,106 @@ class Data(Tracking):
             str(path),
             snapshots,
             mat_version=mat_version,
+            finished=saved,
         )
+
+    def assignments_fingerprint(self, assignments=None):
+        """Hash of the saved assignment content (IDs, review status, union
+        and session inclusion, manipulations)."""
+        assignments = self.assignments if assignments is None else assignments
+        digest = hashlib.blake2b(digest_size=16)
+
+        arrays = [assignments.ids, assignments.review_status]
+
+        union = assignments.union
+        if union is not None and union.included is not None:
+            arrays.append(union.included)
+
+        arrays.extend(
+            session.included for session in self.sessions if session.included is not None
+        )
+
+        for values in arrays:
+            values = np.ascontiguousarray(values)
+            digest.update(str(values.shape).encode())
+            digest.update(values.tobytes())
+
+        digest.update(str(len(assignments.manipulations)).encode())
+        return digest.hexdigest()
+
+    def catan_sessions_file(self):
+        """CATAN session file holding exactly the current sessions (same
+        order, unchanged geometry since restoring or saving), or None."""
+        files = {getattr(session, "_catan_file", None) for session in self.sessions}
+
+        if len(files) != 1 or None in files:
+            return None
+
+        for index, session in enumerate(self.sessions):
+            if getattr(session, "_catan_file_index", None) != index or getattr(
+                session, "_catan_file_revision", None
+            ) != self.geometry_revision(index):
+                return None
+
+        return files.pop()
+
+    def assignments_provenance(self):
+        """Sessions (CATAN session file and/or loading recipe) and model file
+        used with the current assignments, stored when saving them."""
+        provenance = {}
+
+        sessions_file = self.catan_sessions_file()
+        if sessions_file:
+            provenance["sessions_file"] = sessions_file
+
+        try:
+            provenance["loading_recipe"] = json.dumps(
+                self.loading_recipe_snapshot(), ensure_ascii=False
+            )
+        except ValueError:
+            # Sessions without a source path or configuration.
+            pass
+
+        model_path = getattr(self.model, "path", None)
+        if model_path:
+            provenance["model_path"] = str(model_path)
+
+        return provenance
+
+    def _overview_background_snapshot(self):
+        """The loaded overview background, stored with saved assignments."""
+        from catan.core.structures.session_snapshot import (
+            prepare_background_snapshot,
+        )
+
+        background = getattr(self, "overview_background", None)
+        return None if background is None else prepare_background_snapshot(background)
+
+    def mark_assignments_saved(self, assignments=None, fingerprint=None):
+        assignments = self.assignments if assignments is None else assignments
+
+        if assignments is not None:
+            assignments._saved_fingerprint = (
+                self.assignments_fingerprint(assignments)
+                if fingerprint is None
+                else fingerprint
+            )
+
+    def unsaved_assignments(self):
+        """Names of assignment sets with matches changed since loading or
+        saving (never saved: any match)."""
+        names = []
+
+        for name, assignments in self._assignments.items():
+            if assignments is None or not np.any(assignments.ids >= 0):
+                continue
+
+            saved = getattr(assignments, "_saved_fingerprint", None)
+
+            if saved != self.assignments_fingerprint(assignments):
+                names.append(name)
+
+        return names
 
     @after_display_tasks
     def queue_save_result(self, key, path):
@@ -1484,7 +1903,11 @@ class Data(Tracking):
 
         try:
             prepared = (
-                source.prepare_save(sessions=tuple(self.sessions))
+                source.prepare_save(
+                    sessions=tuple(self.sessions),
+                    provenance=self.assignments_provenance(),
+                    overview_background=self._overview_background_snapshot(),
+                )
                 if key == "assignments"
                 else source.prepare_save()
             )
@@ -1496,6 +1919,19 @@ class Data(Tracking):
             )
             return
 
+        # The content written by this save; recorded once it succeeded.
+        if key == "assignments":
+            fingerprint = self.assignments_fingerprint(source)
+
+            def saved():
+                self.mark_assignments_saved(source, fingerprint)
+
+        else:
+
+            def saved():
+                # Referenced by assignments saved later.
+                source.path = os.path.abspath(os.path.expanduser(str(path)))
+
         return tasks.start(
             "saving",
             f"Saving {key}: {Path(path).name}",
@@ -1503,6 +1939,7 @@ class Data(Tracking):
             self.state,
             str(path),
             prepared,
+            finished=saved,
         )
 
     @after_display_tasks
@@ -2021,12 +2458,20 @@ class Data(Tracking):
         self.rebuild_union()
 
         self.state.assignments = self.assignments.ids
+        self.mark_assignments_saved()
 
         self.notify_change(
             C.ASSIGNMENT_SET,
             C.FOOTPRINT_GEOMETRY,
             *ASSIGNMENT_CONTENT_CHANGES,
         )
+
+        if self.assignments.path:
+            try:
+                background = read_overview_background(self.assignments.path)
+            except Exception as exc:
+                background = exc
+            self._apply_stored_overview_background(background)
 
     def queue_load_assignments(self, *, on_config_required=None):
         source = self.assignments
@@ -2173,6 +2618,15 @@ class Data(Tracking):
             if ctx is not None:
                 ctx.check_cancelled()
 
+            try:
+                candidate._overview_background = read_overview_background(
+                    source_path, ctx=ctx
+                )
+            except TaskCancelled:
+                raise
+            except Exception as exc:
+                candidate._overview_background = exc
+
             return candidate
 
         def publish(result):
@@ -2262,10 +2716,15 @@ class Data(Tracking):
                 self._current_assignments = "local"
 
             self.state.assignments = source.ids
+            self.mark_assignments_saved(source)
             self.notify_change(
                 C.ASSIGNMENT_SET,
                 C.FOOTPRINT_GEOMETRY,
                 *ASSIGNMENT_CONTENT_CHANGES,
+            )
+
+            self._apply_stored_overview_background(
+                source.__dict__.pop("_overview_background", None)
             )
 
         return tasks.start(
@@ -2768,6 +3227,14 @@ class Data(Tracking):
             ),
         )
 
+        return Data.parse_loading_recipe(document, path.parent)
+
+    @staticmethod
+    def parse_loading_recipe(document, base_directory):
+        """Recipe document -> unregistered SessionData (relative session
+        paths resolve against ``base_directory``)."""
+        path = Path(base_directory) / "recipe.json"
+
         if (
             not isinstance(document, dict)
             or document.get("type") != "catan-loading-recipe"
@@ -2888,7 +3355,7 @@ class Data(Tracking):
         align_to_reference: bool = False,
         clean_traces: bool = False,
         force_registration: bool = False,
-        p_thr=[0.3, 0.3],
+        p_thr=None,
         ctx=None,
         **kwargs,
     ):
@@ -3231,10 +3698,51 @@ class Data(Tracking):
 
         return target_neuron
 
-    def neuron_merge_distance(self, source_id, target_id):
+    def partial_union_footprint(self, neuron_id, sessions):
+        """Union footprint of a neuron built from ``sessions`` only (as
+        rebuilding the union would after removing the other footprints)."""
+        ids = self.assignments.ids
+        row = ids[neuron_id].copy()
+        keep = np.zeros(len(row), dtype=bool)
+        keep[list(sessions)] = True
+
+        try:
+            ids[neuron_id, ~keep] = -1
+            return self._build_union_footprint_for_neuron(neuron_id)
+        finally:
+            ids[neuron_id] = row
+
+    def neuron_merge_distance(self, source_id, target_id, without=()):
+        """Union centroid distance (px); ``without``: source sessions left
+        out of the source union (partial merge, resolved conflicts)."""
         assignments = self.assignments
         if assignments is None or assignments.union is None:
             return np.inf
+
+        without = [int(s) for s in without]
+
+        if without and 0 <= source_id < len(assignments.ids):
+            from catan.core.data import center_of_mass
+
+            ids = assignments.ids
+            union = assignments.union
+            row = ids[source_id].copy()
+            centroid = union.centroids[source_id].copy()
+
+            try:
+                ids[source_id, without] = -1
+
+                if not np.any(ids[source_id] >= 0):
+                    return np.inf
+
+                column = self._build_union_footprint_for_neuron(source_id)
+                union.centroids[source_id] = center_of_mass(
+                    column, *union.dims, convert=union.params.get("pxtomu", 1.0)
+                )[0]
+                return self.neuron_merge_distance(source_id, target_id)
+            finally:
+                ids[source_id] = row
+                union.centroids[source_id] = centroid
 
         union = assignments.union
         if (
@@ -3256,7 +3764,9 @@ class Data(Tracking):
         )
         return float(distance) if np.isfinite(distance) else np.inf
 
-    def prepare_manipulation(self, plan, *, detach_occupied=False):
+    def prepare_manipulation(
+        self, plan, *, detach_occupied=False, exclude_occupied=False
+    ):
         from catan.gui.data.curation_actions import prepare
 
         if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
@@ -3266,7 +3776,17 @@ class Data(Tracking):
             self,
             plan,
             detach_occupied=detach_occupied,
+            exclude_occupied=exclude_occupied,
         )
+
+    def start_manipulation_batch(self, kind):
+        """Isolated batch of split/merge plans, committed at once."""
+        from catan.gui.data.curation_actions import ManipulationBatch
+
+        if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
+            raise ValueError("Wait for current processing to finish.")
+
+        return ManipulationBatch(self, kind)
 
     def validate_prepared_manipulation(self, prepared, spec):
         from catan.gui.data.curation_actions import (
@@ -3325,10 +3845,26 @@ class Data(Tracking):
         if request.assignments is not self.assignments:
             raise ValueError("The active assignments changed. " "Start a new request.")
 
+        request.refresh()
+        if not request.is_complete:
+            raise ValueError(request.error)
+
+        target = (
+            () if request.target_id is None else (NeuronComponent(request.target_id, None),)
+        )
+
+        if target and request.moves_whole_neuron:
+            return self._apply_manipulation(
+                "neuron_merge",
+                (NeuronComponent(request.source_id, None),),
+                target,
+            )
+
+        # A part of the neuron, or into a new neuron.
         return self._apply_manipulation(
-            "neuron_merge",
-            (NeuronComponent(request.source_id, None),),
-            (NeuronComponent(request.target_id, None),),
+            "move_footprints",
+            tuple(request.origin),
+            target,
         )
 
     def reassign_footprint(self, source, target_neuron=None):

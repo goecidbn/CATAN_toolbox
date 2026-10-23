@@ -52,6 +52,12 @@ from catan.gui.data.statistics.queries import (
     linked_pair_axes,
 )
 from catan.gui.utils.popups import constrain_popup
+from catan.gui.data.statistics.session_relations import (
+    DESCRIPTIONS as RELATION_DESCRIPTIONS,
+    FOLLOWING_RELATIONS,
+    PREVIOUS_RELATIONS,
+    is_order_relation,
+)
 from catan.gui.data.assignment_colors import assignment_label
 
 
@@ -433,30 +439,55 @@ class PairFilterSelector(QToolButton):
     def _build_menu(self):
         self._filter_menu.clear()
 
-        relations = (
-            ("all", "same", "different", "with previous")
-            if self.target == "session"
-            else ("all", "same", "different")
-        )
-
-        for relation in relations:
-            action = QAction(relation, self._filter_menu)
+        def add(menu, relation, label, tooltip=None):
+            action = QAction(label, menu)
             action.setCheckable(True)
             action.setData(relation)
+
+            if tooltip:
+                action.setToolTip(tooltip)
 
             if relation == self._current_relation:
                 action.setChecked(True)
 
             self._action_group.addAction(action)
-            self._filter_menu.addAction(action)
+            menu.addAction(action)
             self._relation_actions[relation] = action
 
+        for relation in ("all", "same", "different"):
+            add(self._filter_menu, relation, relation)
+
+        if self.target == "session":
+            add(
+                self._filter_menu,
+                "with previous",
+                "with previous (s − 1)",
+                "Reference session: the directly preceding session.",
+            )
+
+            # Reference sessions from the reference neuron's detections.
+            for title, relations in (
+                ("with previous…", PREVIOUS_RELATIONS),
+                ("with following…", FOLLOWING_RELATIONS),
+            ):
+                submenu = self._filter_menu.addMenu(title)
+                submenu.setToolTipsVisible(True)
+
+                for relation, label in relations.items():
+                    add(
+                        submenu,
+                        relation,
+                        label,
+                        f"Reference session: {RELATION_DESCRIPTIONS[relation]}.",
+                    )
+
+        self._filter_menu.setToolTipsVisible(True)
         self._action_group.triggered.connect(self._on_action_triggered)
 
     def _on_action_triggered(self, action: QAction):
         relation = action.data()
 
-        if relation not in ("all", "same", "different", "with previous"):
+        if relation not in get_args(PairRelation):
             return
 
         self._current_relation = relation
@@ -464,14 +495,12 @@ class PairFilterSelector(QToolButton):
         self.filterChanged.emit()
 
     def _update_text(self):
-        if self._current_relation == "all":
-            self.setText(f"{self.target}: all")
-        elif self._current_relation == "same":
-            self.setText(f"{self.target}: same")
-        elif self._current_relation == "different":
-            self.setText(f"{self.target}: different")
+        relation = self._current_relation
+
+        if relation in ("all", "same", "different", "with previous"):
+            self.setText(f"{self.target}: {relation}")
         else:
-            self.setText(f"{self.target}: with previous")
+            self.setText(f"{self.target}: with {relation}")
 
     def current_relation(self) -> PairRelation:
         return self._current_relation
@@ -1424,6 +1453,12 @@ class StatisticQuerySelector(QWidget):
             # session_j is implied by the relation
             if relation in ("same", "with previous"):
                 return ()
+
+            # Reference sessions follow from the relation; combine them.
+            if is_order_relation(relation) and dim == "session_j":
+                return tuple(
+                    method for method in methods if method not in ("keep", "single")
+                )
 
             # all / different:
             # choose one reference session_j

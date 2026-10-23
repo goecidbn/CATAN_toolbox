@@ -20,6 +20,9 @@ from PySide6.QtWidgets import (
     QMenu,
     QInputDialog,
     QMessageBox,
+    QFormLayout,
+    QLineEdit,
+    QDialogButtonBox,
 )
 
 from catan.gui.data.curation_filter import (
@@ -43,7 +46,19 @@ from catan.gui.GUI_elements.fragments.curation_filter_group import (
 from catan.gui.GUI_elements.fragments.curation_actions_widget import (
     CuratorActions,
 )
-from catan.gui.data.curation_filter_presets import CurationFilterPresetStore
+from catan.gui.data.curation_filter_presets import (
+    CurationFilterPresetStore,
+    PRESET_CATEGORIES,
+    PRESET_CATEGORY_DESCRIPTIONS,
+    UNCATEGORIZED_LABEL,
+    suggest_category,
+)
+
+# Preset selector entry that starts an empty filter.
+NEW_PRESET_KEY = "__new__"
+
+# Target selector entry inspecting all targets of a neuron at once.
+ALL_TARGETS = "__all_targets__"
 from catan.gui.panels.helper.ReviewStatusFilter import (
     ReviewStatusFilter,
 )
@@ -632,8 +647,10 @@ class Display(QWidget):
     preset_set_default_requested = Signal()
     preset_rename_requested = Signal()
     preset_delete_requested = Signal()
+    preset_category_requested = Signal(object)
 
     binding_changed = Signal(str, str)
+    summary_changed = Signal(str, object)
 
     def __init__(self, parent, controls=None, config=None):
         super().__init__(parent)
@@ -701,6 +718,20 @@ class Display(QWidget):
         self.preset_menu.addSeparator()
         self.preset_default_action = self.preset_menu.addAction("Set as default")
         self.preset_rename_action = self.preset_menu.addAction("Rename…")
+        self.preset_category_menu = self.preset_menu.addMenu("Category")
+        self.preset_category_actions = {}
+
+        for category, label in [*PRESET_CATEGORIES.items(), (None, UNCATEGORIZED_LABEL)]:
+            action = self.preset_category_menu.addAction(label)
+            action.setCheckable(True)
+            action.setToolTip(PRESET_CATEGORY_DESCRIPTIONS.get(category, ""))
+            action.triggered.connect(
+                lambda checked=False, category=category: (
+                    self.preset_category_requested.emit(category)
+                )
+            )
+            self.preset_category_actions[category] = action
+
         self.preset_delete_action = self.preset_menu.addAction("Delete")
         self.preset_menu_button.setMenu(self.preset_menu)
 
@@ -833,9 +864,10 @@ class Display(QWidget):
         layout.addWidget(self.inspection_row)
         self.inspection_row.hide()
 
-        self.target_selector.currentIndexChanged.connect(
-            lambda: self.inspection_changed.emit()
-        )
+        # Explicit choice of "All targets" (kept across neurons).
+        self._all_targets_chosen = False
+
+        self.target_selector.currentIndexChanged.connect(self._on_target_selected)
         self.highlight_selector.currentIndexChanged.connect(
             lambda: self.inspection_changed.emit()
         )
@@ -1135,6 +1167,7 @@ class Display(QWidget):
         widget.count_changed.connect(self.count_changed)
         widget.comment_changed.connect(self.comment_changed)
         widget.binding_changed.connect(self.binding_changed)
+        widget.summary_changed.connect(self.summary_changed)
 
     def _default_format_condition(
         self,
@@ -1278,7 +1311,16 @@ class Display(QWidget):
 
         self.root_widget.set_evidence_source(source_type, source_id)
 
+    def _on_target_selected(self):
+        # Only user changes arrive here (programmatic ones are blocked).
+        self._all_targets_chosen = self.target_selector.currentData() == ALL_TARGETS
+        self.inspection_changed.emit()
+
     def set_target_inspection(self, mapping):
+        """Fill the target selector; returns the inspected target, ALL_TARGETS
+        or None. "All targets" is preselected when the user chose it, or
+        when all targets share the same sources (e.g. two footprint groups
+        of a track mismatch), where single targets show nothing new."""
         previous = self.target_selector.currentData()
 
         targets = sorted(
@@ -1286,10 +1328,17 @@ class Display(QWidget):
             key=lambda c: (c.neuron_id, -1 if c.session_id is None else c.session_id),
         )
 
+        identical = len(targets) > 1 and all(
+            mapping[target] == mapping[targets[0]] for target in targets
+        )
+
         blocked = self.target_selector.blockSignals(True)
 
         try:
             self.target_selector.clear()
+
+            if len(targets) > 1:
+                self.target_selector.addItem(f"All targets ({len(targets)})", ALL_TARGETS)
 
             for target in targets:
                 self.target_selector.addItem(
@@ -1303,7 +1352,13 @@ class Display(QWidget):
                 )
 
             if targets:
-                index = targets.index(previous) if previous in targets else 0
+                if previous in targets:
+                    index = self.target_selector.findData(previous)
+                elif len(targets) > 1 and (identical or self._all_targets_chosen):
+                    index = 0
+                else:
+                    index = self.target_selector.findData(targets[0])
+
                 self.target_selector.setCurrentIndex(index)
 
         finally:
@@ -1342,6 +1397,19 @@ class Display(QWidget):
         if key is not None:
             self.preset_selected.emit(key)
 
+    def _add_preset_header(self, text, tooltip=""):
+        """Non-selectable section title in the preset selector."""
+        self.preset_selector.addItem(text, None)
+        index = self.preset_selector.count() - 1
+        item = self.preset_selector.model().item(index)
+        item.setEnabled(False)
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+
+        if tooltip:
+            self.preset_selector.setItemData(index, tooltip, Qt.ToolTipRole)
+
     def set_preset_state(
         self,
         presets,
@@ -1349,6 +1417,7 @@ class Display(QWidget):
         current_key: str | None,
         default_key: str | None,
         dirty: bool,
+        can_edit_category: bool = False,
     ):
 
         self.preset_selector.blockSignals(True)
@@ -1358,9 +1427,32 @@ class Display(QWidget):
 
             selected_index = -1
 
+            self.preset_selector.addItem("New preset…", NEW_PRESET_KEY)
+            self.preset_selector.setItemData(
+                0, "Start an empty filter.", Qt.ToolTipRole
+            )
+
+            if current_key is None:
+                # The working filter is not saved as a preset.
+                self.preset_selector.addItem("Unsaved preset", None)
+                selected_index = self.preset_selector.count() - 1
+
+            # Presets arrive sorted by category, then name.
+            section = object()
+
             for preset in presets:
 
-                text = preset.name
+                category = preset.category if preset.category in PRESET_CATEGORIES else None
+
+                if category != section:
+                    section = category
+                    self.preset_selector.insertSeparator(self.preset_selector.count())
+                    self._add_preset_header(
+                        PRESET_CATEGORIES.get(category, UNCATEGORIZED_LABEL),
+                        PRESET_CATEGORY_DESCRIPTIONS.get(category, ""),
+                    )
+
+                text = "    " + preset.name
                 tooltip = []
                 if preset.source == "builtin":
                     text = f"{text} [CATAN]"
@@ -1401,11 +1493,19 @@ class Display(QWidget):
 
         writable = current_info is not None and current_info.writable
 
-        self.preset_save_action.setEnabled(writable and dirty)
+        # Built-in presets: editable installations only (same as categories).
+        self.preset_save_action.setEnabled(can_edit_category and dirty)
         self.preset_revert_action.setEnabled(current_info is not None and dirty)
         self.preset_default_action.setEnabled(current_info is not None)
         self.preset_rename_action.setEnabled(writable)
-        self.preset_delete_action.setEnabled(writable)
+        # Built-in presets: editable installations only (same as categories).
+        self.preset_delete_action.setEnabled(can_edit_category)
+
+        self.preset_category_menu.setEnabled(can_edit_category)
+        category = None if current_info is None else current_info.category
+
+        for key, action in self.preset_category_actions.items():
+            action.setChecked(current_info is not None and key == category)
 
     def clear_evaluation_errors(self):
 
@@ -1458,6 +1558,7 @@ class Controller(BasePlot.ControlsController):
 
         self.menu.node_move_requested.connect(self._move_filter_node)
         self.menu.binding_changed.connect(self._set_group_binding)
+        self.menu.summary_changed.connect(self._set_group_summary)
 
         self.menu.clear_results_button.clicked.connect(self._clear_results)
         self.menu.review_filter.changed.connect(self._on_review_filter_changed)
@@ -1470,6 +1571,7 @@ class Controller(BasePlot.ControlsController):
         self.menu.preset_set_default_requested.connect(self._set_filter_preset_default)
         self.menu.preset_rename_requested.connect(self._rename_filter_preset)
         self.menu.preset_delete_requested.connect(self._delete_filter_preset)
+        self.menu.preset_category_requested.connect(self._set_filter_preset_category)
 
         self.state.focused_component_changed.connect(self._on_focused_component_changed)
 
@@ -1502,6 +1604,7 @@ class Controller(BasePlot.ControlsController):
             "target",
             "between_sources",
             "between_targets",
+            "between_sources_targets",
         ):
             return
             # raise ValueError(binding)
@@ -1512,6 +1615,18 @@ class Controller(BasePlot.ControlsController):
             return
 
         group.apply_to = binding
+        self._mark_dirty()
+
+    def _set_group_summary(self, group_id: str, summary):
+        if summary not in (None, "median", "mean", "min", "max"):
+            return
+
+        group = self._find_group(group_id)
+
+        if group is None or group.summary == summary:
+            return
+
+        group.summary = summary
         self._mark_dirty()
 
     def _set_group_comment(self, group_id: str, comment: str):
@@ -2006,6 +2121,19 @@ class Controller(BasePlot.ControlsController):
                 return
 
     def _on_focused_component_changed(self):
+        focused = self.state.focused_component
+        neuron = None if focused is None else int(focused.neuron_id)
+
+        # A source/target view (possibly edited by Ctrl-clicks) stays
+        # until another neuron is focused.
+        if (
+            neuron is not None
+            and neuron == getattr(self, "_evidence_neuron", None)
+            and self.state.highlight_roles
+        ):
+            return
+
+        self._evidence_neuron = neuron
         self._update_evidence_highlight()
 
     def _display_components(self, endpoints):
@@ -2078,18 +2206,25 @@ class Controller(BasePlot.ControlsController):
                 self.menu.evidence_label.setText("No matching target in this group.")
                 return
 
-            sources = mapping[target]
-            source_neurons = {c.neuron_id for c in sources}
-
-            showing = self._highlight_endpoints(sources, {target})
-
-            self.menu.evidence_label.setText(
-                f"Target n{target.neuron_id}"
-                + (
+            if target == ALL_TARGETS:
+                targets = set(mapping)
+                sources = set().union(*mapping.values())
+                described = f"All {len(targets)} targets of n{neuron_id}"
+            else:
+                targets = {target}
+                sources = mapping[target]
+                described = f"Target n{target.neuron_id}" + (
                     ""
                     if target.session_id is None
                     else f", session {target.session_id}"
                 )
+
+            source_neurons = {c.neuron_id for c in sources}
+
+            showing = self._highlight_endpoints(sources, targets)
+
+            self.menu.evidence_label.setText(
+                described
                 + f": {showing}. Sources: "
                 + f"{len(source_neurons)} neurons, "
                 + f"{sum(c.session_id is not None for c in sources)} "
@@ -2278,7 +2413,118 @@ class Controller(BasePlot.ControlsController):
             self._refresh_preset_controls()
             return
 
+        if key == NEW_PRESET_KEY:
+            self._new_filter_preset()
+            return
+
         self._load_filter_preset(key)
+
+    def _new_filter_preset(self):
+        """Empty, unsaved filter (save it with "Save as…")."""
+        self.filter_store.new_working_preset()
+
+        self.root_filter = self.filter_store.working_filter
+
+        self._clear_results()
+
+        self._evidence_source = (
+            "group",
+            self.root_filter.id,
+        )
+
+        self.state.update_highlighted_components(None)
+        self.menu.set_evidence_status(None)
+
+        self._rerender()
+        self._refresh_preset_controls()
+
+    def _set_filter_preset_category(self, category):
+        key = self.filter_store.working_preset_key
+
+        if key is None:
+            return
+
+        try:
+            self.filter_store.set_preset_category(key, category)
+        except Exception as exc:
+            QMessageBox.warning(self.menu, "Could not change category", str(exc))
+
+        self._refresh_preset_controls()
+
+    def _ask_preset_name_and_category(self, title, name="", *, ignore_key=None):
+        """(name, category) or None; the category defaults to the current
+        preset's, else the one suggested by the filter's manipulations.
+        Names of other presets (``ignore_key`` excepted) are refused."""
+        info = self.filter_store.preset_info(self.filter_store.working_preset_key)
+        category = (
+            info.category
+            if info is not None and info.category is not None
+            else suggest_category(self.root_filter)
+        )
+
+        dialog = QDialog(self.menu)
+        dialog.setWindowTitle(title)
+        form = QFormLayout(dialog)
+
+        name_edit = QLineEdit(name)
+        form.addRow("Preset name:", name_edit)
+
+        category_box = QComboBox()
+        for key, label in [*PRESET_CATEGORIES.items(), (None, UNCATEGORIZED_LABEL)]:
+            category_box.addItem(label, key)
+            category_box.setItemData(
+                category_box.count() - 1,
+                PRESET_CATEGORY_DESCRIPTIONS.get(key, ""),
+                Qt.ToolTipRole,
+            )
+        category_box.setCurrentIndex(max(0, category_box.findData(category)))
+        form.addRow("Category:", category_box)
+
+        error = QLabel("")
+        error.setStyleSheet("color: #ffb36b;")
+        error.setWordWrap(True)
+        error.hide()
+        form.addRow(error)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+
+        def accept():
+            text = name_edit.text().strip()
+
+            if not text:
+                message = "Enter a name."
+            else:
+                conflict = self.filter_store.name_conflict(text, ignore_key=ignore_key)
+                message = (
+                    None
+                    if conflict is None
+                    else f"The name is already used by {conflict.name!r}"
+                    + (" (CATAN preset)" if conflict.source == "builtin" else "")
+                    + ". Choose another name."
+                )
+
+            if message is None:
+                dialog.accept()
+            else:
+                error.setText(message)
+                error.show()
+
+        buttons.accepted.connect(accept)
+        buttons.rejected.connect(dialog.reject)
+        name_edit.textChanged.connect(lambda _: error.hide())
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        name = name_edit.text().strip()
+
+        if not name:
+            return None
+
+        return name, category_box.currentData()
 
     def _refresh_preset_controls(self):
 
@@ -2287,6 +2533,9 @@ class Controller(BasePlot.ControlsController):
             current_key=(self.filter_store.working_preset_key),
             default_key=(self.filter_store.default_preset_key),
             dirty=(self.filter_store.working_dirty),
+            can_edit_category=self.filter_store.can_edit_category(
+                self.filter_store.working_preset_key
+            ),
         )
 
     def _confirm_discard_filter_changes(self) -> bool:
@@ -2321,42 +2570,21 @@ class Controller(BasePlot.ControlsController):
 
     def _save_filter_preset_as(self):
 
-        name, accepted = QInputDialog.getText(
-            self.menu, "Save filter preset", "Preset name:"
+        current = self.filter_store.working_preset_key
+
+        # Saving under the current user preset's own name equals "Save".
+        answer = self._ask_preset_name_and_category(
+            "Save filter preset",
+            ignore_key=current if current is not None and current.startswith("user:") else None,
         )
 
-        if not accepted:
+        if answer is None:
             return
 
-        name = name.strip()
-
-        if not name:
-            return
+        name, category = answer
 
         try:
-            self.filter_store.save_working_as(name, overwrite=True)
-
-        except FileExistsError:
-
-            overwrite = QMessageBox.question(
-                self.menu,
-                "Preset already exists",
-                f"A preset named {name!r} " "already exists. Overwrite it?",
-                (QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No),
-                QMessageBox.StandardButton.No,
-            )
-
-            if overwrite != QMessageBox.StandardButton.Yes:
-                return
-
-            # Existing helper already supports overwrite,
-            # so use the underlying method here.
-            key = self.filter_store.save_user_preset(
-                name=name, root=self.root_filter, overwrite=True
-            )
-
-            self.filter_store._working_preset_key = key
-            self.filter_store._working_dirty = False
+            self.filter_store.save_working_as(name, overwrite=True, category=category)
 
         except Exception as exc:
 
@@ -2367,38 +2595,28 @@ class Controller(BasePlot.ControlsController):
         self._refresh_preset_controls()
 
     def _save_builtin_filter_preset(self):
-        info = self.filter_store.preset_info(self.filter_store.working_preset_key)
-        name, accepted = QInputDialog.getText(
-            self.menu,
+        key = self.filter_store.working_preset_key
+        info = self.filter_store.preset_info(key)
+
+        # The working preset itself may be replaced (a user preset moves).
+        answer = self._ask_preset_name_and_category(
             "Save as CATAN preset",
-            "Preset name:",
-            text=info.name if info is not None else "",
+            info.name if info is not None else "",
+            ignore_key=key,
         )
 
-        if not accepted or not name.strip():
+        if answer is None:
             return
 
-        name = name.strip()
+        name, category = answer
 
         try:
-            try:
-                self.filter_store.save_working_as_builtin(name)
-            except FileExistsError:
-                answer = QMessageBox.question(
-                    self.menu,
-                    "Replace CATAN preset?",
-                    f"A built-in preset with this filename already exists "
-                    f"for {name!r}.\n\nReplace it?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
-
-                self.filter_store.save_working_as_builtin(
-                    name,
-                    overwrite=True,
-                )
+            self.filter_store.save_working_as_builtin(
+                name,
+                overwrite=info is not None and self.filter_store._slug(name)
+                == self.filter_store._split_key(key)[1],
+                category=category,
+            )
 
         except Exception as exc:
             QMessageBox.warning(
@@ -2482,13 +2700,19 @@ class Controller(BasePlot.ControlsController):
 
         info = self.filter_store.preset_info(key)
 
-        if info is None or not info.writable:
+        if info is None or not self.filter_store.can_edit_category(key):
             return
 
         answer = QMessageBox.question(
             self.menu,
             "Delete filter preset",
-            f"Delete preset {info.name!r}?",
+            f"Delete preset {info.name!r}?"
+            + (
+                "\n\nThis is a built-in CATAN preset: its file in the "
+                "package is deleted."
+                if not info.writable
+                else ""
+            ),
             (QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel),
             QMessageBox.StandardButton.Cancel,
         )

@@ -37,6 +37,11 @@ from catan.gui.background_tasks.runtime import (
     current_task_context,
     TaskCancelled,
 )
+from catan.gui.GUI_elements.fragments.alignment_correlation_inset import (
+    AlignmentCorrelationInset,
+    background_correlation_matrix,
+    session_background_inputs,
+)
 from catan.gui.GUI_elements.fragments.alignment_shift_inset import (
     AlignmentShiftInset,
 )
@@ -184,7 +189,8 @@ class ManualAlignmentEditor(QWidget):
         self.reference = QComboBox(self)
         self._references = []
         self._reference_session_ids = []
-        self._populate_references()
+
+        self._populate_references(self._pending_reference(draft, -1))
 
         self.reference.setToolTip(
             "Changes the visual comparison only; "
@@ -583,10 +589,26 @@ class ManualAlignmentEditor(QWidget):
         self.shift_inset.interaction_started.connect(self._hover_timer.stop)
         self.shift_inset.focus_released.connect(self._release_inset_focus)
 
-        show_shifts = QCheckBox("Show shift inset", self.options)
-        show_shifts.setChecked(True)
-        show_shifts.toggled.connect(self.shift_inset.setVisible)
-        form.addRow(show_shifts)
+        self.correlation_inset = AlignmentCorrelationInset(self.canvas.native)
+        self.correlation_inset.chosen.connect(self._choose_correlation_pair)
+        self.correlation_inset.hide()
+        self._session_correlation_task_id = None
+
+        # Inset: mean shifts (editable) or the session × session raster of
+        # background correlations; the choice is remembered.
+        self.inset_mode = QComboBox(self.options)
+        self.inset_mode.addItem("Mean shifts", "shifts")
+        self.inset_mode.addItem("Session correlations", "correlations")
+        self.inset_mode.addItem("None", "none")
+        self.inset_mode.setToolTip(
+            "Mean shifts: each session's mean displacement (editable). Session "
+            "correlations: correlation of all pairs of aligned backgrounds; "
+            "click a cell to compare that pair."
+        )
+        saved = self.state.settings.value("alignment/inset", "shifts", type=str)
+        self.inset_mode.setCurrentIndex(max(0, self.inset_mode.findData(saved)))
+        self.inset_mode.currentIndexChanged.connect(self._on_inset_mode_changed)
+        form.addRow("Inset", self.inset_mode)
 
         self.pair_shift_status = QLabel(self.options)
         self.pair_shift_status.setWordWrap(True)
@@ -599,7 +621,7 @@ class ManualAlignmentEditor(QWidget):
         form.addRow(self.recalculate_pair_shifts)
 
         self._refresh_shift_inset(fit=True)
-        self.shift_inset.show()
+        self._apply_inset_mode()
 
         self._correlation_drag = None
         self._correlation_mouse_connections = (
@@ -637,6 +659,8 @@ class ManualAlignmentEditor(QWidget):
                 self.state.data_changed,
                 self._on_pair_shift_data_changed,
             ),
+            (self.state.data_changed, self._on_correlation_data_changed),
+            (self.state.current_session_changed, self._update_correlation_current),
         )
         for signal, slot in self._connections:
             signal.connect(slot)
@@ -694,7 +718,7 @@ class ManualAlignmentEditor(QWidget):
         margin = 8
         available_width = max(1, self.canvas.native.width() - 2 * margin)
 
-        self.options.setMaximumWidth(min(280, available_width))
+        self.options.setMaximumWidth(min(300, available_width))
         self.options.adjustSize()
         self.options.move(
             max(
@@ -703,11 +727,12 @@ class ManualAlignmentEditor(QWidget):
             ),
             margin,
         )
-        self.options.raise_()
 
         # Keep it inside the plotting area, clear of the left axis.
         self.shift_inset.move(75, 8)
         self.shift_inset.raise_()
+        self.correlation_inset.move(75, 8)
+        self.correlation_inset.raise_()
 
         self.shift_controls.adjustSize()
         self.shift_controls.move(
@@ -741,6 +766,10 @@ class ManualAlignmentEditor(QWidget):
         )
         self.status_label.raise_()
 
+        # The options panel expands downwards over the shift controls:
+        # keep it on top.
+        self.options.raise_()
+
     def _update_comparison_label(self, draft, reference_id):
         if reference_id is None:
             reference = "own background"
@@ -754,6 +783,16 @@ class ManualAlignmentEditor(QWidget):
             f"S{draft.session_id} ↔ {reference}" f"{deformation}{suffix}"
         )
         self._position_options()
+
+    def _pending_reference(self, draft, default):
+        """Reference chosen for ``draft``'s session in the session-correlation
+        inset (consumed), else ``default``."""
+        pending = getattr(self.state, "alignment_pending_reference", None)
+        if pending is None or draft.external or pending[0] != draft.session_id:
+            return default
+
+        self.state.alignment_pending_reference = None
+        return pending[1]
 
     def _populate_references(self, preferred_id=-1):
         previous = self.reference.blockSignals(True)
@@ -771,7 +810,11 @@ class ManualAlignmentEditor(QWidget):
                 self._reference_session_ids.append(session_id)
 
             add(
-                "Current geometry of this session",
+                (
+                    "Current geometry of the overview background"
+                    if self.draft.external
+                    else "Current geometry of this session"
+                ),
                 self.draft.session.background,
             )
 
@@ -806,6 +849,7 @@ class ManualAlignmentEditor(QWidget):
 
         index = self.reference.currentIndex()
         preferred_id = self._reference_session_ids[index] if index >= 0 else -1
+        preferred_id = self._pending_reference(draft, preferred_id)
 
         self._clear_hover(render=False)
         self._score_cache.clear()
@@ -835,6 +879,7 @@ class ManualAlignmentEditor(QWidget):
             widget.blockSignals(previous)
 
         self._populate_references(preferred_id)
+        self._update_correlation_current()
         self._sync_from_draft()
 
     def _comparison_context(self):
@@ -1029,6 +1074,8 @@ class ManualAlignmentEditor(QWidget):
                         },
                         use_optical_flow=True,
                         max_shift=max_shift,
+                        # Independent comparison: shown, not committed.
+                        require_confirmation=False,
                     )
 
                     check_cancelled()
@@ -1275,6 +1322,112 @@ class ManualAlignmentEditor(QWidget):
 
     def _on_reference_changed(self, *_):
         self._clear_hover()
+
+    # ------------------------------------------------------------------
+    # Inset selection; session-correlation raster
+    # ------------------------------------------------------------------
+
+    def _on_inset_mode_changed(self, *_):
+        self.state.settings.setValue("alignment/inset", self.inset_mode.currentData())
+        self._apply_inset_mode()
+
+    def _apply_inset_mode(self):
+        mode = self.inset_mode.currentData()
+        self.shift_inset.setVisible(mode == "shifts")
+        self.correlation_inset.setVisible(mode == "correlations")
+        for widget in (self.pair_shift_status, self.recalculate_pair_shifts):
+            widget.setVisible(mode == "shifts")
+
+        if mode == "correlations":
+            self._refresh_session_correlations()
+
+    def _session_correlation_key(self):
+        return tuple(
+            (
+                id(session),
+                id(session.remap),
+                id(session.background),
+                bool(session.status.get("aligned", False)),
+            )
+            for session in self.data.sessions
+        )
+
+    def _refresh_session_correlations(self):
+        if self._disposed or self.inset_mode.currentData() != "correlations":
+            return
+
+        key = self._session_correlation_key()
+        cached = getattr(self.data, "_session_correlation_cache", None)
+
+        if cached is not None and cached[0] == key:
+            self._show_session_correlations(cached[1])
+            return
+
+        if self._session_correlation_task_id is not None:
+            return
+
+        sessions = tuple(self.data.sessions)
+        images, masks = session_background_inputs(sessions)
+        self.correlation_inset.set_message("Calculating session correlations…")
+
+        def calculate():
+            return background_correlation_matrix(images, masks)
+
+        def ready(result):
+            self._session_correlation_task_id = None
+            if self._disposed:
+                return
+            # Kept on the data object: editors are recreated per session.
+            self.data._session_correlation_cache = (key, result)
+            if self._session_correlation_key() == key:
+                self._show_session_correlations(result)
+            else:
+                self._refresh_session_correlations()
+
+        self._session_correlation_task_id = self.state.tasks.start(
+            "calculating",
+            "Session background correlations",
+            calculate,
+            on_result=ready,
+            background=True,
+        )
+
+    def _show_session_correlations(self, result):
+        correlation, overlap = result
+        sessions = self.data.sessions
+        self.correlation_inset.set_matrix(
+            correlation,
+            overlap,
+            [f"S{index} {session.name}" for index, session in enumerate(sessions)],
+            outdated=[
+                index
+                for index in range(len(sessions))
+                if self.data.alignment_is_stale(index)
+            ],
+            current=None if self.draft.external else self.draft.session_id,
+        )
+
+    def _on_correlation_data_changed(self, event=None):
+        if self.inset_mode.currentData() == "correlations":
+            self._refresh_session_correlations()
+
+    def _update_correlation_current(self, *_):
+        if not self.draft.external:
+            self.correlation_inset.set_current(self.draft.session_id)
+
+    def _choose_correlation_pair(self, row, column):
+        later, earlier = max(row, column), min(row, column)
+
+        if not self.draft.external and later == self.draft.session_id:
+            if earlier in self._reference_session_ids:
+                self.reference.setCurrentIndex(
+                    self._reference_session_ids.index(earlier)
+                )
+            return
+
+        # Align the later session; its editor selects the earlier one.
+        self.state.alignment_pending_reference = (later, earlier)
+        self.state.current_session_id = later
 
     @staticmethod
     def _normalize(image):
@@ -2073,10 +2226,16 @@ class ManualAlignmentEditor(QWidget):
         elif previewing_other:
             message = (
                 f"Previewing session {self._hover_context[0].session_id}. "
-                f"Draft remains session {self.draft.session_id}."
+                + (
+                    "Draft remains the overview background."
+                    if self.draft.external
+                    else f"Draft remains session {self.draft.session_id}."
+                )
             )
         elif not available:
             message = "Waiting for background tasks to finish."
+        elif self.draft.external:
+            message = f"Editing the overview background: {self.draft.session.name}"
         else:
             message = (
                 f"Editing session {self.draft.session_id}: "
@@ -2105,7 +2264,10 @@ class ManualAlignmentEditor(QWidget):
         review = self.state.alignment_review
         reviewing = review is not None and review["session"] is self.draft.session
 
-        needs_acceptance = reviewing or not self.draft.session.status["aligned"]
+        # The overview background is never reviewed, accepted or removed.
+        needs_acceptance = not self.draft.external and (
+            reviewing or not self.draft.session.status["aligned"]
+        )
         self.apply_button.setText(
             "Use alignment" if needs_acceptance else "Apply changes"
         )
@@ -2143,7 +2305,7 @@ class ManualAlignmentEditor(QWidget):
 
         self.remove_button.setVisible(needs_acceptance)
         self.remove_button.setEnabled(available)
-        self.later_button.setVisible(reviewing)
+        self.later_button.setVisible(reviewing and not self.draft.external)
         self.later_button.setEnabled(idle)
 
     def _review_later(self):
@@ -2236,6 +2398,13 @@ class ManualAlignmentEditor(QWidget):
 
         if self.draft.is_current(self.data):
             self.draft.values[:] = self.draft.initial
+        elif self.draft.external:
+            background = getattr(self.data, "overview_background", None)
+            if background is None:
+                return
+            self.state.alignment_draft = AlignmentDraft(
+                self.data, None, session=background
+            )
         else:
             self.state.alignment_draft = AlignmentDraft(
                 self.data, self.draft.session_id
@@ -2268,6 +2437,9 @@ class ManualAlignmentEditor(QWidget):
 
         self._cancel_score_task()
         self._score_result = None
+        if self._session_correlation_task_id is not None:
+            self.state.tasks.cancel(self._session_correlation_task_id)
+            self._session_correlation_task_id = None
         for signal, slot in self._connections:
             signal.disconnect(slot)
 
@@ -2975,6 +3147,48 @@ def select_alignment_draft(data, session_id, parent=None, *, proposal=None):
     return draft
 
 
+def select_overview_background_draft(data, parent=None):
+    """Draft for the overview background (see Data.overview_background)."""
+    state = data.state
+    background = getattr(data, "overview_background", None)
+    old = state.alignment_draft
+
+    if background is None:
+        return None
+
+    if (
+        old is not None
+        and getattr(old, "external", False)
+        and old.session is background
+    ):
+        return old
+
+    tasks = state.tasks
+    if tasks.processing_busy() or tasks.processing_requested:
+        state.issue(
+            "warning",
+            "Alignment editor",
+            "Finish or cancel existing tasks first.",
+        )
+        return None
+
+    if old is not None and old.dirty:
+        answer = QMessageBox.question(
+            parent,
+            "Replace alignment draft?",
+            "Discard the unapplied alignment changes and start a new draft?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return None
+
+    draft = AlignmentDraft(data, None, session=background)
+    state.alignment_draft = draft
+    state.alignment_draft_changed.emit()
+    return draft
+
+
 class ManualAlignmentDialog(QDialog):
     def __init__(self, data, draft, parent=None):
         super().__init__(parent)
@@ -3013,8 +3227,14 @@ class ManualAlignmentDialog(QDialog):
         self.setWindowTitle(f"Manual alignment — {draft.session.name}")
 
 
-def open_manual_alignment(data, session_id, parent=None, *, failure_reason=None):
-    draft = select_alignment_draft(data, session_id, parent)
+def open_manual_alignment(
+    data, session_id, parent=None, *, failure_reason=None, overview_background=False
+):
+    draft = (
+        select_overview_background_draft(data, parent)
+        if overview_background
+        else select_alignment_draft(data, session_id, parent)
+    )
     if draft is None:
         return
 
@@ -3028,6 +3248,11 @@ def open_manual_alignment(data, session_id, parent=None, *, failure_reason=None)
     try:
         if dialog.exec() == QDialog.DialogCode.Accepted:
             draft = dialog.editor.draft
+            if draft.external:
+                data.set_overview_background_alignment(
+                    draft.template, dialog.result_remap
+                )
+                return
             data.queue_commit_session_realignment(
                 draft.session_id,
                 background_template=draft.template,

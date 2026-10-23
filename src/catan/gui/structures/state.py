@@ -102,6 +102,8 @@ class AppState(QObject):
         self._adjacency_radius = 15.0
 
         self.alignment_draft = None
+        # (session_id, reference_id) chosen in the session-correlation inset.
+        self.alignment_pending_reference = None
         self.alignment_panels = WeakSet()
         self.alignment_review = None
 
@@ -217,6 +219,11 @@ class AppState(QObject):
             dialog.setDefaultButton(stay_button)
             dialog.setEscapeButton(stay_button)
 
+            from catan.gui.GUI_elements.utils.menu_creation import (
+                fit_message_box_buttons,
+            )
+
+            fit_message_box_buttons(dialog)
             dialog.exec()
             accepted = dialog.clickedButton() is ok_button
             dialog.deleteLater()
@@ -426,6 +433,33 @@ class AppState(QObject):
 
         if isinstance(components, NeuronComponent):
             components = [components]
+
+        if (
+            "Control" in modifiers
+            and roles is None
+            and self.highlight_roles
+            and components is not None
+        ):
+            # Source/target view: Ctrl-click cycles a component's role,
+            # not highlighted -> source -> target -> not highlighted.
+            # The view ends when nothing remains highlighted.
+            highlighted_components = list(self._highlighted_components or ())
+            roles = dict(self.highlight_roles)
+
+            for component in components:
+                if component not in highlighted_components:
+                    highlighted_components.append(component)
+                    roles[component] = "source"
+                elif roles.get(component) == "source":
+                    roles[component] = "target"
+                else:
+                    highlighted_components.remove(component)
+                    roles.pop(component, None)
+
+            # Components without a role keep none (plain highlight).
+            max_components = None
+            components = highlighted_components
+            modifiers = ()
 
         if "Control" in modifiers:
 

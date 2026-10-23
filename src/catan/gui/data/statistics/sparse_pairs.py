@@ -11,6 +11,8 @@ from copy import deepcopy
 
 import numpy as np
 
+from .session_relations import NEURON_RELATIONS, is_order_relation, relation_mask
+
 
 def only_kept_axes(query):
     return all(
@@ -64,7 +66,11 @@ def selection_upper_bound(select_values, limit, samples=4097):
 class SparsePairCollector:
     """Collects selected values at physical pair coordinates."""
 
-    def __init__(self, names, dims, aliases, references, n, s, query, select_values):
+    def __init__(
+        self, names, dims, aliases, references, n, s, query, select_values, ids=None
+    ):
+        from .session_relations import DetectionReference
+
         self.names = names
         self.dims = dims
         self.aliases = aliases
@@ -101,11 +107,20 @@ class SparsePairCollector:
                 continue
 
             if f.relation not in ("all", "same", "different") and not (
-                f.relation == "with previous" and f.target == "session"
+                f.target == "session"
+                and (f.relation == "with previous" or is_order_relation(f.relation))
             ):
                 raise ValueError(f"Unsupported {f.target} relation: {f.relation}")
 
             self.relations[f.target] = f.relation
+
+        # Detections of reference neurons for neuron-dependent relations.
+        self.detection = None
+
+        if self.relations.get("session") in NEURON_RELATIONS:
+            if ids is None:
+                raise ValueError("Neuron-dependent session relations need assignments.")
+            self.detection = DetectionReference(ids)
 
         self.values, self.positions = [], []
 
@@ -124,7 +139,9 @@ class SparsePairCollector:
         result[self.domain(name)] = True
         return result
 
-    def related(self, target, left, right):
+    def related(self, target, left, right, neurons=None):
+        """Relation mask. Without ``neurons``, a neuron-dependent session
+        relation cannot be decided and passes (a prefilter only)."""
         relation = self.relations.get(target, "all")
 
         if relation == "same":
@@ -133,6 +150,10 @@ class SparsePairCollector:
             return left != right
         if relation == "with previous":
             return right == left - 1
+        if is_order_relation(relation):
+            if relation in NEURON_RELATIONS and neurons is None:
+                return np.ones(np.broadcast(left, right).shape, dtype=bool)
+            return relation_mask(relation, left, right, neurons, self.detection)
         return np.ones(np.broadcast(left, right).shape, dtype=bool)
 
     def emit(self, physical, values):
@@ -140,11 +161,14 @@ class SparsePairCollector:
         values = np.asarray(values, dtype=np.float32)
         keep = ~np.isnan(values)
 
+        reference = physical.get("neuron_j", physical.get("neuron"))
+
         for target in self.relations:
             keep &= self.related(
                 target,
                 physical[target + "_i"],
                 physical[target + "_j"],
+                neurons=reference,
             )
 
         positions = {}

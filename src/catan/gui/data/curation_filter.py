@@ -17,6 +17,10 @@ from catan.gui.panels.helper.Threshold import ThresholdSpec
 from catan.gui.data.curation_actions import ManipulationSpec
 
 FilterOperator = Literal["and", "or"]
+
+# Subgroup bindings comparing partners of the parent's relationships.
+BETWEEN_BINDINGS = ("between_sources", "between_targets", "between_sources_targets")
+PAIR_SUMMARIES = ("median", "mean", "min", "max")
 FilterMatchLevel = Literal[
     "neuron", "footprint", "reassignment", "neuron_pair", "relationship"
 ]
@@ -122,8 +126,15 @@ class CurationFilterGroup:
         "target",
         "between_sources",
         "between_targets",
+        "between_sources_targets",
     ] = "same"
     manipulation: ManipulationSpec | None = None
+
+    # Between-partner subgroups: combine each condition's values over all
+    # partner pairs of a target neuron (median / mean / min / max) and
+    # threshold the result. None: largest mutually compatible partner set
+    # (between sources / between targets only).
+    summary: Literal["median", "mean", "min", "max"] | None = None
 
     # None means all statuses; an empty tuple means none.
     review_statuses: tuple[int, ...] | None = None
@@ -785,6 +796,148 @@ class CurationFilterEvaluator:
             target_evidence=pair_target_evidence(selected_pairs),
         )
 
+    @staticmethod
+    def _summary_pairs(binding, sources, targets):
+        """Partner pairs of one target neuron compared by a summary group."""
+        if binding == "between_sources_targets":
+            return [
+                RelationshipMatch(source, target)
+                for source in sources
+                for target in targets
+                if source != target
+            ]
+
+        members = sources if binding == "between_sources" else targets
+
+        # Both orientations: directional statistics stay well defined.
+        return [RelationshipMatch(a, b) for a in members for b in members if a != b]
+
+    def _pair_values(self, condition, pairs):
+        """Statistic values of explicit pairs: {RelationshipMatch: value}.
+
+        Pairs without a value (e.g. not computable) are missing.
+        """
+        if not condition.threshold.active:
+            raise CurationFilterError(
+                "Curation filter condition has no active threshold."
+            )
+
+        if not self.engine.supports_requested_pairs(condition.query):
+            raise CurationFilterError(
+                "Pair summaries need a statistic supporting requested pairs, "
+                "with all identities kept or fixed."
+            )
+
+        if not pairs:
+            return {}
+
+        rows = np.array(
+            [
+                (
+                    pair.source.neuron_id,
+                    pair.target.neuron_id,
+                    -1 if pair.source.session_id is None else pair.source.session_id,
+                    -1 if pair.target.session_id is None else pair.target.session_id,
+                )
+                for pair in pairs
+            ],
+            dtype=np.int64,
+        )
+
+        table = self.engine.evaluate_matching_table(
+            condition.query,
+            lambda values: np.ones(np.shape(values), dtype=bool),
+            requested_pairs=rows,
+        )
+
+        if table is None:
+            raise CurationFilterError("No statistic is available for this condition.")
+
+        endpoints = self._row_endpoints(table, np.arange(table.n_rows, dtype=np.intp))
+        values = np.asarray(table.values, dtype=np.float64)
+
+        return {
+            RelationshipMatch(source, target): float(value)
+            for (source, target), value in zip(endpoints, values)
+            if np.isfinite(value)
+        }
+
+    def _apply_summary_groups(self, result, groups):
+        """Keep target neurons whose partner pairs pass every summary group.
+
+        Per target neuron of the surviving relationships, each condition is
+        evaluated on all pairs of its scope (between sources / between
+        targets / between sources and targets); its values are combined
+        by the group's summary and the threshold applies to that value.
+        Scopes without any value fail.
+        """
+        if result.match_level != "relationship":
+            raise CurationFilterError(
+                "Between-partner summaries need a source-target parent."
+            )
+
+        reduce = {
+            "median": np.median,
+            "mean": np.mean,
+            "min": np.min,
+            "max": np.max,
+        }
+
+        members = {}
+
+        for pair in result.matches:
+            sources, targets = members.setdefault(pair.target.neuron_id, (set(), set()))
+            sources.add(pair.source)
+            targets.add(pair.target)
+
+        passed = set(members)
+
+        for group in groups:
+            if (
+                group.operator != "and"
+                or group.match_level != "relationship"
+                or group.count is not None
+                or any(not is_filter_condition(c) for c in group.children)
+            ):
+                raise CurationFilterError(
+                    "Use an AND source-target group with conditions and no "
+                    "count for between-partner summaries.",
+                    node_id=group.id,
+                    node_type="group",
+                )
+
+            scopes = {
+                neuron: self._summary_pairs(group.apply_to, *members[neuron])
+                for neuron in passed
+            }
+            pairs = {pair for scope in scopes.values() for pair in scope}
+
+            for condition in group.children:
+                try:
+                    values = self._pair_values(condition, pairs)
+                except CurationFilterError as exc:
+                    exc.attach_node(condition.id, "condition")
+                    raise
+
+                for neuron in list(passed):
+                    scope = [values[p] for p in scopes[neuron] if p in values]
+
+                    if not scope or not bool(
+                        condition.threshold.mask(
+                            np.array([reduce[group.summary](scope)])
+                        )[0]
+                    ):
+                        passed.discard(neuron)
+
+        selected = {pair for pair in result.matches if pair.target.neuron_id in passed}
+
+        return replace(
+            result,
+            matches=selected,
+            evidence_by_match={pair: result.evidence_by_match[pair] for pair in selected},
+            target_evidence=pair_target_evidence(selected),
+        )
+
     def _record_support_inspection(self, groups, pairs):
         mapping = pair_target_evidence(pairs)
 
@@ -803,7 +956,17 @@ class CurationFilterEvaluator:
         *,
         initial_pairs=None,
         initial_kinds=None,
+        endpoint_domain=None,
     ) -> CurationFilterGroupResult:
+        """``endpoint_domain``: footprints for which this group's result must
+        be exact (a source subgroup only checks the parent's sources). Other
+        footprints may be missing from the result."""
+
+        if initial_pairs is None and endpoint_domain is not None:
+            initial_pairs = self._domain_pairs(group, endpoint_domain)
+
+            if initial_pairs is not None and self._existence_count(group):
+                initial_pairs = self._existence_pairs(group, initial_pairs)
 
         bound_children = [
             child
@@ -821,11 +984,25 @@ class CurationFilterEvaluator:
             if child.apply_to not in (
                 "source",
                 "target",
-                "between_sources",
-                "between_targets",
+                *BETWEEN_BINDINGS,
             ):
                 raise CurationFilterError(
                     "Unknown subgroup binding.",
+                    node_id=child.id,
+                    node_type="group",
+                )
+
+            if child.summary is not None and child.summary not in PAIR_SUMMARIES:
+                raise CurationFilterError(
+                    f"Unknown pair summary: {child.summary!r}",
+                    node_id=child.id,
+                    node_type="group",
+                )
+
+            if child.apply_to == "between_sources_targets" and child.summary is None:
+                raise CurationFilterError(
+                    "Between sources and targets: choose how pairs are "
+                    "combined (median, mean, min or max).",
                     node_id=child.id,
                     node_type="group",
                 )
@@ -842,16 +1019,24 @@ class CurationFilterEvaluator:
                 node_type="group",
             )
 
+        # Largest compatible partner set (parent count) ...
         support_groups = [
             child
             for child in bound_children
-            if child.apply_to in ("between_sources", "between_targets")
+            if child.apply_to in BETWEEN_BINDINGS and child.summary is None
+        ]
+
+        # ... or pair values combined per target neuron.
+        summary_groups = [
+            child
+            for child in bound_children
+            if child.apply_to in BETWEEN_BINDINGS and child.summary is not None
         ]
 
         endpoint_groups = [
             child
             for child in bound_children
-            if child.apply_to not in ("between_sources", "between_targets")
+            if child.apply_to not in BETWEEN_BINDINGS
         ]
 
         child_results = []
@@ -946,7 +1131,14 @@ class CurationFilterEvaluator:
                     try:
                         with progress_scope(0, 85):
                             child_result = self._evaluate_group(
-                                child, condition_results, group_results
+                                child,
+                                condition_results,
+                                group_results,
+                                endpoint_domain=(
+                                    endpoint_domain
+                                    if group.match_level == "footprint"
+                                    else None
+                                ),
                             )
 
                         with progress_scope(85, 100, "Projecting subgroup matches"):
@@ -1094,10 +1286,23 @@ class CurationFilterEvaluator:
                 progress_index, len(endpoint_groups), start=80, stop=86,
             ):
                 try:
+                    # A source requirement only filters existing pairs, so
+                    # only their sources need a result. A target requirement
+                    # also restricts zero-support targets: evaluate fully.
+                    domain = None
+
+                    if (
+                        child.apply_to == "source"
+                        and child.match_level == "footprint"
+                        and result.match_level == "relationship"
+                    ):
+                        domain = {pair.source for pair in result.matches}
+
                     child_result = self._evaluate_group(
                         child,
                         condition_results,
                         group_results,
+                        endpoint_domain=domain,
                     )
 
                     result = self._apply_endpoint_group(
@@ -1110,7 +1315,11 @@ class CurationFilterEvaluator:
                     exc.attach_node(child.id, "group")
                     raise
 
-        with progress_scope(86, 92, "Evaluating partner requirements"):
+        with progress_scope(86, 89, "Evaluating partner summaries"):
+            if summary_groups:
+                result = self._apply_summary_groups(result, summary_groups)
+
+        with progress_scope(89, 92, "Evaluating partner requirements"):
             if support_groups:
                 result = self._apply_support_groups(
                     group,
@@ -1201,7 +1410,7 @@ class CurationFilterEvaluator:
                 }
 
                 self._record_support_inspection(
-                    support_groups,
+                    support_groups + summary_groups,
                     surviving_pairs,
                 )
 
@@ -1215,6 +1424,117 @@ class CurationFilterEvaluator:
                     )
         group_results[group.id] = result
         return result
+
+    def _domain_pairs(self, group, domain):
+        """Candidate pairs of a relationship group needed for ``domain``.
+
+        Applies to AND groups counting per target footprint where a condition
+        restricts partners to the same neuron: all same-neuron partners of
+        each domain footprint then contain every pair that can match, so
+        counts of domain footprints are exact. None if not applicable.
+        """
+        spec = group.count
+
+        if (
+            group.operator != "and"
+            or group.match_level != "relationship"
+            or spec is None
+            or spec.anchor != "target"
+            or spec.target != "footprint"
+            or spec.separate_partner_sessions
+            or any(component.session_id is None for component in domain)
+        ):
+            return None
+
+        if not any(
+            is_filter_condition(child)
+            and self.engine.supports_requested_pairs(child.query)
+            and any(
+                f.target == "neuron" and f.relation == "same"
+                for f in child.query.filters
+            )
+            for child in group.children
+        ):
+            return None
+
+        ids = np.asarray(self.engine.state.assignments)
+        pairs = set()
+
+        for anchor in domain:
+            for session_id in np.flatnonzero(ids[anchor.neuron_id] >= 0):
+                if session_id != anchor.session_id:
+                    pairs.add(
+                        RelationshipMatch(
+                            NeuronComponent(anchor.neuron_id, int(session_id)),
+                            anchor,
+                        )
+                    )
+
+        return pairs
+
+    @staticmethod
+    def _existence_count(group):
+        """Count "≥ 1 partner" over conditions only: one match suffices."""
+        spec = group.count
+
+        return (
+            spec is not None
+            and spec.comparison == "ge"
+            and spec.value == 1
+            and all(is_filter_condition(child) for child in group.children)
+        )
+
+    @reports_progress("Searching matching partners")
+    def _existence_pairs(self, group, candidates):
+        """Matching pairs found by evaluating partners nearest-session first.
+
+        Rounds evaluate 1, 2, 4, ... further partners of anchors that have
+        no match yet. Each anchor ends with at least one matching pair iff
+        any candidate matches, so the group's count "≥ 1" selects the same
+        anchors as with all candidates. Counts and inspection evidence of
+        the group then show only the partners found.
+        """
+        by_anchor = {}
+
+        for pair in candidates:
+            by_anchor.setdefault(pair.target, []).append(pair)
+
+        for pairs in by_anchor.values():
+            pairs.sort(
+                key=lambda pair: (
+                    abs(pair.source.session_id - pair.target.session_id),
+                    pair.source.session_id,
+                )
+            )
+
+        # Conditions only; the count is applied by the final evaluation.
+        probe = replace(group, count=None)
+
+        matched = set()
+        pending = by_anchor
+        offset, width = 0, 1
+
+        while pending:
+            batch = {
+                pair
+                for pairs in pending.values()
+                for pair in pairs[offset : offset + width]
+            }
+
+            result = self._evaluate_group(probe, {}, {}, initial_pairs=batch)
+            matched.update(result.matches)
+
+            found = {pair.target for pair in result.matches}
+            offset += width
+            width *= 2
+
+            pending = {
+                anchor: pairs
+                for anchor, pairs in pending.items()
+                if anchor not in found and len(pairs) > offset
+            }
+
+        return matched
 
     @reports_progress('Preparing count domains')
     def _prepare_count_domains(self, root):
@@ -1731,13 +2051,12 @@ class CurationFilterEvaluator:
 
         return tuple(effective)
 
-    @reports_progress('Constructing relationships')
-    def _relationship_result(self, result):
-        table = result.table
+    def _row_endpoints(self, table, rows):
+        """(source, target) components of table rows (relationship axes)."""
         axes = self._relationship_axes_for_stat(table.stat)
 
         refs = table.refs_for_rows(
-            result.matching_rows,
+            rows,
             include_fixed=True,
         )
 
@@ -1767,11 +2086,22 @@ class CurationFilterEvaluator:
                 (None if session is None else int(refs[session][index])),
             )
 
+        return [
+            (endpoint(axes[0], index), endpoint(axes[1], index))
+            for index in range(len(rows))
+        ]
+
+    @reports_progress('Constructing relationships')
+    def _relationship_result(self, result):
+        table = result.table
+        axes = self._relationship_axes_for_stat(table.stat)
+
+        endpoints = self._row_endpoints(table, result.matching_rows)
+
         evidence = {}
 
-        for index in progress_iter(range(len(result.matching_rows)), start=5, stop=90):
-            source = endpoint(axes[0], index)
-            target = endpoint(axes[1], index)
+        for index in progress_iter(range(len(endpoints)), start=5, stop=90):
+            source, target = endpoints[index]
 
             if source != target:
                 evidence[RelationshipMatch(source, target)] = {source}
@@ -2127,6 +2457,7 @@ def curation_filter_node_to_dict(
             "count": (None if node.count is None else asdict(node.count)),
             "comment": node.comment,
             "apply_to": node.apply_to,
+            "summary": node.summary,
             "manipulation": (
                 None if node.manipulation is None else asdict(node.manipulation)
             ),
@@ -2203,6 +2534,7 @@ def curation_filter_node_from_dict(data: dict):
             ),
             "comment": data.get("comment", ""),
             "apply_to": data.get("apply_to", "same"),
+            "summary": data.get("summary"),
             "manipulation": (
                 None
                 if data.get("manipulation") is None
@@ -2229,13 +2561,20 @@ def curation_filter_to_dict(
     root: CurationFilterGroup,
     *,
     name: str,
+    category: str | None = None,
 ) -> dict:
 
-    return {
+    document = {
         "schema_version": CURATION_FILTER_SCHEMA_VERSION,
         "name": name,
-        "root": curation_filter_node_to_dict(root),
     }
+
+    # Curation stage (see curation_filter_presets.PRESET_CATEGORIES).
+    if category is not None:
+        document["category"] = category
+
+    document["root"] = curation_filter_node_to_dict(root)
+    return document
 
 
 def curation_filter_from_dict(

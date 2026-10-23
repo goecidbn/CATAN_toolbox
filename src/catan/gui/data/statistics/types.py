@@ -497,6 +497,12 @@ class StatisticDefinition:
     # its reductions itself, before materializing a large result.
     query_getter: Callable | None = None
 
+    # Optional evaluation of explicit requested pairs (curator progressive
+    # evaluation) for statistics without such a query_getter:
+    # pairs_getter(data, state, query, *, requested_pairs, **parameters).
+    # It returns all requested rows; selection follows on compacted values.
+    pairs_getter: Callable | None = None
+
     # Compact stored values after calculation and reduction.
     compact_values: bool = False
 

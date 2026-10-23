@@ -508,6 +508,59 @@ def compact_positive_footprint(column, dims):
     return patch
 
 
+def compact_positive_footprints(footprints, columns, dims):
+    """compact_positive_footprint() for many columns of one footprint matrix.
+
+    Converts and sorts the selected columns once; each patch is identical
+    to the single-column result. Returns a list aligned with ``columns``.
+    """
+    dims = tuple(int(value) for value in dims)
+
+    if len(dims) != 2 or min(dims) <= 0:
+        raise ValueError(f"Invalid image dimensions: {dims}")
+
+    if not sparse.issparse(footprints):
+        raise TypeError("Expected a sparse footprint matrix.")
+
+    if footprints.shape[0] != int(np.prod(dims)):
+        raise ValueError(
+            f"Footprint shape {footprints.shape} does not match dims={dims}."
+        )
+
+    columns = np.asarray(columns, dtype=np.int64).reshape(-1)
+    selected = sparse.csc_matrix(footprints[:, columns], dtype=np.float64, copy=True)
+    selected.sum_duplicates()
+    selected.sort_indices()
+
+    if not np.all(np.isfinite(selected.data)):
+        raise ValueError("Footprint contains NaN or Inf values.")
+
+    patches = []
+
+    for index in range(len(columns)):
+        start, stop = selected.indptr[index], selected.indptr[index + 1]
+        data = selected.data[start:stop]
+        positive = data > 0
+
+        if not np.any(positive):
+            patches.append(None)
+            continue
+
+        pixels = selected.indices[start:stop][positive]
+        values = data[positive]
+
+        # Same C-order interpretation as _as_dense_image(...).reshape(dims).
+        rows, cols = np.divmod(pixels, dims[1])
+        rows = rows - rows.min()
+        cols = cols - cols.min()
+
+        patch = np.zeros((int(rows.max()) + 1, int(cols.max()) + 1), dtype=np.float64)
+        patch[rows, cols] = values
+        patches.append(patch)
+
+    return patches
+
+
 def footprint_similarity_peak(left, right, *, gamma=0.1):
     """Cosine-union peak with shared FFTs.
 

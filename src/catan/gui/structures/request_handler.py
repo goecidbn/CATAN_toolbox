@@ -204,23 +204,76 @@ class RequestHandler:
         )
 
 
+# Part of the source neuron moved by a neuron merge, relative to the
+# session of a source footprint (included).
+MERGE_EXTENTS = ("all", "previous", "following")
+
+
+def merge_extent_sessions(row, extent="all", session_id=None):
+    """Sessions of an assignment row moved by a neuron merge."""
+    if extent not in MERGE_EXTENTS:
+        raise ValueError(f"Unknown merge extent: {extent!r}")
+
+    sessions = np.flatnonzero(np.asarray(row) >= 0)
+
+    if extent == "all":
+        return sessions
+
+    if session_id is None:
+        raise ValueError("A partial neuron merge needs a source footprint.")
+
+    if extent == "previous":
+        return sessions[sessions <= session_id]
+
+    return sessions[sessions >= session_id]
+
+
 class NeuronMergeRequest:
+    """Move footprints of one neuron into another (or a new) neuron.
+
+    The moved set starts as all footprints, a part relative to a session
+    (``extent``), or explicit ``sessions`` (e.g. highlighted footprints),
+    and can be edited with toggle(). ``target_id`` None: a new neuron.
+    """
+
     type = "neuron_merge"
     stage = "destination"
 
-    def __init__(self, assignments, source_id, target_id):
+    def __init__(
+        self,
+        assignments,
+        source_id,
+        target_id,
+        extent="all",
+        session_id=None,
+        sessions=None,
+    ):
         self.assignments = assignments
         self.source_id = int(source_id)
-        self.target_id = int(target_id)
+        self.target_id = None if target_id is None else int(target_id)
         self.highlight_mode = "footprints"
         self.conflicts = ()
         self.origin = []
         self.destination = []
         self.error = None
+
+        if sessions is None:
+            row = assignments.ids[self.source_id] if 0 <= self.source_id < len(
+                assignments.ids
+            ) else ()
+            sessions = merge_extent_sessions(row, extent, session_id)
+
+        self.sessions = {int(s) for s in sessions}
         self.refresh()
 
         if self.conflicts:
             self.highlight_mode = "conflicts"
+
+    @property
+    def moves_whole_neuron(self):
+        """All footprints of the source are moved."""
+        row = self.assignments.ids[self.source_id]
+        return set(np.flatnonzero(row >= 0).tolist()) <= self.sessions
 
     def refresh(self):
         ids = self.assignments.ids
@@ -232,13 +285,20 @@ class NeuronMergeRequest:
         if (
             self.source_id == self.target_id
             or not 0 <= self.source_id < len(ids)
-            or not 0 <= self.target_id < len(ids)
+            or (self.target_id is not None and not 0 <= self.target_id < len(ids))
         ):
             self.error = "The source or destination neuron is no longer available."
             return
 
-        source_sessions = np.flatnonzero(ids[self.source_id] >= 0)
-        target_sessions = np.flatnonzero(ids[self.target_id] >= 0)
+        source_sessions = np.array(
+            sorted(s for s in self.sessions if ids[self.source_id, s] >= 0),
+            dtype=int,
+        )
+        target_sessions = (
+            np.zeros(0, dtype=int)
+            if self.target_id is None
+            else np.flatnonzero(ids[self.target_id] >= 0)
+        )
 
         self.origin = [
             NeuronComponent(self.source_id, int(s))
@@ -253,13 +313,32 @@ class NeuronMergeRequest:
             for s in np.intersect1d(source_sessions, target_sessions)
         )
 
-        if not self.origin or not self.destination:
-            self.error = "The source or destination neuron is empty."
+        if not self.origin:
+            self.error = "No footprints selected to move."
+        elif self.target_id is not None and not self.destination:
+            self.error = "The destination neuron is empty."
         elif self.conflicts:
-            self.error = "Resolve conflicts before merging"
+            self.error = (
+                "The destination already has footprints in sessions "
+                + ", ".join(map(str, self.conflicts))
+                + ". Deselect these footprints or resolve the conflicts."
+            )
 
         if not self.conflicts:
             self.highlight_mode = "footprints"
+
+    def toggle(self, component):
+        """Add or remove a source footprint; returns an error or None."""
+        if component.neuron_id != self.source_id or component.session_id is None:
+            return f"Only footprints of neuron {self.source_id} can be moved."
+
+        session = int(component.session_id)
+        if self.assignments.ids[self.source_id, session] < 0:
+            return "This neuron has no footprint in that session."
+
+        self.sessions ^= {session}
+        self.refresh()
+        return None
 
     @property
     def components(self):
@@ -281,9 +360,15 @@ class NeuronMergeRequest:
 
     def remap_rows(self, neuron_id_map):
         source = neuron_id_map.get(self.source_id)
-        target = neuron_id_map.get(self.target_id)
+        target = (
+            None if self.target_id is None else neuron_id_map.get(self.target_id)
+        )
 
-        if source is None or target is None or source == target:
+        if (
+            source is None
+            or (self.target_id is not None and target is None)
+            or source == target
+        ):
             return None
 
         self.source_id = source

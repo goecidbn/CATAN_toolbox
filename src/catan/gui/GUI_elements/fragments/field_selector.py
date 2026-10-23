@@ -26,6 +26,7 @@ from catan.gui.GUI_elements.utils.FlowLayout import FlowLayout, QSizePolicy
 from .field_chip import FieldChip
 from .dialog_load_field import FieldSelectDialog
 from .file_inspection import FileInspection
+from catan.gui.GUI_elements.utils.paths import display_path
 
 COMPAT_COLORS = {
     "available": "#4F7F5A",  # muted green
@@ -421,7 +422,10 @@ class FieldSelector(QWidget):
 
             field = spec.get("field")
             self.dimension_source.setText(
-                (f"{field.get('source_path') or source.path}: " f"{field['path']}")
+                (
+                    f"{display_path(field.get('source_path') or source.path)}: "
+                    f"{field['path']}"
+                )
                 if field
                 else (
                     "No source selected; image mode uses " "the configured background."

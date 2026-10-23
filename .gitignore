@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.so
+*.zip
 
 # Virtual environments
 .venv/
@@ -38,8 +39,10 @@ src/catan/_version.py
 Thumbs.db
 
 # Project-specific
-# data/
 results/
 tmp/
+tmp*
 
 notebooks/
+
+CLAUDE*

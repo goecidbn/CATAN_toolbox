@@ -1,6 +1,7 @@
 from typing import Literal, Optional
 from dataclasses import dataclass, replace
 
+from .session_relations import is_order_relation
 from .dimensions import (
     canonical_dim,
     SESSION_DIMS,
@@ -124,7 +125,20 @@ ERROR_METHODS["neuron_pair_bound"] = ERROR_METHODS["generic"]
 ERROR_METHODS["component_pair_bound"] = ERROR_METHODS["generic"]
 
 
-PairRelation = Literal["all", "same", "different", "with previous"]
+# Session-only order relations (see session_relations.py) keep both
+# session axes and filter rows relative to the reference neuron's detections.
+PairRelation = Literal[
+    "all",
+    "same",
+    "different",
+    "with previous",
+    "first instance",
+    "previous instance",
+    "all previous",
+    "next instance",
+    "last instance",
+    "all following",
+]
 PairTarget = Literal["neuron", "session"]
 
 
@@ -321,6 +335,11 @@ def normalize_footprint_pair_reductions(
         if {"session_i", "session_j"}.issubset(out):
             if linked["session"]:
                 out["session_i"] = out["session_j"] = ReductionSpec("keep")
+            elif is_order_relation(relations.get("session")):
+                # The relation implies the reference sessions: reduce them.
+                out["session_i"] = ReductionSpec("keep")
+                if out["session_j"].method in ("keep", "single"):
+                    out["session_j"] = ReductionSpec("median")
             else:
                 kept = [
                     d for d in ("session_i", "session_j") if out[d].method == "keep"
@@ -426,6 +445,14 @@ def normalize_session_series_reductions(
             # Afterwards they collapse into one session dimension.
             out[dim_i] = ReductionSpec("keep")
             out[dim_j] = ReductionSpec("keep")
+
+        elif is_order_relation(session_relation):
+            # The relation implies the reference sessions: reduce them.
+            out[dim_i] = ReductionSpec("keep")
+            old = out.get(dim_j, ReductionSpec("median"))
+            out[dim_j] = (
+                ReductionSpec("median") if old.method in ("keep", "single") else old
+            )
 
         else:
             # session_i is the series axis;

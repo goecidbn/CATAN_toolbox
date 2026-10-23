@@ -29,6 +29,7 @@ from catan.core.structures.load_config import FieldSpec
 
 from .file_inspection import FileInspection
 from .path_selector import choose_path
+from catan.gui.GUI_elements.utils.paths import display_path
 
 
 @dataclass(frozen=True)
@@ -430,12 +431,12 @@ class FieldSelectDialog(QDialog):
 
         if self.source_path is None:
             self.source_label.setText("Source: session source")
-            self.source_label.setToolTip(self.primary_path)
+            self.source_label.setToolTip(display_path(self.primary_path))
             self.revert_source_action.setEnabled(False)
 
         else:
             self.source_label.setText(f"Source: {Path(self.path).name}")
-            self.source_label.setToolTip(self.path)
+            self.source_label.setToolTip(display_path(self.path))
             self.revert_source_action.setEnabled(True)
 
     def _set_source(self, source_path: str | None):

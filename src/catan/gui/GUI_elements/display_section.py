@@ -1,3 +1,4 @@
+import json
 from functools import partial
 
 import importlib
@@ -33,8 +34,9 @@ display_modes = {
     "overview": {
         "title": "Overview",
         "options": {
-            "session_overview": "Session footprints",
-            "tracked_overview": "Tracked footprints",
+            # Session footprints are an option of this panel
+            # ("Show current session only").
+            "tracked_overview": "Footprint overview",
             "selection_display": "Selection display",
         },
     },
@@ -74,7 +76,6 @@ display_modes = {
 }
 
 DISPLAY_CONTROLLERS = {
-    "session_overview": Overview,
     "tracked_overview": Overview,
     "footprints": Footprints,
     "traces": Traces,
@@ -106,9 +107,12 @@ class DisplaySection(QFrame):
     requestSplit = Signal(str, str)  # section_id, orientation
     requestClose = Signal(str)  # section_id
 
-    def __init__(self, parent, section_id, display_mode="empty"):
+    def __init__(self, parent, section_id, display_mode="empty", config=None):
         super().__init__(parent)
         self.section_id = section_id
+
+        # Saved settings of the panel's controller (see get_config).
+        self._initial_controller_config = (config or {}).get("controller")
         self.state: AppState = parent.state
         self.data: Data = parent.data
 
@@ -165,7 +169,11 @@ class DisplaySection(QFrame):
         # layout.addWidget(self.section_area, 1)
         body_layout.addWidget(self.section_area, 0, 0)
 
-        self.set_display_mode(self.display_mode, force=True)  # set initial plot mode
+        self.set_display_mode(
+            self.display_mode,
+            config=self._initial_controller_config,
+            force=True,
+        )  # set initial plot mode
 
         # Placeholder for your VisPy canvas / plot mode widget
 
@@ -268,6 +276,11 @@ class DisplaySection(QFrame):
     ):
         # print(f"set display mode to {mode} for section {self.section_id}")
 
+        if mode == "session_overview":
+            # Former separate mode: the overview with session footprints.
+            mode = "tracked_overview"
+            config = {**(config or {}), "session_only": True}
+
         if mode not in DISPLAY_CONTROLLERS:
             # print(f"Unknown display mode: {mode}")
             return
@@ -352,8 +365,22 @@ class DisplaySection(QFrame):
         self.btn_close.setEnabled(can_close)
 
     def get_config(self) -> dict:
+        controller_config = None
+
+        if self.active_controller is not None and hasattr(
+            self.active_controller, "get_config"
+        ):
+            controller_config = self.active_controller.get_config()
+
+            try:
+                json.dumps(controller_config)
+            except (TypeError, ValueError):
+                # Only plain settings are stored with the layout.
+                controller_config = None
+
         return {
             "display_mode": self.display_mode,
+            "controller": controller_config,
             # add whatever else this section owns:
             # "trace_key": self.trace_key,
             # "show_processed": self.show_processed,
@@ -362,6 +389,9 @@ class DisplaySection(QFrame):
 
     def apply_config(self, config: dict):
         self.display_mode = config.get("display_mode", "empty")
+
+        if self.display_mode == "session_overview":
+            self.display_mode = "tracked_overview"
 
         # restore other values here
         # self.trace_key = config.get("trace_key", "C")

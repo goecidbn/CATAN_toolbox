@@ -16,16 +16,75 @@ from catan.gui.data.curation_filter import (
 )
 
 
+# Curation stages, in the recommended order of curation. Presets without
+# a (known) category are listed last.
+PRESET_CATEGORIES = {
+    "footprints": "1. Footprint curation",
+    "neurons": "2. Neuron filtering",
+    "assignments": "3. Assignment correction",
+    "review": "4. Review status",
+}
+
+PRESET_CATEGORY_DESCRIPTIONS = {
+    "footprints": "Split, merge or remove session footprints.",
+    "neurons": "Exclude neurons, e.g. noise, singular or border components.",
+    "assignments": "Merge neurons, reassign or move footprints.",
+    "review": "Mark neurons as reviewed or uncertain.",
+}
+
+UNCATEGORIZED_LABEL = "Other"
+
+# Category suggested for a preset from its manipulations.
+_MANIPULATION_CATEGORIES = {
+    "split": "footprints",
+    "merge": "footprints",
+    "exclude_footprint": "footprints",
+    "exclude_neuron": "neurons",
+    "neuron_merge": "assignments",
+    "reassign": "assignments",
+    "mark_reviewed": "review",
+    "mark_uncertain": "review",
+}
+
+
+def category_rank(category):
+    order = list(PRESET_CATEGORIES)
+    return order.index(category) if category in order else len(order)
+
+
+def suggest_category(root) -> str | None:
+    """Category of the first manipulation in the tree (root first)."""
+    pending = [root]
+
+    while pending:
+        node = pending.pop(0)
+        manipulation = getattr(node, "manipulation", None)
+        kind = getattr(manipulation, "kind", None)
+
+        if kind in _MANIPULATION_CATEGORIES:
+            return _MANIPULATION_CATEGORIES[kind]
+
+        pending.extend(getattr(node, "children", ()))
+
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class CurationFilterPresetInfo:
 
     key: str
     name: str
     source: str  # "builtin" | "user"
+    category: str | None = None
 
     @property
     def writable(self) -> bool:
         return self.source == "user"
+
+
+def _known_category(document):
+    category = document.get("category")
+    return category if category in PRESET_CATEGORIES else None
 
 
 class CurationFilterPresetStore:
@@ -110,6 +169,7 @@ class CurationFilterPresetStore:
                     key=f"builtin:{stem}",
                     name=data.get("name", stem),
                     source="builtin",
+                    category=_known_category(data),
                 )
             )
 
@@ -125,12 +185,18 @@ class CurationFilterPresetStore:
                     key=f"user:{path.stem}",
                     name=data.get("name", path.stem),
                     source="user",
+                    category=_known_category(data),
                 )
             )
 
+        # Curation stage, then alphabetically.
         return sorted(
             presets,
-            key=lambda preset: (preset.name.casefold(), preset.key),
+            key=lambda preset: (
+                category_rank(preset.category),
+                preset.name.casefold(),
+                preset.key,
+            ),
         )
 
     def preset_info(
@@ -187,6 +253,7 @@ class CurationFilterPresetStore:
         name: str,
         root: CurationFilterGroup,
         overwrite: bool = False,
+        category: str | None = None,
     ) -> str:
 
         slug = self._slug(name)
@@ -199,6 +266,7 @@ class CurationFilterPresetStore:
         document = curation_filter_to_dict(
             root,
             name=name,
+            category=category,
         )
 
         path.write_text(
@@ -320,6 +388,48 @@ class CurationFilterPresetStore:
         self._working_preset_key = key
         self._working_dirty = False
 
+    def new_working_preset(self):
+        """Start an empty, unsaved filter."""
+        self._working_filter = CurationFilterGroup(
+            operator="and",
+            match_level="footprint",
+        )
+        self._working_preset_key = None
+        self._working_dirty = False
+
+    def can_edit_category(self, key: str | None) -> bool:
+        info = None if key is None else self.preset_info(key)
+
+        return info is not None and (info.writable or self.can_save_builtin())
+
+    def set_preset_category(self, key: str, category: str | None):
+        """Assign a saved preset to a curation stage (None: uncategorized)."""
+        if category is not None and category not in PRESET_CATEGORIES:
+            raise ValueError(f"Unknown preset category: {category!r}")
+
+        if not self.can_edit_category(key):
+            raise PermissionError("This preset cannot be edited.")
+
+        source, slug = self._split_key(key)
+        document = self._load_document(key)
+        document.pop("category", None)
+
+        if category is not None:
+            # Keep the key order of curation_filter_to_dict().
+            root = document.pop("root")
+            document["category"] = category
+            document["root"] = root
+
+        if source == "builtin":
+            path = Path(str(self._builtin_directory())) / f"{slug}.json"
+        else:
+            path = self.user_directory / f"{slug}.json"
+
+        path.write_text(
+            json.dumps(document, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
     def set_working_preset(self, key: str):
 
         self._working_filter = self.load_preset(key)
@@ -345,28 +455,77 @@ class CurationFilterPresetStore:
         if info is None:
             raise KeyError(key)
 
-        if not info.writable:
-            raise PermissionError("Built-in presets cannot be overwritten.")
+        if info.source == "builtin":
+            if not self.can_save_builtin():
+                raise PermissionError(
+                    "Built-in presets can only be saved in an editable installation."
+                )
 
-        self.save_user_preset(
-            name=info.name,
-            root=self._working_filter,
-            overwrite=True,
-        )
+            # Same file, name and category.
+            source, slug = self._split_key(key)
+            document = curation_filter_to_dict(
+                self._working_filter,
+                name=info.name,
+                category=info.category,
+            )
+            path = Path(str(self._builtin_directory())) / f"{slug}.json"
+            path.write_text(
+                json.dumps(document, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+        else:
+            self.save_user_preset(
+                name=info.name,
+                root=self._working_filter,
+                overwrite=True,
+                category=info.category,
+            )
 
         self._working_dirty = False
+
+    def name_conflict(self, name, *, ignore_key=None):
+        """Existing preset whose name equals ``name`` (ignoring case) or
+        whose file name it would reuse; None if the name is free."""
+        name = name.strip()
+        folded = name.casefold()
+
+        try:
+            slug = self._slug(name)
+        except ValueError:
+            slug = None
+
+        for preset in self.presets():
+            if preset.key == ignore_key:
+                continue
+
+            stem = self._split_key(preset.key)[1]
+
+            if preset.name.strip().casefold() == folded or stem == slug:
+                return preset
+
+        return None
 
     def save_working_as(
         self,
         name: str,
         *,
         overwrite: bool = False,
+        category: str | None = None,
     ) -> str:
+
+        # Saving under the current user preset's own name equals "Save".
+        current = self._working_preset_key
+        ignore = current if current is not None and current.startswith("user:") else None
+
+        if self.name_conflict(name, ignore_key=ignore) is not None:
+            raise FileExistsError(f"A preset named {name!r} already exists.")
 
         key = self.save_user_preset(
             name=name,
             root=self._working_filter,
             overwrite=overwrite,
+            category=category,
         )
 
         self._working_preset_key = key
@@ -391,6 +550,9 @@ class CurationFilterPresetStore:
         source, old_slug = self._split_key(key)
 
         old_path = self.user_directory / f"{old_slug}.json"
+
+        if self.name_conflict(new_name, ignore_key=key) is not None:
+            raise FileExistsError(f"A preset named {new_name!r} already exists.")
 
         document = self._load_document(key)
         document["name"] = new_name
@@ -433,12 +595,17 @@ class CurationFilterPresetStore:
         if info is None:
             raise KeyError(key)
 
-        if not info.writable:
-            raise PermissionError("Built-in presets cannot be deleted.")
+        if not self.can_edit_category(key):
+            raise PermissionError(
+                "Built-in presets can only be deleted in an editable installation."
+            )
 
         source, slug = self._split_key(key)
 
-        path = self.user_directory / f"{slug}.json"
+        if source == "builtin":
+            path = Path(str(self._builtin_directory())) / f"{slug}.json"
+        else:
+            path = self.user_directory / f"{slug}.json"
 
         path.unlink()
 
@@ -461,7 +628,7 @@ class CurationFilterPresetStore:
         except (PackageNotFoundError, OSError, ValueError):
             return False
 
-    def save_working_as_builtin(self, name: str, *, overwrite=False):
+    def save_working_as_builtin(self, name: str, *, overwrite=False, category=None):
         if not self.can_save_builtin():
             raise PermissionError(
                 "Saving CATAN presets requires an editable installation."
@@ -470,6 +637,12 @@ class CurationFilterPresetStore:
         name = name.strip()
         slug = self._slug(name)
         new_key = f"builtin:{slug}"
+
+        # The working preset itself is replaced (a user preset moves here).
+        if not overwrite and self.name_conflict(
+            name, ignore_key=self._working_preset_key
+        ) is not None:
+            raise FileExistsError(f"A preset named {name!r} already exists.")
         destination = Path(str(self._builtin_directory())) / f"{slug}.json"
 
         old_key = self._working_preset_key
@@ -486,6 +659,7 @@ class CurationFilterPresetStore:
         document = curation_filter_to_dict(
             self._working_filter,
             name=name,
+            category=category,
         )
         text = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
 

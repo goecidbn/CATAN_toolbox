@@ -387,6 +387,7 @@ def calculate_border_proximity(
         _, common_distance = data.assignments.common_spatial_coverage(
             data.sessions,
             revision=getattr(state, "data_version", None),
+            tolerance=getattr(data, "border_tolerance", 0),
         )
 
     session_ids = {

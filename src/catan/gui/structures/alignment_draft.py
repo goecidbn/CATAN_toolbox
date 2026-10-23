@@ -5,9 +5,18 @@ from catan.core.structures.remap import Remapping
 
 
 class AlignmentDraft:
-    def __init__(self, data, session_id, *, proposal=None):
-        self.session_id = session_id
-        self.session = data.sessions[session_id]
+    """Editable alignment of a session's background.
+
+    ``session``: an unregistered background owner instead of
+    data.sessions[session_id] (the overview background; ``external``).
+    Its session_id is the number of sessions, so all sessions are earlier
+    references.
+    """
+
+    def __init__(self, data, session_id, *, proposal=None, session=None):
+        self.external = session is not None
+        self.session_id = len(data.sessions) if self.external else session_id
+        self.session = data.sessions[session_id] if session is None else session
         self.expected_version = data.state.data_version
 
         self._base_template = self.session.background_template.copy()
@@ -74,6 +83,10 @@ class AlignmentDraft:
         self._refined_flow = None
 
     def is_current(self, data):
+        if self.external:
+            # Session edits do not invalidate the background being edited.
+            return getattr(data, "overview_background", None) is self.session
+
         return (
             data.state.data_version == self.expected_version
             and 0 <= self.session_id < len(data.sessions)
@@ -119,7 +132,7 @@ class AlignmentDraft:
         if current is None:
             return np.zeros(2), 0.0
 
-        if current.success:
+        if current.success or getattr(current, "confirmation", None):
             return Remapping._rigid_parameters(self.dims, current.matrix)
 
         references = {

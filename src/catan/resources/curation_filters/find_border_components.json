@@ -1,6 +1,7 @@
 {
   "schema_version": 2,
   "name": "Find border components",
+  "category": "neurons",
   "root": {
     "type": "group",
     "id": "741d3e09c1de439e8d639c1b0384073d",

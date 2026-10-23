@@ -34,6 +34,11 @@ from catan.core.structures import NeuronComponent
 from catan.gui.structures import AppState, Data
 from catan.gui.panels import BasePlot, styles, StatisticsData
 from catan.gui.data.statistics import PickTable
+from catan.gui.data.statistics.session_relations import (
+    DetectionReference,
+    is_order_relation,
+    relation_mask,
+)
 from catan.gui.data.statistics.queries import (
     StatisticQuery,
     ReductionSpec,
@@ -1482,6 +1487,7 @@ class Controller(BasePlot.TableController):
         remove_action = menu.addAction("Remove")
 
         action = menu.exec(global_pos)
+        menu.deleteLater()
 
         if action is edit_action:
             self._edit_statistic_column(index, global_pos)
@@ -1768,6 +1774,30 @@ class Controller(BasePlot.TableController):
                         pass
 
                     elif session_i == session_j - 1:
+                        component_i, component_j = (component_j, component_i)
+
+                    else:
+                        return None
+
+                elif is_order_relation(pair_filter.relation):
+                    # component_j is the reference; try both orientations.
+                    detection = DetectionReference(self.data.assignments.ids)
+
+                    def related(a, b):
+                        return bool(
+                            relation_mask(
+                                pair_filter.relation,
+                                a.session_id,
+                                b.session_id,
+                                b.neuron_id,
+                                detection,
+                            )
+                        )
+
+                    if related(component_i, component_j):
+                        pass
+
+                    elif related(component_j, component_i):
                         component_i, component_j = (component_j, component_i)
 
                     else:

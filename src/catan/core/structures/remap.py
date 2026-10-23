@@ -7,7 +7,10 @@ import numpy as np
 from scipy import sparse
 import cv2
 
-from catan.core.image_correlation import calculate_img_correlation
+from catan.core.image_correlation import (
+    calculate_img_correlation,
+    calculate_shift_score_map,
+)
 from catan.core.alignment import (
     get_session_remap,
     _build_remap,
@@ -16,6 +19,22 @@ from catan.core.alignment import (
 from catan.core.io import load_file, save_file, NATIVE_REMAP_CONFIG
 from catan.core.structures.load_config import LoadConfig, FieldSpec
 from catan.core.alignment import calculate_residual_flow
+
+# Flow alignment quality relative to the dataset: a correlation below this
+# fraction of the median accepted correlation of the reference sessions is
+# low (845ad: median 0.80, normal 0.58–0.88, failed 0.35/0.38; other mice
+# reach ~0.3 on average). Needs MIN_CORRELATION_HISTORY reference values.
+RELATIVE_FLOW_CORRELATION = 0.6
+MIN_CORRELATION_HISTORY = 3
+# A low correlation is accepted if at least AGREEMENT_MIN of the
+# AGREEMENT_REFERENCES most recent other references place the session within
+# AGREEMENT_PX of the selected alignment (consistent, just a noisy session).
+AGREEMENT_REFERENCES = 3
+AGREEMENT_MIN = 2
+AGREEMENT_PX = 3.0
+# An older reference replaces the most recent one only if its correlation
+# is higher by more than this.
+FLOW_PREFERENCE_MARGIN = 0.05
 
 MatrixT = TypeVar("MatrixT", sparse.csc_matrix, np.ndarray)
 
@@ -98,7 +117,12 @@ class Remapping:
         min_zcorr: float = 3.0,
         rotation_step: float = 1.0,
         rotation_refine_step: float = 0.1,
+        require_confirmation: bool = True,
     ):
+        """``require_confirmation``: a flow-only alignment departing from the
+        default (see estimate_flow) is proposed unsuccessful, with the
+        description in ``confirmation``, for the user to confirm. Otherwise
+        it is accepted and the description kept in flow_info["deviation"]."""
 
         # Transform from THIS SESSION'S original template
         # into CATAN's common/global coordinate system.
@@ -126,6 +150,10 @@ class Remapping:
 
         self.success = False
         self.dims = None
+
+        self.require_confirmation = bool(require_confirmation)
+        # Why the proposed alignment needs the user's confirmation, or None.
+        self.confirmation = None
 
         if evaluate and template is not None and references:
             self.evaluate(template, references, use_optical_flow=use_optical_flow)
@@ -155,6 +183,7 @@ class Remapping:
         self.remap_data = {}
         self.flow = None
         self.flow_info = {}
+        self.confirmation = None
         if use_optical_flow:
             self.method = "automatic_flow"
             self.shift = np.zeros(2, dtype=np.float64)
@@ -184,6 +213,11 @@ class Remapping:
                 self._factor_flow_rigid(selected["rigid_matrix"])
                 self.flow_info["representation"] = "rigid_plus_residual"
                 self.remap_data = self._flow_comparison_records(references)
+
+                deviation = self.flow_info.get("deviation")
+                if deviation and self.require_confirmation:
+                    self.confirmation = deviation
+                    self.success = False
 
             return
 
@@ -536,6 +570,12 @@ class Remapping:
 
         if self.flow is not None:
             reference = info.get("reference")
+            if reference:
+                # Session name ("S12 Session13") rather than its file path.
+                reference = (
+                    info.get("candidates", {}).get(reference, {}).get("name")
+                    or Path(str(reference)).name
+                )
             label = f" Reference: {reference}." if reference else ""
             return "Flow correction applied." + label
 
@@ -776,7 +816,9 @@ class Remapping:
 
         for path, reference in references.items():
             candidate = self.flow_info.get("candidates", {}).get(str(path))
-            if not candidate or not candidate.get("accepted"):
+            if not candidate or not (
+                candidate.get("accepted") or candidate.get("selected")
+            ):
                 continue
 
             global_matrix = candidate.get("rigid_matrix")
@@ -810,6 +852,129 @@ class Remapping:
 
         return records
 
+    @staticmethod
+    def _translation_prior(reference, reference_valid, template, limit):
+        """(translation matrix in the common frame, peak z-score) maximizing
+        the cosine similarity of the high-passed ``template`` with the
+        high-passed aligned ``reference``, within ``limit`` px. Without
+        high-pass filtering, overall brightness makes zero shift win."""
+
+        def high_pass(image, valid):
+            image = np.asarray(image, dtype=np.float32)
+            valid = valid & np.isfinite(image)
+            image = np.where(valid, image, image[valid].mean()).astype(np.float32)
+            return (image - cv2.GaussianBlur(image, (0, 0), 10.0)).astype(np.float64)
+
+        reference = high_pass(reference, np.asarray(reference_valid, dtype=bool))
+        moving = high_pass(template, np.ones(np.shape(template), dtype=bool))
+
+        scores = calculate_shift_score_map(
+            reference, moving, mode="cosine", min_overlap=0.25
+        )
+        xs = np.arange(scores.shape[1]) - (moving.shape[1] - 1)
+        ys = np.arange(scores.shape[0]) - (moving.shape[0] - 1)
+        allowed = np.isfinite(scores) & (
+            xs[None, :] ** 2 + ys[:, None] ** 2 <= float(limit) ** 2
+        )
+        if not allowed.any():
+            raise ValueError("No translation could be estimated.")
+
+        values = scores[allowed]
+        iy, ix = np.unravel_index(
+            np.argmax(np.where(allowed, scores, -np.inf)), scores.shape
+        )
+        # Peak distinctness: robust z-score among all allowed shifts.
+        median = np.median(values)
+        spread = 1.4826 * np.median(np.abs(values - median))
+        zscore = float((scores[iy, ix] - median) / spread) if spread > 0 else np.nan
+
+        matrix = np.eye(3, dtype=np.float64)
+        matrix[0, 2] = float(xs[ix])
+        matrix[1, 2] = float(ys[iy])
+        return matrix, zscore
+
+    def _flow_deviation(self, path, record, preferred, max_displacement):
+        """Text describing how a selected flow departs from the default
+        (most recent reference, within limits, good agreement), or None."""
+        candidates = self.flow_info["candidates"]
+        notes = []
+
+        if path != preferred:
+            newest = candidates[preferred]
+            why = (
+                f"correlation {newest['correlation_after']:.2f}"
+                if newest.get("correlation_after") is not None
+                and not newest.get("exceeds_limit")
+                else (newest.get("reason") or "rejected").split(". ")[0]
+            )
+            notes.append(
+                f"Aligned to an older session ({record['name']}) instead of the "
+                f"most recent one ({newest['name']}: {why})."
+            )
+
+        if record.get("exceeds_limit"):
+            notes.append(
+                f"Displacement {record['p95_displacement']:.0f} px exceeds the "
+                f"maximum session shift ({max_displacement:.0f} px)."
+            )
+
+        good = self.flow_info.get("good_correlation")
+        correlation = record["correlation_after"]
+        if good is not None and correlation < good:
+            agreement = record.get("agreement")
+            if agreement is None or agreement["agreeing"] < AGREEMENT_MIN:
+                compared = (
+                    "no other references to compare"
+                    if not agreement or not agreement["distances"]
+                    else "other references disagree ("
+                    + ", ".join(
+                        f"{name}: {distance:.0f} px"
+                        for name, distance in agreement["distances"]
+                    )
+                    + ")"
+                )
+                notes.append(
+                    f"Low background correlation {correlation:.2f} (median of "
+                    f"previous alignments {self.flow_info['median_correlation']:.2f}; "
+                    f"low below {good:.2f}); {compared}."
+                )
+
+        return " ".join(notes) or None
+
+    def _reference_agreement(self, path, record, usable):
+        """How many of the most recent other usable references place the
+        image centre within AGREEMENT_PX of the selected alignment."""
+        selected = record.get("rigid_matrix")
+        if selected is None:
+            return None
+
+        centre = np.array([(self.dims[1] - 1) / 2, (self.dims[0] - 1) / 2, 1.0])
+        position = np.asarray(selected) @ centre
+
+        distances = []
+        for other_path, _, other in usable:
+            if other_path == path or other.get("rigid_matrix") is None:
+                continue
+            other_position = np.asarray(other["rigid_matrix"]) @ centre
+            distances.append(
+                (other["name"], float(np.linalg.norm(other_position[:2] - position[:2])))
+            )
+            if len(distances) == AGREEMENT_REFERENCES:
+                break
+
+        return {
+            "agreeing": sum(distance <= AGREEMENT_PX for _, distance in distances),
+            "distances": distances,
+        }
+
+    @property
+    def alignment_correlation(self):
+        """Background correlation of the selected flow alignment, or None."""
+        info = self.flow_info or {}
+        record = info.get("candidates", {}).get(info.get("reference"), {})
+        value = record.get("correlation_after")
+        return float(value) if value is not None and np.isfinite(value) else None
+
     def estimate_flow(
         self,
         template,
@@ -822,24 +987,50 @@ class Remapping:
         hard_max_displacement=50.0,
         residual=True,
     ):
-        """Select one residual flow against already aligned references."""
+        """Select one flow against already aligned references.
+
+        References are supplied in session order; the most recent one is
+        preferred. Only if it fails or agrees poorly (correlation below
+        RELATIVE_FLOW_CORRELATION × the median "alignment_correlation" of the
+        references) are the older ones evaluated, and the most recent
+        candidate within FLOW_PREFERENCE_MARGIN of the best correlation is
+        used; a low correlation is then checked for agreement with other
+        references (_reference_agreement). Without ``residual`` (flow-only alignment) a
+        candidate beyond ``max_displacement`` (but within the hard limit)
+        stays usable. Any departure from the default (older reference,
+        displacement beyond the limit, low correlation) is described in
+        ``flow_info["deviation"]``.
+        """
         self.flow = None
         self.flow_info = {
             "status": "skipped",
-            "reason": "No suitable reference among the previous five sessions.",
+            "reason": "No suitable reference among the previous sessions.",
             "candidates": {},
+            "deviation": None,
         }
 
         if not self.success:
             self.flow_info["reason"] = "Rigid alignment was unsuccessful."
             return
 
-        moving = np.asarray(
-            self.apply_remap(template, use_optical_flow=False),
-            dtype=np.float32,
-        )
-        moving_valid = self.valid_mask(use_optical_flow=False)
         yy, xx = np.indices(self.dims, dtype=np.float32)
+        base_matrix = np.asarray(self.matrix, dtype=np.float64).copy()
+
+        # Dataset-relative quality level from the references' own alignments.
+        history = [
+            float(entry["alignment_correlation"])
+            for entry in references.values()
+            if entry.get("alignment_correlation") is not None
+            and np.isfinite(entry["alignment_correlation"])
+        ]
+        good_correlation = None
+        if len(history) >= MIN_CORRELATION_HISTORY:
+            median_correlation = float(np.median(history))
+            good_correlation = RELATIVE_FLOW_CORRELATION * median_correlation
+            self.flow_info.update(
+                median_correlation=median_correlation,
+                good_correlation=good_correlation,
+            )
 
         def correlation(a, b, mask):
             x = np.asarray(a[mask], dtype=np.float64)
@@ -851,17 +1042,244 @@ class Remapping:
                 return np.nan
             return float(np.dot(x, y) / denominator)
 
-        best_flow = None
-        best_path = None
+        # (path, flow, record) of candidates passing all checks except,
+        # without residual, the displacement limit.
+        usable = []
+        preferred = None
 
         # References are supplied in session order.
         # Prefer the most recent eligible session, then work backward.
+        def evaluate_start(matrix, reference, reference_valid, record):
+            """Flow starting from ``matrix``; fills ``record``, returns the
+            flow or raises ValueError."""
+            self.matrix = np.asarray(matrix, dtype=np.float64).copy()
+            moving = np.asarray(
+                self.apply_remap(template, use_optical_flow=False),
+                dtype=np.float32,
+            )
+            moving_valid = self.valid_mask(use_optical_flow=False)
+
+            joint = moving_valid & reference_valid
+            if joint.mean() < min_overlap:
+                raise ValueError("Insufficient valid overlap.")
+
+            # Equalize the images outside overlap, then fade the resulting
+            # field toward zero at the overlap boundary.
+            reference_input = reference.copy()
+            reference_input[~joint] = moving[~joint]
+
+            flow = calculate_residual_flow(reference_input, moving)
+
+            if not np.isfinite(flow).all():
+                raise ValueError("Estimated flow contains nonfinite values.")
+
+            padded = np.pad(joint.astype(np.uint8), 1)
+            distance = cv2.distanceTransform(padded, cv2.DIST_L2, 3)[1:-1, 1:-1]
+            taper = np.clip(distance / 8.0, 0.0, 1.0)
+
+            flow = np.asarray(flow, dtype=np.float32)
+
+            # Regularize displacement, not image intensities.
+            # Apply the same regularized field that we evaluate below.
+            smoothing_sigma = 16.0  # spatial pixels
+            flow = cv2.GaussianBlur(
+                flow,
+                (0, 0),
+                sigmaX=smoothing_sigma,
+                sigmaY=smoothing_sigma,
+                borderType=cv2.BORDER_REFLECT_101,
+            )
+
+            record["flow_smoothing_sigma"] = smoothing_sigma
+
+            if residual:
+                flow = flow * taper[..., None]
+
+            if residual:
+                magnitude = np.linalg.norm(flow, axis=-1)
+            else:
+                # Total displacement: starting translation + flow.
+                _, _, source_x, source_y = self._flow_source_coordinates(flow)
+                magnitude = np.hypot(xx - source_x, yy - source_y)
+
+            # Measure typical displacement inside valid overlap,
+            # beyond the 8 px boundary taper. Use a fixed mask so
+            # large displacements cannot exclude themselves.
+            displacement_mask = joint & (distance >= 8.0)
+
+            if np.count_nonzero(displacement_mask) < 16:
+                raise ValueError(
+                    "Insufficient interior overlap to assess displacement."
+                )
+
+            p95 = float(np.percentile(magnitude[displacement_mask], 95))
+            interior_maximum = float(magnitude[displacement_mask].max())
+
+            # Keep an absolute safeguard across the entire applied
+            # field, including its tapered boundary.
+            maximum = float(magnitude.max())
+
+            record.update(
+                p95_displacement=p95,
+                interior_max_displacement=interior_maximum,
+                max_displacement=maximum,
+                p95_displacement_limit=float(max_displacement),
+                hard_displacement_limit=float(hard_max_displacement),
+                displacement_pixels=int(np.count_nonzero(displacement_mask)),
+            )
+
+            diagnostics = (
+                f"Interior 95th percentile: {p95:.2f} px "
+                f"(limit {max_displacement:.2f} px); "
+                f"interior maximum: {interior_maximum:.2f} px; "
+                f"whole-field maximum: {maximum:.2f} px "
+                f"(hard limit {hard_max_displacement:.2f} px)."
+            )
+
+            if maximum > hard_max_displacement:
+                raise ValueError(
+                    "Residual displacement exceeds the absolute "
+                    f"safeguard. {diagnostics}"
+                )
+
+            if p95 > max_displacement:
+                reason = (
+                    "Residual displacement exceeds the interior "
+                    f"95th-percentile limit. {diagnostics}"
+                )
+                if residual:
+                    raise ValueError(reason)
+                # Flow-only: usable after confirmation.
+                record["exceeds_limit"] = True
+                record["reason"] = reason
+            # Reject folding and extreme local expansion/compression,
+            # including deformation introduced by tapering.
+            du_dy, du_dx = np.gradient(flow[..., 0])
+            dv_dy, dv_dx = np.gradient(flow[..., 1])
+            determinant = (1.0 + du_dx) * (1.0 + dv_dy) - du_dy * dv_dx
+
+            # Assess geometry inside valid overlap, excluding the
+            # boundary where flow estimates are less constrained.
+            geometry_mask = joint & (distance >= 8.0)
+            jacobian = determinant[geometry_mask]
+
+            if jacobian.size < 16:
+                raise ValueError(
+                    "Insufficient interior overlap to assess deformation."
+                )
+
+            if not np.isfinite(jacobian).all():
+                raise ValueError(
+                    "Deformation contains nonfinite spatial derivatives."
+                )
+
+            folded = jacobian <= 0.0
+            extreme = (jacobian < 0.20) | (jacobian > 5.0)
+
+            folded_fraction = float(folded.mean())
+            extreme_fraction = float(extreme.mean())
+            low, high = np.percentile(jacobian, [1, 99])
+
+            record.update(
+                jacobian_min=float(jacobian.min()),
+                jacobian_max=float(jacobian.max()),
+                jacobian_p01=float(low),
+                jacobian_p99=float(high),
+                folded_fraction=folded_fraction,
+                extreme_deformation_fraction=extreme_fraction,
+            )
+
+            diagnostics = (
+                f"Interior Jacobian: minimum {jacobian.min():.3f}, "
+                f"1st–99th percentile {low:.3f}–{high:.3f}, "
+                f"maximum {jacobian.max():.3f}. "
+                f"Folded pixels: {100 * folded_fraction:.3f}%; "
+                f"strongly compressed/expanded pixels: "
+                f"{100 * extreme_fraction:.3f}%."
+            )
+
+            # Retain strict rejection of folding in the interior.
+            # Allow isolated positive compression/expansion outliers.
+            if folded.any() or extreme_fraction > 0.01:
+                raise ValueError(
+                    "Deformation failed the interior geometry check. " + diagnostics
+                )
+
+            sample_x = xx + flow[..., 0]
+            sample_y = yy + flow[..., 1]
+
+            destination_valid = (
+                cv2.remap(
+                    moving_valid.astype(np.float32),
+                    sample_x,
+                    sample_y,
+                    cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                > 0.999
+            )
+
+            evaluate = joint & destination_valid & (distance >= 4)
+            if evaluate.mean() < min_overlap or (
+                residual
+                and np.count_nonzero(evaluate) < 0.90 * np.count_nonzero(joint)
+            ):
+                raise ValueError("Too much overlap is lost by the deformation.")
+
+            warped = cv2.remap(
+                moving,
+                sample_x,
+                sample_y,
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+
+            # Identical evaluation pixels for before/after comparison.
+            before = correlation(reference, moving, evaluate)
+            after = correlation(reference, warped, evaluate)
+            gain = after - before
+
+            record.update(
+                correlation_before=before,
+                correlation_after=after,
+                gain=gain,
+                overlap=float(evaluate.mean()),
+            )
+
+            if not np.isfinite(before) or not np.isfinite(after):
+                raise ValueError("Insufficient background intensity variation.")
+            if after < min_correlation:
+                raise ValueError("Background agreement remains too weak.")
+            # Without residual, the gain is relative to the starting
+            # translation and may legitimately be tiny.
+            if residual and gain < min_gain:
+                raise ValueError(
+                    "Flow does not improve background agreement enough."
+                )
+
+            if not residual:
+                rigid_matrix, rigid_rms = self._fit_flow_rigid(
+                    flow,
+                    evaluate & (distance >= 8.0),
+                )
+                record["rigid_matrix"] = rigid_matrix
+                record["rigid_residual_rms"] = rigid_rms
+
+            return flow
+
         for path, reference_data in reversed(list(references.items())):
             if not reference_data.get("flow_candidate", False):
                 continue
 
-            record = {"accepted": False}
+            record = {
+                "accepted": False,
+                "name": reference_data.get("name") or Path(str(path)).name,
+            }
             self.flow_info["candidates"][str(path)] = record
+            if preferred is None:
+                preferred = str(path)
 
             try:
                 reference = np.asarray(
@@ -875,222 +1293,80 @@ class Remapping:
 
                 if not np.isfinite(reference).all():
                     raise ValueError("Reference contains nonfinite values.")
+            except ValueError as exc:
+                record["reason"] = str(exc)
+                continue
 
-                joint = moving_valid & reference_valid
-                if joint.mean() < min_overlap:
-                    raise ValueError("Insufficient valid overlap.")
-
-                # Equalize the images outside overlap, then fade the resulting
-                # field toward zero at the overlap boundary.
-                reference_input = reference.copy()
-                reference_input[~joint] = moving[~joint]
-
-                flow = calculate_residual_flow(reference_input, moving)
-
-                if not np.isfinite(flow).all():
-                    raise ValueError("Estimated flow contains nonfinite values.")
-
-                padded = np.pad(joint.astype(np.uint8), 1)
-                distance = cv2.distanceTransform(padded, cv2.DIST_L2, 3)[1:-1, 1:-1]
-                taper = np.clip(distance / 8.0, 0.0, 1.0)
-
-                flow = np.asarray(flow, dtype=np.float32)
-
-                # Regularize displacement, not image intensities.
-                # Apply the same regularized field that we evaluate below.
-                smoothing_sigma = 16.0  # spatial pixels
-                flow = cv2.GaussianBlur(
-                    flow,
-                    (0, 0),
-                    sigmaX=smoothing_sigma,
-                    sigmaY=smoothing_sigma,
-                    borderType=cv2.BORDER_REFLECT_101,
-                )
-
-                record["flow_smoothing_sigma"] = smoothing_sigma
-
-                if residual:
-                    flow = flow * taper[..., None]
-
-                magnitude = np.linalg.norm(flow, axis=-1)
-
-                # Measure typical displacement inside valid overlap,
-                # beyond the 8 px boundary taper. Use a fixed mask so
-                # large displacements cannot exclude themselves.
-                displacement_mask = joint & (distance >= 8.0)
-
-                if np.count_nonzero(displacement_mask) < 16:
-                    raise ValueError(
-                        "Insufficient interior overlap to assess displacement."
+            starts = [("current", base_matrix)]
+            if not residual:
+                # Flow alone converges to small, wrong shifts when the field
+                # of view moved far (845ad S53: 57 px); a start at the best
+                # translation finds them. Both starts are evaluated, the
+                # better agreement wins.
+                try:
+                    prior, record["prior_zscore"] = self._translation_prior(
+                        reference, reference_valid, template, hard_max_displacement
                     )
+                    if np.abs(prior[:2, 2] - base_matrix[:2, 2]).max() > 1.0:
+                        starts.append(("translation", prior))
+                except ValueError:
+                    pass
 
-                p95 = float(np.percentile(magnitude[displacement_mask], 95))
-                interior_maximum = float(magnitude[displacement_mask].max())
+            results, failures = [], []
+            for start, matrix in starts:
+                trial = {}
+                try:
+                    flow = evaluate_start(matrix, reference, reference_valid, trial)
+                    results.append((trial["correlation_after"], start, matrix, flow, trial))
+                except (ValueError, cv2.error) as exc:
+                    failures.append(str(exc))
 
-                # Keep an absolute safeguard across the entire applied
-                # field, including its tapered boundary.
-                maximum = float(magnitude.max())
+            if not results:
+                record["reason"] = " ".join(sorted(set(failures)))
+                continue
 
-                record.update(
-                    p95_displacement=p95,
-                    interior_max_displacement=interior_maximum,
-                    max_displacement=maximum,
-                    p95_displacement_limit=float(max_displacement),
-                    hard_displacement_limit=float(hard_max_displacement),
-                    displacement_pixels=int(np.count_nonzero(displacement_mask)),
-                )
+            after, start, matrix, flow, trial = max(results, key=lambda item: item[0])
+            record.update(trial)
+            record["start"] = start
+            record["prior_matrix"] = np.asarray(matrix, dtype=np.float64).copy()
 
-                diagnostics = (
-                    f"Interior 95th percentile: {p95:.2f} px "
-                    f"(limit {max_displacement:.2f} px); "
-                    f"interior maximum: {interior_maximum:.2f} px; "
-                    f"whole-field maximum: {maximum:.2f} px "
-                    f"(hard limit {hard_max_displacement:.2f} px)."
-                )
+            record["accepted"] = not record.get("exceeds_limit", False)
+            usable.append((str(path), flow, record))
 
-                if maximum > hard_max_displacement:
-                    raise ValueError(
-                        "Residual displacement exceeds the absolute "
-                        f"safeguard. {diagnostics}"
-                    )
-
-                if p95 > max_displacement:
-                    raise ValueError(
-                        "Residual displacement exceeds the interior "
-                        f"95th-percentile limit. {diagnostics}"
-                    )
-                # Reject folding and extreme local expansion/compression,
-                # including deformation introduced by tapering.
-                du_dy, du_dx = np.gradient(flow[..., 0])
-                dv_dy, dv_dx = np.gradient(flow[..., 1])
-                determinant = (1.0 + du_dx) * (1.0 + dv_dy) - du_dy * dv_dx
-
-                # Assess geometry inside valid overlap, excluding the
-                # boundary where flow estimates are less constrained.
-                geometry_mask = joint & (distance >= 8.0)
-                jacobian = determinant[geometry_mask]
-
-                if jacobian.size < 16:
-                    raise ValueError(
-                        "Insufficient interior overlap to assess deformation."
-                    )
-
-                if not np.isfinite(jacobian).all():
-                    raise ValueError(
-                        "Deformation contains nonfinite spatial derivatives."
-                    )
-
-                folded = jacobian <= 0.0
-                extreme = (jacobian < 0.20) | (jacobian > 5.0)
-
-                folded_fraction = float(folded.mean())
-                extreme_fraction = float(extreme.mean())
-                low, high = np.percentile(jacobian, [1, 99])
-
-                record.update(
-                    jacobian_min=float(jacobian.min()),
-                    jacobian_max=float(jacobian.max()),
-                    jacobian_p01=float(low),
-                    jacobian_p99=float(high),
-                    folded_fraction=folded_fraction,
-                    extreme_deformation_fraction=extreme_fraction,
-                )
-
-                diagnostics = (
-                    f"Interior Jacobian: minimum {jacobian.min():.3f}, "
-                    f"1st–99th percentile {low:.3f}–{high:.3f}, "
-                    f"maximum {jacobian.max():.3f}. "
-                    f"Folded pixels: {100 * folded_fraction:.3f}%; "
-                    f"strongly compressed/expanded pixels: "
-                    f"{100 * extreme_fraction:.3f}%."
-                )
-
-                # Retain strict rejection of folding in the interior.
-                # Allow isolated positive compression/expansion outliers.
-                if folded.any() or extreme_fraction > 0.01:
-                    raise ValueError(
-                        "Deformation failed the interior geometry check. " + diagnostics
-                    )
-
-                sample_x = xx + flow[..., 0]
-                sample_y = yy + flow[..., 1]
-
-                destination_valid = (
-                    cv2.remap(
-                        moving_valid.astype(np.float32),
-                        sample_x,
-                        sample_y,
-                        cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_CONSTANT,
-                        borderValue=0,
-                    )
-                    > 0.999
-                )
-
-                evaluate = joint & destination_valid & (distance >= 4)
-                if evaluate.mean() < min_overlap or (
-                    residual
-                    and np.count_nonzero(evaluate) < 0.90 * np.count_nonzero(joint)
-                ):
-                    raise ValueError("Too much overlap is lost by the deformation.")
-
-                warped = cv2.remap(
-                    moving,
-                    sample_x,
-                    sample_y,
-                    cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0,
-                )
-
-                # Identical evaluation pixels for before/after comparison.
-                before = correlation(reference, moving, evaluate)
-                after = correlation(reference, warped, evaluate)
-                gain = after - before
-
-                record.update(
-                    correlation_before=before,
-                    correlation_after=after,
-                    gain=gain,
-                    overlap=float(evaluate.mean()),
-                )
-
-                if not np.isfinite(before) or not np.isfinite(after):
-                    raise ValueError("Insufficient background intensity variation.")
-                if after < min_correlation:
-                    raise ValueError("Background agreement remains too weak.")
-                if gain < min_gain:
-                    raise ValueError(
-                        "Flow does not improve background agreement enough."
-                    )
-
-                if not residual:
-                    rigid_matrix, rigid_rms = self._fit_flow_rigid(
-                        flow,
-                        evaluate & (distance >= 8.0),
-                    )
-                    record["rigid_matrix"] = rigid_matrix
-                    record["rigid_residual_rms"] = rigid_rms
-
-                record["accepted"] = True
-
-                # All quality checks passed. Accept the nearest previous
-                # eligible reference rather than comparing older scores.
-                best_flow = flow
-                best_path = str(path)
+            # The most recent reference agrees well: the default.
+            if (
+                str(path) == preferred
+                and record["accepted"]
+                and (good_correlation is None or after >= good_correlation)
+            ):
                 break
 
-            except (ValueError, cv2.error) as exc:
-                record["reason"] = str(exc)
+        if usable:
+            best = max(record["correlation_after"] for _, _, record in usable)
+            path, flow, record = next(
+                item
+                for item in usable
+                if item[2]["correlation_after"] >= best - FLOW_PREFERENCE_MARGIN
+            )
+            record["selected"] = True
+            if (
+                good_correlation is not None
+                and record["correlation_after"] < good_correlation
+            ):
+                record["agreement"] = self._reference_agreement(path, record, usable)
 
-        if best_flow is not None:
-            self.flow = best_flow
+            self.matrix = record.get("prior_matrix", base_matrix).copy()
+            self.flow = flow
             self.flow_info.update(
                 status="applied",
-                reference=best_path,
+                reference=path,
                 reason="",
+                deviation=self._flow_deviation(
+                    path, record, preferred, max_displacement
+                ),
             )
         elif self.flow_info["candidates"]:
+            self.matrix = base_matrix
             reasons = sorted(
                 {
                     item.get("reason", "Candidate rejected.")
@@ -1106,7 +1382,7 @@ class Remapping:
         if self.flow_info.get("mode") == "flow_only":
             entries = [
                 {
-                    "success": candidate.get("accepted", False),
+                    "success": candidate.get("selected", False),
                     "c_max": candidate.get("correlation_after"),
                     "c_zscored": None,
                     "reason": candidate.get("reason"),
@@ -1135,6 +1411,8 @@ class Remapping:
 
         if self.success:
             reason = None
+        elif getattr(self, "confirmation", None):
+            reason = "confirmation_required"
         elif not entries:
             reason = "no_reference"
         else:

@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     Qt,
 )
 from .Worker import Worker
+from catan.core.memory import release_free_memory
 
 
 @dataclass(eq=False)
@@ -552,6 +553,12 @@ class TaskManager(QObject):
             self._finishing_depth -= 1
             self.process_queues()
             self.scheduling_settled.emit()
+
+            # Processing finished: return freed heap memory to the system.
+            if not task.background and not any(
+                not other.background for other in self.tasks.values()
+            ):
+                QTimer.singleShot(0, release_free_memory)
 
     # ------------------------------------------------------------------
     # Cancellation

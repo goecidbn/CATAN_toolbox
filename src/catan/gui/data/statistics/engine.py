@@ -283,6 +283,7 @@ class StatisticEngine(QObject):
             definition.parameters,
             definition.independent_pairs,
             definition.query_getter,
+            definition.pairs_getter,
             definition.compact_values,
             definition.foreground_safe,
             definition.neuron_local,
@@ -480,7 +481,12 @@ class StatisticEngine(QObject):
                 session_series=query.context == "session_series",
             )
 
-        if stat_def.query_getter is not None:
+        query_getter = stat_def.query_getter
+
+        if requested_pairs is not None and stat_def.pairs_getter is not None:
+            query_getter = stat_def.pairs_getter
+
+        if query_getter is not None:
             prepared_query = replace(
                 query,
                 reductions=tuple(reductions.items()),
@@ -497,7 +503,7 @@ class StatisticEngine(QObject):
                 execution_options["requested_pairs"] = requested_pairs
 
             with progress_scope(0, 98, f"Calculating {stat_def.key}"):
-                stat = stat_def.query_getter(
+                stat = query_getter(
                     data,
                     state,
                     prepared_query,
@@ -721,7 +727,36 @@ class StatisticEngine(QObject):
         while isinstance(getter, partial):
             getter = getter.func
 
-        if getattr(getter, "supports_value_selection", False):
+        if requested_pairs is not None and definition.pairs_getter is not None:
+            # All requested rows, then the selection on compacted values,
+            # exactly as for the full calculation below.
+            with progress_scope(0, 85):
+                stat = self._evaluate_uncached(
+                    query,
+                    definition,
+                    requested_pairs=requested_pairs,
+                )
+
+            if definition.compact_values:
+                with progress_scope(85, 88, "Compacting statistic values"):
+                    _compact_statistic_values(stat)
+
+            with progress_scope(88, 95, "Constructing statistic table"):
+                table = PickTable.from_stat(stat)
+
+            remaining = tuple(
+                f
+                for f in (query.filters or ())
+                if f.target not in stat.applied_pair_filters
+            )
+
+            if remaining:
+                table = table.filtered(remaining)
+
+            with progress_scope(95, 99, "Filtering statistic table"):
+                table = table.subset_rows(np.flatnonzero(select(table.values)))
+
+        elif getattr(getter, "supports_value_selection", False):
             with progress_scope(0, 85):
                 stat = self._evaluate_uncached(
                     query,
@@ -865,8 +900,13 @@ class StatisticEngine(QObject):
             getter = getter.func
 
         return (
-            getattr(getter, "supports_requested_pairs", False)
-            and getattr(getter, "supports_value_selection", False)
+            (
+                definition.pairs_getter is not None
+                or (
+                    getattr(getter, "supports_requested_pairs", False)
+                    and getattr(getter, "supports_value_selection", False)
+                )
+            )
             and definition.relationship_axes is not None
             and all(
                 spec.method in ("keep", "single")

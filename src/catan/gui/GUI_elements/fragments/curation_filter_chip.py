@@ -224,6 +224,7 @@ class CurationFilterChip(QFrame):
         menu.addAction("Remove", lambda: self.remove_requested.emit(self.condition_id))
 
         menu.exec(self.mapToGlobal(pos))
+        menu.deleteLater()
 
     def set_evidence_active(self, active: bool):
         self.setProperty("evidenceActive", active)

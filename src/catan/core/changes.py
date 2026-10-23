@@ -12,7 +12,11 @@ class ChangeKind(str, Enum):
 
     FOOTPRINT_GEOMETRY = "footprint_geometry"
     BACKGROUND_IMAGE = "background_image"
+    # Display-only background of the overview (not a session's data).
+    OVERVIEW_BACKGROUND = "overview_background"
     UNION_GEOMETRY = "union_geometry"
+    # Shared imaging border settings (Data.border_tolerance).
+    BORDER_SETTINGS = "border_settings"
 
     TRACE_VALUES = "trace_values"
     QUALITY_VALUES = "quality_values"

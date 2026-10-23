@@ -137,11 +137,11 @@ class ResourceMonitor(QWidget):
         box.open()
 
     def update_display(self):
-        import time
+        # import time
 
         # print("resource monitor update")
 
-        t0 = time.perf_counter()
+        # t0 = time.perf_counter()
 
         try:
             # existing method contents
@@ -150,10 +150,11 @@ class ResourceMonitor(QWidget):
             self.label.setText(text)
 
         finally:
-            dt = time.perf_counter() - t0
+            pass
+            # dt = time.perf_counter() - t0
 
-            if dt > 0.05:
-                print(f"ResourceMonitor.update_display: " f"{dt * 1000:.1f} ms")
+            # if dt > 0.05:
+            #     print(f"ResourceMonitor.update_display: " f"{dt * 1000:.1f} ms")
 
     def collect_resource_text(self):
         items = {

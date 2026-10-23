@@ -53,6 +53,7 @@ REMAP_FIELDS = (
     "c_zscored",
     "method",
     "flow_info",
+    "confirmation",
 )
 
 
@@ -198,7 +199,10 @@ def read_session_snapshot(backend, ref, *, root="/"):
     if payload["remap"] is not None:
         session.remap = Remapping(evaluate=False)
         for key in REMAP_FIELDS:
-            if key in {"method", "flow_info"} and key not in payload["remap"]:
+            if (
+                key in {"method", "flow_info", "confirmation"}
+                and key not in payload["remap"]
+            ):
                 continue  # Older snapshots retain the constructor default.
             setattr(session.remap, key, payload["remap"][key])
         if session.remap.dims is not None:
@@ -233,4 +237,83 @@ def read_session_snapshot(backend, ref, *, root="/"):
     session.status["registered_to_model"] = False
     session.status["matched"] = False
     session._restored_processing = payload["processing"]
+    return session
+
+
+# ----------------------------------------------------------------------
+# Display-only background (template + alignment, no footprints), e.g. the
+# Overview background stored with assignments.
+# ----------------------------------------------------------------------
+
+BACKGROUND_FIELDS = ("name", "path", "params", "dims", "status")
+
+
+def prepare_background_snapshot(session):
+    """{"document": JSON text, "arrays": {key: array}} of a background-only
+    SessionData (background_template, background, remap)."""
+    arrays = {}
+
+    def encode(value):
+        if isinstance(value, np.ndarray):
+            key = f"a{len(arrays):04d}"
+            arrays[key] = value
+            return {"__array__": key}
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Path):
+            return str(value)
+        raise TypeError(f"Cannot serialize {type(value).__name__}.")
+
+    values = {key: getattr(session, key) for key in BACKGROUND_FIELDS}
+    values["path"] = None if session.path is None else str(session.path)
+    payload = {
+        "version": 1,
+        "session": values,
+        "background_template": session.background_template,
+        "background": session.background,
+        "remap": (
+            None
+            if session.remap is None
+            else {key: getattr(session.remap, key) for key in REMAP_FIELDS}
+        ),
+    }
+    return {"document": json.dumps(payload, default=encode), "arrays": arrays}
+
+
+def restore_background_snapshot(document, arrays):
+    """SessionData from ``prepare_background_snapshot`` output."""
+    if isinstance(document, bytes):
+        document = document.decode("utf-8")
+
+    def decode(value):
+        if set(value) != {"__array__"}:
+            return value
+        return np.asarray(arrays[value["__array__"]])
+
+    payload = json.loads(document, object_hook=decode)
+    if payload.get("version") != 1:
+        raise ValueError("Unsupported background snapshot version.")
+
+    session = SessionData()
+    for key in BACKGROUND_FIELDS:
+        setattr(session, key, payload["session"][key])
+    session.dims = tuple(session.dims)
+
+    session.background_template = np.asarray(
+        payload["background_template"], dtype=np.float32
+    )
+    session.background = np.asarray(payload["background"], dtype=np.float32)
+    for image in (session.background_template, session.background):
+        if image.shape != session.dims:
+            raise ValueError("Stored background has inconsistent dimensions.")
+
+    session.remap = None
+    if payload["remap"] is not None:
+        session.remap = Remapping(evaluate=False)
+        for key in REMAP_FIELDS:
+            if key in payload["remap"]:
+                setattr(session.remap, key, payload["remap"][key])
+        if session.remap.dims is not None:
+            session.remap.dims = tuple(session.remap.dims)
+
     return session

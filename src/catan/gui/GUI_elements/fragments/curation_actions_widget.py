@@ -4,8 +4,10 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import replace
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QEventLoop
 from PySide6.QtWidgets import (
+    QApplication,
+    QProgressBar,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -21,11 +23,56 @@ from PySide6.QtWidgets import (
 
 from catan.gui.data.curation_actions import (
     BATCH_ACTIONS,
+    ManipulationBatch,
     ManipulationSpec,
     ManipulationPlan,
     OccupiedDestination,
 )
+
+CONFLICT_HELP = {
+    "split": (
+        "A conflict: a source neuron already has a footprint in the target "
+        "session. Apply anyway excludes that footprint (it stays in the data "
+        "as an excluded single-footprint neuron) and matches the split "
+        "result to the source neuron instead. Ask additionally offers "
+        "keeping it as a separate, included neuron."
+    ),
+    "reassign": (
+        "A conflict: the target neuron already has a footprint in the "
+        "session of the reassigned footprint. Apply anyway excludes the "
+        "target's existing footprint (it stays in the data as an excluded "
+        "single-footprint neuron) and assigns the reassigned footprint "
+        "instead. Ask additionally offers keeping it as a separate, "
+        "included neuron."
+    ),
+    "neuron_merge": (
+        "A conflict: both neurons have a footprint in the same session. "
+        "Apply anyway excludes the source neuron's footprint in those "
+        "sessions (it stays in the data as an excluded single-footprint "
+        "neuron) and keeps the target's, then merges. Ask additionally "
+        "offers keeping the source's footprint as a separate, included neuron."
+    ),
+}
+
+# Ask dialog: what Exclude / Keep do with the conflicting footprint.
+CONFLICT_CHOICES = {
+    "neuron_merge": (
+        "Exclude: the source neuron's footprint in that session is excluded "
+        "(kept as an excluded single-footprint neuron); the target keeps its "
+        "own, then the neurons are merged.\n"
+        "Keep: the source's footprint moves to a separate, included neuron; "
+        "nothing is excluded.\n"
+    ),
+}
+DEFAULT_CONFLICT_CHOICES = (
+    "Exclude: the existing footprint is excluded (kept as an excluded "
+    "single-footprint neuron) and the result takes its place.\n"
+    "Keep: the existing footprint moves to a separate, included "
+    "neuron; nothing is excluded.\n"
+)
 from catan.tracking.structures import ReviewStatus
+from catan.core.structures import NeuronComponent
+from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 
 
 class CuratorActions(QGroupBox):
@@ -44,6 +91,11 @@ class CuratorActions(QGroupBox):
         self.committing = False
         self.waiting = False
 
+        # Background preparation of the pending manipulation.
+        self._prepare_task = None
+        self.state.tasks.task_cancelled.connect(self._on_prepare_stopped)
+        self.state.tasks.task_failed.connect(self._on_prepare_stopped)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 16, 10, 10)
 
@@ -56,6 +108,7 @@ class CuratorActions(QGroupBox):
             ("Split footprint", "split"),
             ("Merge footprints", "merge"),
             ("Merge neurons", "neuron_merge"),
+            ("Reassign footprint", "reassign"),
             ("Mark reviewed", "mark_reviewed"),
             ("Mark uncertain", "mark_uncertain"),
             ("Exclude neurons", "exclude_neuron"),
@@ -89,6 +142,34 @@ class CuratorActions(QGroupBox):
         self.confirm = QCheckBox("Display and confirm each manipulation")
         layout.addWidget(self.confirm)
 
+        conflict_row = QHBoxLayout()
+        self.conflict_label = QLabel("On conflict:")
+        self.conflict = QComboBox()
+
+        for label, value, tooltip in (
+            ("Ask", "ask", "Ask for each conflicting candidate."),
+            ("Skip candidate", "skip", "Leave conflicting candidates unchanged."),
+            (
+                "Apply anyway",
+                "resolve",
+                "Exclude the footprint occupying the destination, then apply.",
+            ),
+        ):
+            self.conflict.addItem(label, value)
+            self.conflict.setItemData(
+                self.conflict.count() - 1, tooltip, Qt.ItemDataRole.ToolTipRole
+            )
+
+        conflict_row.addWidget(self.conflict_label)
+        conflict_row.addWidget(self.conflict)
+        conflict_row.addStretch()
+        layout.addLayout(conflict_row)
+
+        self.conflict_help = QLabel()
+        self.conflict_help.setWordWrap(True)
+        self.conflict_help.setStyleSheet("color: #9aa3ad;")
+        layout.addWidget(self.conflict_help)
+
         row = QHBoxLayout()
 
         self.current = QPushButton("Apply current")
@@ -108,12 +189,24 @@ class CuratorActions(QGroupBox):
 
         layout.addLayout(row)
 
+        # Progress of "Apply all selected" (no modal dialog: the window and
+        # conflict dialogs stay usable).
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(True)
+        self.progress.hide()
+        layout.addWidget(self.progress)
+
+        # Stop during a batch: stop after the current plan, commit applied.
+        self._batch_running = False
+        self._batch_stop = False
+
         self.status = QLabel()
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
         self.kind.currentIndexChanged.connect(self._settings_changed)
         self.confirm.toggled.connect(self._settings_changed)
+        self.conflict.currentIndexChanged.connect(self._settings_changed)
         self.candidate.currentIndexChanged.connect(self._preview_current)
         self.candidate.currentIndexChanged.connect(
             lambda *_: self._update_selector_layout()
@@ -123,7 +216,7 @@ class CuratorActions(QGroupBox):
         self.all.clicked.connect(lambda: self._start(True))
         self.next.clicked.connect(lambda: self._apply(self.run_id))
         self.skip.clicked.connect(self._skip)
-        self.stop.clicked.connect(lambda: self._finish("Stopped"))
+        self.stop.clicked.connect(self._on_stop)
 
         self.state.focused_component_changed.connect(self.refresh_candidates)
         self.state.selected_components_changed.connect(self.refresh_candidates)
@@ -134,13 +227,14 @@ class CuratorActions(QGroupBox):
     def sync(self):
         spec = self.controller.root_filter.manipulation or ManipulationSpec()
 
-        for widget in (self.kind, self.confirm):
+        for widget in (self.kind, self.confirm, self.conflict):
             widget.blockSignals(True)
 
         self.kind.setCurrentIndex(self.kind.findData(spec.kind))
         self.confirm.setChecked(spec.confirm_each)
+        self.conflict.setCurrentIndex(self.conflict.findData(spec.on_conflict))
 
-        for widget in (self.kind, self.confirm):
+        for widget in (self.kind, self.confirm, self.conflict):
             widget.blockSignals(False)
 
         self.refresh_candidates()
@@ -188,6 +282,7 @@ class CuratorActions(QGroupBox):
             kind=self.kind.currentData(),
             group_id=None,
             confirm_each=self.confirm.isChecked(),
+            on_conflict=self.conflict.currentData(),
         )
 
         self.controller.filter_store.mark_working_dirty()
@@ -199,41 +294,81 @@ class CuratorActions(QGroupBox):
         self.result_version = self.state.data_version
         self.refresh_candidates()
 
-    def _prepare_with_confirmation(self, plan):
-        try:
-            return self.data.prepare_manipulation(plan)
+    def _conflict_choice(self, slots, *, batch=False):
+        """"exclude", "detach", "skip" or (batch only) "stop"."""
+        policy = getattr(self, "_policy", None) or self.conflict.currentData()
 
-        except OccupiedDestination as exc:
-            dialog = QMessageBox(self.window())
-            dialog.setIcon(QMessageBox.Icon.Warning)
-            dialog.setWindowTitle("Destination already contains a footprint")
-            dialog.setText(str(exc))
-            dialog.setInformativeText(
-                "Apply anyway moves each existing footprint to a "
-                "separate, included neuron, then applies this "
-                "manipulation. No footprint is overwritten or "
-                "excluded. Reject leaves this candidate unchanged."
-            )
+        if policy == "skip":
+            return "skip"
 
-            apply_button = dialog.addButton(
-                "Apply anyway",
-                QMessageBox.ButtonRole.AcceptRole,
-            )
-            reject_button = dialog.addButton(
-                "Reject",
-                QMessageBox.ButtonRole.RejectRole,
-            )
-            dialog.setDefaultButton(reject_button)
-            dialog.exec()
+        if policy == "resolve":
+            return "exclude"
 
-            if dialog.clickedButton() is not apply_button:
-                return None
+        if policy == "detach":
+            return "detach"
 
-            # Resolve and validate again after the dialog.
-            return self.data.prepare_manipulation(
-                plan,
-                detach_occupied=True,
+        dialog = QMessageBox(self.window())
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Destination already contains a footprint")
+        kind = self.kind.currentData()
+        dialog.setText(str(OccupiedDestination(slots, kind)))
+        dialog.setInformativeText(
+            CONFLICT_CHOICES.get(kind, DEFAULT_CONFLICT_CHOICES)
+            + "Skip leaves this candidate unchanged."
+            + (
+                "\n\nThis run applies all changes together when it ends."
+                if batch
+                else ""
             )
+        )
+
+        exclude_button = dialog.addButton(
+            "Exclude existing && apply", QMessageBox.ButtonRole.AcceptRole
+        )
+        detach_button = dialog.addButton(
+            "Keep as separate neuron && apply", QMessageBox.ButtonRole.AcceptRole
+        )
+        skip_button = dialog.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+        stop_button = (
+            dialog.addButton("Stop run", QMessageBox.ButtonRole.DestructiveRole)
+            if batch
+            else None
+        )
+        dialog.setDefaultButton(skip_button)
+
+        fit_message_box_buttons(dialog)
+
+        remember = None
+        if self.queue is not None:
+            remember = QCheckBox("Use this choice for the remaining conflicts")
+            dialog.setCheckBox(remember)
+
+        self._run_dialog(dialog)
+        clicked = dialog.clickedButton()
+
+        choice = {
+            exclude_button: "exclude",
+            detach_button: "detach",
+            stop_button: "stop",
+        }.get(clicked, "skip")
+
+        if remember is not None and remember.isChecked() and choice != "stop":
+            self._policy = {"exclude": "resolve", "detach": "detach"}.get(choice, "skip")
+
+        return choice
+
+    def _run_dialog(self, dialog):
+        """Show a conflict dialog without blocking the application: it can
+        be moved and the panels (e.g. footprints) stay usable while the
+        answer is pending. Closing it counts as no choice."""
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setModal(False)
+
+        loop = QEventLoop(self)
+        dialog.finished.connect(loop.quit)
+        dialog.show()
+        dialog.raise_()
+        loop.exec()
 
     def _plans(self):
         result = self.controller.current_result
@@ -404,12 +539,18 @@ class CuratorActions(QGroupBox):
         self.candidate.setVisible(not batch)
         self.confirm.setVisible(not batch)
 
+        help_text = CONFLICT_HELP.get(self.kind.currentData())
+        for widget in (self.conflict_label, self.conflict, self.conflict_help):
+            widget.setVisible(help_text is not None)
+        self.conflict_help.setText(help_text or "")
+
         if running:
             self.controller.menu.evaluate_button.setEnabled(False)
 
         for widget in (
             self.kind,
             self.confirm,
+            self.conflict,
             self.candidate,
         ):
             widget.setEnabled(not running)
@@ -600,8 +741,13 @@ class CuratorActions(QGroupBox):
         self.queue = deque(plans)
         self.pending = None
         self.reports = []
+        self._policy = None
 
         self.review = all_selected and self.confirm.isChecked()
+
+        # Single candidates and reviewed runs report problems immediately;
+        # automatic runs collect them for the summary.
+        self.interactive = self.review or not all_selected
 
         self.generation = self.controller._filter_generation
         self.root = self.controller.root_filter
@@ -609,6 +755,14 @@ class CuratorActions(QGroupBox):
         self.spec = deepcopy(
             self.root.manipulation or ManipulationSpec(kind=self.kind.currentData())
         )
+
+        if (
+            all_selected
+            and not self.review
+            and self.kind.currentData() in ManipulationBatch.KINDS
+        ):
+            self._run_batch(plans)
+            return
 
         self._advance(self.run_id)
 
@@ -672,20 +826,95 @@ class CuratorActions(QGroupBox):
             self._buttons()
             return
 
-        self.waiting = False
         plan = self.pending
 
         try:
             sources, targets = plan.resolve(self.data)
-            prepared = self._prepare_with_confirmation(plan)
+        except ValueError as exc:
+            self._report_skipped(exc)
+            self._continue(token)
+            return
 
-            if prepared is None:
-                self._skip()
-                return
+        self._prepare_in_background(token, plan, sources, targets)
 
+    def _prepare_in_background(self, token, plan, sources, targets, **resolution):
+        """Prepare the manipulation in a worker; commit on the GUI thread.
+
+        prepare() works on an isolated candidate; commit() refuses it if
+        the data changed in the meantime.
+        """
+        from catan.gui.data.curation_actions import prepare
+
+        data = self.data
+
+        def work():
+            try:
+                return "prepared", prepare(data, plan, **resolution)
+            except OccupiedDestination as exc:
+                return "occupied", exc
+            except ValueError as exc:
+                return "invalid", exc
+
+        self.waiting = True
+        self._buttons()
+        self.status.setText(
+            "Preparing: " + self._label(plan.kind, sources, targets) + " …"
+        )
+
+        self._prepare_task = self.state.tasks.start(
+            "model update",
+            f"Curator: prepare {plan.kind}",
+            work,
+            on_result=lambda result: self._prepared(token, plan, sources, targets, result),
+        )
+
+    def _on_prepare_stopped(self, group, task_id):
+        if task_id is None or task_id != self._prepare_task:
+            return
+
+        self._prepare_task = None
+        self.waiting = False
+        self._finish("Stopped: preparation was cancelled or failed")
+
+    def _prepared(self, token, plan, sources, targets, result):
+        self._prepare_task = None
+        self.waiting = False
+
+        if token != self.run_id or self.queue is None or self.pending is not plan:
+            return
+
+        outcome, value = result
+
+        if outcome == "occupied":
+            choice = self._conflict_choice(value.slots)
+
+            # The run may have been stopped while the dialog was open.
             if token != self.run_id or self.queue is None:
                 return
 
+            if choice not in ("exclude", "detach"):
+                self._skip()
+                return
+
+            # Resolve and validate again after the dialog.
+            self._prepare_in_background(
+                token,
+                plan,
+                sources,
+                targets,
+                detach_occupied=choice == "detach",
+                exclude_occupied=choice == "exclude",
+            )
+            return
+
+        if outcome == "invalid":
+            self._report_skipped(value)
+            self._continue(token)
+            return
+
+        prepared = value
+
+        try:
             prepared.validation = self.data.validate_prepared_manipulation(
                 prepared, self.spec
             )
@@ -718,26 +947,11 @@ class CuratorActions(QGroupBox):
             )
             self.controller._refresh_results()
 
-            outcome = {
-                component
-                for values in prepared.replacements.values()
-                for component in values
-            }
-            if not outcome:
-                outcome = set(prepared.affected_after)
-
-            self.state.update_highlighted_components(
-                self.controller._display_components(outcome) or None
-            )
+            self._highlight_outcome(prepared, [(sources, targets)])
             self.reports.append(("applied", plan.kind))
 
         except ValueError as exc:
-            self.reports.append(("skipped", str(exc)))
-            QMessageBox.warning(
-                self.window(),
-                "Manipulation not applied",
-                str(exc),
-            )
+            self._report_skipped(exc)
 
         except Exception as exc:
             self.reports.append(("failed", f"{type(exc).__name__}: {exc}"))
@@ -749,8 +963,193 @@ class CuratorActions(QGroupBox):
             )
             return
 
+        self._continue(token)
+
+    def _report_skipped(self, exc):
+        self.reports.append(("skipped", str(exc)))
+
+        if self.interactive:
+            QMessageBox.warning(
+                self.window(),
+                "Manipulation not applied",
+                str(exc),
+            )
+
+    def _continue(self, token):
         self.pending = None
+        self._buttons()
         QTimer.singleShot(0, lambda: self._advance(token))
+
+    def _highlight_outcome(self, prepared, endpoints):
+        """Highlight results (targets) and the plans' sources at their new
+        identities, following the highlight selector (roles, colours)."""
+
+        def mapped(component):
+            key = (component.neuron_id, component.session_id)
+
+            if key in prepared.component_map:
+                current = prepared.component_map[key]
+                return None if current is None else NeuronComponent(*current)
+
+            neuron = prepared.row_map.get(component.neuron_id)
+            return None if neuron is None else NeuronComponent(neuron, component.session_id)
+
+        results = {
+            component
+            for values in prepared.replacements.values()
+            for component in values
+        }
+
+        if not results:
+            # Neuron merges have no result footprints.
+            results = set(prepared.affected_after)
+
+        sources = {
+            current
+            for plan_sources, _ in endpoints
+            for component in plan_sources
+            if (current := mapped(component)) is not None
+        } - results
+
+        self.controller._highlight_endpoints(sources, results)
+
+    def _run_batch(self, plans):
+        """Apply all plans to one candidate and commit them together."""
+        kind = self.kind.currentData()
+        token = self.run_id
+
+        try:
+            batch = self.data.start_manipulation_batch(kind)
+        except ValueError as exc:
+            self.reports.append(("skipped", str(exc)))
+            self._finish("Not started")
+            return
+
+        self._buttons()
+
+        self._batch_running = True
+        self._batch_stop = False
+        self.progress.setRange(0, len(plans) + 1)
+        self.progress.show()
+
+        stopped = False
+
+        try:
+            for index, plan in enumerate(plans):
+                self._batch_progress(
+                    index, f"Applying manipulations: %v / {len(plans)}"
+                )
+
+                if self._batch_stop or token != self.run_id:
+                    stopped = True
+                    break
+
+                try:
+                    slots = batch.conflicts(plan)
+                    occupied = None
+
+                    if slots:
+                        if self.conflict.currentData() == "ask" and self._policy is None:
+                            # Context for the decision: the committed data.
+                            self._show(plan, focus=True)
+
+                        choice = self._conflict_choice(slots, batch=True)
+
+                        if choice == "stop":
+                            stopped = True
+                            break
+
+                        if choice == "skip":
+                            self.reports.append(
+                                ("skipped", "Conflict: " + str(OccupiedDestination(slots, kind)))
+                            )
+                            continue
+
+                        occupied = choice
+
+                    batch.apply(plan, occupied=occupied)
+                    self.reports.append(("applied", kind))
+
+                except ValueError as exc:
+                    self.reports.append(("skipped", str(exc)))
+
+            if token != self.run_id:
+                # Data changed outside this run; nothing was committed.
+                return
+
+            if not batch.applied:
+                self._finish("Stopped" if stopped else "Finished")
+                return
+
+            self.stop.setEnabled(False)
+            self._batch_progress(
+                len(plans),
+                f"Rebuilding union footprints and committing {len(batch.applied)} "
+                "manipulations…",
+            )
+
+            prepared = batch.finish()
+            prepared.validation = self.data.validate_prepared_manipulation(
+                prepared, self.spec
+            )
+            prepared.validation.require_pass()
+
+            self.committing = True
+            try:
+                self.data.commit_manipulation(prepared)
+
+                result = self.controller.current_result
+                if result is not None:
+                    result.applied_batch(
+                        [(plan.kind, sources, targets) for plan, sources, targets in batch.applied],
+                        prepared,
+                        self.data,
+                    )
+            finally:
+                self.committing = False
+
+        except Exception as exc:
+            self.reports = [
+                (outcome, text) for outcome, text in self.reports if outcome != "applied"
+            ]
+            self.reports.append(("failed", f"{type(exc).__name__}: {exc}"))
+            self._finish("Stopped: nothing was applied")
+            QMessageBox.warning(
+                self.window(),
+                "Manipulations not applied",
+                f"{exc}\n\nNo changes were made to the data.",
+            )
+            return
+
+        finally:
+            self._batch_running = False
+            self.progress.hide()
+            self.stop.setEnabled(True)
+
+        self.controller._results_note = (
+            "Data changed since evaluation; completed candidates were removed."
+        )
+        self.controller._refresh_results()
+
+        self._highlight_outcome(
+            prepared, [(sources, targets) for _, sources, targets in batch.applied]
+        )
+
+        self._finish("Stopped" if stopped else "Finished")
+
+    def _on_stop(self):
+        if self._batch_running:
+            self._batch_stop = True
+            self.progress.setFormat("Stopping after the current manipulation…")
+            return
+
+        self._finish("Stopped")
+
+    def _batch_progress(self, value, text):
+        self.progress.setValue(value)
+        self.progress.setFormat(text)
+        # Keep the window responsive (Stop, conflict context) during the run.
+        QApplication.processEvents()
 
     def _skip(self):
         if self.pending is not None and not self.waiting:
@@ -763,6 +1162,10 @@ class CuratorActions(QGroupBox):
             )
 
     def _finish(self, message):
+        if self._prepare_task is not None:
+            task, self._prepare_task = self._prepare_task, None
+            self.state.tasks.cancel(task)
+
         self.run_id += 1
         self.queue = None
         self.pending = None

@@ -23,6 +23,12 @@ def main() -> int:
     )
     options, qt_arguments = parser.parse_known_args(sys.argv[1:])
 
+    # Before any worker thread exists: fewer per-thread heaps keep freed
+    # memory returnable to the system (see catan.core.memory).
+    from catan.core.memory import limit_malloc_arenas
+
+    limit_malloc_arenas()
+
     if sys.argv[1:2] == ["--catan-read-worker"]:
         if len(sys.argv) != 3:
             raise SystemExit("Internal reader mode requires a request directory.")
@@ -63,6 +69,10 @@ def main() -> int:
 
     font = QFont("Noto Sans", 10)
     app.setFont(font)
+
+    from catan.gui.GUI_elements.utils.tooltips import install_tooltip_wrapping
+
+    install_tooltip_wrapping(app)
 
     # app.aboutToQuit.connect(lambda: print("QApplication aboutToQuit"))
     # app.lastWindowClosed.connect(lambda: print("lastWindowClosed"))

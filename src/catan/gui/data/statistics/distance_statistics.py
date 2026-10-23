@@ -12,6 +12,12 @@ from .dimensions import Dimension
 from .queries import ReductionSpec
 from .blockwise import evaluate_blockwise
 from .sparse_pairs import SparsePairCollector, only_kept_axes, selection_upper_bound
+from .session_relations import (
+    NEURON_RELATIONS,
+    DetectionReference,
+    is_order_relation,
+    relation_mask,
+)
 
 
 def geometry(data, state):
@@ -99,7 +105,17 @@ def union_positions(data, n):
     return result
 
 
-def pair_plan(names, n, s, query):
+def reference_neurons(names, coordinate):
+    """Reference neuron of a pair (j endpoint, or the shared neuron)."""
+    for name in ("neuron_j", "neuron"):
+        if name in names:
+            return coordinate(name)
+
+    return None
+
+
+def pair_plan(names, n, s, query, ids=None):
+    """``ids`` (assignments) is needed for neuron-dependent session relations."""
     reductions = query.reduction_dict()
     requested, fixed = {}, {}
 
@@ -187,6 +203,13 @@ def pair_plan(names, n, s, query):
 
         return np.asarray(selected[logical]).reshape(shape) + offset
 
+    detection = (
+        DetectionReference(ids)
+        if ids is not None
+        and any(f.relation in NEURON_RELATIONS for f in filters.values())
+        else None
+    )
+
     def allowed(selected):
         result = True
 
@@ -205,6 +228,11 @@ def pair_plan(names, n, s, query):
                 result = result & (a != b)
             elif f.relation == "with previous" and target == "session":
                 result = result & (b == a - 1)
+            elif target == "session" and is_order_relation(f.relation):
+                neurons = reference_neurons(
+                    names, lambda name: coordinate(name, selected)
+                )
+                result = result & relation_mask(f.relation, a, b, neurons, detection)
             elif f.relation != "all":
                 raise ValueError(f"Unsupported {target} relation: {f.relation}")
 
@@ -237,7 +265,14 @@ def distance_query(
     positions = None if mode == "union" else geometry(data, state)[0]
     union = union_positions(data, n) if mode in ("union", "to_union") else None
 
-    dims, aliases, references, coord, allowed = pair_plan(names, n, s, query)
+    dims, aliases, references, coord, allowed = pair_plan(
+        names, n, s, query, ids=state.assignments
+    )
+    detection = (
+        DetectionReference(state.assignments)
+        if any(f.relation in NEURON_RELATIONS for f in query.filters)
+        else None
+    )
 
     if requested_pairs is not None:
         from .requested_rows import evaluate_requested_rows
@@ -334,6 +369,8 @@ def distance_query(
                     valid &= a != b
                 elif f.relation == "with previous" and f.target == "session":
                     valid &= b == a - 1
+                elif f.target == "session" and is_order_relation(f.relation):
+                    valid &= relation_mask(f.relation, a, b, nj, detection)
                 elif f.relation != "all":
                     raise ValueError(f"Unsupported pair filter: {f}")
 
@@ -367,6 +404,7 @@ def distance_query(
             query,
             select_values,
             exclude_self=exclude_self,
+            ids=state.assignments,
         )
 
         if result is not None:
@@ -436,6 +474,7 @@ def _sparse_distance_selection(
     select_values,
     *,
     exclude_self,
+    ids=None,
 ):
     """Selected distances, enumerating only pairs within the selection radius.
 
@@ -445,7 +484,7 @@ def _sparse_distance_selection(
     from scipy.spatial import cKDTree
 
     collector = SparsePairCollector(
-        names, dims, aliases, references, n, s, query, select_values
+        names, dims, aliases, references, n, s, query, select_values, ids=ids
     )
 
     clouds = [p.reshape(-1, 2) for p in (positions, union) if p is not None]

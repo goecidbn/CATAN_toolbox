@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt, Signal, QEvent
+from PySide6.QtCore import Qt, Signal, QEvent, QSize, QTimer
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -49,6 +49,10 @@ class ControlPanel(QWidget):
 
         self.parameter_body.setVisible(False)
         self.form = form
+
+        # Content changes (label text, shown/hidden rows) re-fit the panel.
+        self._relayout_pending = False
+        self.parameter_body.installEventFilter(self)
 
         app = QApplication.instance()
 
@@ -209,6 +213,35 @@ class ControlPanel(QWidget):
         self.review_filter.changed.connect(self.display_parameter_changed.emit)
         return self.review_filter
 
+    def adjustSize(self):
+        """Size to the content at the width the panel actually gets
+        (maximumWidth): word-wrapped labels need the height for that width,
+        not for the wider preferred width QWidget.adjustSize assumes."""
+        hint = self.sizeHint()
+        width = max(1, min(hint.width(), self.maximumWidth()))
+        width = max(width, min(self.minimumSizeHint().width(), self.maximumWidth()))
+
+        height = self.heightForWidth(width) if self.hasHeightForWidth() else -1
+        if height < 0:
+            height = hint.height()
+
+        self.resize(QSize(width, height))
+
+    def _schedule_relayout(self):
+        if not self._relayout_pending:
+            self._relayout_pending = True
+            QTimer.singleShot(0, self._relayout)
+
+    def _relayout(self):
+        self._relayout_pending = False
+        if not self.parameter_body.isVisible():
+            return
+
+        before = self.size()
+        self.adjustSize()
+        if self.size() != before:
+            self.overlay_layout_changed.emit()
+
     def _set_expanded(self, expanded: bool):
         self.parameter_body.setVisible(expanded)
         self.adjustSize()
@@ -219,6 +252,10 @@ class ControlPanel(QWidget):
         self.display_parameter_changed.emit()
 
     def eventFilter(self, obj, event):
+        if obj is self.parameter_body and event.type() == QEvent.Type.LayoutRequest:
+            self._schedule_relayout()
+            return False
+
         if (
             self.toggle_button.isChecked()
             and event.type() == QEvent.Type.MouseButtonPress

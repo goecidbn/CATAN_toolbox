@@ -1,5 +1,6 @@
 from typing import Dict, Optional, Tuple
 import textwrap
+from pathlib import Path
 from dataclasses import dataclass
 from catan.gui.data.statistics.queries import ReductionSpec
 import numpy as np
@@ -20,6 +21,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QToolButton,
     QFormLayout,
+    QDoubleSpinBox,
+    QPushButton,
+    QHBoxLayout,
+    QSpinBox,
 )
 
 from catan.core.changes import (
@@ -34,6 +39,7 @@ from catan.gui.interaction import click_events
 from catan.gui.data.statistics.dimensions import SESSION_DIMS, neuron_bound_dim
 from catan.gui.panels.StatisticsData import StatisticQuerySelector
 from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
+from catan.gui.GUI_elements.utils.paths import display_path
 
 STATISTIC_CMAPS = {
     "viridis": "viridis",
@@ -50,6 +56,19 @@ STATISTIC_CMAPS = {
         "#b35806",
     ),
 }
+
+# vispy colormap names offered for the background image.
+BACKGROUND_CMAPS = (
+    "grays",
+    "hot",
+    "fire",
+    "ice",
+    "viridis",
+    "cubehelix",
+    "blues",
+    "greens",
+    "reds",
+)
 
 
 @dataclass
@@ -321,6 +340,43 @@ class Display(BasePlot.BaseCanvas):
         palette.move(max(margin, x), margin)
         palette.raise_()
 
+    def display_background(self):
+        """Background image chosen in the options (aligned to the sessions'
+        reference frame), or None."""
+        panel = self.controls.get("panel")
+        source = "current" if panel is None else panel.background_source.currentData()
+
+        if source == "session":
+            session_id = panel.background_session.value()
+            if 0 <= session_id < len(self.data.sessions):
+                return self.data.sessions[session_id].background
+            return None
+
+        if source == "file":
+            background = getattr(self.data, "overview_background", None)
+            return None if background is None else background.background
+
+        session = self.data.current_session
+        return None if session is None else session.background
+
+    def background_colormap(self):
+        panel = self.controls.get("panel")
+        name = "grays" if panel is None else panel.background_cmap.currentText()
+        reverse = panel is not None and panel.background_cmap_reverse.isChecked()
+
+        if not reverse:
+            return name
+
+        x = np.linspace(1.0, 0.0, 256)[:, None]
+        return color.Colormap(color.get_colormap(name).map(x))
+
+    def update_background_colormap(self):
+        image = self.plotting.get("background")
+
+        if image is not None:
+            image.cmap = self.background_colormap()
+            self.update()
+
     def plot_background(self):
 
         if self.data.current_session is None:
@@ -331,13 +387,13 @@ class Display(BasePlot.BaseCanvas):
             self.plotting["background"].parent = None
             del self.plotting["background"]
 
-        background = self.data.current_session.background
+        background = self.display_background()
         if background is None:
             return
 
         self.plotting["background"] = Image(
             background.astype(np.float32),  # .T,
-            cmap="grays",
+            cmap=self.background_colormap(),
             method="subdivide",
             parent=self.plot_root,
         )
@@ -358,16 +414,38 @@ class Display(BasePlot.BaseCanvas):
                 continue
             visual.visible = False
 
+    @property
+    def session_only(self) -> bool:
+        """Show the current session's own footprints instead of the union."""
+        panel = self.controls.get("panel")
+        return bool(panel is not None and panel.session_only.isChecked())
+
+    @property
+    def footprint_threshold(self) -> float:
+        """Applied display cutoff (fraction of each footprint's peak)."""
+        panel = self.controls.get("panel")
+        return DEFAULT_FOOTPRINT_THRESHOLD if panel is None else panel.applied_threshold
+
+    def _tooltip_statistic_entity_mode(self) -> str:
+        return "footprint" if self.session_only else "neuron"
+
     def build_neuron_visuals_union(self):
 
         if not self.data.is_available():
             return
 
+        union = self.data.assignments.union
+
         roi_pos, neuron_ids, roi_vals = sparse_A_to_points(
-            self.data.assignments.union.footprints,
-            self.data.assignments.union.dims,
-            thr=0.5,
+            union.footprints,
+            union.dims,
+            thr=self.footprint_threshold,
         )
+
+        # Excluded neurons are not displayed.
+        if union.included is not None:
+            keep = np.asarray(union.included, dtype=bool)[neuron_ids]
+            roi_pos, neuron_ids, roi_vals = roi_pos[keep], neuron_ids[keep], roi_vals[keep]
 
         self.plotting["data"]["union"] = OverviewRecord(
             pos=roi_pos,
@@ -377,7 +455,10 @@ class Display(BasePlot.BaseCanvas):
             color=None,
         )
 
-    def build_neuron_visuals_session(self, session_id: Optional[int] = None, thr=0.2):
+    def build_neuron_visuals_session(self, session_id: Optional[int] = None, thr=None):
+
+        if thr is None:
+            thr = self.footprint_threshold
 
         if session_id is None:
             session_id = self.state.current_session_id
@@ -390,7 +471,7 @@ class Display(BasePlot.BaseCanvas):
         ):
             return
 
-        if self.display_mode == "tracked_overview" and "union" in self.plotting["data"]:
+        if not self.session_only and "union" in self.plotting["data"]:
             present_neuron_ids = np.where(
                 self.state.assignments[:, self.state.current_session_id] >= 0
             )[0]
@@ -419,6 +500,23 @@ class Display(BasePlot.BaseCanvas):
                 [c.neuron_id if c is not None else -1 for c in footprint_to_component]
             )
             neuron_ids = footprint_to_neuron_id[roi_ids]
+
+            # Excluded footprints and footprints of excluded neurons are
+            # not displayed.
+            keep = np.ones(len(roi_ids), dtype=bool)
+            session = self.data.sessions[session_id]
+
+            if session.included is not None:
+                keep &= np.asarray(session.included, dtype=bool)[roi_ids]
+
+            union = self.data.assignments.union
+            if union is not None and union.included is not None:
+                assigned = neuron_ids >= 0
+                keep[assigned] &= np.asarray(union.included, dtype=bool)[
+                    neuron_ids[assigned]
+                ]
+
+            roi_pos, roi_vals, neuron_ids = roi_pos[keep], roi_vals[keep], neuron_ids[keep]
 
         self.plotting["data"][session_id] = OverviewRecord(
             pos=roi_pos,
@@ -695,7 +793,7 @@ class Display(BasePlot.BaseCanvas):
         rgba[finite] = self.statistic_cmap.map(normalized).astype(np.float32)
 
         if (
-            self.display_mode == "tracked_overview"
+            not self.session_only
             and record is self.plotting["data"].get("union")
             and self.state.current_session_id is not None
         ):
@@ -915,7 +1013,7 @@ class Display(BasePlot.BaseCanvas):
                 continue
             if (
                 self.neuron_statistic_values is not None
-                and self.display_mode == "tracked_overview"
+                and not self.session_only
                 and key != "union"
             ):
                 visual.visible = False
@@ -1076,7 +1174,7 @@ class Display(BasePlot.BaseCanvas):
         if not isinstance(component, list):
             component = [component]
 
-        if self.display_mode == "session_overview":
+        if self.session_only:
             key = self.state.current_session_id
         else:
             key = "union"
@@ -1151,7 +1249,12 @@ class Display(BasePlot.BaseCanvas):
         )
         distances[~review_mask] = np.inf
 
-        if self.display_mode == "session_overview":
+        # Excluded neurons are not displayed, so they cannot be hovered.
+        union = self.data.assignments.union
+        if union.included is not None:
+            distances[~np.asarray(union.included, dtype=bool)] = np.inf
+
+        if self.session_only:
             mask = self.state.assignments[:, self.state.current_session_id] >= 0
             distances[~mask] = np.inf
 
@@ -1253,8 +1356,33 @@ class Controller(BasePlot.CanvasController):
         self.current_statistic_query = None
         self.statistic_table = None
 
-        self.controls["panel"] = OverviewControlPanel(self.section)
+        self.controls["panel"] = OverviewControlPanel(
+            self.section,
+            session_only=bool(self.config.get("session_only", False)),
+            threshold=float(
+                self.config.get("footprint_threshold", DEFAULT_FOOTPRINT_THRESHOLD)
+            ),
+            background_source=self.config.get("background_source", "current"),
+            background_session=int(self.config.get("background_session", 0)),
+            background_cmap=self.config.get("background_cmap", "grays"),
+            background_cmap_reversed=bool(
+                self.config.get("background_cmap_reversed", False)
+            ),
+            border_tolerance=getattr(self.data, "border_tolerance", 0),
+        )
         self.canvas.attach_control_overlay()
+        self.controls["panel"].display_settings_changed.connect(
+            self._on_display_settings_changed
+        )
+        self.controls["panel"].background_changed.connect(self._on_background_changed)
+        self.controls["panel"].background_load_requested.connect(
+            self._load_overview_background
+        )
+        self.controls["panel"].background_style_changed.connect(
+            self._on_background_style_changed
+        )
+        self.controls["panel"].border_changed.connect(self._on_border_changed)
+        self._update_background_controls()
 
         self.controls["statistics"] = StatisticQuerySelector(
             engine=self.data.statistic_engine,
@@ -1298,6 +1426,76 @@ class Controller(BasePlot.CanvasController):
             self._on_review_filter_changed
         )
 
+    def _on_display_settings_changed(self):
+        panel = self.controls["panel"]
+        self.config["session_only"] = panel.session_only.isChecked()
+        self.config["footprint_threshold"] = panel.applied_threshold
+
+        # Rebuild the footprint points (union or session) with the settings.
+        self.initialize_display()
+
+    def _on_background_changed(self):
+        panel = self.controls["panel"]
+        self.config["background_source"] = panel.background_source.currentData()
+        self.config["background_session"] = panel.background_session.value()
+        self._update_background_controls()
+        self.canvas.plot_background()
+
+    def _on_border_changed(self):
+        # Shared with the border statistic; the change notification
+        # refreshes the overlay of every Overview.
+        self.data.set_border_tolerance(
+            self.controls["panel"].applied_border_tolerance
+        )
+
+    def _on_background_style_changed(self):
+        panel = self.controls["panel"]
+        self.config["background_cmap"] = panel.background_cmap.currentText()
+        self.config["background_cmap_reversed"] = (
+            panel.background_cmap_reverse.isChecked()
+        )
+        self.canvas.update_background_colormap()
+
+    def _update_background_controls(self):
+        panel = self.controls["panel"]
+        panel.background_session.setMaximum(max(0, len(self.data.sessions) - 1))
+
+        background = getattr(self.data, "overview_background", None)
+        panel.background_file_label.setText(
+            "" if background is None else Path(str(background.path)).name
+        )
+        panel.background_file_label.setToolTip(
+            "" if background is None else display_path(background.path)
+        )
+
+    def _load_overview_background(self):
+        from catan.gui.GUI_elements.fragments.dialog_load_field import (
+            FieldSelectDialog,
+        )
+        from catan.gui.GUI_elements.fragments.path_selector import choose_path
+
+        path = choose_path(
+            self.section,
+            init_path=str(getattr(self.data, "root", "") or ""),
+            display_text="Select background image or file",
+            only_existing=True,
+            state=self.state,
+        )
+        if not path:
+            return
+
+        selection = FieldSelectDialog.get_field(
+            path=str(path),
+            key="background",
+            title="Select background",
+            context="Overview background",
+            parent=self.section,
+        )
+        if selection is None:
+            return
+
+        self.data.queue_load_overview_background(path, selection)
+
     def _cancel_boundary_task(self):
         self._boundary_generation += 1
 
@@ -1315,27 +1513,29 @@ class Controller(BasePlot.CanvasController):
             return
 
         assignments = self.data.assignments
-        sessions = tuple(self.data.sessions)
 
         if (
             assignments is None
-            or not sessions
             or self.state.current_session_id is None
             or self.data.current_session is None
         ):
             return
 
-        # During loading/realignment, hide the overlay rather than
-        # displaying a boundary derived from incomplete geometry.
-        for session_id, session in enumerate(sessions):
-            if (
-                session is None
-                or not session.status.get("spatial_loaded", False)
-                or not session.status.get("aligned", False)
-                or self.data.alignment_is_stale(session_id)
-            ):
-                return
+        # Sessions with current alignments only: unaligned or outdated ones
+        # (during loading/realignment) are left out instead of hiding the
+        # overlay.
+        sessions = tuple(
+            session
+            for session_id, session in enumerate(self.data.sessions)
+            if session is not None
+            and session.status.get("spatial_loaded", False)
+            and session.status.get("aligned", False)
+            and not self.data.alignment_is_stale(session_id)
+        )
+        if not sessions:
+            return
 
+        tolerance = getattr(self.data, "border_tolerance", 0)
         generation = self._boundary_generation
         revision = self.state.data_version
 
@@ -1352,6 +1552,7 @@ class Controller(BasePlot.CanvasController):
                 mask, _ = assignments.common_spatial_coverage(
                     sessions,
                     revision=revision,
+                    tolerance=tolerance,
                 )
             except ValueError:
                 # Coverage can become unavailable while loading changes.
@@ -1475,7 +1676,7 @@ class Controller(BasePlot.CanvasController):
 
         session_dims = [dim for dim in stat_def.dims if dim in SESSION_DIMS]
 
-        if self.section.display_mode == "session_overview":
+        if self.canvas.session_only:
             session_id = self.state.current_session_id
 
             if session_id is not None:
@@ -1485,7 +1686,7 @@ class Controller(BasePlot.CanvasController):
                         index=session_id,
                     )
 
-        elif self.section.display_mode == "tracked_overview":
+        else:
             for dim in session_dims:
                 reductions[dim] = ReductionSpec("mean")
 
@@ -1520,11 +1721,21 @@ class Controller(BasePlot.CanvasController):
             C.SESSION_METADATA,
         ) or event.has_availability("spatial")
 
+        if event.has(C.OVERVIEW_BACKGROUND, *SESSION_STRUCTURE_CHANGES):
+            self._update_background_controls()
+
         if rebuild:
             self.initialize_display()
+        elif event.has(C.OVERVIEW_BACKGROUND):
+            self.canvas.plot_background()
         elif event.has(C.REVIEW_STATUS):
             self._on_review_filter_changed()
-        elif event.has(C.PROCESSING_STATUS):
+        elif event.has(C.PROCESSING_STATUS, C.BORDER_SETTINGS):
+            if event.has(C.BORDER_SETTINGS):
+                panel = self.controls["panel"]
+                blocked = panel.border_tolerance.blockSignals(True)
+                panel.border_tolerance.setValue(self.data.border_tolerance)
+                panel.border_tolerance.blockSignals(blocked)
             self._refresh_common_boundary()
 
     def _on_session_changed(self):
@@ -1535,9 +1746,12 @@ class Controller(BasePlot.CanvasController):
         ):
             return
 
-        self.canvas.plot_background()
+        # A fixed background (session X, file) does not follow the session.
+        source = self.controls["panel"].background_source.currentData()
+        if source == "current" or self.canvas.plotting.get("background") is None:
+            self.canvas.plot_background()
         self._refresh_common_boundary()
-        if self.section.display_mode == "tracked_overview":
+        if not self.canvas.session_only:
             if "union" not in self.canvas.plotting["data"]:
                 self.canvas.build_neuron_visuals_union()
             self.canvas.clean(with_union=False)
@@ -1547,7 +1761,6 @@ class Controller(BasePlot.CanvasController):
 
             self.canvas.build_neuron_visuals_session(
                 session_id=self.state.current_session_id,
-                thr=0.2,
             )
 
         self.canvas.plot_neurons_visuals()
@@ -1593,11 +1806,173 @@ class Controller(BasePlot.CanvasController):
 
 class OverviewControlPanel(ControlPanel.ControlPanel):
 
-    def __init__(self, parent):
+    # Union vs. session footprints, or the applied threshold changed.
+    display_settings_changed = Signal()
+    background_changed = Signal()
+    background_load_requested = Signal()
+    background_style_changed = Signal()
+    border_changed = Signal()
+
+    def __init__(
+        self,
+        parent,
+        *,
+        session_only=False,
+        threshold=None,
+        background_source="current",
+        background_session=0,
+        background_cmap="grays",
+        background_cmap_reversed=False,
+        border_tolerance=0,
+    ):
         super().__init__(parent)
 
         review_selector = self._build_review_selector()
         self.form.addRow("Review status", review_selector)
+
+        # Display background, independent of the alignment backgrounds.
+        self.background_source = QComboBox()
+        self.background_source.addItem("current session", "current")
+        self.background_source.addItem("from session", "session")
+        self.background_source.addItem("from file", "file")
+        self.background_source.setToolTip(
+            "Current session: follows the session selection. From session: "
+            "fixed to one session's background. From file: an image loaded "
+            "from another source, aligned to the sessions' reference frame "
+            "(adjust it in Session alignment, target: overview background)."
+        )
+
+        self.background_session = QSpinBox()
+        self.background_session.setMinimum(0)
+        self.background_session.setValue(int(background_session))
+        self.background_session.setToolTip("Session ID; numbering starts at 0.")
+
+        self.background_load = QPushButton("Load…")
+        self.background_file_label = QLabel()
+        self.background_file_label.setStyleSheet("color: #9aa3ad;")
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.background_source)
+        row.addWidget(self.background_session)
+        row.addWidget(self.background_load)
+        row.addWidget(self.background_file_label, 1)
+        background_widget = QWidget()
+        background_widget.setLayout(row)
+        self.form.addRow("Background", background_widget)
+
+        index = self.background_source.findData(background_source)
+        self.background_source.setCurrentIndex(max(0, index))
+        self._update_background_widgets()
+
+        self.background_source.currentIndexChanged.connect(
+            lambda _: (self._update_background_widgets(), self.background_changed.emit())
+        )
+        self.background_session.valueChanged.connect(
+            lambda _: self.background_changed.emit()
+        )
+        self.background_load.clicked.connect(self.background_load_requested.emit)
+
+        self.background_cmap = QComboBox()
+        self.background_cmap.addItems(BACKGROUND_CMAPS)
+        self.background_cmap.setCurrentIndex(
+            max(0, self.background_cmap.findText(background_cmap))
+        )
+        self.background_cmap_reverse = QCheckBox("Reverse")
+        self.background_cmap_reverse.setChecked(bool(background_cmap_reversed))
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.background_cmap)
+        row.addWidget(self.background_cmap_reverse)
+        row.addStretch()
+        cmap_widget = QWidget()
+        cmap_widget.setLayout(row)
+        self.form.addRow("Background colormap", cmap_widget)
+
+        self.background_cmap.currentTextChanged.connect(
+            lambda _: self.background_style_changed.emit()
+        )
+        self.background_cmap_reverse.toggled.connect(
+            lambda _: self.background_style_changed.emit()
+        )
+
+        # Shared imaging border (red overlay outside).
+        self.border_tolerance = QSpinBox()
+        self.border_tolerance.setRange(0, 999)
+        self.border_tolerance.setValue(max(0, int(border_tolerance)))
+        self.border_tolerance.setSuffix(" sessions")
+        self.border_tolerance.setToolTip(
+            "The red overlay marks pixels outside the area imaged in all "
+            "sessions (after alignment). A pixel counts as inside if it is "
+            "within the imaging window of all but this many sessions. Sessions "
+            "without a current alignment are left out."
+        )
+        self.border_tolerance.valueChanged.connect(
+            lambda _: self.border_changed.emit()
+        )
+        self.form.addRow("Border: tolerate outside", self.border_tolerance)
+
+        self.session_only = QCheckBox("Show current session only")
+        self.session_only.setToolTip(
+            "Show the footprints detected in the current session (including "
+            "unassigned ones) instead of the union footprints of all neurons."
+        )
+        self.session_only.setChecked(bool(session_only))
+        self.session_only.toggled.connect(lambda _: self.display_settings_changed.emit())
+        self.form.addRow(self.session_only)
+
+        # Converting all footprints to points is costly: apply explicitly.
+        self.applied_threshold = (
+            DEFAULT_FOOTPRINT_THRESHOLD if threshold is None else float(threshold)
+        )
+
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setRange(0.01, 0.99)
+        self.threshold_spin.setSingleStep(0.05)
+        self.threshold_spin.setValue(self.applied_threshold)
+        self.threshold_spin.setFixedWidth(72)
+        self.threshold_spin.setToolTip(
+            "Footprint pixels above this fraction of each footprint's peak "
+            "are displayed."
+        )
+
+        self.threshold_apply = QPushButton("Apply")
+        self.threshold_apply.setEnabled(False)
+        self.threshold_apply.clicked.connect(self._apply_threshold)
+        self.threshold_spin.valueChanged.connect(
+            lambda value: self.threshold_apply.setEnabled(
+                abs(value - self.applied_threshold) > 1e-9
+            )
+        )
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.threshold_spin)
+        row.addWidget(self.threshold_apply)
+        row.addStretch()
+        threshold_widget = QWidget()
+        threshold_widget.setLayout(row)
+        self.form.addRow("Threshold", threshold_widget)
+
+    @property
+    def applied_border_tolerance(self):
+        return int(self.border_tolerance.value())
+
+    def _update_background_widgets(self):
+        source = self.background_source.currentData()
+        self.background_session.setVisible(source == "session")
+        self.background_load.setVisible(source == "file")
+        self.background_file_label.setVisible(source == "file")
+
+    def _apply_threshold(self):
+        self.applied_threshold = float(self.threshold_spin.value())
+        self.threshold_apply.setEnabled(False)
+        self.display_settings_changed.emit()
+
+
+DEFAULT_FOOTPRINT_THRESHOLD = 0.1
 
 
 def sparse_A_to_points(A_csc, dims, thr=0.2):
@@ -1638,21 +2013,46 @@ def normalize_sparse_array(
           fraction of peak value, at below which entries are considered to be 0
       - minimum_nonzero_entries: int
           minimum number of nonzero entries of the footprint to be considered for further analyses
+
+    Per column: entries above relative_threshold * peak, divided by the sum
+    of entries above 0.001 * peak; columns with too few positive entries
+    are empty. Vectorized over columns.
     """
-    return sparse.vstack(
-        [
-            # a.multiply(a>relative_threshold*a.max())/a.max()  # threshold footprint
-            (
-                a.multiply(a > (relative_threshold * a.max()))
-                / a[a > 0.001 * a.max()].sum()  # threshold footprint
-                if (a > 0).sum()
-                > minimum_nonzero_entries  # require minimum non-zero entries ...
-                else sparse.csr_matrix(a.shape)
-            )  # ... otherwise return empty slice
-            for a in A.T  # loop through all footprints
-        ],
-        format=format,
-    ).T
+    A = sparse.csc_matrix(A)
+    A.sum_duplicates()
+    n_columns = A.shape[1]
+
+    counts = np.diff(A.indptr)
+    column = np.repeat(np.arange(n_columns), counts)
+    data = np.asarray(A.data)
+
+    peak = np.full(n_columns, -np.inf)
+    filled = counts > 0
+    if filled.any():
+        peak[filled] = np.maximum.reduceat(data, A.indptr[:-1][filled])
+    # Implicit zeros take part in the column maximum.
+    peak[counts < A.shape[0]] = np.maximum(peak[counts < A.shape[0]], 0)
+
+    positive = np.bincount(column, weights=data > 0, minlength=n_columns)
+    norm = np.bincount(
+        column,
+        weights=np.where(data > 0.001 * peak[column], data, 0),
+        minlength=n_columns,
+    )
+
+    keep = (data > relative_threshold * peak[column]) & (
+        positive[column] > minimum_nonzero_entries
+    )
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        values = data[keep] / norm[column[keep]]
+
+    result = sparse.coo_matrix(
+        (values, (A.indices[keep], column[keep])),
+        shape=A.shape,
+    )
+
+    return result.asformat(format)
 
 
 def format_colorbar_limits(

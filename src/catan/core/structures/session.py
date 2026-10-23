@@ -131,6 +131,10 @@ class SessionData:
             "correct_rotation": False,
             "rotation_step": 1.0,
             "rotation_refine_step": 0.1,
+            # flow alignment departing from the default (older reference,
+            # shift beyond max_session_shift, low correlation) needs the
+            # user's confirmation; False accepts it
+            "confirm_alignment_deviations": True,
             # kde parameters
             "use_kde": False,
             "qtl": [0.05, 0.95],
@@ -829,6 +833,7 @@ class SessionData:
         background_template=None,
         use_optical_flow=True,
         correct_rotation: bool | None = None,
+        require_confirmation: bool | None = None,
     ) -> Remapping:
         """
         Calculate a candidate remapping without
@@ -861,6 +866,11 @@ class SessionData:
         if correct_rotation is None:
             correct_rotation = self.params.get("correct_rotation", False)
 
+        if require_confirmation is None:
+            require_confirmation = self.params.get(
+                "confirm_alignment_deviations", True
+            )
+
         return Remapping(
             template=template,
             references=alignment_references,
@@ -873,6 +883,7 @@ class SessionData:
             min_zcorr=self.params["min_session_correlation_zscore"],
             rotation_step=self.params["rotation_step"],
             rotation_refine_step=self.params["rotation_refine_step"],
+            require_confirmation=require_confirmation,
         )
 
     def align_to_reference(self, alignment_references, use_optical_flow=True):

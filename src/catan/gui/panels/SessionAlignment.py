@@ -1,4 +1,4 @@
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QTimer, Qt
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -6,6 +6,10 @@ from PySide6.QtWidgets import (
     QComboBox,
     QPushButton,
     QLabel,
+    QToolButton,
+    QMenu,
+    QMessageBox,
+    QCheckBox,
 )
 
 from catan.core.changes import (
@@ -13,9 +17,11 @@ from catan.core.changes import (
     DataChange,
     SESSION_STRUCTURE_CHANGES,
 )
+from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 from catan.gui.GUI_elements.fragments.manual_alignment_dialog import (
     ManualAlignmentEditor,
     select_alignment_draft,
+    select_overview_background_draft,
     open_manual_alignment,
 )
 
@@ -40,6 +46,32 @@ class Display(QWidget):
 
         display_section.x_options_layout.insertWidget(0, self.toolbar, 1)
 
+        # What to align: the current session, or the overview background
+        # loaded from another source (Overview options).
+        self.target = QComboBox(display_section)
+        self.target.addItem("Align: current session", "session")
+        self.target.addItem("Align: overview background", "overview")
+        self.target.setToolTip(
+            "The overview background is a display-only image loaded in the "
+            "Overview options (Background: from file)."
+        )
+        display_section.x_options_layout.insertWidget(0, self.target)
+        self.target.currentIndexChanged.connect(lambda _: self._schedule_current())
+        self._update_target_options()
+
+        # Outdated (stale) alignments after an earlier session changed;
+        # the arrow menu realigns all sessions.
+        self.update_stale = QToolButton(display_section)
+        self.update_stale.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.update_stale.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.update_stale.clicked.connect(self._update_stale_alignments)
+        menu = QMenu(self.update_stale)
+        self.realign_all_action = menu.addAction(
+            "Realign all sessions…", self._realign_all
+        )
+        self.update_stale.setMenu(menu)
+        display_section.x_options_layout.insertWidget(1, self.update_stale)
+
         self.placeholder = QLabel(
             "Select a session with loaded spatial data and a background.", self
         )
@@ -54,9 +86,12 @@ class Display(QWidget):
         self._follow_timer.timeout.connect(self._follow_current)
 
         self.state.data_changed.connect(self._refresh_sessions)
+        self.state.data_changed.connect(self._refresh_stale_button)
         self.state.current_session_changed.connect(self._schedule_current)
         self.state.alignment_draft_changed.connect(self._sync_draft)
         self.state.tasks.queue_changed.connect(self._schedule_current)
+        self.state.tasks.queue_changed.connect(self._refresh_stale_button)
+        self._refresh_stale_button()
 
         self._follow_current()
         self.state.alignment_panels.add(self)
@@ -72,12 +107,106 @@ class Display(QWidget):
                 C.SESSION_METADATA,
                 C.FOOTPRINT_GEOMETRY,
                 C.BACKGROUND_IMAGE,
+                C.OVERVIEW_BACKGROUND,
             )
             or event.has_availability("spatial")
         ):
             return
 
+        self._update_target_options()
         self._schedule_current()
+
+    def _stale_sessions(self):
+        return [
+            session_id
+            for session_id in range(len(self.data.sessions))
+            if self.data.alignment_is_stale(session_id)
+        ]
+
+    def _refresh_stale_button(self, *_):
+        if self._disposed:
+            return
+
+        stale = self._stale_sessions()
+        tasks = self.state.tasks
+        idle = not (tasks.processing_busy() or tasks.processing_requested)
+
+        self.update_stale.setVisible(len(self.data.sessions) > 1)
+        self.update_stale.setEnabled(idle)
+        self.realign_all_action.setEnabled(idle)
+
+        if stale:
+            self.update_stale.setText(f"Update outdated alignments ({len(stale)})")
+            self.update_stale.setToolTip(
+                "Realign in session order (manual alignments keep their "
+                "transform; stops at a session needing review):\n"
+                + "\n".join(
+                    f"S{session_id} {self.data.sessions[session_id].name}"
+                    for session_id in stale
+                )
+                + "\n\nArrow: realign all sessions."
+            )
+        else:
+            self.update_stale.setText("Alignments up to date")
+            self.update_stale.setToolTip(
+                "No outdated alignments. Arrow: realign all sessions."
+            )
+
+    def _update_stale_alignments(self):
+        stale = self._stale_sessions()
+        if stale:
+            self.data.queue_process_alignments(session_ids=stale)
+
+    def _realign_all(self):
+        sessions = self.data.sessions
+        manual = [
+            session_id
+            for session_id, session in enumerate(sessions)
+            if session.remap is not None and session.remap.method == "manual"
+        ]
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Realign all sessions")
+        box.setText(
+            f"Realign sessions 1–{len(sessions) - 1} automatically, in session "
+            "order? Session 0 is the reference."
+        )
+        box.setInformativeText(
+            "Model evidence and assignments of all sessions become outdated. "
+            "Deviations from the default alignment are shown for confirmation."
+        )
+        replace_manual = None
+        if manual:
+            replace_manual = QCheckBox(
+                f"Also recompute manual alignments ({len(manual)}: "
+                + ", ".join(f"S{session_id}" for session_id in manual[:8])
+                + (" …" if len(manual) > 8 else "")
+                + ")"
+            )
+            box.setCheckBox(replace_manual)
+        start = box.addButton("Realign all", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        fit_message_box_buttons(box)
+        box.exec()
+
+        if box.clickedButton() is not start or self._disposed:
+            return
+
+        self.data.queue_realign_all(
+            replace_manual=replace_manual is not None and replace_manual.isChecked()
+        )
+
+    def _update_target_options(self):
+        available = getattr(self.data, "overview_background", None) is not None
+        self.target.model().item(1).setEnabled(available)
+
+        if not available and self.target.currentData() == "overview":
+            self.target.setCurrentIndex(0)
+
+    @property
+    def _overview_target(self):
+        return self.target.currentData() == "overview"
 
     def _schedule_current(self, *_):
         if not self._disposed:
@@ -85,6 +214,10 @@ class Display(QWidget):
 
     def _follow_current(self):
         if self._disposed:
+            return
+
+        if self._overview_target:
+            self._follow_overview_background()
             return
 
         sid = self.state.current_session_id
@@ -146,15 +279,54 @@ class Display(QWidget):
 
         self._sync_draft()
 
+    def _follow_overview_background(self):
+        old = self.state.alignment_draft
+
+        if (
+            old is not None
+            and getattr(old, "external", False)
+            and old.is_current(self.data)
+        ):
+            self._sync_draft()
+            return
+
+        draft = select_overview_background_draft(self.data, self)
+
+        if draft is None:
+            self.placeholder.setText(
+                "Load an overview background first "
+                "(Overview options: Background from file)."
+            )
+            self.placeholder.show()
+            self.toolbar.hide()
+            if self.editor is not None:
+                self.editor.hide()
+            return
+
+        self._sync_draft()
+
     def _open_window(self):
-        open_manual_alignment(self.data, self.state.current_session_id, self)
+        open_manual_alignment(
+            self.data,
+            self.state.current_session_id,
+            self,
+            overview_background=self._overview_target,
+        )
 
     def _sync_draft(self):
         if self._disposed:
             return
 
         draft = self.state.alignment_draft
-        if draft is None or draft.session_id != self.state.current_session_id:
+        external = draft is not None and getattr(draft, "external", False)
+
+        # The draft must match the selected target (and, for sessions,
+        # the current session).
+        if (
+            draft is None
+            or external != self._overview_target
+            or (not external and draft.session_id != self.state.current_session_id)
+        ):
             self._schedule_current()
             return
 
@@ -183,6 +355,16 @@ class Display(QWidget):
             return
 
         draft = self.editor.draft
+
+        if getattr(draft, "external", False):
+            self.data.set_overview_background_alignment(
+                draft.template, draft.make_remap()
+            )
+            # A fresh draft starts from the applied alignment.
+            self.state.alignment_draft = None
+            self.state.alignment_draft_changed.emit()
+            return
+
         self.data.queue_commit_session_realignment(
             draft.session_id,
             background_template=draft.template,
@@ -204,10 +386,16 @@ class Display(QWidget):
         self.state.tasks.queue_changed.disconnect(self._schedule_current)
 
         self.state.data_changed.disconnect(self._refresh_sessions)
+        self.state.data_changed.disconnect(self._refresh_stale_button)
+        self.state.tasks.queue_changed.disconnect(self._refresh_stale_button)
         self.state.alignment_draft_changed.disconnect(self._sync_draft)
         self._remove_editor()
         self.toolbar.hide()
         self.toolbar.deleteLater()
+        self.target.hide()
+        self.target.deleteLater()
+        self.update_stale.hide()
+        self.update_stale.deleteLater()
 
 
 class Controller(QObject):

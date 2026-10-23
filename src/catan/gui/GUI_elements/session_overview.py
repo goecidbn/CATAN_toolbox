@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 
+from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 from catan.core.changes import (
     ChangeKind as C,
     DataChange,
@@ -70,6 +71,7 @@ from .fragments.manual_alignment_dialog import (
     select_alignment_draft,
 )
 from .fragments.file_inspection import FileInspection
+from catan.gui.GUI_elements.utils.paths import display_path
 
 
 class SessionRowWidget(QFrame):
@@ -281,7 +283,7 @@ class SessionRowWidget(QFrame):
         self.name_edit.setText(str(name))
         self.name_edit.blockSignals(False)
 
-        self.name_edit.setToolTip(str(path))
+        self.name_edit.setToolTip(display_path(path))
 
         self.active_checkbox.blockSignals(True)
         self.active_checkbox.setChecked(bool(active))
@@ -372,6 +374,7 @@ class SessionRowWidget(QFrame):
 
             dialog.setDetailedText("\n".join(details))
 
+        fit_message_box_buttons(dialog)
         dialog.exec()
 
     def _session_state(self):
@@ -536,7 +539,7 @@ class SessionRowWidget(QFrame):
 
         # Soft translucent background, so text remains readable.
         r, g, b, _ = color.getRgb()
-        self.setStyleSheet(f"""
+        style = f"""
             QFrame#SessionRowWidget {{
                 background-color: rgba({r}, {g}, {b}, 85);
                 border: {"3px solid rgba(255, 255, 255, 85)" if current else "1px solid rgba(255, 255, 255, 85)"};
@@ -556,7 +559,11 @@ class SessionRowWidget(QFrame):
                 border-radius: 3px;
                 background: rgba(0, 0, 0, 55);
             }}
-            """)
+            """
+
+        # Restyling recomputes the style of all child widgets.
+        if style != self.styleSheet():
+            self.setStyleSheet(style)
 
     def _alignment_report_text(self, *, detailed: bool = False) -> str:
 
@@ -571,6 +578,9 @@ class SessionRowWidget(QFrame):
 
         if report.success:
             lines.append("Alignment successful")
+        elif getattr(remap, "confirmation", None):
+            lines.append("Alignment needs confirmation")
+            lines.append(remap.confirmation)
         else:
             lines.append("Alignment failed")
 
@@ -615,10 +625,14 @@ class SessionRowWidget(QFrame):
             lines.append("Pairwise alignments")
             lines.append("-------------------")
 
+            names = {
+                str(session.path): f"S{index} {session.name}"
+                for index, session in enumerate(self.data.sessions)
+            }
             for path, entry in report.remap_data.items():
 
                 lines.append("")
-                lines.append(str(path))
+                lines.append(names.get(str(path)) or display_path(path))
 
                 shift = entry.get("shift")
 
@@ -720,6 +734,7 @@ class SessionRowWidget(QFrame):
         menu.addAction(remove_action)
 
         menu.exec(self.mapToGlobal(pos))
+        menu.deleteLater()
 
 
 REGISTRATION_ACTION_LABELS = {
@@ -1735,7 +1750,7 @@ class LoadSessionRowWidget(QFrame):
             details = "\n".join(
                 f"• {field.group}.{field.label}: {field.spec.path}"
                 + (
-                    f" (source: {field.spec.source_path})"
+                    f" (source: {display_path(field.spec.source_path)})"
                     if field.spec.source_path
                     else ""
                 )
@@ -1887,13 +1902,19 @@ class LoadSessionRowWidget(QFrame):
     def _show_alignment_error(self, session_id: int, report):
 
         session = self.data.sessions[session_id]
+        confirmation = getattr(session.remap, "confirmation", None)
 
         text = (
-            f"Automatic alignment failed for {session.name!r}.\n\n"
+            f"Automatic alignment of {session.name!r} needs confirmation.\n\n"
+            f"{confirmation}\n\n"
+            "Check the proposal, then use it, adjust it or remove the session. "
+            "Until then, no neurons are registered."
+            if confirmation
+            else f"Automatic alignment failed for {session.name!r}.\n\n"
             "The session has been kept loaded, but no neurons were registered."
         )
 
-        if report is not None:
+        if report is not None and not confirmation:
 
             if report.reason is not None:
                 text += "\n\nReason: " + report.reason.replace("_", " ")
@@ -2472,7 +2493,7 @@ class LoadSessionRowWidget(QFrame):
                     "warning",
                     "Duplicate inclusion filenames",
                     "Multiple sessions would save to the same file:\n"
-                    f"{destination}\n\n"
+                    f"{display_path(destination)}\n\n"
                     "Save those sessions individually with distinct names.",
                     parent=self.window(),
                 )
@@ -3166,6 +3187,7 @@ class SessionOverview(QWidget):
         apply_button = dialog.addButton(QMessageBox.StandardButton.Apply)
         apply_button.setEnabled(proposed_report.success)
 
+        fit_message_box_buttons(dialog)
         dialog.exec()
 
         if dialog.clickedButton() is not apply_button:

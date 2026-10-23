@@ -1,7 +1,7 @@
 import importlib
 import threading
 
-from PySide6.QtCore import QCoreApplication, QSettings, QThreadPool
+from PySide6.QtCore import QCoreApplication, QSettings, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QFont, Qt, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -32,6 +32,7 @@ from catan.tracking.structures import ReviewStatus
 
 from .display_area import DisplayArea
 from .main_menu import MainMenu
+from .utils.menu_creation import fit_message_box_buttons
 
 
 class MainWindow(QMainWindow):
@@ -227,8 +228,106 @@ class MainWindow(QMainWindow):
     def print_debug_info(self):
         click_events.print_debug(self.state, self.data)
 
+        from .utils.memory_report import memory_report
+
+        print("\n".join(memory_report(self.data)))
+
+    def _confirm_unsaved_assignments(self) -> bool:
+        """Offer saving changed assignments before closing.
+
+        Returns True to close now. Saving runs in the background; the
+        window closes again once it has finished.
+        """
+        if getattr(self, "_closing_after_save", False):
+            return True
+
+        unsaved = self.data.unsaved_assignments()
+
+        if not unsaved:
+            return True
+
+        current = self.data.current_assignments
+        others = [name for name in unsaved if name != current]
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Unsaved assignments")
+        dialog.setText("The assignments have changes that were not saved.")
+        dialog.setInformativeText(
+            (
+                f"Save the current assignments ({current}) before closing?"
+                if current in unsaved
+                else ""
+            )
+            + (
+                "\n\nAlso changed (switch to them to save): " + ", ".join(others)
+                if others
+                else ""
+            )
+        )
+
+        save_button = (
+            dialog.addButton("Save…", QMessageBox.ButtonRole.AcceptRole)
+            if current in unsaved
+            else None
+        )
+        dialog.addButton("Discard changes", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(save_button or cancel_button)
+        fit_message_box_buttons(dialog)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+
+        if clicked is cancel_button:
+            return False
+
+        if clicked is not save_button:
+            return True
+
+        path = self.gui_elements["main_menu"].save_data("assignments")
+
+        if path is None:
+            # No file chosen: stay open.
+            return False
+
+        # Close once the save finished and nothing is left unsaved; the save
+        # may start only after display workers stopped.
+        tasks = self.state.tasks
+
+        def disconnect():
+            tasks.task_finished.disconnect(on_finished)
+            tasks.task_failed.disconnect(on_failed)
+            tasks.task_cancelled.disconnect(on_failed)
+
+        def on_finished(group, task_id):
+            if group != "saving":
+                return
+
+            # Saved-state bookkeeping runs right after this signal.
+            def check():
+                if current not in self.data.unsaved_assignments():
+                    self._closing_after_save = True
+                    self.close()
+
+            disconnect()
+            QTimer.singleShot(0, check)
+
+        def on_failed(group, task_id):
+            if group == "saving":
+                disconnect()
+
+        tasks.task_finished.connect(on_finished)
+        tasks.task_failed.connect(on_failed)
+        tasks.task_cancelled.connect(on_failed)
+        return False
+
     def closeEvent(self, event):
         # print("MainWindow closeEvent")
+        if not self._confirm_unsaved_assignments():
+            event.ignore()
+            return
+
         self._save_settings()
         for gui in self.gui_elements.values():
             if hasattr(gui, "_save_settings"):

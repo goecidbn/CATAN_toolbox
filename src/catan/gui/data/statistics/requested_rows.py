@@ -87,15 +87,22 @@ def evaluate_requested_rows(
                 if name not in logical:
                     raise ValueError(f"Missing requested coordinate: {name}")
 
-                lookup = {
-                    int(value): index for index, value in enumerate(dimensions[name].coords)
-                }
+                # Coordinate value -> position, -1 if absent. As with the
+                # former dict, a repeated coordinate maps to its last position.
+                coords = np.asarray(dimensions[name].coords, dtype=np.int64)
+                values = np.asarray(logical[name], dtype=np.int64)
+                positions = np.full(len(values), -1, dtype=np.int64)
 
-                positions = np.fromiter(
-                    (lookup.get(int(value), -1) for value in logical[name]),
-                    dtype=np.int64,
-                    count=len(valid),
-                )
+                if len(coords):
+                    low = int(coords.min())
+                    lookup = np.full(int(coords.max()) - low + 1, -1, dtype=np.int64)
+                    order = np.arange(len(coords))
+                    last = np.unique(coords[::-1], return_index=True)[1]
+                    last = len(coords) - 1 - last
+                    lookup[coords[last] - low] = order[last]
+
+                    inside = (values >= low) & (values - low < len(lookup))
+                    positions[inside] = lookup[values[inside] - low]
 
                 valid &= positions >= 0
                 columns.append(positions)

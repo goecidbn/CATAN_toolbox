@@ -16,6 +16,12 @@ from catan.gui.background_tasks.runtime import (
 
 from .blockwise import evaluate_blockwise
 from .distance_statistics import pair_plan
+from .session_relations import (
+    NEURON_RELATIONS,
+    DetectionReference,
+    is_order_relation,
+    relation_mask,
+)
 
 # ---------------------------------------------------------------------
 # Sparse selection path
@@ -179,6 +185,10 @@ def _intersect_supports(left, right, *, weighted):
     return unique // n_right, unique % n_right, intersection
 
 
+# Rows per requested-pair block (bounds memory, not correctness).
+REQUESTED_BLOCK_ROWS = 65_536
+
+
 @reports_progress("Calculating footprint overlap")
 def overlap_query(
     data,
@@ -206,7 +216,7 @@ def overlap_query(
         "session_j",
     )
 
-    dims, aliases, references, coord, allowed = pair_plan(names, n, s, query)
+    dims, aliases, references, coord, allowed = pair_plan(names, n, s, query, ids=ids)
 
     ctx = current_task_context()
 
@@ -314,6 +324,41 @@ def overlap_query(
         if pairs.ndim != 2 or pairs.shape[1] != 4:
             raise ValueError("Requested pairs must have four coordinate columns.")
 
+        detection = (
+            DetectionReference(ids)
+            if any(f.relation in NEURON_RELATIONS for f in query.filters)
+            else None
+        )
+
+        # Prepare each session once, with every footprint any requested pair
+        # needs. Per-column processing is independent, so values equal those
+        # of supports prepared for a single session pair.
+        needed = {}
+
+        for neuron_column, session_column in ((0, 2), (1, 3)):
+            neurons = pairs[:, neuron_column]
+            sessions = pairs[:, session_column]
+            inside = (
+                (neurons >= 0) & (neurons < n) & (sessions >= 0) & (sessions < s)
+            )
+            footprints = ids[neurons[inside], sessions[inside]]
+            present = footprints >= 0
+
+            for sid in np.unique(sessions[inside][present]):
+                needed.setdefault(int(sid), []).append(
+                    footprints[present][sessions[inside][present] == sid]
+                )
+
+        needed = {sid: np.unique(np.concatenate(parts)) for sid, parts in needed.items()}
+        session_supports = {}
+
+        def supports(sid):
+            if sid not in session_supports:
+                session_supports[sid] = prepare(
+                    sid, tuple(int(value) for value in needed[sid])
+                )
+            return session_supports[sid], needed[sid]
+
         @reports_progress("Calculating requested overlap")
         def read_rows(refs):
             ni, nj, si, sj = (refs[name] for name in names)
@@ -331,13 +376,22 @@ def overlap_query(
                     permitted &= left != right
                 elif relation == "with previous" and pair_filter.target == "session":
                     permitted &= right == left - 1
+                elif pair_filter.target == "session" and is_order_relation(relation):
+                    permitted &= relation_mask(relation, si, sj, nj, detection)
                 elif relation != "all":
                     raise ValueError(f"Unsupported pair filter: {pair_filter}")
 
-            session_pairs = np.unique(
+            session_pairs, inverse = np.unique(
                 np.column_stack((si, sj)),
                 axis=0,
+                return_inverse=True,
             )
+
+            # Rows grouped by session pair, ascending within each group
+            # (the order of a per-pair mask scan, without rescanning).
+            inverse = np.asarray(inverse).reshape(-1)
+            order = np.argsort(inverse, kind="stable")
+            bounds = np.searchsorted(inverse[order], np.arange(len(session_pairs) + 1))
 
             for progress_index, (source, target) in enumerate(session_pairs):
                 with progress_step(
@@ -346,7 +400,8 @@ def overlap_query(
                     start=0,
                     stop=100,
                 ):
-                    rows = np.flatnonzero(permitted & (si == source) & (sj == target))
+                    rows = order[bounds[progress_index] : bounds[progress_index + 1]]
+                    rows = rows[permitted[rows]]
 
                     if not rows.size:
                         continue
@@ -365,19 +420,10 @@ def overlap_query(
                     if not rows.size:
                         continue
 
-                    columns_i = np.unique(fi)
-                    columns_j = np.unique(fj)
-
                     with progress_scope(0, 20):
-                        left = prepare(
-                            int(source),
-                            tuple(int(value) for value in columns_i),
-                        )
+                        left, columns_i = supports(int(source))
                     with progress_scope(20, 40):
-                        right = prepare(
-                            int(target),
-                            tuple(int(value) for value in columns_j),
-                        )
+                        right, columns_j = supports(int(target))
 
                     if left is None or right is None:
                         continue
@@ -428,6 +474,8 @@ def overlap_query(
             reduction_aliases=aliases,
             applied_filters=tuple(f.target for f in query.filters),
             select_values=select_values,
+            # Per-block cost is dominated by the session-pair loop.
+            block_rows=REQUESTED_BLOCK_ROWS,
         )
 
     if _sparse_selection_applies(query, select_values):
@@ -834,7 +882,7 @@ def _sparse_overlap_selection(
     ctx = current_task_context()
 
     collector = SparsePairCollector(
-        names, dims, aliases, references, n, s, query, select_values
+        names, dims, aliases, references, n, s, query, select_values, ids=ids
     )
 
     sources = set(collector.domain("session_i").tolist())

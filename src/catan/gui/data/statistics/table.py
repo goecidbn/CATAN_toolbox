@@ -245,12 +245,20 @@ class PickTable:
         if probe._values_for_dim(dim_i) is None or probe._values_for_dim(dim_j) is None:
             return self
 
+        from .session_relations import NEURON_RELATIONS, is_order_relation
+
         if pair_filter.relation not in (
             "same",
             "different",
             "with previous",
-        ):
+        ) and not (pair_filter.target == "session" and is_order_relation(pair_filter.relation)):
             raise ValueError(pair_filter.relation)
+
+        if pair_filter.relation in NEURON_RELATIONS:
+            raise ValueError(
+                f"Session relation {pair_filter.relation!r} needs the neuron "
+                "assignments and is not supported for this statistic."
+            )
 
         if pair_filter.relation == "with previous" and pair_filter.target != "session":
             raise ValueError("'with previous' is only meaningful for session pairs.")
@@ -263,6 +271,10 @@ class PickTable:
                 mask = ref_i == ref_j
             elif pair_filter.relation == "different":
                 mask = ref_i != ref_j
+            elif pair_filter.relation == "all previous":
+                mask = ref_j < ref_i
+            elif pair_filter.relation == "all following":
+                mask = ref_j > ref_i
             else:
                 # session_i = current; session_j = previous/reference.
                 mask = ref_j == ref_i - 1

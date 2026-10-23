@@ -7,6 +7,22 @@ from PySide6.QtWidgets import (
 )
 
 
+def fit_message_box_buttons(box, padding=36):
+    """Make every button of a message box wide enough for its label.
+
+    The dark theme's padding clips long labels otherwise. Call after all
+    buttons (including "Show Details…") exist, before showing the box.
+    """
+    for button in box.buttons():
+        text = button.text().replace("&&", "\0").replace("&", "").replace("\0", "&")
+        width = button.fontMetrics().horizontalAdvance(text) + padding
+
+        if not button.icon().isNull():
+            width += button.iconSize().width() + 6
+
+        button.setMinimumWidth(max(button.minimumWidth(), width))
+
+
 def get_colored_label(text, value, cmap, additional_tags=[]):
     color = cmap[value].rgba[0]
     color_hex = "#{:02x}{:02x}{:02x}".format(

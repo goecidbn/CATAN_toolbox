@@ -28,6 +28,12 @@ from scipy.spatial import cKDTree
 from catan.gui.background_tasks.runtime import current_task_context, reports_progress
 
 from .dimensions import canonical_dim
+from .session_relations import (
+    NEURON_RELATIONS,
+    DetectionReference,
+    is_order_relation,
+    relation_mask,
+)
 from .queries import PairFilter, ReductionSpec
 from .table import PickTable
 
@@ -127,7 +133,7 @@ def partner_endpoints(definition, query):
     if any(spec.method not in ("keep", "single") for spec in query.reduction_dict().values()):
         return None
 
-    if definition.key == "footprint_similarity":
+    if definition.key == "footprint_similarity" or definition.pairs_getter is not None:
         return endpoints
 
     getter = _base_getter(definition)
@@ -368,6 +374,22 @@ def _session_pairs(query, endpoints, n_sessions, available):
     if relation == "with previous":
         return [(int(a), int(a) - 1) for a in left if int(a) - 1 in right_set]
 
+    if is_order_relation(relation):
+        # Rows are filtered per neuron when the populations are drawn.
+        direction = {
+            "previous instance": -1,
+            "all previous": -1,
+            "next instance": 1,
+            "all following": 1,
+        }.get(relation, 0)
+
+        return [
+            (int(a), int(b))
+            for a in left
+            for b in right
+            if a != b and (direction == 0 or np.sign(b - a) == direction)
+        ]
+
     return [
         (int(a), int(b))
         for a in left
@@ -447,6 +469,16 @@ def _sample_pairs(engine, query, definition, endpoints, *, max_samples, budget, 
         + (PairFilter("neuron", "all"),),
     )
 
+    relation = next(
+        (f.relation for f in query.filters if f.target == "session"), "all"
+    )
+    ordered = is_order_relation(relation) and None not in (si_axis, sj_axis)
+    detection = (
+        DetectionReference(state.assignments)
+        if ordered and relation in NEURON_RELATIONS
+        else None
+    )
+
     trees = {}
 
     def target_tree(session_id):
@@ -480,6 +512,10 @@ def _sample_pairs(engine, query, definition, endpoints, *, max_samples, budget, 
             # Same neuron, other footprint (identical endpoints carry no value).
             if a != b:
                 same = sources[target_neurons[sources] & np.all(np.isfinite(right[sources]), axis=1)]
+
+                if ordered:
+                    same = same[relation_mask(relation, a, b, same, detection)]
+
                 counts["same"][1] += len(same)
 
                 if len(same) > quota:
@@ -503,6 +539,10 @@ def _sample_pairs(engine, query, definition, endpoints, *, max_samples, budget, 
             _, nearest = tree.query(left[sources], k=2)
             first, second = targets[nearest[:, 0]], targets[nearest[:, 1]]
             partner = np.where(first == sources, second, first)
+
+            if ordered:
+                related = relation_mask(relation, a, b, partner, detection)
+                sources, partner = sources[related], partner[related]
 
             counts["other"][0] += len(sources)
             other_pairs.extend(

@@ -19,6 +19,18 @@ from scipy import sparse
 from enum import IntEnum
 
 
+# Sessions and model in use when the assignments were saved.
+PROVENANCE_PATHS = {
+    "sessions_file": "/provenance/sessions_file",
+    "loading_recipe": "/provenance/loading_recipe",
+    "model_path": "/provenance/model_path",
+}
+
+# Display background stored with the assignments
+# (core.structures.session_snapshot.prepare_background_snapshot).
+OVERVIEW_BACKGROUND_PATH = "/overview_background"
+
+
 class ReviewStatus(IntEnum):
     PENDING = 0
     REVIEWED = 1
@@ -435,8 +447,12 @@ class Assignments:
 
         self.status["loaded"] = True
 
-    def common_spatial_coverage(self, sessions, *, revision=None):
+    def common_spatial_coverage(self, sessions, *, revision=None, tolerance=0):
+        """(mask, signed border distance) of the area imaged in all sessions
+        (after alignment); ``tolerance``: number of sessions a pixel may be
+        outside of (inside = in at least len(sessions) - tolerance)."""
         sessions = tuple(sessions)
+        tolerance = max(0, int(tolerance))
 
         if not sessions:
             raise ValueError(
@@ -451,6 +467,7 @@ class Assignments:
 
         key = (
             revision,
+            tolerance,
             tuple(
                 (
                     id(session),
@@ -469,13 +486,15 @@ class Assignments:
             return cached[1], cached[2]
 
         shape = tuple(sessions[0].dims)
-        common = np.ones(shape, dtype=bool)
+        coverage = np.zeros(shape, dtype=np.int32)
 
         for session in sessions:
             if tuple(session.dims) != shape:
                 raise ValueError("Sessions must share the same aligned pixel grid.")
 
-            common &= session_valid_mask(session)
+            coverage += session_valid_mask(session)
+
+        common = coverage >= max(1, len(sessions) - tolerance)
 
         distance = signed_border_distance(common)
 
@@ -488,7 +507,18 @@ class Assignments:
 
         return common, distance
 
-    def prepare_save(self, fields_to_save=None, *, sessions=None):
+    def prepare_save(
+        self,
+        fields_to_save=None,
+        *,
+        sessions=None,
+        provenance=None,
+        overview_background=None,
+    ):
+        """``provenance``: optional {"sessions_file": CATAN session file,
+        "loading_recipe": JSON text, "model_path": str} describing the
+        sessions and model in use. ``overview_background``: optional
+        background snapshot {"document", "arrays"}."""
 
         fields_to_save = fields_to_save or LoadConfig.fields_from_resource(
             NATIVE_ASSIGNMENTS_CONFIG,
@@ -526,6 +556,34 @@ class Assignments:
             # Preserve metadata when re-saving a loaded object without
             # access to its live sessions.
             save_data["curation"]["session_included"] = self.session_included
+
+        provenance = {
+            key: str(value)
+            for key, value in (provenance or {}).items()
+            if key in PROVENANCE_PATHS and value
+        }
+
+        if provenance:
+            save_data["provenance"] = provenance
+            fields_to_save["provenance"] = {
+                key: FieldSpec(path=PROVENANCE_PATHS[key], required=False, exposed=False)
+                for key in provenance
+            }
+
+        if overview_background is not None:
+            arrays = overview_background["arrays"]
+            save_data["overview_background"] = {
+                "document": overview_background["document"],
+                **arrays,
+            }
+            fields_to_save["overview_background"] = {
+                key: FieldSpec(
+                    path=f"{OVERVIEW_BACKGROUND_PATH}/{key}",
+                    required=False,
+                    exposed=False,
+                )
+                for key in ("document", *arrays)
+            }
 
         return deepcopy(
             {

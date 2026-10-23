@@ -12,6 +12,9 @@ from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QSignalBlocker
 from PySide6.QtGui import (
     QCursor,
     QAction,
+    QColor,
+    QIcon,
+    QPixmap,
 )
 
 from PySide6.QtWidgets import (
@@ -404,6 +407,33 @@ class Display(BasePlot.BaseCanvas):
         record = self.plotting["data"].get(component.id)
         return bool(getattr(record, "inferred", False))
 
+    def session_levels(self):
+        """Stack level of each displayed session (session ID -> level).
+
+        Collapsed: only sessions in which the focused neuron has a
+        footprint (plus the session-filter session), evenly spaced.
+        """
+        n_sessions = len(self.data.sessions)
+        parameters = self.controls["parameter"]
+        assignments = self.display_assignments
+        focused = self.display_focused_component
+
+        if (
+            not parameters.checkbox_collapse_sessions.isChecked()
+            or assignments is None
+            or focused is None
+            or not 0 <= focused.neuron_id < len(assignments.ids)
+        ):
+            return {sid: sid for sid in range(n_sessions)}
+
+        row = assignments.ids[focused.neuron_id]
+        shown = set(np.flatnonzero(row >= 0).tolist())
+
+        if parameters.checkbox_session_only.isChecked():
+            shown.add(int(self.controls["session_filter"].slider.value()))
+
+        return {sid: level for level, sid in enumerate(sorted(shown))}
+
     def plot_neurons(self, reset=False):
 
         # self.state.logger.debug(
@@ -434,6 +464,7 @@ class Display(BasePlot.BaseCanvas):
             None if focused is None else focused.neuron_id,
             parameters.threshold_spin.value(),
             parameters.z_stretch_spin.value(),
+            tuple(sorted(self.session_levels().items())),
         )
 
         if context != self._mesh_context:
@@ -537,7 +568,8 @@ class Display(BasePlot.BaseCanvas):
                 key = "focused"
                 alpha = self.styles.opts[key]["alpha"]
 
-            elif neuron in selected_neurons:
+            elif neuron in selected_neurons and display_scope == "selection":
+                # "Nearby": selected neurons look like any other neighbour.
                 key = "selected"
                 alpha = self.styles.opts[key]["alpha"]
 
@@ -656,7 +688,7 @@ class Display(BasePlot.BaseCanvas):
         )
 
         z_stretch = self.controls["parameter"].z_stretch_spin.value()
-        z_range = (0, len(self.data.sessions) * z_stretch)
+        z_range = (0, len(self.session_levels()) * z_stretch)
 
         if full:
             ## not working well, yet. rotation is somewhat preserved
@@ -769,10 +801,13 @@ class Display(BasePlot.BaseCanvas):
         vertex_offset = 0
         face_offset = 0
 
+        levels = self.session_levels()
+
         for session in self.data.sessions:
             if (
                 session.id >= assignments.ids.shape[1]
                 or not session.status["spatial_loaded"]
+                or session.id not in levels
             ):
                 continue
 
@@ -826,7 +861,7 @@ class Display(BasePlot.BaseCanvas):
             vertices, faces, colors, pick_points = footprint_to_mesh(
                 footprint,
                 session.dims,
-                z_offset=float(session.id) * z_stretch,
+                z_offset=float(levels[session.id]) * z_stretch,
                 z_scale=z_stretch,
                 z_thr=threshold,
                 rgba=rgba,
@@ -1066,8 +1101,7 @@ class Display(BasePlot.BaseCanvas):
 
         if request is not None:
             if (
-                request.type != "neuron_merge"
-                and event.button == 1
+                event.button == 1
                 and event.pos is not None
                 and not self.is_drag(event.pos)
             ):
@@ -1237,29 +1271,62 @@ class Display(BasePlot.BaseCanvas):
             + get_colored_label(f"{ds}", float(np.clip(ds / 10.0, 0.0, 1.0)), cmap)
             + f"({session_id})"
         )
-        html_probability = ""
-        html_similarity = ""
-        html_shift = ""
-        if p_same is not None:
-            html_probability = get_colored_label(
-                f"p={p_same:.2f}", float(np.clip(1 - p_same, 0.0, 1.0)), cmap, ["b"]
-            )
-
-        if similarity is not None:
-            html_similarity = "c=" + get_colored_label(
-                f"{similarity:.2f}",
-                float(np.clip((1 - similarity) / 2.0, 0.0, 1.0)),
-                cmap,
-            )
-
-        if shift is not None:
-            html_shift = "shift=" + get_colored_label(
-                f"{shift:.2f}px", float(np.clip(shift / 10.0, 0.0, 1.0)), cmap
-            )
+        html_probability, html_similarity, html_shift = match_quality_html(
+            similarity, shift, p_same, cmap
+        )
 
         add_label_to_menu(
             menu,
             f"{arrow} {html_probability} - {html_session},\t{html_similarity},\t{html_shift}",
+            enabled=False,
+        )
+
+    def footprint_set_statistics(self, union_footprint, neuron_id):
+        """Similarity, shift (px) and model probability between a footprint
+        (e.g. the union of moved footprints) and a neuron's union footprint."""
+        other = self.display_assignments.union.footprints[:, neuron_id]
+        return self._set_statistics_between(union_footprint, other)
+
+    def _set_statistics_between(self, footprint, other):
+        """footprint_set_statistics() between two footprint columns."""
+        if footprint is None or other is None or footprint.nnz == 0 or other.nnz == 0:
+            return None, None, None
+
+        similarity, _, shift = calculate_img_correlation(
+            A1=footprint,
+            A2=other,
+            dims=self.display_assignments.union.dims,
+            crop=True,
+            binary=False,
+            shift=True,
+            mode="cosine_union",
+            gamma=0.1,
+            shift_optimized=True,
+        )
+        d_shift = float(np.sqrt(np.sum([s**2 for s in shift])))
+
+        p_same = None
+        if self.data.model is not None and self.data.model.fitted:
+            p_same = self.data.model.f_same(d_shift, similarity)[0]
+
+        return similarity, d_shift, p_same
+
+    def add_set_info_str(self, menu, union_footprint, neuron_id, cmap=MATCH_QUALITY_CMAP):
+        """add_info_str() for a set of footprints vs. a neuron's union."""
+        similarity, shift, p_same = self.footprint_set_statistics(
+            union_footprint, neuron_id
+        )
+
+        if similarity is None:
+            add_label_to_menu(menu, "no union footprint to compare", enabled=False)
+            return
+
+        html_probability, html_similarity, html_shift = match_quality_html(
+            similarity, shift, p_same, cmap
+        )
+        add_label_to_menu(
+            menu,
+            f"\u25c6 {html_probability or 'p=–'} - union,\t{html_similarity},\t{html_shift}",
             enabled=False,
         )
 
@@ -1295,6 +1362,7 @@ class Display(BasePlot.BaseCanvas):
                 )
 
             menu.exec(QCursor.pos())
+            menu.deleteLater()
             return
 
         if not self.displays_active_assignments:
@@ -1322,6 +1390,7 @@ class Display(BasePlot.BaseCanvas):
             )
 
             menu.exec(QCursor.pos())
+            menu.deleteLater()
             return
 
         if this_component.session_id is None:
@@ -1340,6 +1409,8 @@ class Display(BasePlot.BaseCanvas):
         act_focus = QAction("Set focus", menu)
         act_focus.triggered.connect(lambda: self.set_focused_footprint(this_component))
         menu.addAction(act_focus)
+
+        self.add_neuron_highlight_menu(menu, this_component.neuron_id)
 
         menu.addSeparator()
 
@@ -1384,22 +1455,8 @@ class Display(BasePlot.BaseCanvas):
             menu.addMenu(submenu_change)
             menu.addSeparator()
 
-        focused = self.state.focused_component
-        if focused is not None:
-            source_id = int(this_component.neuron_id)
-            target_id = int(focused.neuron_id)
-
-            if (
-                source_id != target_id
-                and self.data.neuron_merge_distance(source_id, target_id) <= 10.0
-            ):
-                action = menu.addAction("Merge with selected neuron")
-                action.setEnabled(self.state.current_request is None)
-                action.triggered.connect(
-                    lambda checked=False, source=source_id, target=target_id: self.start_neuron_merge(
-                        source, target
-                    )
-                )
+        if self.displays_active_assignments:
+            self.add_neuron_merge_menu(menu, this_component)
 
         menu.addSeparator()
 
@@ -1422,6 +1479,7 @@ class Display(BasePlot.BaseCanvas):
             )
 
         menu.exec(QCursor.pos())
+        menu.deleteLater()
 
     def build_neuron_tag_menu(self, neuron_id: int, menu: QMenu) -> QMenu:
         submenu = QMenu("Tag neuron ...", menu)
@@ -1520,20 +1578,248 @@ class Display(BasePlot.BaseCanvas):
 
         self.request_display.set_request(request)
 
-        if request is not None:
+        if request is not None and request.type == "neuron_merge" and (
+            request.highlight_mode == "footprints"
+        ):
+            # Moved footprints as sources, the destination's as targets.
+            roles = {c: "source" for c in request.origin}
+            roles.update({c: "target" for c in request.destination})
+            self.state.update_highlighted_components(list(roles) or None, roles=roles)
+
+        elif request is not None:
             self.state.update_highlighted_components(request.components)
 
         self._position_request_display()
 
-    def start_neuron_merge(self, source_id, target_id):
+    def add_neuron_highlight_menu(self, menu, neuron_id):
+        """Highlight all footprints of a neuron as source or target (replacing
+        that role's current highlight), or remove them from the highlight."""
+        submenu = QMenu(f"Highlight all footprints of neuron {neuron_id}", menu)
+        submenu.setEnabled(self.state.current_request is None)
+        menu.addMenu(submenu)
+
+        for role in ("source", "target"):
+            action = submenu.addAction(f"as {role}")
+            action.setIcon(self._role_icon(role))
+            action.triggered.connect(
+                lambda checked=False, role=role: self.highlight_neuron_footprints(
+                    neuron_id, role
+                )
+            )
+
+        if any(
+            c.neuron_id == neuron_id for c in (self.state.highlighted_components or ())
+        ):
+            submenu.addSeparator()
+            action = submenu.addAction("remove from highlight")
+            action.triggered.connect(
+                lambda: self.highlight_neuron_footprints(neuron_id, None)
+            )
+
+    def highlight_neuron_footprints(self, neuron_id, role):
+        """Highlight all footprints of a neuron as "source"/"target", replacing
+        the current highlight of that role (plain highlights count as targets;
+        the other role is kept), or remove them from the highlight (None)."""
+        ids = self.data.assignments.ids
+        footprints = [
+            NeuronComponent(int(neuron_id), int(session))
+            for session in np.flatnonzero(ids[neuron_id] >= 0)
+        ]
+
+        current_roles = self.state.highlight_roles
+
+        def replaced(component):
+            if component.neuron_id == neuron_id:
+                return True
+            if role is None:
+                return False
+            return current_roles.get(component, "target") == role
+
+        components = [
+            c for c in (self.state.highlighted_components or ()) if not replaced(c)
+        ]
+        roles = {c: r for c, r in current_roles.items() if c in components}
+
+        if role is not None:
+            components.extend(footprints)
+            roles.update({c: role for c in footprints})
+
+        self.state.update_highlighted_components(components or None, roles=roles)
+
+    def _role_icon(self, role):
+        """Small swatch in the highlight colour of a source/target role."""
+        if role not in ("source", "target"):
+            return None
+
+        rgba = self.styles.opts[f"highlighted_{role}"]["cmap"].map(np.array([0.5]))[0]
+        pixmap = QPixmap(12, 12)
+        pixmap.fill(QColor.fromRgbF(*(float(v) for v in rgba[:3]), 1.0))
+        return QIcon(pixmap)
+
+    def highlighted_footprints_of(self, component):
+        """Sessions of the highlighted footprints of the component's neuron.
+
+        With highlight roles (e.g. curator sources / targets), only those
+        sharing the role of the component, if it is highlighted itself.
+        """
+        neuron = component.neuron_id
+        highlighted = [
+            c
+            for c in (self.state.highlighted_components or ())
+            if c.neuron_id == neuron and c.session_id is not None
+        ]
+        roles = self.state.highlight_roles
+        role = roles.get(component)
+
+        if role is not None:
+            highlighted = [c for c in highlighted if roles.get(c) == role]
+
+        return sorted({int(c.session_id) for c in highlighted})
+
+    def add_neuron_merge_menu(self, menu, component):
+        """Move footprints of this neuron into the selected (focused)
+        neuron or another one: all, this and previous / following, or
+        the highlighted footprints. The moved set can be edited afterwards
+        by clicking footprints."""
+        source_id = int(component.neuron_id)
+        session_id = component.session_id
+        row = self.display_assignments.ids[source_id]
+        sessions = np.flatnonzero(row >= 0)
+        highlighted = self.highlighted_footprints_of(component)
+        enabled = self.state.current_request is None
+
+        options = [("all footprints", sessions)]
+
+        if session_id is not None:
+            options += [
+                (
+                    f"this and all previous (sessions ≤ {session_id})",
+                    sessions[sessions <= session_id],
+                ),
+                (
+                    f"this and all following (sessions ≥ {session_id})",
+                    sessions[sessions >= session_id],
+                ),
+            ]
+
+        role = self.state.highlight_roles.get(component)
+        described = f"highlighted {role} footprints" if role else "highlighted footprints"
+        role_icon = self._role_icon(role)
+
+        if highlighted:
+            options.append((f"{described} ({len(highlighted)})", highlighted))
+
+        focused = self.state.focused_component
+        target_id = None if focused is None else int(focused.neuron_id)
+
+        if target_id is not None and target_id != source_id:
+            available = [
+                (label, moved)
+                for label, moved in options
+                if self.data.neuron_merge_distance(
+                    source_id, target_id, without=np.setdiff1d(sessions, moved)
+                )
+                <= 10.0
+            ]
+
+            if available:
+                submenu = QMenu("Merge with selected neuron", menu)
+                submenu.setEnabled(enabled)
+                menu.addMenu(submenu)
+
+                for label, moved in available:
+                    action = submenu.addAction(label)
+                    if label.startswith(described) and role_icon is not None:
+                        action.setIcon(role_icon)
+                    action.triggered.connect(
+                        lambda checked=False, moved=moved: self.start_neuron_merge(
+                            source_id, target_id, sessions=moved
+                        )
+                    )
+
+        if not highlighted:
+            return
+
+        # Highlighted footprints to a neuron other than the focused one,
+        # scored like single-footprint reassignment: the union of the moved
+        # footprints vs. each candidate's union (no session difference).
+        union = self.display_assignments.union
+        neighbours, distances = self.find_nearby_neurons(component)
+
+        submenu = QMenu(f"Move {described} ({len(highlighted)}) to…", menu)
+        if role_icon is not None:
+            submenu.setIcon(role_icon)
+        submenu.setEnabled(enabled)
+        menu.addMenu(submenu)
+
+        moved_union = self.data.partial_union_footprint(source_id, highlighted)
+        remaining = np.setdiff1d(sessions, highlighted)
+
+        add_label_to_menu(
+            submenu,
+            f"<b>Current assignment (neuron {source_id}, sessions "
+            f"{', '.join(map(str, highlighted))})</b>",
+            enabled=False,
+        )
+
+        if len(remaining):
+            # Moved footprints vs. the footprints that would remain.
+            rest = self.data.partial_union_footprint(source_id, remaining)
+            similarity, shift, p_same = self._set_statistics_between(moved_union, rest)
+            html = match_quality_html(similarity, shift, p_same, MATCH_QUALITY_CMAP)
+            add_label_to_menu(
+                submenu,
+                f"\u25c6 {html[0] or 'p=–'} - {len(remaining)} remaining footprints,\t{html[1]},\t{html[2]}",
+                enabled=False,
+            )
+        else:
+            add_label_to_menu(submenu, "no remaining footprints", enabled=False)
+
+        submenu.addSeparator()
+
+        for neighbour, distance in sorted(zip(neighbours, distances), key=lambda x: x[1]):
+            neighbour = int(neighbour)
+
+            if not union.included[neighbour]:
+                continue
+
+            n_footprints = int(np.count_nonzero(self.display_assignments.ids[neighbour] >= 0))
+            label = f"... to neuron {neighbour} ({n_footprints} footprints)"
+            if neighbour == target_id:
+                label += " — selected"
+
+            action = submenu.addAction(label)
+            action.triggered.connect(
+                lambda checked=False, target=neighbour: self.start_neuron_merge(
+                    source_id, target, sessions=highlighted
+                )
+            )
+            self.add_set_info_str(submenu, moved_union, neighbour)
+            submenu.addSeparator()
+
+        action = submenu.addAction("... to new neuron")
+        action.triggered.connect(
+            lambda: self.start_neuron_merge(source_id, None, sessions=highlighted)
+        )
+
+    def start_neuron_merge(self, source_id, target_id, sessions=None):
         if self.state.current_request is not None:
             return
 
-        self.state.current_request = request_handler.NeuronMergeRequest(
+        request = request_handler.NeuronMergeRequest(
             self.display_assignments,
             source_id,
             target_id,
+            sessions=sessions,
         )
+
+        # Restored when the request is cancelled.
+        request.previous_highlight = (
+            list(self.state.highlighted_components or ()),
+            dict(self.state.highlight_roles),
+        )
+
+        self.state.current_request = request
         self.plot_neurons(reset=True)
 
     def change_request_highlight(self, mode):
@@ -1552,9 +1838,28 @@ class Display(BasePlot.BaseCanvas):
         self.state.current_request = request_handler.RequestHandler("split", component)
         self.state.update_highlighted_components(self.state.current_request.components)
 
-    def cancel_request(self):
+    def cancel_request(self, restore=True):
+        request = self.state.current_request
+        previous = getattr(request, "previous_highlight", None) if restore else None
+
         self.state.current_request = None
-        self.state.update_highlighted_components(None)
+
+        if previous is None or not previous[0]:
+            self.state.update_highlighted_components(None)
+            return
+
+        components, roles = previous
+        ids = self.data.assignments.ids
+        components = [
+            c
+            for c in components
+            if c.neuron_id < len(ids)
+            and (c.session_id is None or ids[c.neuron_id, c.session_id] >= 0)
+        ]
+        self.state.update_highlighted_components(
+            components or None,
+            roles={c: roles[c] for c in components if c in roles},
+        )
 
     def advance_or_confirm_request(self):
 
@@ -1571,7 +1876,7 @@ class Display(BasePlot.BaseCanvas):
                 self.request_display.set_error(str(exc))
                 return
 
-            self.cancel_request()
+            self.cancel_request(restore=False)
             return
 
         # ---------------------------------------------
@@ -1609,12 +1914,23 @@ class Display(BasePlot.BaseCanvas):
 
         request = self.state.current_request
 
-        if request is None or request.type == "neuron_merge":
+        if request is None:
             return
 
         component = self.find_closest_component(event.pos)
 
         if component is None or self.is_inferred_component(component):
+            return
+
+        if request.type == "neuron_merge":
+            # Edit the set of moved footprints.
+            error = request.toggle(component)
+
+            if error is not None:
+                self.request_display.set_error(error)
+                return
+
+            self.state.notify_request_changed()
             return
 
         current_components = (
@@ -2273,12 +2589,19 @@ class RequestDisplay(QFrame):
         if request_handler.type == "neuron_merge":
             request = request_handler
 
-            self.title.setText("Merge neurons")
+            whole = request.target_id is not None and request.moves_whole_neuron
+            self.title.setText("Merge neurons" if whole else "Move footprints")
+            sessions = ", ".join(str(c.session_id) for c in request.origin)
             self.origin_label.setText(
-                f"Move neuron {request.source_id} "
-                f"({len(request.origin)} footprints)"
+                f"Move {len(request.origin)} footprints of neuron "
+                f"{request.source_id}" + (f" (sessions {sessions})" if sessions else "")
+                + "\nClick its footprints to add or remove them."
             )
-            self.destination_label.setText(f"Into neuron {request.target_id}")
+            self.destination_label.setText(
+                "Into a new neuron"
+                if request.target_id is None
+                else f"Into neuron {request.target_id}"
+            )
 
             self.highlight_selector.blockSignals(True)
             try:
@@ -2450,6 +2773,17 @@ class FootprintParametersController(ControlPanel.ControlPanel):
         )
         self.form.addRow(self.checkbox_show_excluded)
 
+        self.checkbox_collapse_sessions = QCheckBox("Collapse empty sessions")
+        self.checkbox_collapse_sessions.setChecked(False)
+        self.checkbox_collapse_sessions.setToolTip(
+            "Stack only sessions in which the focused neuron has a footprint "
+            "(and the session-filter session), evenly spaced."
+        )
+        self.checkbox_collapse_sessions.toggled.connect(
+            lambda: self.data_parameter_changed.emit()
+        )
+        self.form.addRow(self.checkbox_collapse_sessions)
+
     def _on_session_only_changed(self):
 
         active = self.checkbox_session_only.isChecked()
@@ -2459,6 +2793,31 @@ class FootprintParametersController(ControlPanel.ControlPanel):
         self.session_only_changed.emit(active)
 
         super()._on_session_only_changed()
+
+
+def match_quality_html(similarity, shift, p_same, cmap=MATCH_QUALITY_CMAP):
+    """Coloured p / c / shift labels of the reassignment menus."""
+    html_probability = ""
+    html_similarity = ""
+    html_shift = ""
+    if p_same is not None:
+        html_probability = get_colored_label(
+            f"p={p_same:.2f}", float(np.clip(1 - p_same, 0.0, 1.0)), cmap, ["b"]
+        )
+
+    if similarity is not None:
+        html_similarity = "c=" + get_colored_label(
+            f"{similarity:.2f}",
+            float(np.clip((1 - similarity) / 2.0, 0.0, 1.0)),
+            cmap,
+        )
+
+    if shift is not None:
+        html_shift = "shift=" + get_colored_label(
+            f"{shift:.2f}px", float(np.clip(shift / 10.0, 0.0, 1.0)), cmap
+        )
+
+    return html_probability, html_similarity, html_shift
 
 
 def add_surface_to_mesh(vertices_all, faces_all, colors_all, X, Y, Z, rgba):

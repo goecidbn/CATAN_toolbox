@@ -1,6 +1,7 @@
 {
   "schema_version": 2,
   "name": "High-confidence tracked neurons",
+  "category": "review",
   "root": {
     "type": "group",
     "id": "741d3e09c1de439e8d639c1b0384073d",
@@ -39,40 +40,7 @@
         "type": "condition",
         "id": "a5ef6457436b4567aeb42934ed45c3aa",
         "query": {
-          "statistic_key": "centroid_shift",
-          "reductions": {
-            "neuron": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            },
-            "session_i": {
-              "method": "max",
-              "index": null,
-              "error_method": "none"
-            },
-            "session_j": {
-              "method": "max",
-              "index": null,
-              "error_method": "none"
-            }
-          },
-          "reduction_order": [],
-          "filters": [],
-          "context": "generic",
-          "parameters": {}
-        },
-        "threshold": {
-          "value": 4.0,
-          "direction": "less",
-          "active": true
-        }
-      },
-      {
-        "type": "condition",
-        "id": "40ff6a43a1334f9ca3c28442feeb4437",
-        "query": {
-          "statistic_key": "footprint_similarity",
+          "statistic_key": "footprint_union_distance",
           "reductions": {
             "neuron_i": {
               "method": "keep",
@@ -84,13 +52,8 @@
               "index": null,
               "error_method": "none"
             },
-            "session_i": {
-              "method": "median",
-              "index": null,
-              "error_method": "none"
-            },
-            "session_j": {
-              "method": "median",
+            "session": {
+              "method": "keep",
               "index": null,
               "error_method": "none"
             }
@@ -101,10 +64,44 @@
               "target": "neuron",
               "relation": "same",
               "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {}
+        },
+        "threshold": {
+          "value": 3.0,
+          "direction": "less",
+          "active": true
+        }
+      },
+      {
+        "type": "condition",
+        "id": "40ff6a43a1334f9ca3c28442feeb4437",
+        "query": {
+          "statistic_key": "footprint_union_similarity",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
             },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
             {
-              "target": "session",
-              "relation": "different",
+              "target": "neuron",
+              "relation": "same",
               "collapse_same": true
             }
           ],
@@ -135,7 +132,7 @@
                 "type": "condition",
                 "id": "d53c37553d80483d9c682f4a65e7ccd6",
                 "query": {
-                  "statistic_key": "cross_session_distances",
+                  "statistic_key": "footprint_union_distance",
                   "reductions": {
                     "neuron_i": {
                       "method": "keep",
@@ -147,12 +144,7 @@
                       "index": null,
                       "error_method": "none"
                     },
-                    "session_i": {
-                      "method": "keep",
-                      "index": null,
-                      "error_method": "none"
-                    },
-                    "session_j": {
+                    "session": {
                       "method": "keep",
                       "index": null,
                       "error_method": "none"
@@ -170,7 +162,7 @@
                   "parameters": {}
                 },
                 "threshold": {
-                  "value": 5.0,
+                  "value": 3.0,
                   "direction": "less",
                   "active": true
                 }
@@ -179,7 +171,7 @@
                 "type": "condition",
                 "id": "483904c4edb142b4be9a523a791d11e4",
                 "query": {
-                  "statistic_key": "footprint_overlap",
+                  "statistic_key": "footprint_union_overlap",
                   "reductions": {
                     "neuron_i": {
                       "method": "keep",
@@ -191,12 +183,7 @@
                       "index": null,
                       "error_method": "none"
                     },
-                    "session_i": {
-                      "method": "keep",
-                      "index": null,
-                      "error_method": "none"
-                    },
-                    "session_j": {
+                    "session": {
                       "method": "keep",
                       "index": null,
                       "error_method": "none"
@@ -229,6 +216,7 @@
             "count": null,
             "comment": "",
             "apply_to": "same",
+            "summary": null,
             "manipulation": null,
             "review_statuses": null
           },
@@ -236,7 +224,7 @@
             "type": "condition",
             "id": "5c881a4ba72a4b99b17197b55b71e709",
             "query": {
-              "statistic_key": "footprint_similarity",
+              "statistic_key": "footprint_union_similarity",
               "reductions": {
                 "neuron_i": {
                   "method": "keep",
@@ -248,12 +236,7 @@
                   "index": null,
                   "error_method": "none"
                 },
-                "session_i": {
-                  "method": "keep",
-                  "index": null,
-                  "error_method": "none"
-                },
-                "session_j": {
+                "session": {
                   "method": "keep",
                   "index": null,
                   "error_method": "none"
@@ -289,6 +272,7 @@
         },
         "comment": "No nearby confusing footprint",
         "apply_to": "same",
+        "summary": null,
         "manipulation": null,
         "review_statuses": null
       }
@@ -296,7 +280,14 @@
     "count": null,
     "comment": "",
     "apply_to": "same",
-    "manipulation": null,
+    "summary": null,
+    "manipulation": {
+      "kind": "mark_reviewed",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
     "review_statuses": null
   }
 }

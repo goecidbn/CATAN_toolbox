@@ -6,7 +6,19 @@ from .parameters import StatisticParameter
 from .distance_statistics import distance_query
 from .overlap_statistics import overlap_query
 from .cooccurrence_statistics import cooccurrence_query
+from .footprint_pairs import footprint_similarity_requested_pairs
+from .union_similarity import (
+    calculate_footprint_union_similarity,
+    calculate_union_similarity,
+    footprint_union_similarity_requested_pairs,
+    union_similarity_requested_pairs,
+)
 from .event_rate import calculate_event_rate, trace_keys
+from .track_split import calculate_track_split, measure_choices
+from .union_overlap import (
+    calculate_footprint_union_overlap,
+    footprint_union_overlap_requested_pairs,
+)
 from . import calculations
 
 from catan.core.changes import (
@@ -48,8 +60,10 @@ CALCULATED_STATISTICS = {
                 kind=bool,
                 default=False,
                 tooltip=(
-                    "Use the area covered by all loaded sessions. "
-                    "Otherwise use this session's own aligned imaging area."
+                    "Use the area covered by all loaded sessions (all but the "
+                    "number tolerated in the Overview option 'Border: tolerate "
+                    "outside'). Otherwise use this session's own aligned "
+                    "imaging area."
                 ),
             ),
         ),
@@ -210,6 +224,7 @@ CALCULATED_STATISTICS = {
         ),
         independent_pairs=True,
         compact_values=True,
+        pairs_getter=footprint_similarity_requested_pairs,
     ),
 }
 
@@ -315,6 +330,107 @@ definition = CALCULATED_STATISTICS["union_distances"]
 definition.component_axes = ()
 definition.curation_kind = "neuron_pair"
 
+# Footprint counterpart of footprint_union_distance: compare with the union
+# of a neuron instead of each of its stored footprints.
+CALCULATED_STATISTICS["footprint_union_similarity"] = StatisticDefinition(
+    key="footprint_union_similarity",
+    title="Footprint → union similarity",
+    description=(
+        "Similarity of a session footprint of neuron_i to the union "
+        "footprint of neuron_j (same score as footprint similarity). "
+        "Pairs with centroids 10 px or more apart are omitted; the own "
+        "union (neuron_i = neuron_j) is included."
+    ),
+    dims=("neuron_i", "neuron_j", "session"),
+    category="pair",
+    getter=calculate_footprint_union_similarity,
+    pairs_getter=footprint_union_similarity_requested_pairs,
+    allowed_reductions=None,
+    default_reductions={
+        "neuron_i": ReductionSpec("keep"),
+        "neuron_j": ReductionSpec("keep"),
+        "session": ReductionSpec("single", 0),
+    },
+    parameters=CALCULATED_STATISTICS["footprint_similarity"].parameters,
+    independent_pairs=True,
+    compact_values=True,
+    component_axes=(("neuron_i", "session"),),
+    curation_kind="reassignment",
+    relationship_axes=(("neuron_i", "session"), ("neuron_j", None)),
+)
+
+# Union counterpart of union_distances (neuron pairs, e.g. merge candidates).
+CALCULATED_STATISTICS["union_similarity"] = StatisticDefinition(
+    key="union_similarity",
+    title="Union similarity",
+    description=(
+        "Similarity between the union footprints of two neurons (same score "
+        "as footprint similarity). Pairs with union centroids 10 px or more "
+        "apart and identical neurons are omitted."
+    ),
+    dims=("neuron_i", "neuron_j"),
+    category="pair",
+    getter=calculate_union_similarity,
+    pairs_getter=union_similarity_requested_pairs,
+    allowed_reductions=None,
+    default_reductions={
+        "neuron_i": ReductionSpec("keep"),
+        "neuron_j": ReductionSpec("keep"),
+    },
+    parameters=CALCULATED_STATISTICS["footprint_similarity"].parameters,
+    independent_pairs=True,
+    compact_values=True,
+    component_axes=(),
+    curation_kind="neuron_pair",
+    relationship_axes=(("neuron_i", None), ("neuron_j", None)),
+)
+
+# Neurons assembled from two cells: best two-group partition of the footprints.
+CALCULATED_STATISTICS["track_split"] = StatisticDefinition(
+    key="track_split",
+    title="Track split (px)",
+    description=(
+        "Best partition of a neuron's footprints into two groups by centroid "
+        "position, maximizing the gap (smallest distance between the "
+        "groups); any grouping, including a single cut in time. Values "
+        "exist only for footprint pairs across the groups, from the group "
+        "with the first detection (s_i) to the other (s_j)."
+    ),
+    dims=("neuron", "session_i", "session_j"),
+    category="neuron",
+    getter=calculate_track_split,
+    default_reductions={
+        "neuron": ReductionSpec("keep"),
+        "session_i": ReductionSpec("keep"),
+        "session_j": ReductionSpec("keep"),
+    },
+    parameters=(
+        StatisticParameter(
+            key="measure",
+            label="Measure",
+            kind=str,
+            default="gap",
+            tooltip=(
+                "gap: smallest distance between the groups (insensitive to "
+                "gradual drift within a group). separation: distance "
+                "between the group medians."
+            ),
+            choices=measure_choices,
+        ),
+        StatisticParameter(
+            key="min_group",
+            label="Minimum group size",
+            kind=int,
+            default=2,
+            minimum=1,
+            step=1,
+            decimals=0,
+            tooltip="Footprints required in each group.",
+        ),
+    ),
+    relationship_axes=(("neuron", "session_i"), ("neuron", "session_j")),
+)
+
 CALCULATED_STATISTICS["footprint_overlap"] = StatisticDefinition(
     key="footprint_overlap",
     title="Footprint overlap",
@@ -411,6 +527,7 @@ _CALCULATED_DEPENDENCIES = {
                 ChangeKind.BACKGROUND_IMAGE,
                 ChangeKind.PROCESSING_STATUS,
                 ChangeKind.SESSION_METADATA,
+                ChangeKind.BORDER_SETTINGS,
             }
         ),
         frozenset({"spatial"}),
@@ -496,6 +613,7 @@ for key in (
     "footprint_similarity",
     "footprint_overlap",
     "cross_session_distances",
+    "track_split",
 ):
     CALCULATED_STATISTICS[key].neuron_local = True
 
@@ -505,6 +623,10 @@ distance_keys = (
     "cross_session_distances",
     "footprint_union_distance",
     "union_distances",
+    # Depend on the same footprint/union geometry and inclusion.
+    "footprint_union_similarity",
+    "union_similarity",
+    "track_split",
 )
 
 for key in distance_keys:
@@ -519,6 +641,39 @@ for key in distance_keys:
         }
     )
     definition.availability_dependencies = frozenset({"spatial"})
+
+# Overlap counterpart of footprint_union_similarity (one union per neuron).
+CALCULATED_STATISTICS["footprint_union_overlap"] = StatisticDefinition(
+    key="footprint_union_overlap",
+    title="Footprint → union overlap",
+    description=(
+        "Overlap of a session footprint of neuron_i with the union footprint "
+        "of neuron_j (same measure as footprint overlap). Pairs with "
+        "centroids 10 px or more apart are omitted; the own union "
+        "(neuron_i = neuron_j) is included."
+    ),
+    dims=("neuron_i", "neuron_j", "session"),
+    category="pair",
+    getter=calculate_footprint_union_overlap,
+    pairs_getter=footprint_union_overlap_requested_pairs,
+    allowed_reductions=None,
+    default_reductions={
+        "neuron_i": ReductionSpec("keep"),
+        "neuron_j": ReductionSpec("keep"),
+        "session": ReductionSpec("single", 0),
+    },
+    parameters=CALCULATED_STATISTICS["footprint_overlap"].parameters,
+    independent_pairs=True,
+    compact_values=True,
+    component_axes=(("neuron_i", "session"),),
+    curation_kind="reassignment",
+    relationship_axes=(("neuron_i", "session"), ("neuron_j", None)),
+    # Same footprint/union geometry and inclusion as the similarity.
+    dependencies=CALCULATED_STATISTICS["footprint_union_similarity"].dependencies,
+    availability_dependencies=CALCULATED_STATISTICS[
+        "footprint_union_similarity"
+    ].availability_dependencies,
+)
 
 CALCULATED_STATISTICS["cooccurrence"] = StatisticDefinition(
     key="cooccurrence",

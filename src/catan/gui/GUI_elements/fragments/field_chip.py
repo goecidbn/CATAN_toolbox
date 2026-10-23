@@ -71,6 +71,7 @@ class FieldChip(QWidget):
             "Edit field path...", lambda: self.change_path_requested.emit(self.name)
         )
         menu.exec(self.mapToGlobal(pos))
+        menu.deleteLater()
 
     def set(self, *, name: Optional[str] = None, path: Optional[str] = None):
         if name is not None:

@@ -7,6 +7,7 @@ from collections import OrderedDict
 
 from catan.core.image_correlation import (
     compact_positive_footprint,
+    compact_positive_footprints,
     footprint_similarity_peaks,
 )
 from catan.gui.background_tasks.runtime import (
@@ -17,6 +18,12 @@ from catan.gui.background_tasks.runtime import (
 )
 
 from .dimensions import Dimension
+from .session_relations import (
+    NEURON_RELATIONS,
+    DetectionReference,
+    is_order_relation,
+    relation_mask,
+)
 from .sparse_values import SparseStatisticArray
 
 from collections import Counter
@@ -66,13 +73,14 @@ def calculate_footprint_pairs(
     collapse = {f.target: f.collapse_same for f in filters}
     nr = relations.get("neuron", "all")
     sr = relations.get("session", "all")
-    if nr not in ("all", "same", "different") or sr not in (
-        "all",
-        "same",
-        "different",
-        "with previous",
+    if nr not in ("all", "same", "different") or not (
+        sr in ("all", "same", "different", "with previous") or is_order_relation(sr)
     ):
         raise ValueError("Unsupported pair relation")
+
+    detection = (
+        DetectionReference(state.assignments) if sr in NEURON_RELATIONS else None
+    )
     compact_n = nr == "same" and collapse.get("neuron", True)
     compact_s = sr in ("same", "with previous") and collapse.get("session", True)
 
@@ -85,6 +93,21 @@ def calculate_footprint_pairs(
             (int(si), int(si) - offset)
             for si in si_ids
             if int(si) - offset in allowed_j
+        ]
+    elif is_order_relation(sr):
+        # Neuron-dependent relations are resolved per candidate below.
+        # The first/last detection of another neuron may lie on either side.
+        direction = {
+            "previous instance": -1,
+            "all previous": -1,
+            "next instance": 1,
+            "all following": 1,
+        }.get(sr, 0)
+        pairs = [
+            (int(si), int(sj))
+            for si in si_ids
+            for sj in sj_ids
+            if si != sj and (direction == 0 or np.sign(sj - si) == direction)
         ]
     else:
         pairs = [
@@ -284,6 +307,10 @@ def calculate_footprint_pairs(
                     distinct = ni_ids[cand_i] != nj_ids[cand_j]
                     cand_i, cand_j = cand_i[distinct], cand_j[distinct]
 
+            if detection is not None and len(cand_i):
+                related = relation_mask(sr, si, sj, nj_ids[cand_j], detection)
+                cand_i, cand_j = cand_i[related], cand_j[related]
+
             if not len(cand_i):
                 continue
 
@@ -435,12 +462,18 @@ def footprint_similarity_for_pairs(
     *,
     neighborhood_thr=10,
     gamma=0.1,
+    canonical=True,
 ):
     """Similarity of explicit (neuron_i, neuron_j, session_i, session_j) rows.
 
     Applies the candidate rules of calculate_footprint_pairs(): both
     footprints present, raw centroids closer than ``neighborhood_thr`` and
     no self-comparison. Other rows are NaN.
+
+    The score is not bitwise symmetric. With ``canonical``, each footprint
+    pair is scored once in the orientation calculate_footprint_pairs() uses
+    when both directions are in its domain: lower session first, within a
+    session lower neuron first. Otherwise rows are scored as requested.
     """
     pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 4)
     values = np.full(len(pairs), np.nan, dtype=np.float64)
@@ -460,7 +493,9 @@ def footprint_similarity_for_pairs(
     valid &= (fi >= 0) & (fj >= 0)
 
     ctx = current_task_context()
-    lefts, rights, targets = [], [], []
+
+    # Unordered footprint pair -> rows requesting it.
+    scored = {}
 
     for source_id, reference_id in np.unique(pairs[valid][:, 2:], axis=0):
         if ctx is not None:
@@ -487,20 +522,136 @@ def footprint_similarity_for_pairs(
         )
         rows = rows[np.isfinite(distance) & (distance < neighborhood_thr)]
 
-        for row in rows:
-            lefts.append(
-                compact_positive_footprint(
-                    source.footprints[:, fi[row]], tuple(source.dims)
-                )
-            )
-            rights.append(
-                compact_positive_footprint(
-                    reference.footprints[:, fj[row]], tuple(reference.dims)
-                )
-            )
-            targets.append(row)
+        for row in rows.tolist():
+            left = (int(si[row]), int(fi[row]), int(ni[row]))
+            right = (int(sj[row]), int(fj[row]), int(nj[row]))
 
-    if targets:
-        values[targets] = footprint_similarity_peaks(lefts, rights, gamma=gamma)
+            if canonical and (right[0], right[2]) < (left[0], left[2]):
+                left, right = right, left
+
+            scored.setdefault((left, right), []).append(row)
+
+    if not scored:
+        return values
+
+    keys = list(scored)
+
+    # Prepare all patches of a session at once.
+    needed = {}
+    for left, right in keys:
+        needed.setdefault(left[0], set()).add(left[1])
+        needed.setdefault(right[0], set()).add(right[1])
+
+    patches = {}
+    for session_id, footprint_ids in needed.items():
+        if ctx is not None:
+            ctx.check_cancelled()
+
+        session = data.sessions[session_id]
+        footprint_ids = sorted(footprint_ids)
+        patches.update(
+            zip(
+                ((session_id, fp) for fp in footprint_ids),
+                compact_positive_footprints(
+                    session.footprints, footprint_ids, tuple(session.dims)
+                ),
+            )
+        )
+
+    scores = footprint_similarity_peaks(
+        [patches[left[:2]] for left, _ in keys],
+        [patches[right[:2]] for _, right in keys],
+        gamma=gamma,
+    )
+
+    for key, score in zip(keys, scores.tolist()):
+        values[scored[key]] = score
 
     return values
+
+
+@reports_progress("Calculating requested footprint similarity")
+def footprint_similarity_requested_pairs(
+    data,
+    state,
+    query,
+    *,
+    requested_pairs,
+    neighborhood_thr=10,
+    gamma=0.1,
+):
+    """Requested-row variant of calculate_footprint_pairs() for curator use.
+
+    Returns all requested rows with a value. Selection happens afterwards on
+    compacted values, as for the full calculation (see the engine).
+    """
+    from .distance_statistics import pair_plan
+    from .requested_rows import evaluate_requested_rows
+
+    names = ("neuron_i", "neuron_j", "session_i", "session_j")
+    n, s = state.assignments.shape
+
+    if any(
+        spec.method not in ("keep", "single") for spec in query.reduction_dict().values()
+    ):
+        raise ValueError("Requested pairs require unreduced footprint identities.")
+
+    pairs = np.asarray(requested_pairs, dtype=np.int64)
+
+    if pairs.ndim != 2 or pairs.shape[1] != 4:
+        raise ValueError("Requested pairs must have four coordinate columns.")
+
+    dims, aliases, references, _, _ = pair_plan(names, n, s, query)
+    detection = (
+        DetectionReference(state.assignments)
+        if any(f.relation in NEURON_RELATIONS for f in query.filters)
+        else None
+    )
+
+    # Fixed axes restrict the full calculation to one direction.
+    canonical = all(
+        spec.method != "single" for spec in query.reduction_dict().values()
+    )
+
+    def read_rows(refs):
+        ni, nj, si, sj = (refs[name] for name in names)
+
+        values = footprint_similarity_for_pairs(
+            data,
+            state,
+            np.column_stack((ni, nj, si, sj)),
+            neighborhood_thr=neighborhood_thr,
+            gamma=gamma,
+            canonical=canonical,
+        )
+
+        for pair_filter in query.filters:
+            left, right = (ni, nj) if pair_filter.target == "neuron" else (si, sj)
+            relation = pair_filter.relation
+
+            if relation == "same":
+                values[left != right] = np.nan
+            elif relation == "different":
+                values[left == right] = np.nan
+            elif relation == "with previous" and pair_filter.target == "session":
+                values[right != left - 1] = np.nan
+            elif pair_filter.target == "session" and is_order_relation(relation):
+                values[~relation_mask(relation, si, sj, nj, detection)] = np.nan
+            elif relation != "all":
+                raise ValueError(f"Unsupported pair filter: {pair_filter}")
+
+        # The full calculation compacts float64 scores (<= 1) to float16.
+        # Rounding here keeps the float32 row values exact, so the later
+        # compaction gives the same float16 values (no double rounding).
+        return values.astype(np.float16)
+
+    return evaluate_requested_rows(
+        dims,
+        read_rows,
+        {name: pairs[:, index] for index, name in enumerate(names)},
+        reference_aliases=references,
+        reduction_aliases=aliases,
+        applied_filters=tuple(f.target for f in query.filters),
+        # One block per FFT batch; the per-block session loop is costly.
+        block_rows=65_536,
+    )

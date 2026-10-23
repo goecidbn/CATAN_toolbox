@@ -1,0 +1,101 @@
+{
+  "schema_version": 2,
+  "name": "Merge neuron candidates",
+  "category": "assignments",
+  "root": {
+    "type": "group",
+    "id": "741d3e09c1de439e8d639c1b0384073d",
+    "operator": "and",
+    "match_level": "relationship",
+    "children": [
+      {
+        "type": "condition",
+        "id": "a5ef6457436b4567aeb42934ed45c3aa",
+        "query": {
+          "statistic_key": "union_distances",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
+            {
+              "target": "neuron",
+              "relation": "different",
+              "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {}
+        },
+        "threshold": {
+          "value": 4.965,
+          "direction": "less",
+          "active": true
+        }
+      },
+      {
+        "type": "group",
+        "id": "255cd685aeff4e34ba0d909bd14b4bff",
+        "operator": "and",
+        "match_level": "relationship",
+        "children": [
+          {
+            "type": "condition",
+            "id": "0b0d2064e0b346febfe5960f6e902802",
+            "query": {
+              "statistic_key": "union_similarity",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "different",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {
+                "gamma": 0.1
+              }
+            },
+            "threshold": {
+              "value": 0.9,
+              "direction": "greater",
+              "active": true
+            }
+          }
+        ],
+        "count": null,
+        "comment": "",
+        "apply_to": "same",
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": null,
+    "comment": "",
+    "apply_to": "same",
+    "manipulation": null,
+    "review_statuses": null
+  }
+}

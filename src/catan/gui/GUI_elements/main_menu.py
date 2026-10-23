@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QToolButton,
     QSpinBox,
+    QDoubleSpinBox,
     QWidgetAction,
     QCheckBox,
     QDialogButtonBox,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal, QSignalBlocker, QSize
 from PySide6.QtGui import QAction
 from shiboken6 import isValid
+from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 
 from pathlib import Path
 
@@ -47,6 +49,7 @@ from .fragments import (
     choose_path,
 )
 from . import session_overview
+from catan.gui.GUI_elements.utils.paths import display_path
 
 selector_options = {
     "model": [
@@ -231,6 +234,8 @@ class MainMenu(QFrame):
             ),
         )
 
+        form.addRow("", self.build_registration_parameters())
+
         self.review_counts_label = QLabel()
         self.review_counts_label.setWordWrap(True)
         self.review_counts_label.setToolTip(
@@ -245,6 +250,74 @@ class MainMenu(QFrame):
         self.paths_layout.addWidget(frame)
         self.update_buttons()
         return paths_menu
+
+    def build_registration_parameters(self) -> QWidget:
+        """Parameters of neuron registration (stored in the settings and
+        applied to Tracking.params)."""
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        specs = (
+            (
+                "match_threshold",
+                "Match p ≥",
+                0.3,
+                (0.05, 0.95),
+                "Minimum match probability for assigning a footprint to an "
+                "existing neuron.",
+            ),
+            (
+                "competitor_threshold",
+                "Drop competitor p ≥",
+                0.3,
+                (0.05, 0.95),
+                "An unmatched footprint whose match probability with any "
+                "neuron reaches this value (it lost the match to another "
+                "footprint) is dropped instead of becoming a new neuron, "
+                "to avoid confusing the two downstream.",
+            ),
+            (
+                "union_update_strength",
+                "Union update",
+                0.5,
+                (0.05, 1.0),
+                "Weight of a matched footprint in the union footprint: "
+                "U ← (1 − a)·U + a·A, a = strength × match probability. "
+                "Lower: more inertia (less pulled by a single bad match); "
+                "higher: follows changes faster. Also used whenever the union "
+                "is rebuilt (loading, manipulations).",
+            ),
+        )
+
+        self.registration_spins = {}
+
+        for key, label, default, (low, high), tooltip in specs:
+            value = self.settings.value(f"registration/{key}", default, type=float)
+            self.data.params[key] = float(value)
+
+            spin = QDoubleSpinBox()
+            spin.setDecimals(2)
+            spin.setRange(low, high)
+            spin.setSingleStep(0.05)
+            spin.setValue(float(value))
+            spin.setToolTip(tooltip)
+            spin.setFixedWidth(70)
+
+            def changed(value, key=key):
+                self.data.params[key] = float(value)
+                self.settings.setValue(f"registration/{key}", float(value))
+
+            spin.valueChanged.connect(changed)
+
+            caption = QLabel(label)
+            caption.setToolTip(tooltip)
+            layout.addWidget(caption)
+            layout.addWidget(spin)
+            self.registration_spins[key] = spin
+
+        layout.addStretch()
+        return widget
 
     def build_root_selector(self) -> QWidget:
 
@@ -514,6 +587,7 @@ class MainMenu(QFrame):
             "merge": "merge",
             "neuron_merge": "merge",
             "reassign": "reassign",
+            "move_footprints": "reassign",
         }
 
         if assignments is not None:
@@ -572,8 +646,11 @@ class MainMenu(QFrame):
             default_filename=f"catan_{key}.hdf5",
         )
 
+        # The save may start later (after display workers stopped).
         if save_path is not None:
             self.data.queue_save_result(key, save_path)
+
+        return save_path
 
     def _on_load_option_changed(self, key, opt: str):
 
@@ -857,7 +934,190 @@ class MainMenu(QFrame):
 
             return
 
+        if not self._offer_assignments_provenance(source):
+            return
+
         self._load_assignments_from_source()
+
+    def _offer_assignments_provenance(self, source) -> bool:
+        """Offer the sessions and model stored with saved assignments.
+
+        Returns False if the user cancelled (assignments stay unloaded and
+        can be loaded with the open-folder button). Otherwise the stored
+        sessions/model are queued first when chosen; loading the
+        assignments waits for that processing.
+        """
+        provenance = getattr(source, "provenance", None)
+
+        if not provenance:
+            return True
+
+        sessions = []
+        if provenance.get("recipe") is not None:
+            try:
+                sessions = self.data.parse_loading_recipe(
+                    provenance["recipe"], Path(source.path).parent
+                )
+            except ValueError as exc:
+                self.state.issue(
+                    "warning",
+                    "Stored sessions not usable",
+                    f"The assignments file lists its sessions, but they cannot "
+                    f"be read: {exc}",
+                    parent=self.window(),
+                )
+
+        model_path = provenance.get("model_path")
+        current_model_path = getattr(self.data.model, "path", None)
+
+        # Preferred: the CATAN session file (keeps alignment and loaded
+        # data); the recipe re-registers from the original sources.
+        sessions_file = provenance.get("sessions_file")
+        if sessions_file and not Path(sessions_file).is_file():
+            self.state.issue(
+                "warning",
+                "Stored session file not found",
+                f"{display_path(sessions_file)}\n\nThe sessions can only be loaded from "
+                "their original sources (loading recipe).",
+                parent=self.window(),
+            )
+            sessions_file = None
+
+        key = self.data.session_source_key
+        if sessions_file and self.data.catan_sessions_file() is not None:
+            sessions_differ = key(self.data.catan_sessions_file()) != key(sessions_file)
+        elif sessions:
+            sessions_differ = [
+                key(session.path) for session in self.data.sessions
+            ] != [key(session.path) for session in sessions]
+        else:
+            sessions_differ = bool(sessions_file)
+        model_differs = bool(model_path) and (
+            current_model_path is None
+            or Path(current_model_path).resolve() != Path(model_path).resolve()
+        )
+
+        if not sessions_differ and not model_differs:
+            return True
+
+        model = self.data.model
+        have_current = bool(self.data.sessions) or (
+            model is not None and (model.fitted or model.loaded)
+        )
+
+        stored = []
+        if sessions_differ and sessions_file:
+            stored.append(
+                (f"{len(sessions)} sessions" if sessions else "sessions")
+                + f" (session file {Path(sessions_file).name})"
+            )
+        elif sessions_differ:
+            stored.append(f"{len(sessions)} sessions (loading recipe)")
+        if model_differs:
+            stored.append(f"model {Path(model_path).name}")
+
+        dialog = QMessageBox(self.window())
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("Sessions and model of these assignments")
+        dialog.setText(
+            "These assignments were saved together with "
+            + " and ".join(stored)
+            + "."
+        )
+
+        details = []
+        if sessions_differ and sessions_file:
+            details.append(f"Session file:\n  {display_path(sessions_file)}")
+        elif sessions_differ:
+            details.append(
+                "Sessions:\n"
+                + "\n".join(
+                    f"  {display_path(session.path)}" for session in sessions[:8]
+                )
+                + (f"\n  … {len(sessions) - 8} more" if len(sessions) > 8 else "")
+            )
+        if model_differs:
+            details.append(f"Model:\n  {display_path(model_path)}")
+
+        if have_current:
+            dialog.setInformativeText(
+                "Keep the currently loaded sessions and model, or replace them? "
+                "Replacing removes the current sessions, including their "
+                "columns in all loaded assignments."
+            )
+            load_button = dialog.addButton(
+                "Replace with stored", QMessageBox.ButtonRole.DestructiveRole
+            )
+            keep_button = dialog.addButton(
+                "Keep current", QMessageBox.ButtonRole.AcceptRole
+            )
+        else:
+            dialog.setInformativeText("Load them before the assignments?")
+            load_button = dialog.addButton(
+                "Load stored sessions and model", QMessageBox.ButtonRole.AcceptRole
+            )
+            keep_button = dialog.addButton(
+                "Assignments only", QMessageBox.ButtonRole.RejectRole
+            )
+
+        dialog.setDetailedText("\n\n".join(details))
+        cancel_button = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(keep_button if have_current else load_button)
+        fit_message_box_buttons(dialog)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+
+        if clicked is cancel_button or not isValid(self):
+            return False
+
+        if clicked is keep_button:
+            return True
+
+        if sessions_differ:
+            for session_id in reversed(range(len(self.data.sessions))):
+                self.data.remove_session(session_id)
+
+            loader = self.session_list.load_row
+            actions = set(loader.registration_action_selector.actions)
+
+            if sessions_file:
+                # Restores all sessions with alignment and loaded data.
+                loader._queue_registration_path(
+                    Path(sessions_file),
+                    batch=TaskBatch(),
+                    actions=actions,
+                    force_first_session=True,
+                )
+            else:
+                # The usual recipe review, then registration and loading.
+                loader._review_recipe(
+                    sessions,
+                    batch=TaskBatch(),
+                    actions=actions,
+                )
+
+        if model_differs:
+            replace = self.data.can_replace_empty_model()
+
+            if replace:
+                # An empty current model is replaced under its own name.
+                name = self.data.current_model_name
+            else:
+                base = Path(model_path).stem or "model"
+                name, number = base, 2
+                while name in self.data.available_models:
+                    name, number = f"{base} ({number})", number + 1
+
+            self.data.queue_import_source(
+                "model",
+                model_path,
+                name,
+                replace_empty_model=replace,
+                on_loaded=lambda: self._refresh_source_selector("model"),
+            )
+
+        return self.data.assignments is source
 
     def update_buttons(self):
 

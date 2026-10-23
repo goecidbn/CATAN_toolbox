@@ -145,6 +145,7 @@ class DisplayArea(QWidget):
                 self,
                 section_id=node["id"],
                 display_mode=node.get("config", {}).get("display_mode", "empty"),
+                config=node.get("config", {}),
             )
 
             w.apply_config(node.get("config", {}))

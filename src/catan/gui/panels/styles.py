@@ -3,6 +3,11 @@ from vispy import color
 from typing import Optional
 
 
+# Highlight colours: sources violet, targets (and plain highlights) orange.
+HIGHLIGHT_SOURCE_COLOR = "#C9A6FF"
+HIGHLIGHT_TARGET_COLOR = "#FFB36B"
+
+
 class Styles:
 
     opts = {
@@ -42,7 +47,8 @@ class Styles:
             "edge_width": 1.5,
         },
         "highlighted": {
-            "cmap": "Oranges",
+            # Same as targets: only two highlight colours.
+            "cmap": color.Colormap([HIGHLIGHT_TARGET_COLOR, HIGHLIGHT_TARGET_COLOR]),
             "alpha": 1.0,
             "width": 3.0,
             "size": 3.0,
@@ -51,12 +57,12 @@ class Styles:
     }
     opts["highlighted_source"] = {
         **opts["highlighted"],
-        "cmap": color.Colormap(["#C9A6FF", "#C9A6FF"]),
+        "cmap": color.Colormap([HIGHLIGHT_SOURCE_COLOR, HIGHLIGHT_SOURCE_COLOR]),
     }
 
     opts["highlighted_target"] = {
         **opts["highlighted"],
-        "cmap": color.Colormap(["#FFB36B", "#FFB36B"]),
+        "cmap": color.Colormap([HIGHLIGHT_TARGET_COLOR, HIGHLIGHT_TARGET_COLOR]),
     }
 
     overview = {

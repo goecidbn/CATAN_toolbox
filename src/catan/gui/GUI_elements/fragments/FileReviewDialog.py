@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from catan.gui.GUI_elements.utils.paths import display_path
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -69,7 +70,7 @@ class GlobReviewDialog(QDialog):
         self._original_paths.sort()
 
         self.info_label = QLabel(
-            f"{len(self._original_paths)} matching files found with common path {self.common_path}."
+            f"{len(self._original_paths)} matching files found with common path {display_path(self.common_path)}."
         )
 
         self.list_widget = SessionListWidget()
@@ -208,13 +209,15 @@ class RecipeReviewDialog(QDialog):
         layout.addWidget(self.list_widget)
 
         for index, row in enumerate(rows):
-            item = QListWidgetItem(f"{row['name']} — {row['status']}\n{row['path']}")
+            item = QListWidgetItem(
+                f"{row['name']} — {row['status']}\n{display_path(row['path'])}"
+            )
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
                 Qt.CheckState.Checked if row["checked"] else Qt.CheckState.Unchecked
             )
             item.setData(Qt.ItemDataRole.UserRole, index)
-            item.setToolTip(row["path"])
+            item.setToolTip(display_path(row["path"]))
             self.list_widget.addItem(item)
 
         controls = QHBoxLayout()

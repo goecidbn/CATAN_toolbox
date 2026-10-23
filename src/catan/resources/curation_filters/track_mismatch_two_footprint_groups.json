@@ -1,0 +1,225 @@
+{
+  "schema_version": 2,
+  "name": "Track mismatch: two footprint groups",
+  "category": "assignments",
+  "root": {
+    "type": "group",
+    "id": "5b17b413fd90460597bed2e9fa99ea47",
+    "operator": "and",
+    "match_level": "relationship",
+    "children": [
+      {
+        "type": "condition",
+        "id": "f2b60990c8b04387bd2afbd936eff4a6",
+        "query": {
+          "statistic_key": "track_split",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic",
+          "parameters": {
+            "measure": "separation",
+            "min_group": 2
+          }
+        },
+        "threshold": {
+          "value": 3.0,
+          "direction": "greater",
+          "active": true
+        }
+      },
+      {
+        "type": "group",
+        "id": "a4dc751653ba44028738b501ccf75711",
+        "operator": "and",
+        "match_level": "relationship",
+        "children": [
+          {
+            "type": "condition",
+            "id": "fa0a4f2e053c4502a8bebb15497264ca",
+            "query": {
+              "statistic_key": "footprint_overlap",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "containment": true,
+                "directional": false,
+                "normalize_by_target": false,
+                "support_threshold": 0.1,
+                "weighted": false
+              }
+            },
+            "threshold": {
+              "value": 0.6,
+              "direction": "less",
+              "active": true
+            }
+          }
+        ],
+        "count": null,
+        "comment": "Median overlap of every source with every target footprint.",
+        "apply_to": "between_sources_targets",
+        "summary": "median",
+        "manipulation": null,
+        "review_statuses": null
+      },
+      {
+        "type": "group",
+        "id": "05cbc2a4b5b04f85926617eaea86ca1e",
+        "operator": "and",
+        "match_level": "relationship",
+        "children": [
+          {
+            "type": "condition",
+            "id": "1d58aa741bd14cc88afd62c6430308fc",
+            "query": {
+              "statistic_key": "footprint_overlap",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "containment": true,
+                "directional": false,
+                "normalize_by_target": false,
+                "support_threshold": 0.1,
+                "weighted": false
+              }
+            },
+            "threshold": {
+              "value": 0.4,
+              "direction": "greater",
+              "active": true
+            }
+          }
+        ],
+        "count": null,
+        "comment": "Median overlap among the source footprints.",
+        "apply_to": "between_sources",
+        "summary": "median",
+        "manipulation": null,
+        "review_statuses": null
+      },
+      {
+        "type": "group",
+        "id": "7342c42d8bba4d3fb022ae1e38d55595",
+        "operator": "and",
+        "match_level": "relationship",
+        "children": [
+          {
+            "type": "condition",
+            "id": "6292e9c6ef4d43b2a1c05882401ba0e0",
+            "query": {
+              "statistic_key": "footprint_overlap",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "containment": true
+              }
+            },
+            "threshold": {
+              "value": 0.6,
+              "direction": "greater",
+              "active": true
+            }
+          }
+        ],
+        "count": null,
+        "comment": "Median overlap among the target footprints.",
+        "apply_to": "between_targets",
+        "summary": "median",
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": null,
+    "comment": "Neurons whose footprints form two groups more than 4 px apart (smallest distance between the groups; >= 2 footprints each) that look like two cells: footprints overlap little across the groups but well within each group, which rejects single cells whose footprint shape changed. E.g. a cascaded mismatch from some session on, or alternating assignments of two cells. Sources: the group with the first detection, targets: the other group. Repair in the Footprints panel: right-click a highlighted footprint > 'Merge with selected neuron' > highlighted footprints, or 'Move highlighted footprints to…'.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": null,
+    "review_statuses": null
+  }
+}
