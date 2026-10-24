@@ -23,6 +23,9 @@ from catan.gui.data.statistics import (
     StatisticDefinition,
     StatisticEngine,
     CATEGORY_TITLES,
+    GROUP_TITLES,
+    MENU_CATEGORIES,
+    statistic_group,
 )
 from catan.gui.data.statistics.dimensions import (
     NEURON_DIMS,
@@ -890,13 +893,15 @@ class StatisticQuerySelector(QWidget):
             )
             self.stat_menu.addSeparator()
 
-        for category, title in CATEGORY_TITLES.items():
+        # Single / pair statistics, each in titled sections by what is
+        # compared (footprints, neurons, footprints with neurons).
+        for title, categories in MENU_CATEGORIES.items():
 
             stats = [
                 (key, stat_def)
                 for key, stat_def in registry.items()
                 if (
-                    stat_def.category == category
+                    stat_def.category in categories
                     and statistic_allowed_in_context(
                         stat_def.dims,
                         self.query_mode,
@@ -909,15 +914,23 @@ class StatisticQuerySelector(QWidget):
 
             submenu = self.stat_menu.addMenu(title)
 
-            for key, stat_def in sorted(
-                stats,
-                key=lambda item: item[1].title.lower(),
-            ):
-                self._add_stat_action(
-                    submenu,
-                    key,
-                    stat_def,
+            for group, group_title in GROUP_TITLES.items():
+                section = sorted(
+                    (item for item in stats if statistic_group(item[1]) == group),
+                    key=lambda item: item[1].title.lower(),
                 )
+
+                if not section:
+                    continue
+
+                submenu.addSection(group_title)
+
+                for key, stat_def in section:
+                    self._add_stat_action(
+                        submenu,
+                        key,
+                        stat_def,
+                    )
 
         self._update_stat_menu_checks()
 

@@ -20,12 +20,33 @@ class CuratorInteractionGuard(QObject):
     def __init__(self, controller):
         super().__init__(controller.menu)
         self.controller = controller
-        QApplication.instance().installEventFilter(self)
+
+        # Wheel and shortcut handling only matter while the curator is
+        # shown: the application-wide filter (which sees every event of the
+        # GUI) is installed on Show and removed on Hide of the menu.
+        self._app_filter_installed = False
+        controller.menu.installEventFilter(self)
+        self._set_app_filter(controller.menu.isVisible())
+
+    def _set_app_filter(self, installed):
+        app = QApplication.instance()
+        if app is None or installed == self._app_filter_installed:
+            return
+
+        if installed:
+            app.installEventFilter(self)
+        else:
+            app.removeEventFilter(self)
+        self._app_filter_installed = installed
 
     def eventFilter(self, obj, event):
         menu = self.controller.menu
         kind = event.type()
         app = QApplication.instance()
+
+        if obj is menu and kind in (QEvent.Type.Show, QEvent.Type.Hide):
+            self._set_app_filter(kind == QEvent.Type.Show)
+            return False
 
         if kind == QEvent.Type.Wheel and isinstance(obj, QWidget):
             if app.activePopupWidget() is not None:

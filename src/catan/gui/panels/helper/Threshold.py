@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QToolTip
 from vispy.scene import visuals
 
 from catan.gui.interaction import click_events
+from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 
 ThresholdAxis = Literal["x", "y"]
 ThresholdDirection = Literal["greater", "less", "between"]
@@ -344,7 +345,7 @@ class ThresholdOverlay:
         return self.hovered
 
     def show_tooltip(self):
-        QToolTip.showText(
+        show_tooltip(
             QCursor.pos(),
             self.tooltip_text(),
             self.canvas.native,

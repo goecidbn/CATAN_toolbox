@@ -6,7 +6,9 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QFormLayout, QComboBox,
     QDoubleSpinBox, QPushButton, QLabel, QScrollArea, QGridLayout, QToolButton, QMenu,
+    QMessageBox,
 )
+from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 from vispy import scene, color
 from vispy.geometry import Rect
 from vispy.visuals.axis import Ticker
@@ -654,7 +656,8 @@ class Controller(BasePlot.BaseDisplayController):
             self.display_widget.draw(None, None)
             return
         try:
-            order = [str(s.path) for s in self.data.sessions if s.path is not None]
+            # Active sessions only (inactive ones provide no evidence).
+            order = self.data.active_session_order()
             gap = self.display_widget.gaps.currentData()
             evidence_key = (id(self.data.model), tuple(order), gap)
             if self._evidence_key == evidence_key:
@@ -695,20 +698,21 @@ class Controller(BasePlot.BaseDisplayController):
         model = self.data.model
         sessions = self.data.sessions
         requests = []
-        for j, session in enumerate(sessions):
-            if session.path is None:
-                continue
+        # Pairs between active sessions; the gap counts active sessions.
+        active = [j for j in self.data.active_session_ids() if sessions[j].path is not None]
+        for position, j in enumerate(active):
+            session = sessions[j]
             if gap in (0, None):
                 requests.append(("same", str(session.path), j, j))
             if gap != 0:
-                for i in range(j):
-                    if sessions[i].path is not None and (gap is None or j-i == gap):
+                for earlier, i in enumerate(active[:position]):
+                    if gap is None or position - earlier == gap:
                         requests.append(("cross", (str(sessions[i].path), str(session.path)), i, j))
         missing = [r for r in requests if r[1] not in model.counts[r[0]] or r[1] in model.stale_counts[r[0]]]
         return missing, len(requests)
 
-    def _calculate_evidence(self):
-        if self._counts_running:
+    def _calculate_evidence(self, *_, offer_alignment=True):
+        if self._counts_running or self._deactivated:
             return
         tasks = self.state.tasks
         if tasks.processing_busy() or tasks.processing_requested:
@@ -717,6 +721,17 @@ class Controller(BasePlot.BaseDisplayController):
         source = self.data.model
         requests, _ = self._evidence_records(self.display_widget.gaps.currentData())
         if not requests:
+            return
+        # Moving / removing sessions marks later alignments outdated; the
+        # evidence needs current ones. Offer to update them first.
+        outdated = sorted({sid for r in requests for sid in r[2:]
+                           if self.data.alignment_is_stale(sid)})
+        if outdated:
+            if offer_alignment and self._offer_alignment_update(outdated):
+                return
+            self.display_widget.status.setText(
+                f"{len(outdated)} session alignment(s) are outdated; update them "
+                "(Session alignment panel) before calculating evidence.")
             return
         try:
             for sid in {sid for r in requests for sid in r[2:]}:
@@ -785,6 +800,44 @@ class Controller(BasePlot.BaseDisplayController):
         task["connected"] = True
         task["id"] = tasks.start("calculating", "Calculate model evidence", calculate,
                                  on_result=ready, background=True)
+
+    def _offer_alignment_update(self, outdated):
+        """Ask to update outdated alignments, then calculate the evidence.
+        Returns True if the update was started."""
+        # Realigning a session outdates all later ones (and their evidence):
+        # update every outdated alignment, not only the requested sessions.
+        outdated = [sid for sid in range(len(self.data.sessions))
+                    if self.data.alignment_is_stale(sid) and self.data.session_is_active(sid)]
+        names = [self.data.sessions[sid].name for sid in outdated]
+        listed = ", ".join(names[:6]) + (f" and {len(names) - 6} more" if len(names) > 6 else "")
+        box = QMessageBox(self.display_widget)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Outdated alignments")
+        box.setText(f"{len(outdated)} session alignment(s) are outdated (sessions were moved or removed).")
+        box.setInformativeText(
+            f"Evidence needs current alignments: {listed}.\n\n"
+            "Update these alignments now and calculate the evidence afterwards? "
+            "Sessions that need a review stop the update; calculate again after reviewing.")
+        update = box.addButton("Update alignments", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        fit_message_box_buttons(box)
+        box.exec()
+        if box.clickedButton() is not update:
+            return False
+
+        self.display_widget.status.setText(f"Updating {len(outdated)} alignments, then calculating evidence…")
+        tasks = self.state.tasks
+        # finished runs only when all outdated alignments were updated (not
+        # after a stop for review); the evidence waits for other processing.
+        self.data.queue_process_alignments(
+            session_ids=outdated,
+            finished=lambda: tasks.queue_after_processing(
+                "Calculate model evidence (after alignment)",
+                lambda: self._calculate_evidence(offer_alignment=False),
+            ),
+        )
+        # A refused update reports its reason itself.
+        return True
 
     def _apply(self):
         if self._candidate is None:

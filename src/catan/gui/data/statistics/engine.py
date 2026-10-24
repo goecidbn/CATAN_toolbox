@@ -466,6 +466,9 @@ class StatisticEngine(QObject):
         data = self.data if data is None else data
         state = self.state if state is None else state
 
+        # Inactive sessions are absent for all statistics.
+        data, state = active_session_view(data, state)
+
         if stat_def is None:
             stat_def = self.registry[query.statistic_key]
 
@@ -940,3 +943,55 @@ def _compact_statistic_values(stat):
         dtype = np.float64
 
     stat.values = values.astype(dtype, copy=False)
+
+
+class _StateView:
+    """State with other assignments; everything else is the original."""
+
+    def __init__(self, state, assignments):
+        self._state = state
+        self.assignments = assignments
+
+    def __getattr__(self, name):
+        return getattr(self._state, name)
+
+
+def active_session_view(data, state):
+    """Data/state in which footprints of inactive sessions are unassigned
+    (``ids`` column -1), so statistics treat these sessions as absent.
+    The original objects if all sessions are active. Small identity objects
+    are copied; spatial and temporal arrays stay shared."""
+    sessions = getattr(data, "sessions", None) or []
+    assignments = getattr(data, "assignments", None)
+
+    if assignments is None or not any(
+        not getattr(session, "active", True) for session in sessions
+    ):
+        return data, state
+
+    ids = getattr(state, "assignments", None)
+    ids = np.asarray(assignments.ids if ids is None else ids)
+    inactive = [
+        index
+        for index, session in enumerate(sessions)
+        if not getattr(session, "active", True) and index < ids.shape[1]
+    ]
+    if not inactive:
+        return data, state
+
+    masked = ids.copy()
+    masked[:, inactive] = -1
+
+    bound_assignments = copy(assignments)
+    bound_assignments.ids = masked
+    bound_assignments.stats = dict(assignments.stats)
+
+    bound_state = _StateView(state, masked)
+
+    bound_data = copy(data)
+    name = data._current_assignments
+    bound_data._assignments = {name: bound_assignments}
+    bound_data.sessions = list(sessions)
+    bound_data.state = bound_state
+
+    return bound_data, bound_state

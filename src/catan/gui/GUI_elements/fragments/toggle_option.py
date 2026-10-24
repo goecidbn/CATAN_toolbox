@@ -56,6 +56,9 @@ class ToggleOption(QToolButton):
         super().__init__(parent)
 
         self.container = None
+        # Optional callable run before the container is shown, e.g. to build
+        # expensive content only on first expansion.
+        self.before_expand = None
         self._base_text = text
         self._popup_mode = popup
         self._popup_size = QSize(*popup_size)
@@ -235,6 +238,10 @@ class ToggleOption(QToolButton):
 
     def toggle_visibility(self, expanded):
         expanded = bool(expanded and self.container is not None)
+
+        if expanded and self.before_expand is not None:
+            self.before_expand()
+
         self._update_caption(expanded)
 
         if self._popup_mode:

@@ -44,15 +44,21 @@ def set_button_icon(
     tooltip: Optional[str] = None,
     fallback_theme_icon: str | None = None,
 ):
-    # icon = None
+    # Rows refresh their buttons on every data change; creating the icon
+    # again is the expensive part. Skip it if this icon is still shown
+    # (an icon set elsewhere, e.g. a spinner, has another cache key).
+    key = (icon_name, color, fallback_theme_icon)
+    shown = getattr(button, "_catan_icon", None)
 
-    icon = get_fa_icon(icon_name,color) if icon_name is not None else None
+    if shown is None or shown != (key, button.icon().cacheKey()):
+        icon = get_fa_icon(icon_name, color) if icon_name is not None else None
 
-    if icon is None and fallback_theme_icon is not None:
-        icon = QIcon.fromTheme(fallback_theme_icon)
+        if icon is None and fallback_theme_icon is not None:
+            icon = QIcon.fromTheme(fallback_theme_icon)
 
-    if icon is not None:
-        button.setIcon(icon)
+        if icon is not None:
+            button.setIcon(icon)
+            button._catan_icon = (key, button.icon().cacheKey())
 
-    if tooltip is not None:
+    if tooltip is not None and button.toolTip() != tooltip:
         button.setToolTip(tooltip)

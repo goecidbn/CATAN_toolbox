@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 from functools import wraps
 from copy import copy, deepcopy
-import hashlib, json, os, re, tempfile
+import hashlib, json, os, re, tempfile, threading
 
 from catan import Tracking
 from . import AppState, StatisticDisplayConfig
@@ -102,6 +102,8 @@ DEFERRED_ASSIGNMENT_TASK = "Process neuron registrations (after current processi
 # Tasks that perform neuron registration (assignment) work.
 ASSIGNMENT_TASK_NAMES = ("Process pending neuron registrations",)
 ASSIGNMENT_TASK_PREFIXES = ("Register neurons for ",)
+# Union columns rebuilt after sessions were moved / removed / unassigned.
+UNION_REFRESH_TASK = "Rebuild unions after session change"
 
 
 def read_overview_background(path, *, ctx=None):
@@ -199,6 +201,10 @@ class Data(Tracking):
         self._model_fit_requested = False
         self._model_fit_batches = []
         self.state.tasks.scheduling_settled.connect(self._try_fit_after_loading)
+
+        # Neurons whose union awaits a background rebuild (see
+        # _queue_union_refresh), valid for one assignments object.
+        self._union_refresh = {"assignments": None, "neurons": set(), "token": 0}
 
     def is_available(self, what: List[str] | None = None) -> bool:
 
@@ -635,11 +641,16 @@ class Data(Tracking):
             )
             return
 
-        # Marks all later sessions outdated (and notifies).
-        self.mark_geometry_changed(0)
+        # The first active session is the reference. Marks all later
+        # sessions outdated (and notifies); inactive ones are skipped.
+        active = self.active_session_ids()
+        if len(active) < 2:
+            return
+
+        self.mark_geometry_changed(active[0])
 
         return self.queue_process_alignments(
-            session_ids=list(range(1, len(self.sessions))),
+            session_ids=active[1:],
             replace_manual=replace_manual,
         )
 
@@ -668,11 +679,15 @@ class Data(Tracking):
 
             last = max(required, default=-1)
 
+            # Inactive sessions are skipped (they keep their state).
             pending = [
                 index
                 for index in range(last + 1)
-                if self.alignment_is_stale(index)
-                or (index in required and not self.sessions[index].status["aligned"])
+                if self.session_is_active(index)
+                and (
+                    self.alignment_is_stale(index)
+                    or (index in required and not self.sessions[index].status["aligned"])
+                )
             ]
 
             for index in pending:
@@ -963,11 +978,7 @@ class Data(Tracking):
             return
 
         counts = self.model.aggregate_counts(
-            session_order=[
-                str(session.path)
-                for session in self.sessions
-                if session.path is not None
-            ],
+            session_order=self.active_session_order(),
             session_distances=(1,),
         )
 
@@ -1239,7 +1250,11 @@ class Data(Tracking):
     def propose_session_remapping(self, session_id: int, *, background_template=None):
 
         session = self.sessions[session_id]
-        if any(self.alignment_is_stale(i) for i in range(session_id)):
+        # Inactive sessions are not references; their state does not block.
+        if any(
+            self.alignment_is_stale(i) and self.session_is_active(i)
+            for i in range(session_id)
+        ):
             raise ValueError("Update earlier stale alignments first.")
 
         references = self.alignment_references_for_session(session_id)
@@ -1564,6 +1579,8 @@ class Data(Tracking):
         for sid, records in result["comparison_updates"].items():
             self.sessions[sid].remap.remap_data = records
 
+        # Read before mark_geometry_changed clears it.
+        isolated = self._processing_state(result["session_id"]).alignment_isolated
         Tracking.mark_geometry_changed(self, result["session_id"])
 
         extra_ids = set(result["updates"]) - {result["session_id"]}
@@ -1582,7 +1599,10 @@ class Data(Tracking):
         # Dependent synthetic copies can precede the realigned session.
         first = min(result["updates"])
         assignment_paths = {
-            str(item.path) for item in self.sessions[first:] if item.path is not None
+            str(item.path)
+            for index, item in enumerate(self.sessions)
+            if item.path is not None
+            and (index in result["updates"] if isolated else index >= first)
         }
 
         for name in self._assignments:
@@ -2285,32 +2305,66 @@ class Data(Tracking):
         previous_current = self.current_session
 
         removed_path = self.sessions[session_id].path
+
+        # Neurons left without footprints are dropped from the assignments;
+        # selections must follow the remaining rows.
+        neuron_id_map = None
+        # Neurons with a footprint in the removed session: their union loses it.
+        union_neurons = []
+        if (
+            self.assignments is not None
+            and session_id < self.assignments.ids.shape[1]
+        ):
+            remaining = np.delete(self.assignments.ids, session_id, axis=1)
+            keep = np.flatnonzero((remaining >= 0).any(axis=1))
+            if len(keep) < self.assignments.ids.shape[0]:
+                neuron_id_map = {int(old): new for new, old in enumerate(keep)}
+
+            union_neurons = [
+                int(neuron)
+                for neuron in np.flatnonzero(self.assignments.ids[:, session_id] >= 0)
+            ]
+            if neuron_id_map is not None:
+                union_neurons = [
+                    neuron_id_map[neuron]
+                    for neuron in union_neurons
+                    if neuron in neuron_id_map
+                ]
+
+        n_sessions = len(self.sessions)
         super().move_session(session_id, -1)
-        self.state.assignments = (
-            None if self.assignments is None else self.assignments.ids
+
+        session_map = {
+            old: (None if old == session_id else old - (old > session_id))
+            for old in range(n_sessions)
+        }
+        self.state.apply_session_change(
+            None if self.assignments is None else self.assignments.ids,
+            session_map,
+            neuron_id_map,
         )
 
-        if self.state.assignments is None:
-            self.state.update_selected_components(None)
-        else:
-            self.adjust_selected_components_after_data_change(session_id, -1)
-
-        if previous_current is not None:
+        current_id = None
+        if previous_current is not None and self.sessions:
             current_id = next(
                 (
                     index
                     for index, item in enumerate(self.sessions)
                     if item is previous_current
                 ),
-                None,
+                min(session_id, len(self.sessions) - 1),
             )
-            if current_id is None and self.sessions:
-                current_id = min(session_id, len(self.sessions) - 1)
 
-            self.state.current_session_id = current_id
+        # The index may be unchanged although the session is a different one
+        # (removing the current session): set both explicitly.
+        self.current_session = None if current_id is None else self.sessions[current_id]
+        self.state.current_session_id = current_id
 
+        # Its model counts were removed (Tracking.move_session).
         self.notify_change(
             C.SESSION_REMOVED,
+            C.MODEL_COUNTS,
+            C.PROCESSING_STATUS,
             session_paths=(None if removed_path is None else {str(removed_path)}),
         )
 
@@ -2321,35 +2375,157 @@ class Data(Tracking):
 
         self.state.alignment_review_finished.emit(removed_session)
 
+        self._queue_union_refresh(union_neurons, neuron_id_map=neuron_id_map)
+
+    def set_session_active(self, session_id: int, active: bool):
+        """(De)activate a session (row checkbox). Its data is kept; plots,
+        statistics, union, model evidence and new processing skip it.
+        Reactivating marks a missing / outdated alignment or registration
+        stale (isolated, see Tracking.set_session_active)."""
+        if not super().set_session_active(session_id, active):
+            return
+
+        session = self.sessions[session_id]
+
+        # The fit used this session's evidence (or now may use it).
+        model = self.model
+        if (
+            model is not None
+            and model.fitted
+            and session.path is not None
+            and any(str(session.path) in key for key in model.counts["cross"])
+        ):
+            model.fit_stale = True
+
+        self.notify_change(
+            C.SESSION_ACTIVITY,
+            C.PROCESSING_STATUS,
+            C.MODEL_COUNTS,
+            session_id=session_id,
+        )
+
+        # Unions blend active sessions only.
+        if self.assignments is not None and session_id < self.assignments.ids.shape[1]:
+            self._queue_union_refresh(
+                np.flatnonzero(self.assignments.ids[:, session_id] >= 0)
+            )
+
     def move_session(self, session_id: int, new_session_id: int):
         """
         behavior should be off on session removing - check that!
         """
 
         super().move_session(session_id, new_session_id)
-        self.state.assignments = self.assignments.ids
 
-        order_translation = list(range(len(self.sessions)))
-        id = order_translation.pop(new_session_id)
-        order_translation.insert(session_id, id)
+        # order[new index] = old index
+        order = list(range(len(self.sessions)))
+        order.insert(new_session_id, order.pop(session_id))
 
-        ## adjust selected components to reflect the new session IDs
-        if self.state.selected_components is not None:
-            components = set()
-            for component in self.state.selected_components:
-                components.add(
-                    NeuronComponent(
-                        neuron_id=component.neuron_id,
-                        session_id=order_translation[component.session_id],
-                    )
-                )
-
-            self.state.update_selected_components(list(components))
+        self.state.apply_session_change(
+            None if self.assignments is None else self.assignments.ids,
+            {old: new for new, old in enumerate(order)},
+        )
 
         if self.current_session is not None:
             self.state.current_session_id = self.current_session.id
 
-        self.notify_change(C.SESSION_ORDER)  # Notify that sessions have changed
+        # Later alignments, model counts and assignments became stale
+        # (Tracking.mark_order_changed).
+        self.notify_change(C.SESSION_ORDER, C.MODEL_COUNTS, C.PROCESSING_STATUS)
+
+        # Unions blend footprints in session order: rebuild the neurons that
+        # have a footprint in the moved session.
+        if (
+            self.assignments is not None
+            and session_id != new_session_id
+            and new_session_id < self.assignments.ids.shape[1]
+        ):
+            self._queue_union_refresh(
+                np.flatnonzero(self.assignments.ids[:, new_session_id] >= 0)
+            )
+
+    def _queue_union_refresh(self, neurons=(), *, neuron_id_map=None):
+        """Rebuild the union footprints of ``neurons`` in a background task.
+
+        Requests accumulate until a rebuild is published (``neuron_id_map``
+        remaps pending rows after rows were dropped). The worker uses a
+        snapshot of ids/stats; a result is applied only if those neurons'
+        assignments and the sessions are unchanged, otherwise the rebuild
+        is requeued with the current state.
+        """
+        pending = self._union_refresh
+        assignments = self.assignments
+
+        if assignments is None or assignments.union is None or not assignments.ids.size:
+            pending["neurons"] = set()
+            return
+
+        if pending["assignments"] is not assignments:
+            pending["assignments"] = assignments
+            pending["neurons"] = set()
+        elif neuron_id_map is not None:
+            pending["neurons"] = {
+                neuron_id_map[neuron]
+                for neuron in pending["neurons"]
+                if neuron in neuron_id_map
+            }
+
+        pending["neurons"].update(int(neuron) for neuron in neurons)
+
+        if not pending["neurons"]:
+            return
+
+        pending["token"] += 1
+        token = pending["token"]
+        targets = np.array(sorted(pending["neurons"]), dtype=int)
+
+        candidate = copy(assignments)
+        candidate.ids = assignments.ids.copy()
+        candidate.stats = {key: values.copy() for key, values in assignments.stats.items()}
+
+        worker = copy(self)
+        worker._assignments = {self._current_assignments: candidate}
+        worker.sessions = list(self.sessions)
+        sessions = tuple(self.sessions)
+        activity = tuple(bool(getattr(item, "active", True)) for item in self.sessions)
+
+        def run():
+            return worker.build_union_replacements(targets, ctx=current_task_context())
+
+        def unchanged():
+            current = self.assignments
+            return (
+                current is assignments
+                and len(self.sessions) == len(sessions)
+                and all(a is b for a, b in zip(self.sessions, sessions))
+                and tuple(bool(getattr(item, "active", True)) for item in self.sessions)
+                == activity
+                and current.ids.shape == candidate.ids.shape
+                and np.array_equal(current.ids[targets], candidate.ids[targets])
+                and current.union is not None
+                and current.union.footprints.shape[1] == current.ids.shape[0]
+            )
+
+        def publish(replacements):
+            # A newer request covers these neurons as well.
+            if pending["token"] != token:
+                return
+
+            if not unchanged():
+                self._queue_union_refresh()
+                return
+
+            self.apply_union_replacements(targets, replacements)
+            pending["neurons"].difference_update(targets.tolist())
+            self.notify_change(C.UNION_GEOMETRY)
+
+        return self.state.tasks.start(
+            "loading",
+            UNION_REFRESH_TASK,
+            run,
+            on_result=publish,
+            unique=True,
+        )
 
     def add_model(self, name: str, model: Optional[str | Model] = None):
         super().add_model(name, model)
@@ -3002,7 +3178,7 @@ class Data(Tracking):
                 mode=mode,
             )
 
-            if not plan["register_sessions"]:
+            if not plan["register_sessions"] and not plan["isolated_sessions"]:
                 return
 
             if plan["load_sessions"]:
@@ -3039,7 +3215,11 @@ class Data(Tracking):
                 return
 
             required = sorted(
-                set(plan["preserved_sessions"] + plan["register_sessions"])
+                set(
+                    plan["preserved_sessions"]
+                    + plan["register_sessions"]
+                    + plan["isolated_sessions"]
+                )
             )
 
             return self.queue_process_model(
@@ -3057,16 +3237,123 @@ class Data(Tracking):
         model = self.model
         data_version = self.state.data_version
 
+        # Incremental display: after each registered session the worker
+        # hands a snapshot of the candidate to the GUI thread, which shows
+        # it as the current assignments (latest one only). A cancelled,
+        # failed or discarded run restores the original assignments.
+        progress = {
+            "lock": threading.Lock(),
+            "pending": None,
+            "scheduled": False,
+            "published": False,
+            "done": False,
+            "version": data_version,
+            "backup": None,
+            "first_map": None,
+            "first_changed": None,
+            "task_id": None,
+        }
+
+        def expected_version():
+            return progress["version"]
+
+        def show_progress():
+            with progress["lock"]:
+                item = progress["pending"]
+                progress["pending"] = None
+                progress["scheduled"] = False
+
+            if (
+                item is None
+                or progress["done"]
+                or self.assignments is not source
+                or self.current_assignments != assignment_name
+                or self.state.data_version != expected_version()
+            ):
+                return
+
+            snapshot, neuron_id_map, first_changed = item
+
+            if not progress["published"]:
+                progress["backup"] = dict(source.__dict__)
+                progress["first_map"] = dict(neuron_id_map)
+                progress["first_changed"] = first_changed
+                source.__dict__.update(snapshot.__dict__)
+                self.state.apply_assignment_rebuild(
+                    source.ids, neuron_id_map, from_session_id=first_changed
+                )
+                progress["published"] = True
+            else:
+                # Later snapshots only append rows.
+                source.__dict__.update(snapshot.__dict__)
+                self.state.assignments = source.ids
+
+            self.notify_change(C.ASSIGNMENT_MAPPING, C.UNION_GEOMETRY, C.MATCH_VALUES)
+            progress["version"] = self.state.data_version
+
+        def on_progress(candidate, neuron_id_map, update_plan):
+            from catan.gui.data.curation_actions import clone_session
+
+            # Worker thread: copy what later registrations change.
+            snapshot = copy(candidate)
+            snapshot.ids = candidate.ids.copy()
+            snapshot.stats = {key: values.copy() for key, values in candidate.stats.items()}
+            snapshot.matched_status = candidate.matched_status.copy()
+            snapshot.review_status = candidate.review_status.copy()
+            snapshot.manipulation_id = dict(candidate.manipulation_id)
+            snapshot.union = clone_session(candidate.union, union=True)
+
+            with progress["lock"]:
+                progress["pending"] = (
+                    snapshot,
+                    dict(neuron_id_map),
+                    update_plan["first_changed"],
+                )
+                schedule = not progress["scheduled"]
+                progress["scheduled"] = True
+
+            if schedule:
+                self.state.call_on_gui_thread(show_progress)
+
+        def restore():
+            """Undo displayed progress (run cancelled, failed or discarded)."""
+            progress["done"] = True
+            if not progress["published"] or self.assignments is not source:
+                return
+
+            inverse = {new: old for old, new in progress["first_map"].items()}
+            source.__dict__.clear()
+            source.__dict__.update(progress["backup"])
+            self.state.apply_assignment_rebuild(
+                source.ids, inverse, from_session_id=progress["first_changed"]
+            )
+            self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
+
+        def stopped(group, task_id):
+            if task_id != progress["task_id"]:
+                return
+            disconnect()
+            restore()
+
+        def disconnect():
+            if progress.pop("connected", False):
+                tasks.task_cancelled.disconnect(stopped)
+                tasks.task_failed.disconnect(stopped)
+
         def publish(result):
+            disconnect()
+
             if result is None:
+                restore()
                 return
 
             if (
-                self.state.data_version != data_version
+                self.state.data_version != expected_version()
                 or self.assignments is not source
                 or self.current_assignments != assignment_name
                 or self.model is not model
             ):
+                restore()
                 self.state.issue(
                     "warning",
                     "Assignment update discarded",
@@ -3075,26 +3362,44 @@ class Data(Tracking):
                 )
                 return
 
+            progress["done"] = True
             candidate = result["candidate"]
             completed_plan = result["plan"]
+            shown_rows = source.ids.shape[0]
 
             # Preserve object identity for existing GUI/config references.
             source.__dict__.update(candidate.__dict__)
 
+            completed = (
+                completed_plan["register_sessions"] + completed_plan["isolated_sessions"]
+            )
             completed_paths = {
                 str(self.sessions[index].path)
-                for index in completed_plan["register_sessions"]
+                for index in completed
                 if self.sessions[index].path is not None
             }
             self._stale_assignments.setdefault(
                 assignment_name, set()
             ).difference_update(completed_paths)
 
-            self.state.apply_assignment_rebuild(
-                source.ids,
-                result["neuron_id_map"],
-                from_session_id=completed_plan["from_session_id"],
-            )
+            for index in completed:
+                self._processing_state(index).assignment_isolated = False
+
+            if progress["published"]:
+                # Selections already follow the displayed snapshot; only
+                # rows dropped at the end change.
+                row_map = result["progress_row_map"] or {
+                    index: index for index in range(shown_rows)
+                }
+                self.state.apply_assignment_rebuild(
+                    source.ids, row_map, from_session_id=len(self.sessions)
+                )
+            else:
+                self.state.apply_assignment_rebuild(
+                    source.ids,
+                    result["neuron_id_map"],
+                    from_session_id=completed_plan["first_changed"],
+                )
             self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
         def run():
@@ -3102,14 +3407,22 @@ class Data(Tracking):
                 session_ids=plan["session_ids"],
                 mode=mode,
                 ctx=current_task_context(),
+                on_progress=on_progress,
             )
 
-        return tasks.start(
+        tasks.task_cancelled.connect(stopped)
+        tasks.task_failed.connect(stopped)
+        progress["connected"] = True
+
+        progress["task_id"] = tasks.start(
             "calculating",
             "Process pending neuron registrations",
             run,
             on_result=publish,
         )
+        if progress["task_id"] is None:
+            disconnect()
+        return progress["task_id"]
 
     def queue_copy_assignments(self, name, *, on_copied=None):
         name = str(name).strip()
@@ -3239,6 +3552,7 @@ class Data(Tracking):
                     "name": session.name,
                     "load_config": deepcopy(session.source_config.to_dict()),
                     "load_options": options,
+                    "active": bool(getattr(session, "active", True)),
                 }
             )
 
@@ -3340,6 +3654,7 @@ class Data(Tracking):
                 )
                 session.source_config = config
                 session._recipe_options = options
+                session.active = bool(entry.get("active", True))
                 sessions.append(session)
 
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
@@ -3374,7 +3689,8 @@ class Data(Tracking):
                 session.status["aligned"]
                 and not self.alignment_is_stale(session_id)
                 and (
-                    session_id == 0
+                    # The first active session needs no model.
+                    session_id == next(iter(self.active_session_ids()), 0)
                     or (
                         self.model is not None
                         and self.model.fitted
@@ -3407,6 +3723,10 @@ class Data(Tracking):
         **kwargs,
     ):
         """ """
+        isolated = (
+            from_session_index is not None
+            and self._processing_state(from_session_index).assignment_isolated
+        )
         super().assign_neurons(
             from_file=from_file,
             from_data=from_data,
@@ -3421,6 +3741,13 @@ class Data(Tracking):
         self.notify_change(
             *ASSIGNMENT_CONTENT_CHANGES
         )  # Notify that neurons have changed
+
+        # A reactivated session was matched out of order: its neurons'
+        # unions are rebuilt in session order (background, GUI thread).
+        if isolated and self.session_assigned(from_session_index):
+            self._processing_state(from_session_index).assignment_isolated = False
+            neurons = np.flatnonzero(self.assignments.ids[:, from_session_index] >= 0)
+            self.state.call_on_gui_thread(lambda: self._queue_union_refresh(neurons))
 
     def is_included(self, component: NeuronComponent | int) -> bool:
 
@@ -3726,10 +4053,11 @@ class Data(Tracking):
         # Register it under its intended neuron identity.
         self.assignments.ids[target_neuron.id] = new_fp_id
 
-        # A synthetic/manual assignment gets the ordinary
-        # default assignment statistics.
-        for key, values in self.assignments.stats.items():
-            values[*target_neuron.id, ...] = np.nan
+        # A synthetic/manual assignment: shift against the target union, no
+        # registration probability.
+        self.update_moved_footprint_stats(
+            [(None, target_neuron_id, int(target_neuron.session_id))]
+        )
 
         self.rebuild_union_neurons([target_neuron_id])
 
@@ -3971,17 +4299,18 @@ class Data(Tracking):
         candidate.ids[target, sessions] = candidate.ids[source, sessions]
         candidate.ids[source, :] = -1
 
-        # Existing matching scores no longer describe this combined neuron.
-        for values in candidate.stats.values():
-            values[target, ...] = np.nan
-            values[source, ...] = np.nan
-
         candidate.review_status[target] = ReviewStatus.PENDING
         union.synthetic[target] |= union.synthetic[source]
 
         worker = copy(self)
         worker._assignments = {self._current_assignments: candidate}
         worker._current_assignments = self._current_assignments
+
+        # The source's footprints are measured against the target union;
+        # the target's own footprints keep their statistics.
+        worker.update_moved_footprint_stats(
+            (source, target, int(session_id)) for session_id in sessions
+        )
 
         worker.rebuild_union_neurons([source, target])
         worker.rebuild_union_included()
@@ -4028,50 +4357,47 @@ class Data(Tracking):
 
     def unassign_neurons(self, session_id: int, **kwargs):
 
+        ids = self.assignments.ids
+        n_neurons, n_sessions = ids.shape
+        remaining = ids.copy()
+        remaining[:, session_id] = -1
+        keep = np.flatnonzero((remaining >= 0).any(axis=1))
+        union_neurons = set(np.flatnonzero(ids[:, session_id] >= 0).tolist())
+
         super().unassign_neurons(session_id)
-        self.state.assignments = self.assignments.ids
+
+        # The session's footprints leave the tracking; selections there move
+        # to the neuron's first remaining footprint. Emptied rows are dropped
+        # (all of them when the only session was unassigned: reset).
+        if self.assignments.ids.shape[0] != len(keep):
+            neuron_id_map = {}
+        elif len(keep) == n_neurons:
+            neuron_id_map = None
+        else:
+            neuron_id_map = {int(old): new for new, old in enumerate(keep)}
+
+        self.state.apply_session_change(
+            self.assignments.ids,
+            {
+                old: (None if old == session_id else old)
+                for old in range(n_sessions)
+            },
+            neuron_id_map,
+        )
         if self.state.current_session_id == session_id:
             self.state.current_session_id = None
 
-        self.adjust_selected_components_after_data_change(session_id, -1)
         self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
-    def adjust_selected_components_after_data_change(
-        self, session_id: int, new_session_id: int
-    ):
-        """
-        this is (and should) only be called on session removal!
-        """
-
-        ## adjust selected components to reflect the new session IDs
-        if self.state.selected_components is None:
-            return
-
-        components = set()
-        for component in self.state.selected_components:
-            if component.session_id == session_id:
-
-                ## first, check if neuron is still present
-                if component.neuron_id >= self.state.assignments.shape[0]:
-                    continue
-
-                # if new_session_id >= 0:
-                # component.session_id = new_session_id
-                ## dynamically find first first session presence, if session is removed
-                # if new_session_id == -1:
-                other_sessions = np.where(
-                    self.state.assignments[component.neuron_id, :]
-                )[0]
-                if len(other_sessions):
-                    components.add(
-                        NeuronComponent(
-                            neuron_id=component.neuron_id, session_id=other_sessions[0]
-                        )
-                    )
-        if len(components) > 0:
-            self.state.update_selected_components(list(components))
-        else:
-            self.state.update_selected_components(None)
+        # The session's footprints leave these neurons' unions. This runs in
+        # a registration worker; tasks are started on the GUI thread.
+        if neuron_id_map is not None:
+            union_neurons = {
+                neuron_id_map[neuron] for neuron in union_neurons if neuron in neuron_id_map
+            }
+        self.state.call_on_gui_thread(
+            lambda: self._queue_union_refresh(union_neurons, neuron_id_map=neuron_id_map)
+        )
 
     def _process_component_request_inplace(
         self,

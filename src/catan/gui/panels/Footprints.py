@@ -45,6 +45,7 @@ from catan.core.changes import (
 from catan.core.structures import NeuronComponent, sessiondata_type
 from catan.core.redetection import infer_aligned_footprint
 from catan.gui.panels import BasePlot
+from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
 from catan.gui.interaction import click_events
 from catan.gui.data.assignment_colors import assignment_label
@@ -424,7 +425,10 @@ class Display(BasePlot.BaseCanvas):
             or focused is None
             or not 0 <= focused.neuron_id < len(assignments.ids)
         ):
-            return {sid: sid for sid in range(n_sessions)}
+            # Inactive sessions are not displayed (their level stays empty).
+            return {
+                sid: sid for sid in range(n_sessions) if self.data.session_is_active(sid)
+            }
 
         row = assignments.ids[focused.neuron_id]
         shown = set(np.flatnonzero(row >= 0).tolist())
@@ -432,6 +436,9 @@ class Display(BasePlot.BaseCanvas):
         if parameters.checkbox_session_only.isChecked():
             shown.add(int(self.controls["session_filter"].slider.value()))
 
+        shown = {
+            sid for sid in shown if sid < n_sessions and self.data.session_is_active(sid)
+        }
         return {sid: level for level, sid in enumerate(sorted(shown))}
 
     def plot_neurons(self, reset=False):
@@ -465,6 +472,9 @@ class Display(BasePlot.BaseCanvas):
             parameters.threshold_spin.value(),
             parameters.z_stretch_spin.value(),
             tuple(sorted(self.session_levels().items())),
+            # Meshes are cached per (neuron, session index): a reordering
+            # (e.g. swapping two sessions) must rebuild them.
+            tuple(id(session) for session in self.data.sessions),
         )
 
         if context != self._mesh_context:
@@ -688,7 +698,8 @@ class Display(BasePlot.BaseCanvas):
         )
 
         z_stretch = self.controls["parameter"].z_stretch_spin.value()
-        z_range = (0, len(self.session_levels()) * z_stretch)
+        # Levels can have gaps (inactive sessions): use the highest one.
+        z_range = (0, (max(self.session_levels().values(), default=-1) + 1) * z_stretch)
 
         if full:
             ## not working well, yet. rotation is somewhat preserved
@@ -1164,7 +1175,7 @@ class Display(BasePlot.BaseCanvas):
                 else f"Active counterpart: neuron {counterpart.neuron_id}"
             )
 
-        QToolTip.showText(
+        show_tooltip(
             QCursor.pos(),
             "\n".join(lines),
             self.native,
@@ -1648,7 +1659,9 @@ class Display(BasePlot.BaseCanvas):
             components.extend(footprints)
             roles.update({c: role for c in footprints})
 
-        self.state.update_highlighted_components(components or None, roles=roles)
+        self.state.update_highlighted_components(
+            components or None, roles=roles, edited=True
+        )
 
     def _role_icon(self, role):
         """Small swatch in the highlight colour of a source/target role."""
@@ -1992,11 +2005,11 @@ class Display(BasePlot.BaseCanvas):
         component: NeuronComponent,
         new_neuron: Optional[int] = None,
     ):
+        # The resulting data change replots (Controller._on_data_changed).
         self.data.reassign_footprint(
             component,
             new_neuron,
         )
-        self.plot_neurons(reset=True)
 
     def set_focused_footprint(self, component):
         mapped = self.component_to_active(component)

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QHBoxLayout,
+    QGridLayout,
     QLabel,
     QFrame,
     QVBoxLayout,
@@ -263,8 +264,17 @@ class MainMenu(QFrame):
         """Parameters of neuron registration (stored in the settings and
         applied to Tracking.params)."""
         widget = QWidget()
-        layout = QHBoxLayout(widget)
+        # Two lines (match / drop thresholds, union update), captions and
+        # spin boxes in their own columns so captions never overlap them.
+        layout = QGridLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(3)
+        positions = {
+            "match_threshold": (0, 0),
+            "competitor_threshold": (0, 2),
+            "union_update_strength": (1, 0),
+        }
 
         specs = (
             (
@@ -322,11 +332,12 @@ class MainMenu(QFrame):
             caption.setToolTip(tooltip)
             # Never truncated: the row keeps its full width.
             caption.setMinimumWidth(caption.sizeHint().width())
-            layout.addWidget(caption)
-            layout.addWidget(spin)
+            row, column = positions[key]
+            layout.addWidget(caption, row, column)
+            layout.addWidget(spin, row, column + 1)
             self.registration_spins[key] = spin
 
-        layout.addStretch()
+        layout.setColumnStretch(4, 1)
         return widget
 
     def build_root_selector(self) -> QWidget:

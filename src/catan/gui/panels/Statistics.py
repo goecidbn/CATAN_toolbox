@@ -67,6 +67,7 @@ from catan.gui.background_tasks.runtime import TaskCancelled
 import catan.gui.data.curation_filter as curation_filter
 from catan.gui.panels.helper.Threshold import ThresholdSpec
 from catan.gui.GUI_elements.fragments.ResetViewButton import ResetViewButton
+from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 
 STATUS_ROW_HEIGHT = 58
 STATUS_CARD_IDLE_HEIGHT = 30
@@ -1046,7 +1047,7 @@ class Display(BasePlot.BaseCanvas):
                 threshold.update_visuals()
 
         if hits:
-            QToolTip.showText(
+            show_tooltip(
                 QCursor.pos(),
                 "<br><br>".join(t.tooltip_text() for t in hits),
                 self.native,
@@ -1849,7 +1850,7 @@ class Display(BasePlot.BaseCanvas):
         else:
             tooltip_text = "Unknown selection"
 
-        QToolTip.showText(
+        show_tooltip(
             QCursor.pos(),
             tooltip_text,
             self.native,

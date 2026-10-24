@@ -32,6 +32,35 @@ CATEGORY_TITLES = {
     "pair": "Pair statistics",
 }
 
+# Statistics menu: single and pair statistics, each in sections by what is
+# compared (StatisticDefinition.group, see statistic_group()).
+MENU_CATEGORIES = {
+    "Single statistics": ("neuron", "session_loaded", "match_loaded"),
+    "Pair statistics": ("pair",),
+}
+
+GROUP_TITLES = {
+    "footprint": "Footprint statistics",
+    "neuron": "Neuron statistics",
+    "footprint_neuron": "Footprint to Neuron pairings",
+}
+
+
+def statistic_group(definition) -> str:
+    """Menu section: explicit ``group``; footprint → union statistics
+    (reassignment rows) compare footprints with neurons; statistics without
+    a session axis describe neurons (unions); others describe footprints."""
+    if getattr(definition, "group", None) is not None:
+        return definition.group
+
+    if getattr(definition, "curation_kind", None) == "reassignment":
+        return "footprint_neuron"
+
+    if not any(dim.startswith("session") for dim in definition.dims):
+        return "neuron"
+
+    return "footprint"
+
 
 @dataclass
 class StatisticArray:
@@ -527,6 +556,9 @@ class StatisticDefinition:
     # only on that neuron's footprints and the getter has no side effects.
     # Such statistics may be sampled by masking all other assignment rows.
     neuron_local: bool = False
+
+    # Statistics menu section (GROUP_TITLES); None: see statistic_group().
+    group: str | None = None
 
     def is_affected_by(self, event: DataChange) -> bool:
         if self.dependencies is None:

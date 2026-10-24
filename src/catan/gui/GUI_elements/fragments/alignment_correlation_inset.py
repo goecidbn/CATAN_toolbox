@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import QToolTip, QWidget
 
 from catan.core.spatial_coverage import session_valid_mask
+from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 
 
 def _binned(image, factor):
@@ -295,7 +296,7 @@ class AlignmentCorrelationInset(QWidget):
         if row != column:
             text += "\nClick: align the later session against the earlier one."
 
-        QToolTip.showText(event.globalPosition().toPoint() + QPoint(12, 12), text, self)
+        show_tooltip(event.globalPosition().toPoint() + QPoint(12, 12), text, self)
 
     def mousePressEvent(self, event):
         cell = self._cell_at(event.position().toPoint())

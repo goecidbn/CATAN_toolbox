@@ -45,6 +45,7 @@ from catan.gui.GUI_elements.fragments.alignment_correlation_inset import (
 from catan.gui.GUI_elements.fragments.alignment_shift_inset import (
     AlignmentShiftInset,
 )
+from catan.gui.GUI_elements.utils.vispy_axes import link_axis
 from catan.core.alignment import calculate_residual_flow
 
 
@@ -382,7 +383,7 @@ class ManualAlignmentEditor(QWidget):
             axis.axis.text_color = "#e8eaed"
             axis.axis.tick_color = "#aab2bd"
             axis.axis.axis_color = "#aab2bd"
-            axis.link_view(self.view)
+            link_axis(axis, self.view)
 
         self.x_axis.axis.axis_label = "x (px)"
         self.y_axis.axis.axis_label = "y (px)"

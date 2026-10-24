@@ -100,6 +100,8 @@ TRACKED_STATISTIC_STRUCTURE = frozenset({
     ChangeKind.SESSION_ADDED,
     ChangeKind.SESSION_REMOVED,
     ChangeKind.SESSION_ORDER,
+    # Inactive sessions count as absent in statistics.
+    ChangeKind.SESSION_ACTIVITY,
     ChangeKind.ASSIGNMENT_SET,
     ChangeKind.ASSIGNMENT_MAPPING,
 })

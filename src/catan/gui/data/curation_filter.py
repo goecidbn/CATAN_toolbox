@@ -1457,7 +1457,7 @@ class CurationFilterEvaluator:
         ):
             return None
 
-        ids = np.asarray(self.engine.state.assignments)
+        ids = _active_ids(self.engine)
         pairs = set()
 
         for anchor in domain:
@@ -1550,7 +1550,8 @@ class CurationFilterEvaluator:
         if not self._counting:
             return
 
-        ids = np.asarray(self.engine.state.assignments, dtype=int)
+        # Footprints of inactive sessions are not part of the domain.
+        ids = np.asarray(_active_ids(self.engine), dtype=int)
         included = np.ones(ids.shape[0], dtype=bool)
 
         union = self.engine.data.assignments.union
@@ -2597,3 +2598,11 @@ def curation_filter_from_dict(
         raise ValueError("Curation filter root " "must be a group.")
 
     return root
+
+
+def _active_ids(engine):
+    """Assignment ids in which inactive sessions have no footprints."""
+    from catan.gui.data.statistics.engine import active_session_view
+
+    _, state = active_session_view(engine.data, engine.state)
+    return np.asarray(state.assignments)

@@ -77,10 +77,8 @@ def print_debug(state: AppState, data: Data):
     print("ID centroid:", data.assignments.union.centroids[id, :])
 
     print("stats keys:", list(data.assignments.stats.keys()))
-    print("weights:", data.assignments.stats.get("fp_corr").shape)
     print("shift:", data.assignments.stats.get("shifts").shape)
 
-    print(f"fp_corr for neuron {id}:", data.assignments.stats.get("fp_corr")[id, :])
     print(f"shifts for neuron {id}:", data.assignments.stats.get("shifts")[id, ...])
     for s, fp_id in enumerate(data.assignments.ids[id, :]):
 

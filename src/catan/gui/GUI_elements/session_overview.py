@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
     QSizePolicy,
     QFileDialog,
+    QGraphicsOpacityEffect,
 )
 
 
@@ -246,7 +247,9 @@ class SessionRowWidget(QFrame):
 
         layout.addWidget(self.delete_button)
 
-        self.config_constructor = FieldConfigConstructor(self, self.session)
+        # Built on first expansion: constructing the field options for every
+        # row made adding sessions slow (~80 ms per row).
+        self.config_constructor = FieldConfigConstructor(self, self.session, lazy=True)
 
         layout.addWidget(self.config_constructor.toggle_config_options)
         stacked_layout.addLayout(layout)
@@ -271,7 +274,7 @@ class SessionRowWidget(QFrame):
             self._update_buttons()
             self._update_status()
 
-        if event.has(C.DATA_AVAILABILITY):
+        if event.has(C.DATA_AVAILABILITY) and self.config_constructor._content_built:
             self.config_constructor.config_field_options.rebuild()
 
     def refresh(self, current=False):
@@ -300,13 +303,39 @@ class SessionRowWidget(QFrame):
         self._update_buttons()
         self._update_status()
         self._update_background(current=current)
+        self._update_activity(bool(active))
         self.config_constructor.refresh()
+
+    def _update_activity(self, active):
+        """Inactive sessions are greyed out (the checkbox stays usable)."""
+        self.active_checkbox.setToolTip(
+            "Session active: shown and processed"
+            if active
+            else "Session inactive: data kept, but not shown and skipped "
+            "by new alignments, registrations, union and model evidence"
+        )
+
+        for widget in (
+            self.name_edit,
+            self.offset_label,
+            self.status_button,
+            self.load_fields_button,
+            self.delete_button,
+            self.config_constructor.toggle_config_options,
+        ):
+            effect = widget.graphicsEffect()
+            if active and effect is not None:
+                widget.setGraphicsEffect(None)
+            elif not active and effect is None:
+                effect = QGraphicsOpacityEffect(widget)
+                effect.setOpacity(0.4)
+                widget.setGraphicsEffect(effect)
 
     def _update_status(self):
 
         key, label, color = self._session_state()
 
-        self.status_button.setStyleSheet(f"""
+        style = f"""
             QToolButton {{
                 color: {color};
                 background-color: rgba(
@@ -325,14 +354,19 @@ class SessionRowWidget(QFrame):
                     255, 255, 255, 30
                 );
             }}
-            """)
+            """
+
+        # Restyling is expensive; rows refresh on every data change.
+        if self.status_button.styleSheet() != style:
+            self.status_button.setStyleSheet(style)
 
         tooltip = label
 
         if self.session.status["spatial_loaded"] and self.session.remap is not None:
             tooltip += "\n\n" + self._alignment_report_text(detailed=False)
 
-        self.status_button.setToolTip(tooltip)
+        if self.status_button.toolTip() != tooltip:
+            self.status_button.setToolTip(tooltip)
 
     def _show_status_details(self):
 
@@ -389,11 +423,22 @@ class SessionRowWidget(QFrame):
         session_id = self.session.id
         model = self.data.model
 
+        if not getattr(self.session, "active", True):
+            return (
+                "inactive",
+                "Inactive – data kept, skipped by processing and displays",
+                "#6f7378",
+            )
+
         outdated = []
 
         if self.data.alignment_is_stale(session_id):
             blocker = next(
-                (sid for sid in range(session_id) if self.data.alignment_is_stale(sid)),
+                (
+                    sid
+                    for sid in range(session_id)
+                    if self.data.alignment_is_stale(sid) and self.data.session_is_active(sid)
+                ),
                 None,
             )
 
@@ -2543,6 +2588,29 @@ class LoadSessionRowWidget(QFrame):
         return f"{count} {noun} loaded"
 
 
+def _longest_increasing_run(values):
+    """Positions of a longest strictly increasing subsequence of ``values``."""
+    n = len(values)
+    length = [1] * n
+    previous = [-1] * n
+
+    for i in range(n):
+        for j in range(i):
+            if values[j] < values[i] and length[j] + 1 > length[i]:
+                length[i] = length[j] + 1
+                previous[i] = j
+
+    if not n:
+        return set()
+
+    i = max(range(n), key=length.__getitem__)
+    positions = set()
+    while i >= 0:
+        positions.add(i)
+        i = previous[i]
+    return positions
+
+
 class SessionList(QListWidget):
     drag_n_dropped = Signal(int, int)  # old_index, new_index
     refresh_requested = Signal()
@@ -2585,7 +2653,7 @@ class SessionList(QListWidget):
 
         new_index = self.row(item)
 
-        print(f"Session moved from {old_index} to {new_index}")
+        # print(f"Session moved from {old_index} to {new_index}")
         if old_index == new_index:
             return
 
@@ -2641,13 +2709,84 @@ class SessionOverview(QWidget):
         self.rebuild()
 
     def rebuild(self):
-        # print("rebuilding!")
-        self.list_widget.clear()
-        self._row_widgets.clear()
+        """Bring the rows in line with ``data.sessions``.
 
-        for session in self.data.sessions:
-            # print("Adding session row:", session.id, getattr(session, "name", None))
-            self._add_session_row(session.id, session)
+        Existing rows are kept (row construction is expensive); only rows of
+        new sessions, and rows that must change position relative to the
+        others, are created. All remaining rows get their new index and are
+        refreshed, since status and highlighting depend on the order.
+        """
+        list_widget = self.list_widget
+        sessions = self.data.sessions
+        position = {id(session): index for index, session in enumerate(sessions)}
+
+        def alive(row):
+            # Qt may delete the widget of an item moved by drag & drop.
+            return (
+                isValid(row)
+                and isValid(row.item)
+                and list_widget.itemWidget(row.item) is row
+            )
+
+        rows = []
+        for row in self._row_widgets.values():
+            index = position.get(id(row.session))
+            if alive(row) and index is not None and sessions[index] is row.session:
+                rows.append(row)
+            else:
+                self._discard_row(row)
+
+        # Items without a live row widget (e.g. after a drag).
+        kept_items = {id(row.item) for row in rows}
+        for index in reversed(range(list_widget.count())):
+            if id(list_widget.item(index)) not in kept_items:
+                list_widget.takeItem(index)
+
+        # Keep the longest run of rows already in session order; the others
+        # changed position and are recreated at their place.
+        rows.sort(key=lambda row: list_widget.row(row.item))
+        in_order = _longest_increasing_run([position[id(row.session)] for row in rows])
+        for k, row in enumerate(rows):
+            if k not in in_order:
+                self._discard_row(row)
+        existing = {id(rows[k].session): rows[k] for k in in_order}
+
+        self._row_widgets = {}
+        for index, session in enumerate(sessions):
+            row = existing.get(id(session))
+            if row is None:
+                row = self._add_session_row(index, session)
+            else:
+                row.index = index
+                row.item.setData(Qt.ItemDataRole.UserRole, index)
+                row.refresh(current=index == self.state.current_session_id)
+            self._row_widgets[index] = row
+
+    def _discard_row(self, row):
+        if isValid(row) and isValid(row.item):
+            index = self.list_widget.row(row.item)
+            if index >= 0:
+                self.list_widget.takeItem(index)
+        if isValid(row):
+            row.deleteLater()
+
+    def _rows_match_sessions(self):
+        sessions = self.data.sessions
+        if len(self._row_widgets) != len(sessions) or self.list_widget.count() != len(sessions):
+            return False
+
+        for index, session in enumerate(sessions):
+            row = self._row_widgets.get(index)
+            if (
+                row is None
+                or not isValid(row)
+                or row.session is not session
+                or row.index != index
+                or self.list_widget.item(index) is not row.item
+                or self.list_widget.itemWidget(row.item) is not row
+            ):
+                return False
+        return True
 
     def _add_session_row(self, session_id: int, session):
         item = QListWidgetItem()
@@ -2669,7 +2808,8 @@ class SessionOverview(QWidget):
         row.editOffsetRequested.connect(self.edit_time_offset)
         # row.changeColorRequested.connect(self.change_session_color)
 
-        row.loadRequested.connect(lambda id=session_id: self.load_requested.emit(id))
+        # The row emits its current index (rows are reused after reordering).
+        row.loadRequested.connect(self.load_requested.emit)
         row.backgroundRequested.connect(self.change_session_background)
         row.manualAlignmentRequested.connect(self.adjust_session_alignment)
         row.saveIncludedRequested.connect(
@@ -2702,6 +2842,7 @@ class SessionOverview(QWidget):
         self.list_widget.setItemWidget(item, row)
 
         self._row_widgets[session_id] = row
+        return row
 
     def update_row_height(
         self,
@@ -2757,23 +2898,15 @@ class SessionOverview(QWidget):
         """
         Use this when session properties changed but the order did not.
         """
-        session_ids = [s.id for s in self.data.sessions]
-        for row in list(self._row_widgets.values()):
-            if not (row.session.id in session_ids):
-                self.list_widget.takeItem(self.list_widget.row(row.item))
-                del self._row_widgets[row.session.id]
-                continue
+        # Signals can arrive between a structural data change and its
+        # notification (e.g. the current session is updated first).
+        if not self._rows_match_sessions():
+            self.rebuild()
+            return
 
-            order_index = self.list_widget.row(row.item)
-            row.index = order_index
-
-            self._row_widgets[order_index] = row
-
-            assert (
-                order_index == row.session.id
-            ), f"Row index {order_index} does not match session id {row.session.id}"
-
-            row.refresh(current=row.session.id == self.state.current_session_id)
+        current = self.state.current_session_id
+        for index, row in self._row_widgets.items():
+            row.refresh(current=index == current)
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         session_id = item.data(Qt.ItemDataRole.UserRole)
@@ -2806,13 +2939,7 @@ class SessionOverview(QWidget):
         self.state.current_session_id = session_id
 
     def set_session_active(self, session_id: int, active: bool):
-        session = self.data.sessions[session_id]
-        session.active = active
-
-        self.data.notify_change(
-            C.SESSION_ACTIVITY,
-            session_id=session_id,
-        )
+        self.data.set_session_active(session_id, active)
 
     def rename_session(self, session_id: int, name: str):
         if not name:
@@ -3111,8 +3238,14 @@ class SessionOverview(QWidget):
         if new_session_index < 0 or new_session_index >= len(self.data.sessions):
             return
 
-        print(f"Moving session {session_index} to {new_session_index}")
-        self.data.move_session(session_index, new_session_index)
+        # print(f"Moving session {session_index} to {new_session_index}")
+        try:
+            self.data.move_session(session_index, new_session_index)
+        finally:
+            # A drag has already moved the list item; if the data refused the
+            # move, this restores the data order.
+            if not self._rows_match_sessions():
+                self.rebuild()
 
         # self.refresh_rows()
         # print(f"New session order: {[s.id for s in self.data.sessions]}")

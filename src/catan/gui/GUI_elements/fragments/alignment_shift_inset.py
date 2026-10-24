@@ -5,6 +5,7 @@ from copy import deepcopy
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from catan.gui.GUI_elements.utils.vispy_axes import link_axis
 
 
 class AlignmentShiftInset(QWidget):
@@ -83,7 +84,7 @@ class AlignmentShiftInset(QWidget):
             axis.text_color = "#e8eaed"
             axis.tick_color = "#aab2bd"
             axis.axis_color = "#aab2bd"
-            widget.link_view(self.view)
+            link_axis(widget, self.view)
 
         self.x_axis.axis.axis_label_margin = 20
         self.x_axis.axis.tick_label_margin = 12

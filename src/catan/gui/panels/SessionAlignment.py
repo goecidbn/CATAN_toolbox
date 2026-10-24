@@ -105,6 +105,7 @@ class Display(QWidget):
             event.has(
                 *SESSION_STRUCTURE_CHANGES,
                 C.SESSION_METADATA,
+                C.SESSION_ACTIVITY,
                 C.FOOTPRINT_GEOMETRY,
                 C.BACKGROUND_IMAGE,
                 C.OVERVIEW_BACKGROUND,
@@ -120,7 +121,9 @@ class Display(QWidget):
         return [
             session_id
             for session_id in range(len(self.data.sessions))
+            # Inactive sessions are skipped by alignment updates.
             if self.data.alignment_is_stale(session_id)
+            and self.data.session_is_active(session_id)
         ]
 
     def _refresh_stale_button(self, *_):

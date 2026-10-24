@@ -161,6 +161,49 @@ class Model:
 
         return {"same": stale_same, "cross": stale_cross}
 
+    def remove_counts_for_paths(self, paths):
+        """Delete all count records of these sessions (e.g. removed sessions)."""
+        paths = {str(path) for path in paths}
+
+        same = [path for path in self.counts["same"] if path in paths]
+        cross = [
+            key for key in self.counts["cross"] if key[0] in paths or key[1] in paths
+        ]
+
+        for path in same:
+            self._drop_record("same", path)
+        for key in cross:
+            self._drop_record("cross", key)
+
+        if self.fitted and cross:
+            self.fit_stale = True
+
+        return {"same": set(same), "cross": set(cross)}
+
+    def remove_reversed_pairs(self, session_order):
+        """Delete cross-session records whose sessions are now in reverse
+        order; the counts are directional and never used reversed."""
+        order = {str(path): index for index, path in enumerate(session_order)}
+
+        reversed_pairs = [
+            key
+            for key in self.counts["cross"]
+            if key[0] in order and key[1] in order and order[key[1]] <= order[key[0]]
+        ]
+
+        for key in reversed_pairs:
+            self._drop_record("cross", key)
+
+        if self.fitted and reversed_pairs:
+            self.fit_stale = True
+
+        return set(reversed_pairs)
+
+    def _drop_record(self, kind, key):
+        self.counts[kind].pop(key, None)
+        self.count_revisions[kind].pop(key, None)
+        self.stale_counts[kind].discard(key)
+
     def counts_stale_for_path(self, path: str | Path) -> bool:
 
         path = str(path)

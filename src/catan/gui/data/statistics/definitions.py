@@ -14,6 +14,10 @@ from .union_similarity import (
     union_similarity_requested_pairs,
 )
 from .event_rate import calculate_event_rate, trace_keys
+from .match_statistics import (
+    calculate_match_probability,
+    match_probability_requested_pairs,
+)
 from .track_split import calculate_track_split, measure_choices
 from .union_overlap import (
     calculate_footprint_union_overlap,
@@ -674,6 +678,40 @@ CALCULATED_STATISTICS["footprint_union_overlap"] = StatisticDefinition(
         "footprint_union_similarity"
     ].availability_dependencies,
 )
+
+# Registration probability of a footprint for its own neuron's union.
+CALCULATED_STATISTICS["match_probability"] = StatisticDefinition(
+    key="match_probability",
+    title="Match probability",
+    description=(
+        "Probability with which a session footprint of neuron_i was matched "
+        "to the union of its neuron during registration (only "
+        "neuron_i = neuron_j). Not available for manually assigned or "
+        "moved footprints."
+    ),
+    dims=("neuron_i", "neuron_j", "session"),
+    category="pair",
+    getter=calculate_match_probability,
+    pairs_getter=match_probability_requested_pairs,
+    allowed_reductions=None,
+    default_reductions={
+        "neuron_i": ReductionSpec("keep"),
+        "neuron_j": ReductionSpec("keep"),
+        "session": ReductionSpec("single", 0),
+    },
+    independent_pairs=True,
+    component_axes=(("neuron_i", "session"),),
+    curation_kind="reassignment",
+    relationship_axes=(("neuron_i", "session"), ("neuron_j", None)),
+    dependencies=TRACKED_STATISTIC_STRUCTURE | frozenset({ChangeKind.MATCH_VALUES}),
+    foreground_safe=True,
+    neuron_local=True,
+    group="footprint_neuron",
+)
+
+# Track statistics (a neuron's footprints across sessions) belong to neurons.
+CALCULATED_STATISTICS["centroid_shift"].group = "neuron"
+CALCULATED_STATISTICS["track_split"].group = "neuron"
 
 CALCULATED_STATISTICS["cooccurrence"] = StatisticDefinition(
     key="cooccurrence",

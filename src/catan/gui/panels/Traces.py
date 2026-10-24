@@ -411,6 +411,14 @@ class Display(BasePlot.BaseCanvas):
         else:
             raise ValueError(f"Unknown display scope: {display_scope}")
 
+        # Inactive sessions are not displayed.
+        to_plot_components = [
+            component
+            for component in (to_plot_components or [])
+            if component.session_id is None
+            or self.data.session_is_active(component.session_id)
+        ]
+
         if not to_plot_components:
             return
 

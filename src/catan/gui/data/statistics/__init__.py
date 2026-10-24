@@ -6,6 +6,9 @@ from .types import (
     StatisticDefinition,
     StatisticCategory,
     CATEGORY_TITLES,
+    GROUP_TITLES,
+    MENU_CATEGORIES,
+    statistic_group,
 )
 
 __all__ = [
@@ -16,4 +19,7 @@ __all__ = [
     "StatisticDefinition",
     "StatisticCategory",
     "CATEGORY_TITLES",
+    "GROUP_TITLES",
+    "MENU_CATEGORIES",
+    "statistic_group",
 ]

@@ -29,7 +29,10 @@ class FieldConfigConstructor(QObject):
     toggle_config_options: ToggleOption
     config_options: QWidget
 
-    def __init__(self, parent, source):
+    def __init__(self, parent, source, *, lazy=False):
+        """``lazy``: build the configuration content (selector, field options,
+        compatibility check) only when the options are first expanded.
+        Used by session rows, which are many and rarely expanded."""
         super().__init__(parent)
         self._parent = parent
         self.state = parent.state
@@ -49,14 +52,29 @@ class FieldConfigConstructor(QObject):
         self.config_layout.setContentsMargins(6, 6, 6, 6)
         self.config_layout.setSpacing(3)
 
-        self.build_config_file_options()
-        self.build_config_field_options()
+        self._content_built = False
+        if lazy:
+            self.toggle_config_options.before_expand = self.build_content
+        else:
+            self.build_content()
 
         ## connect the container to the toggle
         self.toggle_config_options.set_container(self.config_options)
         self.source_changed.connect(self._on_source_changed)
 
         self.update_source(source)
+
+    def build_content(self):
+        if self._content_built:
+            return
+        self._content_built = True
+
+        self.build_config_file_options()
+        self.build_config_field_options()
+
+        # A lazily built constructor already has its source.
+        if self.source is not None:
+            self._on_source_changed()
 
     def update_source(self, source: SessionData | Assignments | None):
         expanded = self.toggle_config_options.isChecked()
@@ -67,6 +85,8 @@ class FieldConfigConstructor(QObject):
         self.source_changed.emit()
 
     def _on_source_changed(self):
+        if not self._content_built:
+            return
         self.config_field_options.update_source(self.source)
         self.rebuild_config_selector()
         self.refresh()
@@ -173,6 +193,8 @@ class FieldConfigConstructor(QObject):
         self.config_layout.addWidget(self.config_file_options)
 
     def rebuild_config_selector(self):
+        if not self._content_built:
+            return
         selector = self.load_config_selector
 
         selector.blockSignals(True)
@@ -343,7 +365,7 @@ class FieldConfigConstructor(QObject):
 
     def refresh(self):
         """Refresh configuration controls without announcing data changes."""
-        if self.source is None:
+        if self.source is None or not self._content_built:
             return
 
         config = self.source.source_config

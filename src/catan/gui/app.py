@@ -74,6 +74,12 @@ def main() -> int:
 
     install_tooltip_wrapping(app)
 
+    from catan.gui.GUI_elements.utils.message_boxes import (
+        install_message_box_fitting,
+    )
+
+    install_message_box_fitting(app)
+
     # app.aboutToQuit.connect(lambda: print("QApplication aboutToQuit"))
     # app.lastWindowClosed.connect(lambda: print("lastWindowClosed"))
     # app.aboutToQuit.connect(lambda: print("aboutToQuit"))

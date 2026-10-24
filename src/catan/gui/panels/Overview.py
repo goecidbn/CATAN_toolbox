@@ -9,7 +9,8 @@ from vispy import scene, color
 from vispy.scene import visuals
 from vispy.scene.visuals import Markers, Image, Rectangle, Text
 
-from PySide6.QtCore import Qt, Signal, Slot, QEvent
+from PySide6.QtCore import Qt, Signal, Slot, QEvent, QTimer
+from shiboken6 import isValid
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -79,6 +80,9 @@ class OverviewRecord:
     vals: np.ndarray
     n_rois: int
     color: list | tuple | str
+    # Points grouped by neuron in ascending id order (union records):
+    # a neuron's points are found by binary search.
+    sorted_ids: bool = False
 
 
 class Display(BasePlot.BaseCanvas):
@@ -161,6 +165,11 @@ class Display(BasePlot.BaseCanvas):
             dtype=np.float32,
         )
         self.statistic_nan_color[3] = 0.55
+
+        # Union points of unchanged neurons are reused on rebuilds.
+        self._union_points = UnionPointCache()
+        # Recoloring is applied once per event-loop pass.
+        self._statistic_colors_pending = False
 
         self.freeze()
 
@@ -436,11 +445,19 @@ class Display(BasePlot.BaseCanvas):
 
         union = self.data.assignments.union
 
-        roi_pos, neuron_ids, roi_vals = sparse_A_to_points(
-            union.footprints,
-            union.dims,
-            thr=self.footprint_threshold,
-        )
+        cache = getattr(self, "_union_points", None)
+        if cache is not None:
+            roi_pos, neuron_ids, roi_vals = cache.points(
+                union.footprints,
+                union.dims,
+                thr=self.footprint_threshold,
+            )
+        else:
+            roi_pos, neuron_ids, roi_vals = sparse_A_to_points(
+                union.footprints,
+                union.dims,
+                thr=self.footprint_threshold,
+            )
 
         # Excluded neurons are not displayed.
         if union.included is not None:
@@ -453,6 +470,7 @@ class Display(BasePlot.BaseCanvas):
             vals=roi_vals,
             n_rois=self.data.assignments.union.n_neurons,
             color=None,
+            sorted_ids=True,
         )
 
     def build_neuron_visuals_session(self, session_id: Optional[int] = None, thr=None):
@@ -468,6 +486,8 @@ class Display(BasePlot.BaseCanvas):
             or self.data.sessions[session_id] is None
             or not self.data.sessions[session_id].status["spatial_loaded"]
             or not self.data.session_assigned(session_id)
+            # Inactive sessions are not displayed.
+            or not self.data.session_is_active(session_id)
         ):
             return
 
@@ -527,7 +547,39 @@ class Display(BasePlot.BaseCanvas):
             color="white",
         )
 
+    def reset_neuron_records(self):
+        """Forget the neuron point records but keep their visuals: the next
+        plot_neurons_visuals reuses them, and they show the previous points
+        until the new ones are applied (removing them first showed an empty
+        frame: footprints vanished and reappeared)."""
+        self.plotting["data"] = {}
+
+    def _reuse_visuals(self):
+        """Visuals without a record are handed to records without a visual
+        (e.g. the current session changed in session-only mode, or the mode
+        was toggled), the rest are removed."""
+        visuals = self.plotting["visuals"]
+        data = self.plotting["data"]
+        unused = [key for key in visuals if key not in data]
+
+        for key in data:
+            if key in visuals:
+                continue
+            donor = next(iter(unused), None)
+            if donor is not None:
+                visuals[key] = visuals.pop(donor)
+                visuals[key].order = 0 if key == "union" else 1
+                unused.remove(donor)
+
+        for key in unused:
+            visual = visuals.pop(key)
+            if visual is not None:
+                visual.visible = False
+                visual.parent = None
+
     def plot_neurons_visuals(self):
+
+        self._reuse_visuals()
 
         for key, record in self.plotting["data"].items():
 
@@ -548,7 +600,7 @@ class Display(BasePlot.BaseCanvas):
                 ),  # Make overlaps visible
             )
 
-            footprints.set_data(record.pos)  # , **plot_options)
+            # Data (positions and colors) is set by _update_statistic_colors.
 
             if key == "union":
                 footprints.order = 0
@@ -1002,8 +1054,26 @@ class Display(BasePlot.BaseCanvas):
         """
         Recolor existing neuron visuals from the current statistic.
 
-        Does not rebuild positions/footprints.
+        Does not rebuild positions/footprints. Requests are applied once per
+        event-loop pass (one manipulation requested it ~3×, ~70 ms each).
         """
+        if not hasattr(self, "_statistic_colors_pending"):
+            # Canvas created before a hot reload of this module.
+            self._apply_statistic_colors()
+            return
+
+        if self._statistic_colors_pending:
+            return
+
+        self._statistic_colors_pending = True
+        QTimer.singleShot(0, self._apply_statistic_colors)
+
+    def _apply_statistic_colors(self):
+        if getattr(self, "_statistic_colors_pending", False):
+            self._statistic_colors_pending = False
+
+        if not isValid(self.native):
+            return
 
         for key, record in self.plotting["data"].items():
 
@@ -1189,21 +1259,34 @@ class Display(BasePlot.BaseCanvas):
 
         record = self.plotting["data"][key]
 
-        mask = np.isin(record.ids, neuron_ids)
-        mask &= self._review_mask_for_record(record)
+        if getattr(record, "sorted_ids", False):
+            # Union points are grouped by neuron: no scan of all points.
+            ids = np.asarray(record.ids)
+            wanted = np.unique(np.asarray(neuron_ids, dtype=ids.dtype))
+            starts = np.searchsorted(ids, wanted, side="left")
+            stops = np.searchsorted(ids, wanted, side="right")
+            index = (
+                np.concatenate([np.arange(a, b) for a, b in zip(starts, stops)])
+                if len(wanted)
+                else np.zeros(0, dtype=int)
+            )
+            index = index[self._review_mask_for_ids(ids[index])]
+        else:
+            mask = np.isin(record.ids, neuron_ids)
+            mask &= self._review_mask_for_record(record)
+            index = np.flatnonzero(mask)
 
-        # mask = np.isin(self.plotting["data"][key].ids, neuron_ids)
-        if not np.any(mask):
+        if not len(index):
             self.plotting["overlays"][style][0].visible = False
             self.update()
             return
-        vals = self.plotting["data"][key].vals[mask]
+        vals = record.vals[index]
         vals += 0.5
 
         plot_options = self.styles.get_plot_options(style, "marker", vals, edge_width=0)
 
         self.plotting["overlays"][style][0].set_data(
-            self.plotting["data"][key].pos[mask].astype(np.float32),
+            record.pos[index].astype(np.float32),
             **plot_options,
         )
         self.plotting["overlays"][style][0].visible = True
@@ -1312,8 +1395,11 @@ class Display(BasePlot.BaseCanvas):
         super().on_mouse_release(event)
 
     def _review_mask_for_record(self, record: OverviewRecord) -> np.ndarray:
+        return self._review_mask_for_ids(record.ids)
 
-        ids = np.asarray(record.ids, dtype=int)
+    def _review_mask_for_ids(self, ids) -> np.ndarray:
+        """Review-filter visibility of each point (by its neuron id)."""
+        ids = np.asarray(ids, dtype=int)
 
         mask = np.zeros(ids.shape, dtype=bool)
 
@@ -1333,13 +1419,15 @@ class Display(BasePlot.BaseCanvas):
             else self.state.focused_component.neuron_id
         )
 
-        mask[valid] = ReviewStatusFilter.neuron_mask(
-            ids[valid],
+        # Per neuron, then gathered per point (points >> neurons).
+        visible = ReviewStatusFilter.neuron_mask(
+            np.arange(len(review_status)),
             review_status,
             (self.controls["panel"].review_filter.visible_statuses),
             focused_neuron_id=focused_neuron_id,
             keep_focused=True,
         )
+        mask[valid] = visible[ids[valid]]
 
         return mask
 
@@ -1352,6 +1440,10 @@ class Controller(BasePlot.CanvasController):
 
         self._boundary_task_id = None
         self._boundary_generation = 0
+        # Inputs (_boundary_inputs key) of the shown / calculating border.
+        self._boundary_key = None
+        self._boundary_mask = None
+        self._boundary_pending_key = None
 
         self.current_statistic_query = None
         self.statistic_table = None
@@ -1505,11 +1597,35 @@ class Controller(BasePlot.CanvasController):
         if task_id is not None:
             self.state.tasks.cancel(task_id)
 
-    def _refresh_common_boundary(self):
-        self._cancel_boundary_task()
-        self.canvas.set_common_boundary(None)
+    def _boundary_inputs(self):
+        """Sessions the shared border is computed from, and a key of all it
+        depends on (alignments, tolerance), so unrelated data changes (e.g.
+        manipulations) do not recompute it."""
+        # Sessions with current alignments only: unaligned or outdated ones
+        # (during loading/realignment) are left out instead of hiding the
+        # overlay.
+        usable = [
+            (session_id, session)
+            for session_id, session in enumerate(self.data.sessions)
+            if session is not None
+            and session.status.get("spatial_loaded", False)
+            and session.status.get("aligned", False)
+            and not self.data.alignment_is_stale(session_id)
+        ]
+        tolerance = getattr(self.data, "border_tolerance", 0)
+        key = (
+            id(self.data.assignments),
+            tolerance,
+            tuple(
+                (id(session), id(session.remap), self.data.geometry_revision(session_id))
+                for session_id, session in usable
+            ),
+        )
+        return tuple(session for _, session in usable), tolerance, key
 
+    def _refresh_common_boundary(self):
         if self._deactivated:
+            self._cancel_boundary_task()
             return
 
         assignments = self.data.assignments
@@ -1519,25 +1635,41 @@ class Controller(BasePlot.CanvasController):
             or self.state.current_session_id is None
             or self.data.current_session is None
         ):
+            self._cancel_boundary_task()
+            self.canvas.set_common_boundary(None)
             return
 
-        # Sessions with current alignments only: unaligned or outdated ones
-        # (during loading/realignment) are left out instead of hiding the
-        # overlay.
-        sessions = tuple(
-            session
-            for session_id, session in enumerate(self.data.sessions)
-            if session is not None
-            and session.status.get("spatial_loaded", False)
-            and session.status.get("aligned", False)
-            and not self.data.alignment_is_stale(session_id)
-        )
+        sessions, tolerance, key = self._boundary_inputs()
+
         if not sessions:
+            self._cancel_boundary_task()
+            self.canvas.set_common_boundary(None)
+            self._boundary_key = self._boundary_mask = None
             return
 
-        tolerance = getattr(self.data, "border_tolerance", 0)
+        # A display task may have been cancelled for processing (then no
+        # result arrives).
+        running = (
+            self._boundary_task_id is not None
+            and self.state.tasks.get_task(self._boundary_task_id) is not None
+        )
+
+        # Unchanged inputs: show the stored mask again (it follows the
+        # background); nothing to calculate.
+        if key == getattr(self, "_boundary_key", None) and not running:
+            self.canvas.set_common_boundary(self._boundary_mask)
+            return
+
+        if key == getattr(self, "_boundary_pending_key", None) and running:
+            return
+
+        self._cancel_boundary_task()
+        self.canvas.set_common_boundary(None)
+        self._boundary_pending_key = key
+
         generation = self._boundary_generation
-        revision = self.state.data_version
+        # Lets Assignments.common_spatial_coverage reuse its cached result.
+        revision = key
 
         def calculate():
             from catan.gui.background_tasks.runtime import (
@@ -1581,12 +1713,15 @@ class Controller(BasePlot.CanvasController):
             return
 
         self._boundary_task_id = None
+        self._boundary_pending_key = None
 
-        if revision != self.state.data_version:
-            # A change occurred during calculation. Request current data.
+        if revision != self._boundary_inputs()[2]:
+            # The inputs changed during calculation. Request current data.
             self._refresh_common_boundary()
             return
 
+        self._boundary_key = revision
+        self._boundary_mask = mask
         self.canvas.set_common_boundary(mask)
 
     def _on_statistic_query_changed(self, query):
@@ -1703,7 +1838,8 @@ class Controller(BasePlot.CanvasController):
 
     def initialize_display(self):
 
-        self.canvas.clean()
+        # Visuals are reused by the rebuild (no empty frame in between).
+        self.canvas.reset_neuron_records()
         self.canvas.initialize_overlays()
 
         self._on_session_changed()
@@ -1712,20 +1848,31 @@ class Controller(BasePlot.CanvasController):
         rebuild = event.has(
             *SESSION_STRUCTURE_CHANGES,
             C.ASSIGNMENT_SET,
-            C.ASSIGNMENT_MAPPING,
-            C.UNION_GEOMETRY,
             C.FOOTPRINT_GEOMETRY,
             C.BACKGROUND_IMAGE,
-            C.INCLUSION,
             C.SESSION_ACTIVITY,
             C.SESSION_METADATA,
         ) or event.has_availability("spatial")
+
+        # Assignment content (manipulations, union rebuilds, inclusion):
+        # only the neuron points change.
+        content = event.has(
+            C.ASSIGNMENT_MAPPING,
+            C.UNION_GEOMETRY,
+            C.INCLUSION,
+        )
 
         if event.has(C.OVERVIEW_BACKGROUND, *SESSION_STRUCTURE_CHANGES):
             self._update_background_controls()
 
         if rebuild:
             self.initialize_display()
+        elif content:
+            self._refresh_neuron_visuals()
+            if event.has(C.OVERVIEW_BACKGROUND):
+                self.canvas.plot_background()
+            if event.has(C.PROCESSING_STATUS, C.BORDER_SETTINGS):
+                self._refresh_common_boundary()
         elif event.has(C.OVERVIEW_BACKGROUND):
             self.canvas.plot_background()
         elif event.has(C.REVIEW_STATUS):
@@ -1754,10 +1901,15 @@ class Controller(BasePlot.CanvasController):
         if not self.canvas.session_only:
             if "union" not in self.canvas.plotting["data"]:
                 self.canvas.build_neuron_visuals_union()
-            self.canvas.clean(with_union=False)
+            # Only the union record stays; visuals are reused when plotting.
+            self.canvas.plotting["data"] = {
+                key: record
+                for key, record in self.canvas.plotting["data"].items()
+                if key == "union"
+            }
 
         else:
-            self.canvas.clean(with_union=True)
+            self.canvas.reset_neuron_records()
 
             self.canvas.build_neuron_visuals_session(
                 session_id=self.state.current_session_id,
@@ -1765,6 +1917,33 @@ class Controller(BasePlot.CanvasController):
 
         self.canvas.plot_neurons_visuals()
 
+        super()._on_session_changed()
+
+    def _refresh_neuron_visuals(self):
+        """Rebuild the neuron points after assignment content changed;
+        background, shared border and overlays' visuals are kept."""
+        if (
+            self.data.assignments is None
+            or self.data.assignments.ids.shape[1] == 0
+            or self.state.current_session_id is None
+        ):
+            return
+
+        canvas = self.canvas
+        # Visuals are reused (they keep the previous points until the new
+        # ones are applied; no empty frame).
+        canvas.reset_neuron_records()
+
+        if not canvas.session_only:
+            canvas.build_neuron_visuals_union()
+        else:
+            canvas.build_neuron_visuals_session(
+                session_id=self.state.current_session_id,
+            )
+
+        canvas.plot_neurons_visuals()
+
+        # Hover / selection / focus / highlight styles of the new points.
         super()._on_session_changed()
 
     def _on_session_style_changed(self, session_id):
@@ -1992,16 +2171,88 @@ def sparse_A_to_points(A_csc, dims, thr=0.2):
     # Normalize each column by its 99th percentile
 
     A = normalize_sparse_array(A_csc, relative_threshold=thr, format="coo")
-    pix = A.row.astype(np.int64)
-    roi = A.col.astype(np.int32)
-    val = A.data.astype(np.float32)
-    val /= np.percentile(val, 99) + 1e-8  # normalize to [0,1] for color mapping
+    return _points_from_normalized(A.row, A.col, A.data, W)
+
+
+def _points_from_normalized(pix, roi, val, W):
+    pix = np.asarray(pix).astype(np.int64)
+    roi = np.asarray(roi).astype(np.int32)
+    val = np.asarray(val).astype(np.float32)
+    if val.size:
+        val /= np.percentile(val, 99) + 1e-8  # normalize to [0,1] for color mapping
 
     x = (pix // W).astype(np.float32)
     y = (pix % W).astype(np.float32)
 
     pos = np.column_stack([y, x]).astype(np.float32)  # (Nnz, 2)
     return pos, roi, val
+
+
+class UnionPointCache:
+    """``sparse_A_to_points`` for the union footprints, reusing the
+    normalized points of unchanged columns: a manipulation changes only a
+    few neurons, but normalizing all 2000+ columns takes ~80 ms.
+
+    Columns are matched by content (entry count, first row index, sum and
+    last value), so added / removed / reordered neurons are handled; the
+    result equals ``sparse_A_to_points`` (same point order).
+    """
+
+    def __init__(self):
+        self.setting = None
+        self.columns = {}
+
+    def points(self, A_csc, dims, thr):
+        H, W = dims
+        A = sparse.csc_matrix(A_csc)
+        A.sum_duplicates()
+
+        setting = (float(thr), int(H), int(W), A.shape[0])
+        if setting != self.setting:
+            self.setting = setting
+            self.columns = {}
+
+        n_columns = A.shape[1]
+        counts = np.diff(A.indptr)
+        filled = np.flatnonzero(counts)
+        starts = A.indptr[:-1][filled]
+
+        sums = np.zeros(n_columns)
+        first = np.full(n_columns, -1, dtype=np.int64)
+        last = np.zeros(n_columns)
+        if len(filled):
+            sums[filled] = np.add.reduceat(A.data, starts)
+            first[filled] = A.indices[starts]
+            last[filled] = A.data[A.indptr[filled + 1] - 1]
+
+        keys = list(zip(counts.tolist(), first.tolist(), sums.tolist(), last.tolist()))
+
+        missing = [j for j, key in enumerate(keys) if key not in self.columns]
+        if missing:
+            N = normalize_sparse_array(
+                A[:, missing], relative_threshold=thr, format="csc"
+            )
+            N.sort_indices()
+            for i, j in enumerate(missing):
+                lo, hi = N.indptr[i], N.indptr[i + 1]
+                self.columns[keys[j]] = (N.indices[lo:hi].copy(), N.data[lo:hi].copy())
+
+        used = set(keys)
+        if len(self.columns) > len(used):
+            self.columns = {key: value for key, value in self.columns.items() if key in used}
+
+        parts = [self.columns[key] for key in keys]
+        lengths = np.fromiter((len(part[0]) for part in parts), dtype=np.int64, count=n_columns)
+
+        if lengths.sum() == 0:
+            empty = np.zeros(0)
+            return _points_from_normalized(empty, empty, empty, W)
+
+        pix = np.concatenate([part[0] for part in parts])
+        val = np.concatenate([part[1] for part in parts])
+        roi = np.repeat(np.arange(n_columns, dtype=np.int32), lengths)
+
+        return _points_from_normalized(pix, roi, val, W)
 
 
 def normalize_sparse_array(

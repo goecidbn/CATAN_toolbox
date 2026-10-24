@@ -352,8 +352,8 @@ def _detach_occupied(worker, slots):
 
         worker.state.assignments = candidate.ids
 
-        for values in candidate.stats.values():
-            values[[neuron_id, new_neuron_id], ...] = np.nan
+        # The detached footprint starts a new neuron; others keep their stats.
+        worker.update_moved_footprint_stats([(neuron_id, new_neuron_id, sid)])
 
         worker.rebuild_union_neurons([neuron_id, new_neuron_id])
 
@@ -685,8 +685,11 @@ def prepare(data, plan, *, detach_occupied=False, exclude_occupied=False):
 
         affected.add(target)
 
-        for values in candidate.stats.values():
-            values[list(affected), ...] = np.nan
+        # Moved footprints: shift against the target union, no registration
+        # probability; footprints that stay keep their statistics.
+        worker.update_moved_footprint_stats(
+            (source.neuron_id, target, source.session_id) for source in sources
+        )
 
         worker.rebuild_union_neurons(list(affected))
         worker.rebuild_union_included()
@@ -872,15 +875,15 @@ class ManipulationBatch:
         candidate.ids[target, sessions] = candidate.ids[source, sessions]
         candidate.ids[source, :] = -1
 
-        # Existing matching scores no longer describe this combined neuron.
-        for values in candidate.stats.values():
-            values[target, ...] = np.nan
-            values[source, ...] = np.nan
-
         candidate.review_status[target] = ReviewStatus.PENDING
         union.synthetic[target] |= union.synthetic[source]
 
         self.worker.state.assignments = candidate.ids
+
+        # The source's footprints are measured against the target union.
+        self.worker.update_moved_footprint_stats(
+            (source, target, int(session_id)) for session_id in sessions
+        )
         self.worker.rebuild_union_neurons([source, target])
 
         self.removed[source] = target
@@ -977,8 +980,9 @@ class ManipulationBatch:
 
         affected.add(target)
 
-        for values in candidate.stats.values():
-            values[list(affected), ...] = np.nan
+        self.worker.update_moved_footprint_stats(
+            [(source.neuron_id, target, source.session_id)]
+        )
 
         self.worker.state.assignments = candidate.ids
         self.worker.rebuild_union_neurons(list(affected))

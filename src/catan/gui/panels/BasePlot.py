@@ -28,6 +28,7 @@ from catan.gui.data.statistics.tabledata import (
 )
 from catan.gui.data.statistics.tabledata import prepare_tooltip_query
 from catan.gui.GUI_elements.fragments import SaveDisplayButton
+from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 from catan.gui.background_tasks.runtime import (
     TaskCancelled,
     current_task_context,
@@ -559,7 +560,7 @@ class BaseCanvas(scene.SceneCanvas):
         if statistic_lines:
             text += "\n" + "\n".join(statistic_lines)
 
-        QToolTip.showText(
+        show_tooltip(
             QCursor.pos(),
             text,
             self.native,
@@ -877,7 +878,9 @@ class BaseDisplayController(QObject):
         pass
 
     def _on_hover_changed(self):
-        self.update_styles()
+        # Styles are applied once per event-loop pass (a manipulation emits
+        # hover, selection, focus and highlight changes together).
+        self._queue_selection_update("style")
 
     def _on_selection_changed(self):
         self._queue_selection_update("selection")
@@ -895,18 +898,23 @@ class BaseDisplayController(QObject):
             self._selection_update_timer.start()
 
     def _flush_selection_update(self):
+        events = set(self._pending_selection_events)
         self._pending_selection_events.clear()
 
         if self._deactivated:
             return
 
-        self.update_neuron_selection()
+        if events & {"selection", "focus"}:
+            self.update_neuron_selection()
+
+        if "style" in events:
+            self.update_styles()
 
     def _on_highlight_changed(self):
         self.state.logger.debug(
             f"[BASEPLOT - {self.section.display_mode}] Highlight changed. Current highlighted: {self.state.highlighted_components}"
         )
-        self.update_styles()
+        self._queue_selection_update("style")
 
     def update_neuron_selection(self):
         pass

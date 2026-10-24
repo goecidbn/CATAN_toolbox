@@ -36,6 +36,7 @@ from catan.gui.data.curation_filter import (
 )
 
 from catan.core.structures import NeuronComponent
+from catan.core.changes import ChangeKind, DataChange
 from catan.gui.panels import StatisticsData
 from catan.gui.panels.helper.Threshold import ThresholdSpec
 from catan.gui.data.curation_filter import CurationFilterCondition
@@ -2152,7 +2153,8 @@ class Controller(BasePlot.ControlsController):
                 continue
 
             for sid, session in enumerate(self.data.sessions[: ids.shape[1]]):
-                if session is None:
+                # Inactive sessions are not displayed.
+                if session is None or not getattr(session, "active", True):
                     continue
 
                 footprint = int(ids[neuron, sid])
@@ -2339,6 +2341,23 @@ class Controller(BasePlot.ControlsController):
         return False
 
     def _on_statistic_availability_changed(self, *args):
+        event = args[0] if args else None
+
+        # Results, inspection and pending actions refer to session indices
+        # of the old order (appending sessions keeps them valid), or may
+        # contain footprints of a now inactive session.
+        if (
+            isinstance(event, DataChange)
+            and event.has(
+                ChangeKind.SESSION_REMOVED,
+                ChangeKind.SESSION_ORDER,
+                ChangeKind.SESSION_ACTIVITY,
+            )
+            and (self.current_result is not None or self._evaluation_token is not None)
+        ):
+            self._clear_results()
+            return
+
         self._update_filter_validity()
 
     def _update_filter_validity(self, *, preserve_status=False):

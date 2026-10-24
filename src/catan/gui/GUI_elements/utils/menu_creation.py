@@ -10,16 +10,20 @@ from PySide6.QtWidgets import (
 def fit_message_box_buttons(box, padding=36):
     """Make every button of a message box wide enough for its label.
 
-    The dark theme's padding clips long labels otherwise. Call after all
-    buttons (including "Show Details…") exist, before showing the box.
+    The dark theme's padding clips long labels otherwise. Applied
+    automatically when a message box is shown (message_boxes.py); calling it
+    before showing is still fine.
     """
     for button in box.buttons():
+        # Measure with the final style and font (stylesheet resolved).
+        button.ensurePolished()
         text = button.text().replace("&&", "\0").replace("&", "").replace("\0", "&")
         width = button.fontMetrics().horizontalAdvance(text) + padding
 
         if not button.icon().isNull():
             width += button.iconSize().width() + 6
 
+        width = max(width, button.sizeHint().width())
         button.setMinimumWidth(max(button.minimumWidth(), width))
 
 

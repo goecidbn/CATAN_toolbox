@@ -54,10 +54,10 @@ class ControlPanel(QWidget):
         self._relayout_pending = False
         self.parameter_body.installEventFilter(self)
 
-        app = QApplication.instance()
-
-        if app is not None:
-            app.installEventFilter(self)
+        # The application-wide filter (close on outside clicks) is installed
+        # only while the panel is expanded (_set_expanded): it runs for every
+        # event of the whole GUI.
+        self._app_filter_installed = False
 
         self.setObjectName("footprintParameterOverlay")
 
@@ -243,10 +243,23 @@ class ControlPanel(QWidget):
             self.overlay_layout_changed.emit()
 
     def _set_expanded(self, expanded: bool):
+        self._set_app_filter(expanded)
+
         self.parameter_body.setVisible(expanded)
         self.adjustSize()
 
         self.overlay_layout_changed.emit()
+
+    def _set_app_filter(self, installed: bool):
+        app = QApplication.instance()
+        if app is None or installed == self._app_filter_installed:
+            return
+
+        if installed:
+            app.installEventFilter(self)
+        else:
+            app.removeEventFilter(self)
+        self._app_filter_installed = installed
 
     def _on_session_only_changed(self):
         self.display_parameter_changed.emit()

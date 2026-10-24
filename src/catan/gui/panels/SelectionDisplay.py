@@ -362,7 +362,15 @@ class Display(QWidget):
             return []
 
         if self.entity_mode == "footprint":
-            return list(dict.fromkeys(components))
+            # Footprints of inactive sessions are not displayed.
+            return list(
+                dict.fromkeys(
+                    component
+                    for component in components
+                    if component.session_id is None
+                    or self.data.session_is_active(component.session_id)
+                )
+            )
 
         if self.entity_mode == "neuron":
             neuron_ids = dict.fromkeys(

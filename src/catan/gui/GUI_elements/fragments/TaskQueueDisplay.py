@@ -1,4 +1,4 @@
-from PySide6.QtCore import Signal, Qt, QSize
+from PySide6.QtCore import Signal, Qt, QSize, QTimer
 from PySide6.QtWidgets import (
     QWidget,
     QLabel,
@@ -120,6 +120,18 @@ class TaskQueueDisplay(QWidget):
         layout.addWidget(self.current_container)
         layout.addWidget(self.queue_list)
 
+        # What is displayed, to update in place instead of rebuilding.
+        self._current_key = None
+        self._queued_ids = []
+
+        # Task bursts (e.g. queueing a recipe) emit many signals; refresh
+        # once per burst, and not at all while hidden (refreshed on show).
+        self._refresh_pending = False
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(50)
+        self._refresh_timer.timeout.connect(self.refresh)
+
         # ---- TaskManager signals ----
 
         self.task_manager.queue_changed.connect(self._queue_changed)
@@ -139,7 +151,7 @@ class TaskQueueDisplay(QWidget):
         group: str,
     ):
         if group == self.group:
-            self.refresh()
+            self._schedule_refresh()
 
     def _task_changed(
         self,
@@ -147,6 +159,18 @@ class TaskQueueDisplay(QWidget):
         task_id: str,
     ):
         if group == self.group:
+            self._schedule_refresh()
+
+    def _schedule_refresh(self):
+        self._refresh_pending = True
+
+        if self.isVisible() and not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+
+        if self._refresh_pending:
             self.refresh()
 
     def _move_task(
@@ -173,6 +197,9 @@ class TaskQueueDisplay(QWidget):
                 widget.deleteLater()
 
     def refresh(self):
+        self._refresh_pending = False
+        self._refresh_timer.stop()
+
         # ============================================================
         # Current task
         # ============================================================
@@ -196,62 +223,83 @@ class TaskQueueDisplay(QWidget):
 
         current = self.task_manager.current_task(self.group)
 
-        self._clear_layout(self.current_layout)
+        current_key = (
+            None
+            if current is None
+            else (current.id, current.name, current.worker.is_cancelled())
+        )
 
-        has_current = current is not None
-        if current is None:
-            pass
-            # self.current_layout.addWidget(
-            #     QLabel("Idle")
-            # )
+        if current_key != self._current_key:
+            self._current_key = current_key
+            self._clear_layout(self.current_layout)
 
-        else:
-            current_widget = TaskItemWidget(
-                task_id=current.id,
-                name=current.name,
-                running=True,
-                cancelling=current.worker.is_cancelled(),
-            )
+            if current is not None:
+                current_widget = TaskItemWidget(
+                    task_id=current.id,
+                    name=current.name,
+                    running=True,
+                    cancelling=current.worker.is_cancelled(),
+                )
 
-            current_widget.cancel_requested.connect(self.task_manager.cancel)
+                current_widget.cancel_requested.connect(self.task_manager.cancel)
 
-            self.current_layout.addWidget(current_widget)
+                self.current_layout.addWidget(current_widget)
 
         # ============================================================
         # Queued tasks
         # ============================================================
 
-        self.queue_list.clear()
+        queued = self.task_manager.queued_tasks(self.group)
+        queued_ids = [task.id for task in queued]
+        shown = self._queued_ids
 
-        n_queued = len(self.task_manager.queued_tasks(self.group))
-        has_queued = n_queued > 0
-        self.queue_list.setVisible(has_queued)
+        self.queue_list.setVisible(bool(queued))
 
-        for task in self.task_manager.queued_tasks(self.group):
-            item = QListWidgetItem()
+        if queued_ids == shown:
+            return
 
-            item.setData(
-                Qt.ItemDataRole.UserRole,
-                task.id,
-            )
+        n_shown = len(shown)
+        if n_shown and queued_ids == shown[n_shown - len(queued_ids) :]:
+            # Tasks left the front of the queue (started or cancelled).
+            for _ in range(n_shown - len(queued_ids)):
+                self.queue_list.takeItem(0)
+        elif queued_ids[:n_shown] == shown:
+            # Tasks were appended.
+            for task in queued[n_shown:]:
+                self._add_queued_item(task)
+        else:
+            # Reordered, or removed from the middle.
+            self.queue_list.clear()
+            for task in queued:
+                self._add_queued_item(task)
 
-            widget = TaskItemWidget(
-                task_id=task.id,
-                name=task.name,
-                running=False,
-                cancelling=False,
-            )
+        self._queued_ids = queued_ids
 
-            widget.cancel_requested.connect(self.task_manager.cancel)
+    def _add_queued_item(self, task):
+        item = QListWidgetItem()
 
-            item.setSizeHint(widget.sizeHint())
+        item.setData(
+            Qt.ItemDataRole.UserRole,
+            task.id,
+        )
 
-            self.queue_list.addItem(item)
+        widget = TaskItemWidget(
+            task_id=task.id,
+            name=task.name,
+            running=False,
+            cancelling=False,
+        )
 
-            self.queue_list.setItemWidget(
-                item,
-                widget,
-            )
+        widget.cancel_requested.connect(self.task_manager.cancel)
+
+        item.setSizeHint(widget.sizeHint())
+
+        self.queue_list.addItem(item)
+
+        self.queue_list.setItemWidget(
+            item,
+            widget,
+        )
 
         # if not has_current and not has_queued:
         #     self.title.setText(

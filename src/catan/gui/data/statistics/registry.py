@@ -87,18 +87,8 @@ def build_statistics_registry(
         definition = make_session_stat_definition(name)
         registry[definition.key] = definition
 
-    assignments = getattr(
-        data,
-        "assignments",
-        None,
-    )
-
-    if assignments is not None:
-        for name, values in assignments.stats.items():
-            definition = make_match_stat_definition(
-                name,
-                values,
-            )
-            registry[definition.key] = definition
+    # Registration statistics are not exposed as loaded statistics: the
+    # match probability is the calculated pair statistic
+    # "match_probability"; the shifts are only used for union construction.
 
     return registry

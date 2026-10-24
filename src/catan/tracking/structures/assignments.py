@@ -81,6 +81,10 @@ class DetectionCorrection:
     seeds: tuple[FootprintRef, ...]
 
 
+# Statistics of older files that are dropped on loading.
+OBSOLETE_STATS = frozenset({"fp_corr"})
+
+
 class Assignments:
     """
     Class to store and manage neuron assignments across sessions.
@@ -114,12 +118,10 @@ class Assignments:
         self.stats: Dict[str, np.ndarray] = {
             "p_matched": np.zeros((0, 0, 2), float),
             "shifts": np.zeros((0, 0, 2), float),  # nNeurons x nSessions x 2 (x,y)
-            "fp_corr": np.zeros((0, 0), float),
         }
         self.stats_default_value = {
             "p_matched": (1.0, np.nan),
             "shifts": 0.0,
-            "fp_corr": 1.0,
         }
 
         self._common_spatial_cache = None
@@ -230,7 +232,7 @@ class Assignments:
                     self.stats[key], session_id, new_session_id
                 )
             self.matched_status = move_single_row(
-                self.matched_status, session_id, new_session_id
+                self.matched_status, session_id, new_session_id, axis=0
             )
         else:
             self.ids = np.delete(self.ids, session_id, axis=1)
@@ -271,13 +273,19 @@ class Assignments:
         if np.all(neuron_presence):
             return
 
-        print(neuron_presence.shape)
-
         self.ids = self.ids[neuron_presence, :]
 
         self.review_status = self.review_status[neuron_presence]
         for key in self.stats.keys():
             self.stats[key] = self.stats[key][neuron_presence, ...]
+
+        # Keep the latest manipulation of each remaining neuron at its new row.
+        new_rows = np.cumsum(neuron_presence) - 1
+        self.manipulation_id = {
+            int(new_rows[neuron]): value
+            for neuron, value in self.manipulation_id.items()
+            if neuron < len(neuron_presence) and neuron_presence[neuron]
+        }
 
         ## could just rebuild it entirely from the remaining sessions, but for now just remove the columns of empty neurons
         if self.union is None:
@@ -409,11 +417,12 @@ class Assignments:
                 (n_neurons, n_sessions, 2),
             ).copy(),
             "shifts": np.zeros((n_neurons, n_sessions, 2), dtype=float),
-            "fp_corr": np.ones((n_neurons, n_sessions), dtype=float),
         }
 
         for name, values in stats.items():
-            if values is None:
+            # Footprint correlations at registration are no longer kept
+            # (union weights use p_matched); older files may contain them.
+            if values is None or name in OBSOLETE_STATS:
                 continue
 
             values = np.asarray(values)
@@ -756,19 +765,20 @@ class Assignments:
         }
 
 
-def move_single_row(a, old_index, new_index):
-    """
-    could be changed to using "np.take" instead of slicing
-    """
+def move_single_row(a, old_index, new_index, axis=1):
+    """Move one entry along ``axis`` (sessions: columns of ids/stats, axis 0
+    of matched_status) in place, shifting the entries in between."""
+    view = np.moveaxis(a, axis, 0)
+
     if old_index < new_index:
-        a[:, old_index:new_index], a[:, new_index] = (
-            a[:, old_index + 1 : new_index + 1],
-            a[:, old_index].copy(),
+        view[old_index:new_index], view[new_index] = (
+            view[old_index + 1 : new_index + 1],
+            view[old_index].copy(),
         )
     elif new_index < old_index:
-        a[:, new_index + 1 : old_index + 1], a[:, new_index] = (
-            a[:, new_index:old_index],
-            a[:, old_index].copy(),
+        view[new_index + 1 : old_index + 1], view[new_index] = (
+            view[new_index:old_index],
+            view[old_index].copy(),
         )
 
     return a

@@ -61,12 +61,17 @@ class AppState(QObject):
     load_status_message = Signal(str)
 
     _issue_requested = Signal(str, str, str, object)
+    _gui_call_requested = Signal(object)
 
     def __init__(self, settings: QSettings):
         super().__init__()
 
         self._issue_requested.connect(
             self._show_issue,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._gui_call_requested.connect(
+            self._run_gui_call,
             Qt.ConnectionType.QueuedConnection,
         )
 
@@ -83,6 +88,9 @@ class AppState(QObject):
         self._focused_component: Optional[NeuronComponent] = None
         self._highlighted_components: Optional[List[NeuronComponent]] = None
         self.highlight_roles = {}
+        # The last highlight change was made by the user (Ctrl-click role
+        # cycling, Footprints highlight menu), not set programmatically.
+        self.highlight_edited = False
 
         self.current_job = None
         self.tasks = TaskManager()
@@ -120,6 +128,18 @@ class AppState(QObject):
             self._show_issue(level, title, message, parent)
         else:
             self._issue_requested.emit(level, title, message, parent)
+
+    def call_on_gui_thread(self, fn):
+        """Run ``fn`` now on the GUI thread, or queue it there from a worker
+        (e.g. starting tasks, which must happen on the GUI thread)."""
+        if QThread.currentThread() == self.thread():
+            fn()
+        else:
+            self._gui_call_requested.emit(fn)
+
+    @Slot(object)
+    def _run_gui_call(self, fn):
+        fn()
 
     @Slot(str, str, str, object)
     def _show_issue(self, level, title, message, parent):
@@ -431,10 +451,15 @@ class AppState(QObject):
         *,
         max_components: int | None = None,
         roles=None,
+        edited=False,
     ):
+        """``edited``: a user's edit of the highlight (see highlight_edited);
+        Ctrl-clicks count as edits."""
 
         if isinstance(components, NeuronComponent):
             components = [components]
+
+        edited = bool(edited) or "Control" in modifiers
 
         if (
             "Control" in modifiers
@@ -522,6 +547,7 @@ class AppState(QObject):
             return
 
         self.highlight_roles = new_roles
+        self.highlight_edited = edited
 
         self._highlighted_components = highlighted_components
 
@@ -667,6 +693,84 @@ class AppState(QObject):
             self._current_request = request.remap_rows(neuron_id_map)
         else:
             self._current_request = None
+
+        self.selected_components_changed.emit()
+        self.focused_component_changed.emit()
+        self.highlighted_components_changed.emit()
+        self.hovered_components_changed.emit()
+        self.request_status_changed.emit()
+
+    def apply_session_change(
+        self,
+        assignments: Optional[np.ndarray],
+        session_map: dict[int, Optional[int]],
+        neuron_id_map: Optional[dict[int, int]] = None,
+    ):
+        """Publish assignments after sessions moved or were removed and
+        remap GUI selections to the new session (and neuron) indices.
+
+        ``session_map``: old -> new session index, None for a removed session.
+        ``neuron_id_map``: old -> new neuron row when rows were dropped
+        (None: rows unchanged; missing key: neuron removed).
+        Selected/focused footprints of a removed session move to the neuron's
+        first remaining footprint; highlights there are dropped.
+        """
+
+        def remap_component(component, redirect=False):
+            if component is None:
+                return None
+
+            neuron = component.neuron_id
+            if neuron_id_map is not None:
+                neuron = neuron_id_map.get(neuron)
+                if neuron is None:
+                    return None
+
+            session = component.session_id
+            if session is not None:
+                session = session_map.get(session)
+
+                if session is None:
+                    if not redirect or assignments is None:
+                        return None
+                    present = np.flatnonzero(assignments[neuron] >= 0)
+                    if not len(present):
+                        return None
+                    session = int(present[0])
+
+            return NeuronComponent(neuron_id=int(neuron), session_id=session)
+
+        def remap_components(components, redirect=False):
+            result = []
+            for component in components or []:
+                mapped = remap_component(component, redirect)
+                if mapped is not None and mapped not in result:
+                    result.append(mapped)
+            return result or None
+
+        selected = remap_components(self._selected_components, redirect=True)
+        focused = remap_component(self._focused_component, redirect=True)
+        if selected is not None and focused not in selected:
+            focused = selected[-1]
+        if selected is None:
+            focused = None
+
+        highlight_roles = {}
+        for component, role in self.highlight_roles.items():
+            mapped = remap_component(component)
+            if mapped is not None:
+                highlight_roles[mapped] = role
+
+        self.assignments = assignments
+        self._selected_components = (
+            None if selected is None else sorted(selected, key=lambda c: c.neuron_id)
+        )
+        self._focused_component = focused
+        self._highlighted_components = remap_components(self._highlighted_components)
+        self.highlight_roles = highlight_roles
+        self._hovered_components = None
+        # Requests hold session-specific components of the old order.
+        self._current_request = None
 
         self.selected_components_changed.emit()
         self.focused_component_changed.emit()

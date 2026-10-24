@@ -27,7 +27,7 @@ from catan.core.structures.session_snapshot import (
 )
 from catan.core.analysis import calculate_statistics, calculate_p
 from catan.core.progress import ProgressRange
-from catan.core.alignment import _shift_sparse_bilinear
+from catan.core.alignment import _shift_sparse_bilinear, calculate_img_correlation
 
 
 def normalize_union_footprints(A):
@@ -76,6 +76,11 @@ class SessionProcessingState:
     # but it depends on upstream geometry that has
     # subsequently changed.
     alignment_stale: bool = False
+
+    # Reactivated session that later sessions were processed without:
+    # realigning / registering it does not invalidate later sessions.
+    alignment_isolated: bool = False
+    assignment_isolated: bool = False
 
 
 class Tracking:
@@ -353,6 +358,81 @@ class Tracking:
     def geometry_revision(self, session_id: int) -> int:
         return self._processing_state(session_id).geometry_revision
 
+    # ---- active sessions -------------------------------------------------
+    # Inactive sessions keep their data but are skipped by new alignments,
+    # registrations, union construction and model evidence.
+
+    def session_is_active(self, session_id: int) -> bool:
+        return bool(getattr(self.sessions[session_id], "active", True))
+
+    def active_session_ids(self) -> list[int]:
+        return [index for index in range(len(self.sessions)) if self.session_is_active(index)]
+
+    def active_session_order(self) -> list[str]:
+        """Paths of active sessions in session order (model evidence order)."""
+        return [
+            str(session.path)
+            for index, session in enumerate(self.sessions)
+            if session.path is not None and self.session_is_active(index)
+        ]
+
+    def active_reference_ids(self, session_id: int, distances) -> dict[int, int]:
+        """distance -> session id of the active session ``distance`` active
+        positions before ``session_id`` (model evidence pairs)."""
+        earlier = [index for index in range(session_id) if self.session_is_active(index)]
+        return {
+            int(distance): earlier[-int(distance)]
+            for distance in distances
+            if 0 < int(distance) <= len(earlier)
+        }
+
+    def set_session_active(self, session_id: int, active: bool):
+        """Activate / deactivate a session without touching its data.
+
+        Deactivating changes nothing else (existing alignments and
+        assignments stay current). On reactivation, an alignment that is
+        missing or became outdated meanwhile, and a registration that is
+        missing (e.g. cleared while later sessions were re-registered), are
+        marked stale and isolated: updating them does not invalidate later
+        sessions, which were processed without this one.
+        """
+        session = self.sessions[session_id]
+        active = bool(active)
+
+        if bool(getattr(session, "active", True)) == active:
+            return False
+
+        session.active = active
+
+        if not active:
+            return True
+
+        state = self._processing_state(session_id)
+
+        if session.status.get("spatial_loaded", False) and (
+            not session.status.get("aligned", False) or state.alignment_stale
+        ):
+            state.alignment_stale = True
+            state.alignment_isolated = True
+
+        others_assigned = any(
+            self.session_assigned(index)
+            for index in range(len(self.sessions))
+            if index != session_id
+        )
+        if (
+            self.assignments is not None
+            and others_assigned
+            and session.path is not None
+            and (not self.session_assigned(session_id) or state.alignment_isolated)
+        ):
+            state.assignment_isolated = True
+            for name in self._assignments:
+                self._stale_assignments.setdefault(name, set()).add(str(session.path))
+
+        session.status["registered_to_model"] = False
+        return True
+
     def alignment_is_stale(self, session_id: int) -> bool:
         return self._processing_state(session_id).alignment_stale
 
@@ -390,16 +470,24 @@ class Tracking:
         changed_state.geometry_revision += 1
         changed_state.alignment_stale = False
 
+        # A reactivated session: later sessions were aligned and registered
+        # without it, so only its own evidence and registration change.
+        isolated = changed_state.alignment_isolated
+        changed_state.alignment_isolated = False
+
         # ============================================
         # Downstream remappings
         # ============================================
-        for downstream_id in range(session_id + 1, len(self.sessions)):
-            self._processing_state(downstream_id).alignment_stale = True
+        if not isolated:
+            for downstream_id in range(session_id + 1, len(self.sessions)):
+                self._processing_state(downstream_id).alignment_stale = True
+        elif self.assignments is not None:
+            changed_state.assignment_isolated = True
 
         # ============================================
         # Model evidence
         # ============================================
-        affected_sessions = self.sessions[session_id:]
+        affected_sessions = [changed] if isolated else self.sessions[session_id:]
         affected_paths = {
             str(session.path)
             for session in affected_sessions
@@ -417,6 +505,42 @@ class Tracking:
             self._stale_assignments.setdefault(name, set()).update(affected_paths)
 
         # Compatibility flags for existing GUI code.
+        for session in affected_sessions:
+            session.status["registered_to_model"] = False
+
+        return affected_paths
+
+    def mark_order_changed(self, first_session_id: int):
+        """
+        Mark dependencies invalid after the session order changed from
+        ``first_session_id`` on (sessions moved).
+
+        Alignments use earlier sessions as references, so they are stale from
+        there on; session 0 defines the common frame and keeps its alignment.
+        Assignments of those sessions become stale. Count records stay valid:
+        they depend on the aligned geometry, which changes only when a session
+        is realigned (mark_geometry_changed then marks them stale). Only
+        cross-session records now in reverse order are deleted; newly adjacent
+        pairs are missing.
+        """
+        n_sessions = len(self.sessions)
+        first = max(1, int(first_session_id))
+
+        for session_id in range(first, n_sessions):
+            self._processing_state(session_id).alignment_stale = True
+
+        affected_sessions = self.sessions[first:]
+        affected_paths = {
+            str(session.path) for session in affected_sessions if session.path is not None
+        }
+        order = [str(session.path) for session in self.sessions if session.path is not None]
+
+        for model in self._model.values():
+            model.remove_reversed_pairs(order)
+
+        for name in self._assignments:
+            self._stale_assignments.setdefault(name, set()).update(affected_paths)
+
         for session in affected_sessions:
             session.status["registered_to_model"] = False
 
@@ -541,15 +665,21 @@ class Tracking:
         if not 0 <= stop <= len(self.sessions):
             raise IndexError(f"Invalid session_id {session_id}.")
 
-        # Flow candidates: the previous FLOW_REFERENCE_SESSIONS positions in
-        # the session sequence (the most recent preferred, see estimate_flow).
-        flow_start = max(0, stop - FLOW_REFERENCE_SESSIONS)
+        # Flow candidates: the previous FLOW_REFERENCE_SESSIONS active sessions
+        # (the most recent preferred, see estimate_flow). Inactive sessions
+        # are never references.
+        earlier_active = [sid for sid in range(stop) if self.session_is_active(sid)]
+        flow_start = (
+            earlier_active[-FLOW_REFERENCE_SESSIONS] if len(earlier_active) >= FLOW_REFERENCE_SESSIONS
+            else 0
+        )
 
         eligible = [
             (sid, session)
             for sid, session in enumerate(self.sessions[:stop])
             if (
-                session.status["aligned"]
+                self.session_is_active(sid)
+                and session.status["aligned"]
                 and not self.alignment_is_stale(sid)
                 and session.path is not None
                 and session.background_template is not None
@@ -611,7 +741,8 @@ class Tracking:
             (sid, session)
             for sid, session in enumerate(self.sessions)
             if (
-                session.status["aligned"]
+                self.session_is_active(sid)
+                and session.status["aligned"]
                 and not self.alignment_is_stale(sid)
                 and session.path is not None
                 and session.background_template is not None
@@ -949,13 +1080,19 @@ class Tracking:
 
         results = {"same": None, "cross": {}}
 
+        # Inactive sessions provide no model evidence.
+        if not self.session_is_active(session_id):
+            return results
+
+        # References: the active sessions `distance` active positions before.
         # The pair is structurally requested, but
         # cannot currently be calculated if the reference is unaligned.
         reference_ids = [
-            session_id - distance
-            for distance in distances
-            if session_id - distance >= 0
-            and self.sessions[session_id - distance].status["aligned"]
+            reference_id
+            for _, reference_id in sorted(
+                self.active_reference_ids(session_id, distances).items()
+            )
+            if self.sessions[reference_id].status["aligned"]
         ]
 
         progress = ProgressRange(ctx)
@@ -1052,12 +1189,13 @@ class Tracking:
 
         path = session_path(session_id)
 
-        cross = {}
-        for distance in distances:
-            reference_id = session_id - distance
-            if reference_id < 0:
-                continue
+        # Inactive sessions provide no evidence (state "inactive": never
+        # requested); references are the previous active sessions.
+        if not self.session_is_active(session_id):
+            return {"same": "inactive", "cross": {}}
 
+        cross = {}
+        for reference_id in self.active_reference_ids(session_id, distances).values():
             key = (session_path(reference_id), path)
             cross[reference_id] = record_state("cross", key, (reference_id, session_id))
 
@@ -1116,11 +1254,14 @@ class Tracking:
         cross_pairs = []
 
         for target_id in range(n_sessions):
-            reference_ids = [
-                target_id - distance
-                for distance in self._normalize_session_distances(target_id, distances)
-                if target_id - distance >= 0
-            ]
+            if not self.session_is_active(target_id):
+                continue
+
+            reference_ids = list(
+                self.active_reference_ids(
+                    target_id, self._normalize_session_distances(target_id, distances)
+                ).values()
+            )
 
             relevant_references = [
                 index
@@ -1247,12 +1388,9 @@ class Tracking:
                 value == "current" for value in state["cross"].values()
             )
 
+        # Active sessions only: distances count active neighbours.
         counts = self.model.aggregate_counts(
-            session_order=[
-                str(session.path)
-                for session in self.sessions
-                if session.path is not None
-            ],
+            session_order=self.active_session_order(),
             session_distances=plan["session_distances"],
         )
 
@@ -1308,14 +1446,9 @@ class Tracking:
             )
 
         # Current session order is deliberately supplied here,
-        # rather than stored inside Model.
-        session_order = []
-        for session in self.sessions:
-
-            if session.path is None:
-                continue
-
-            session_order.append(str(session.path))
+        # rather than stored inside Model. Inactive sessions are left out
+        # (their records are kept but unused; distances count active ones).
+        session_order = self.active_session_order()
 
         selected_paths = None
         if session_ids is not None:
@@ -1396,35 +1529,68 @@ class Tracking:
                 return "stale"
             return "current"
 
+        # Inactive sessions are never registered.
         requested = {
-            index for index in selected if assignment_state(index) in accepted[mode]
+            index
+            for index in selected
+            if self.session_is_active(index)
+            and assignment_state(index) in accepted[mode]
         }
+
+        # Reactivated sessions the later sessions were registered without:
+        # registered on their own, without clearing later sessions.
+        isolated = {
+            index
+            for index in requested
+            if self._processing_state(index).assignment_isolated
+        }
+        sequential = requested - isolated
 
         first = None
         preserved = []
         clear_sessions = []
         register_sessions = []
 
-        if requested:
-            first = min(requested)
+        if sequential:
+            first = min(sequential)
 
-            # A stale earlier assignment cannot provide a current prefix.
+            # A stale earlier (active, not isolated) assignment cannot
+            # provide a current prefix.
             stale_prefix = [
                 index
                 for index in assigned
-                if index < first and self.assignment_is_stale(index)
+                if index < first
+                and self.session_is_active(index)
+                and self.assignment_is_stale(index)
+                and not self._processing_state(index).assignment_isolated
             ]
             if stale_prefix:
                 first = min(stale_prefix)
 
             preserved = sorted(index for index in assigned if index < first)
+            # Inactive columns here are cleared and stay empty (skipped).
             clear_sessions = sorted(index for index in assigned if index >= first)
 
             # Include requested missing sessions and every existing
             # registration whose union dependency will change.
-            register_sessions = sorted(requested | set(clear_sessions))
+            register_sessions = sorted(
+                index
+                for index in sequential | set(clear_sessions)
+                if self.session_is_active(index)
+            )
+        elif isolated:
+            first = n_sessions
+            preserved = sorted(assigned)
 
-        required = sorted(set(preserved) | set(register_sessions))
+        isolated_sessions = sorted(isolated - set(register_sessions))
+        changed = register_sessions + isolated_sessions
+        first_changed = min(changed) if changed else first
+
+        required = sorted(
+            {index for index in preserved if self.session_is_active(index)}
+            | set(register_sessions)
+            | set(isolated_sessions)
+        )
 
         model_state = "not_required"
         if len(required) > 1:
@@ -1441,6 +1607,8 @@ class Tracking:
             "preserved_sessions": preserved,
             "clear_sessions": clear_sessions,
             "register_sessions": register_sessions,
+            "isolated_sessions": isolated_sessions,
+            "first_changed": first_changed,
             "load_sessions": [
                 index
                 for index in required
@@ -1463,14 +1631,17 @@ class Tracking:
         from_session_id=None,
         mode="pending",
         ctx=None,
+        on_progress=None,
     ):
+        """``on_progress(candidate, neuron_id_map, plan)``: called in this
+        thread after each registered session (incremental display)."""
         plan = self.plan_assignment_update(
             session_ids=session_ids,
             from_session_id=from_session_id,
             mode=mode,
         )
 
-        if not plan["register_sessions"]:
+        if not plan["register_sessions"] and not plan["isolated_sessions"]:
             return None
 
         if plan["load_sessions"] or plan["alignment_sessions"]:
@@ -1486,7 +1657,12 @@ class Tracking:
                 "reprocessing assignments."
             )
 
-        required = plan["preserved_sessions"] + plan["register_sessions"]
+        isolated = plan["isolated_sessions"]
+        required = [
+            session_id
+            for session_id in plan["preserved_sessions"]
+            if self.session_is_active(session_id)
+        ] + plan["register_sessions"] + isolated
         for session_id in required:
             self.require_current_alignment(session_id)
 
@@ -1507,11 +1683,21 @@ class Tracking:
 
         progress = ProgressRange(ctx)
 
+        # Isolated sessions are registered anew: clear their columns (rows
+        # are kept here so neuron_id_map stays valid; emptied rows are
+        # dropped at the end).
+        for session_id in isolated:
+            if session_id < candidate.ids.shape[1]:
+                candidate.ids[:, session_id] = -1
+                for values in candidate.stats.values():
+                    values[:, session_id, ...] = np.nan
+                candidate.matched_status[session_id] = False
+
         Tracking.rebuild_union(
             worker, ctx=progress.range(0, 10, "Rebuilding union footprints")
         )
 
-        register = plan["register_sessions"]
+        register = plan["register_sessions"] + isolated
 
         for index, session_id in enumerate(register):
             # Use the core implementation, bypassing GUI notifications.
@@ -1534,6 +1720,28 @@ class Tracking:
 
             if not worker.session_assigned(session_id):
                 raise RuntimeError(f"Session {session_id} was not registered.")
+
+            if on_progress is not None:
+                on_progress(candidate, neuron_id_map, plan)
+
+        # Rows of the last progress snapshot -> final rows.
+        progress_row_map = None
+
+        if isolated:
+            # Registered out of order: rebuild their neurons' unions in
+            # session order, then drop rows left without footprints.
+            affected = np.flatnonzero((candidate.ids[:, isolated] >= 0).any(axis=1))
+            if len(affected):
+                Tracking.rebuild_union_neurons(worker, affected)
+
+            keep = np.flatnonzero((candidate.ids >= 0).any(axis=1))
+            if len(keep) < candidate.ids.shape[0]:
+                rows = {int(old): new for new, old in enumerate(keep)}
+                progress_row_map = rows
+                candidate.updating_neuron_presence()
+                neuron_id_map = {
+                    old: rows[new] for old, new in neuron_id_map.items() if new in rows
+                }
 
         # Recover manipulation associations through stable footprint refs.
         # Later history entries supersede earlier entries for a neuron.
@@ -1570,6 +1778,7 @@ class Tracking:
             "assignment_name": name,
             "candidate": candidate,
             "neuron_id_map": neuron_id_map,
+            "progress_row_map": progress_row_map,
         }
 
     def assign_neurons(
@@ -1661,7 +1870,6 @@ class Tracking:
                 # # first occurence of neuron defined as p_match = 1, shift = 0
                 # self.assignments.stats["p_matched"][:, this_data.id, 0] = 1.0
                 # self.assignments.stats["shifts"][:, this_data.id, :] = 0.0
-                # self.assignments.stats["fp_corr"][:, this_data.id] = 1.0
 
                 self.assignments.matched_status[this_data.id] = True
                 self.mark_assignment_current(this_data.id)
@@ -1765,9 +1973,6 @@ class Tracking:
             )
             self.assignments.stats["shifts"][matched_ref, this_data.id, :] = (
                 footprint_shifts[matched_ref, matched]
-            )
-            self.assignments.stats["fp_corr"][matched_ref, this_data.id] = (
-                footprint_correlations[matched_ref, matched]
             )
 
             if N_add > 0:
@@ -2035,7 +2240,8 @@ class Tracking:
 
             fp_id = int(self.assignments.ids[neuron_id, session_id])
 
-            if fp_id < 0:
+            # Inactive sessions do not contribute to the union.
+            if fp_id < 0 or not self.session_is_active(session_id):
                 continue
 
             session = self.sessions[session_id]
@@ -2161,7 +2367,8 @@ class Tracking:
             # - tracking postponed
             #
             # Such a session contributes nothing to the union.
-            if not np.any(assignment_ids >= 0):
+            # Neither does an inactive session.
+            if not np.any(assignment_ids >= 0) or not self.session_is_active(session_id):
                 continue
 
             weights = self._union_weights()
@@ -2185,6 +2392,25 @@ class Tracking:
         if ctx is not None:
             ctx.check_cancelled()
         union = self.assignments.union
+
+        # Neurons detected only in inactive sessions keep an empty column.
+        n_neurons = self.assignments.ids.shape[0]
+        have = union.footprints.shape[1]
+        if have < n_neurons:
+            if have:
+                n_pixels = union.footprints.shape[0]
+                base = union.footprints
+            else:
+                loaded = [
+                    session for session in self.sessions if session.status["spatial_loaded"]
+                ]
+                union.dims = tuple(loaded[0].dims) if loaded else union.dims
+                n_pixels = int(np.prod(union.dims))
+                base = sparse.csc_matrix((n_pixels, 0))
+            union.footprints = sparse.hstack(
+                [base, sparse.csc_matrix((n_pixels, n_neurons - have))], format="csc"
+            )
+
         if union.footprints.shape[1] > 0:
             union.update_footprints(
                 footprints=union.footprints,
@@ -2214,6 +2440,132 @@ class Tracking:
             ]
 
         self.assignments.union.included = np.any(included, axis=1)
+
+    @staticmethod
+    def _match_measure(footprint, union, dims):
+        """(correlation, shift) of a footprint relative to a union footprint,
+        as measured at registration (shift-optimized cosine_union, gamma 0.1)."""
+        correlation, _, shift = calculate_img_correlation(
+            footprint,
+            union,
+            dims=dims,
+            crop=True,
+            shift=True,
+            mode="cosine_union",
+            gamma=0.1,
+            shift_optimized=True,
+        )
+        return float(correlation), np.asarray(shift, dtype=float)
+
+    def _union_shift(self, footprint, union, dims):
+        _, shift = self._match_measure(footprint, union, dims)
+        return shift if np.all(np.isfinite(shift)) else np.zeros(2)
+
+    def match_probability(self, footprint, union, dims) -> float:
+        """Model probability that a footprint belongs to a union footprint, as
+        at registration (distance = |shift|, shift-optimized correlation).
+        NaN without a fitted model or union."""
+        model = self.model
+        if (
+            model is None
+            or not model.fitted
+            or getattr(model, "f_same", None) is None
+            or union is None
+            or union.nnz == 0
+        ):
+            return np.nan
+
+        correlation, shift = self._match_measure(footprint, union, dims)
+        if not np.isfinite(correlation) or not np.all(np.isfinite(shift)):
+            return 0.0
+
+        p_same = calculate_p(
+            np.array([np.linalg.norm(shift)]),
+            np.array([correlation]),
+            model.f_same,
+            self.params["neighbor_distance"],
+        )
+        return float(p_same.toarray().ravel()[0])
+
+    def refresh_union_shifts(self, neuron_id: int, sessions):
+        """Re-measure the shifts of a neuron's footprints in ``sessions``
+        against the union as built up to each of them (one sequential pass
+        up to the last of them, as _build_union_footprint_for_neuron; the
+        first footprint defines the union: shift 0)."""
+        shifts = self.assignments.stats.get("shifts")
+        sessions = {int(session_id) for session_id in sessions}
+        if shifts is None or not sessions:
+            return
+
+        union = self.assignments.union
+        weights = self._union_weights()
+        last = max(sessions)
+        footprint = None
+
+        for session_id in range(min(last + 1, self.assignments.ids.shape[1])):
+            fp_id = int(self.assignments.ids[neuron_id, session_id])
+
+            if fp_id < 0 or not self.session_is_active(session_id):
+                continue
+
+            current = self.sessions[session_id].footprints[:, fp_id]
+
+            if footprint is None:
+                if session_id in sessions:
+                    shifts[neuron_id, session_id, :] = 0.0
+                footprint = normalize_union_footprints(current)
+                continue
+
+            if session_id in sessions:
+                shifts[neuron_id, session_id, :] = self._union_shift(
+                    current, footprint, self.sessions[session_id].dims
+                )
+
+            if session_id == last:
+                break
+
+            weight = weights[neuron_id, session_id] if weights is not None else 1.0
+            footprint = self._union_update_step(
+                footprint, current, shifts[neuron_id, session_id], weight, union.dims
+            )
+
+    def update_moved_footprint_stats(self, moves):
+        """Matching statistics of footprints moved manually between neurons
+        (``ids`` already updated, union not yet rebuilt). ``moves``: (source
+        row or None, target row, session). The moved footprint's match
+        probability is calculated from the model against the target
+        neuron's current (overall) union; its shift is measured against the
+        target union as built up to its session (consistent with the union
+        rebuild). Other footprints keep their statistics."""
+        stats = self.assignments.stats
+        union = self.assignments.union
+        moves = list(moves)
+        moved = {}
+
+        for source, target, session_id in moves:
+            for values in stats.values():
+                if source is not None and source != target:
+                    values[source, session_id, ...] = np.nan
+                values[target, session_id, ...] = np.nan
+            moved.setdefault(target, set()).add(int(session_id))
+
+        p_matched = stats.get("p_matched")
+        if p_matched is not None:
+            for target, sessions in moved.items():
+                if union is None or target >= union.footprints.shape[1]:
+                    continue
+                union_footprint = union.footprints[:, target]
+                for session_id in sessions:
+                    fp_id = int(self.assignments.ids[target, session_id])
+                    if fp_id < 0:
+                        continue
+                    session = self.sessions[session_id]
+                    p_matched[target, session_id, 0] = self.match_probability(
+                        session.footprints[:, fp_id], union_footprint, session.dims
+                    )
+
+        for target, sessions in moved.items():
+            self.refresh_union_shifts(target, sessions)
 
     def rebuild_union_neurons(self, neuron_ids):
         """
@@ -2289,6 +2641,32 @@ class Tracking:
             neuron_id: self._build_union_footprint_for_neuron(int(neuron_id))
             for neuron_id in neuron_ids
         }
+
+        self.apply_union_replacements(neuron_ids, replacements)
+
+    def build_union_replacements(self, neuron_ids, *, ctx=None):
+        """Union columns of the given neurons from the current assignments,
+        without changing the union (can run on a snapshot in a worker)."""
+        neuron_ids = np.unique(np.atleast_1d(neuron_ids).astype(int))
+        progress = ProgressRange(ctx)
+        replacements = {}
+
+        for index, neuron_id in enumerate(neuron_ids):
+            if index % 32 == 0:
+                progress.check_cancelled()
+                progress.progress(100 * index / len(neuron_ids))
+            replacements[int(neuron_id)] = self._build_union_footprint_for_neuron(
+                int(neuron_id)
+            )
+
+        return replacements
+
+    def apply_union_replacements(self, neuron_ids, replacements):
+        """Write rebuilt union columns (one per neuron in ``neuron_ids``),
+        their centroids and the background projection."""
+        union = self.assignments.union
+        neuron_ids = np.unique(np.atleast_1d(neuron_ids).astype(int))
+        n_neurons = self.assignments.ids.shape[0]
 
         new_block = sparse.hstack(
             [replacements[int(neuron_id)] for neuron_id in neuron_ids],
@@ -2480,6 +2858,9 @@ class Tracking:
                 "Invalid new_session_id. It must be within the range of existing sessions."
             )
 
+        if session_id == new_session_id:
+            return
+
         session = self.sessions.pop(session_id)
 
         n_assigned = 0 if self.assignments is None else self.assignments.ids.shape[1]
@@ -2487,6 +2868,7 @@ class Tracking:
         if new_session_id >= 0:
             self.sessions.insert(new_session_id, session)
             self.reindex_sessions_after_order_change()
+            self.mark_order_changed(min(session_id, new_session_id))
 
             if session_id >= n_assigned or new_session_id >= n_assigned:
                 return
@@ -2496,6 +2878,18 @@ class Tracking:
             # object) would otherwise keep all of its arrays alive.
             self._session_processing.pop(session, None)
             self.reindex_sessions_after_order_change()
+
+            # Its evidence leaves the model; the pair bridging the gap is
+            # then missing and computed by the next model update.
+            if session.path is not None:
+                for model in self._model.values():
+                    model.remove_counts_for_paths({session.path})
+                for stale in self._stale_assignments.values():
+                    stale.discard(str(session.path))
+
+            # Later sessions lost a reference: like a reorder from there on.
+            if session_id < len(self.sessions):
+                self.mark_order_changed(session_id)
 
             if len(self.sessions) == 0:
                 ## when last session is removed

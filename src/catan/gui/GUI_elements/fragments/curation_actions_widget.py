@@ -27,7 +27,20 @@ from catan.gui.data.curation_actions import (
     ManipulationSpec,
     ManipulationPlan,
     OccupiedDestination,
+    _validate as validate_endpoints,
 )
+
+# Candidate entries built from the user's source/target highlight.
+HIGHLIGHT_PREFIX = "Highlighted"
+HIGHLIGHT_LABEL = HIGHLIGHT_PREFIX + ": "
+# What a highlight must contain per kind (sources violet, targets orange).
+HIGHLIGHT_NEEDS = {
+    "split": "1 target footprint (to split) and 2 source footprints "
+    "(references from two different neurons)",
+    "merge": "2 target footprints (to merge) and 1 source footprint (reference)",
+    "reassign": "1 source footprint and target footprints of 1 other neuron",
+    "neuron_merge": "footprints of 1 source neuron and 1 target neuron",
+}
 
 CONFLICT_HELP = {
     "split": (
@@ -221,6 +234,8 @@ class CuratorActions(QGroupBox):
         self.state.focused_component_changed.connect(self.refresh_candidates)
         self.state.selected_components_changed.connect(self.refresh_candidates)
         self.state.data_changed.connect(self._data_changed)
+        self.state.highlighted_components_changed.connect(self._on_highlight_edited)
+        self._showing = False
 
         self.sync()
 
@@ -489,6 +504,110 @@ class CuratorActions(QGroupBox):
         self._update_selector_layout()
         self._buttons()
 
+        # A user-edited highlight stays the candidate after the list is
+        # rebuilt (e.g. a Ctrl-click also changed the focused footprint).
+        if getattr(self.state, "highlight_edited", False):
+            self._on_highlight_edited()
+
+    # ------------------------------------------------------------------
+    # Candidate from the user's source/target highlight
+    # ------------------------------------------------------------------
+
+    def _highlight_endpoints_for(self, kind):
+        """(sources, targets) of the current source/target highlight in the
+        endpoint form of ``kind``; None without a role view. Highlighted
+        components without a role count as targets."""
+        roles = self.state.highlight_roles
+        if not roles:
+            return None
+
+        components = list(self.state.highlighted_components or ())
+        sources = [c for c in components if roles.get(c) == "source"]
+        targets = [c for c in components if roles.get(c, "target") == "target"]
+
+        def neurons(items):
+            return list(
+                dict.fromkeys(NeuronComponent(int(c.neuron_id), None) for c in items)
+            )
+
+        if kind == "neuron_merge":
+            sources, targets = neurons(sources), neurons(targets)
+        elif kind == "reassign":
+            targets = neurons(targets)
+
+        key = lambda c: (c.neuron_id, -1 if c.session_id is None else c.session_id)
+        return tuple(sorted(sources, key=key)), tuple(sorted(targets, key=key))
+
+    def _on_highlight_edited(self):
+        """A user edit of the source/target highlight (Ctrl-click roles,
+        Footprints highlight menu) selects the matching candidate, or adds
+        it as "Highlighted: …", so Apply uses what is highlighted."""
+        if (
+            self._showing
+            or self.queue is not None
+            or not getattr(self.state, "highlight_edited", False)
+        ):
+            return
+
+        kind = self.kind.currentData()
+        if kind in (None, "none") or kind in BATCH_ACTIONS:
+            return
+
+        endpoints = self._highlight_endpoints_for(kind)
+        if endpoints is None:
+            return
+
+        sources, targets = endpoints
+        plan, problem = None, None
+        try:
+            validate_endpoints(self.data, kind, sources, targets)
+            plan = ManipulationPlan.capture(self.data, kind, sources, targets)
+        except (ValueError, AttributeError, IndexError) as exc:
+            problem = str(exc)
+
+        self.candidate.blockSignals(True)
+        try:
+            # Replace an earlier highlight entry.
+            for index in reversed(range(self.candidate.count())):
+                if self.candidate.itemText(index).startswith(HIGHLIGHT_PREFIX):
+                    self.candidate.removeItem(index)
+
+            if plan is not None:
+                index = next(
+                    (
+                        i
+                        for i in range(self.candidate.count())
+                        if self.candidate.itemData(i) == plan
+                    ),
+                    -1,
+                )
+                if index < 0:
+                    self.candidate.insertItem(
+                        0,
+                        HIGHLIGHT_LABEL + self._label(kind, sources, targets),
+                        plan,
+                    )
+                    index = 0
+                self.candidate.setCurrentIndex(index)
+                self.status.setText(
+                    "Using the highlighted footprints: "
+                    + self._label(kind, sources, targets)
+                )
+            else:
+                self.candidate.insertItem(0, "Highlighted (incomplete)", None)
+                self.candidate.setCurrentIndex(0)
+                if "expected source/target counts" in (problem or ""):
+                    problem = (
+                        f"highlight {HIGHLIGHT_NEEDS.get(kind, 'sources and targets')} "
+                        f"(now {len(sources)} source, {len(targets)} target)."
+                    )
+                self.status.setText(f"Highlight not usable for {kind}: {problem}")
+        finally:
+            self.candidate.blockSignals(False)
+
+        self._update_selector_layout()
+        self._buttons()
+
     @staticmethod
     def _label(kind, sources, targets):
         def label(component):
@@ -517,7 +636,11 @@ class CuratorActions(QGroupBox):
         if focus and targets:
             self.state.focused_component = targets[0]
 
-        self.controller._highlight_endpoints(set(sources), set(targets))
+        self._showing = True
+        try:
+            self.controller._highlight_endpoints(set(sources), set(targets))
+        finally:
+            self._showing = False
 
         self.status.setText(self._label(plan.kind, sources, targets))
 
