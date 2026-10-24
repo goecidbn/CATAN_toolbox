@@ -50,6 +50,8 @@ from .fragments import (
 )
 from . import session_overview
 from catan.gui.GUI_elements.utils.paths import display_path
+from catan.gui.GUI_elements.utils.elided_label import ElidedLabel
+import qtawesome as qta
 
 selector_options = {
     "model": [
@@ -124,6 +126,18 @@ class MainMenu(QFrame):
 
         self.state.data_changed.connect(self._on_data_changed)
 
+        # "Go" buttons show a spinner while their work is scheduled/running.
+        tasks = self.state.tasks
+        for signal in (
+            tasks.queue_changed,
+            tasks.task_started,
+            tasks.task_finished,
+            tasks.task_cancelled,
+            tasks.task_failed,
+            tasks.scheduling_settled,
+        ):
+            signal.connect(self._refresh_execute_buttons)
+
     def rebuild(self):
         # importlib.reload(session_overview)
         importlib.reload(data)
@@ -166,17 +180,10 @@ class MainMenu(QFrame):
         self.edit_root_path.setEnabled(not sessions_loaded)
 
         ## model buttons
-        local_model = (self.data.model is not None) and (not self.data.model.loaded)
-        model_fit_possible = local_model and sessions_loaded
-        self.loader["model"]["button_execute"].setEnabled(model_fit_possible)
-
         model_fitted = self.data.model is not None and self.data.model.fitted
         self.loader["model"]["button_save"].setEnabled(model_fitted)
 
-        ## registration buttons
-        self.loader["assignments"]["button_execute"].setEnabled(
-            sessions_loaded and model_fitted
-        )
+        self._refresh_execute_buttons()
 
         if self.data.assignments is None:
             return
@@ -236,8 +243,9 @@ class MainMenu(QFrame):
 
         form.addRow("", self.build_registration_parameters())
 
-        self.review_counts_label = QLabel()
-        self.review_counts_label.setWordWrap(True)
+        # Two fixed lines (elided, full text in the tooltip): growing
+        # numbers must not add lines and shift the menu.
+        self.review_counts_label = ElidedLabel(lines=2)
         self.review_counts_label.setToolTip(
             "Review status of included neurons in the active assignments."
         )
@@ -261,28 +269,28 @@ class MainMenu(QFrame):
         specs = (
             (
                 "match_threshold",
-                "Match p ≥",
+                "Match p",
                 0.3,
                 (0.05, 0.95),
-                "Minimum match probability for assigning a footprint to an "
-                "existing neuron.",
+                "Match p ≥: minimum match probability for assigning a "
+                "footprint to an existing neuron.",
             ),
             (
                 "competitor_threshold",
-                "Drop competitor p ≥",
+                "Drop p",
                 0.3,
                 (0.05, 0.95),
-                "An unmatched footprint whose match probability with any "
+                "Drop competitor p ≥: an unmatched footprint whose match probability with any "
                 "neuron reaches this value (it lost the match to another "
                 "footprint) is dropped instead of becoming a new neuron, "
                 "to avoid confusing the two downstream.",
             ),
             (
                 "union_update_strength",
-                "Union update",
+                "Union a",
                 0.5,
                 (0.05, 1.0),
-                "Weight of a matched footprint in the union footprint: "
+                "Union update strength: weight of a matched footprint in the union footprint: "
                 "U ← (1 − a)·U + a·A, a = strength × match probability. "
                 "Lower: more inertia (less pulled by a single bad match); "
                 "higher: follows changes faster. Also used whenever the union "
@@ -302,7 +310,7 @@ class MainMenu(QFrame):
             spin.setSingleStep(0.05)
             spin.setValue(float(value))
             spin.setToolTip(tooltip)
-            spin.setFixedWidth(70)
+            spin.setFixedWidth(66)
 
             def changed(value, key=key):
                 self.data.params[key] = float(value)
@@ -312,6 +320,8 @@ class MainMenu(QFrame):
 
             caption = QLabel(label)
             caption.setToolTip(tooltip)
+            # Never truncated: the row keeps its full width.
+            caption.setMinimumWidth(caption.sizeHint().width())
             layout.addWidget(caption)
             layout.addWidget(spin)
             self.registration_spins[key] = spin
@@ -1121,33 +1131,85 @@ class MainMenu(QFrame):
 
     def update_buttons(self):
 
-        ## update of assignments button
-        loading = False
-        if (
-            self.data.assignments
-            and self.data.assignments.path
-            and not self.data.assignments.status["loaded"]
-        ):
-            loading = True
-            set_button_icon(
-                self.loader["assignments"]["button_execute"],
-                "folder-open",
-                tooltip=f"Load assignments",
-            )
-        elif self.data.assignments:
-            set_button_icon(
-                self.loader["assignments"]["button_execute"],
-                "play",
-                tooltip="Process missing or outdated neuron registrations",
-            )
-
-        self.loader["assignments"]["button_execute"].setEnabled(
-            self.data.assignments is not None and (loading or bool(self.data.sessions))
-        )
+        self._refresh_execute_buttons()
 
         for controls in self.loader.values():
             controls["button_execute"].setIconSize(QSize(16, 16))
             controls["button_save"].setIconSize(QSize(16, 16))
+
+    def _refresh_execute_buttons(self, *_):
+        """Icons, tooltips and availability of the model / assignments "go"
+        buttons. While their work is running, queued or deferred, they show
+        a spinner and cannot be clicked again."""
+        if not isValid(self) or not hasattr(self, "loader"):
+            return
+
+        sessions_loaded = bool(self.data.sessions)
+        model = self.data.model
+
+        # --- model
+        button = self.loader["model"]["button_execute"]
+        if self.data.model_work_pending():
+            self._set_busy_icon(button, "Model update scheduled or running…")
+        else:
+            self._clear_busy_icon(button)
+            set_button_icon(button, "play", tooltip="Process pending model counts and fit")
+            button.setEnabled(model is not None and not model.loaded and sessions_loaded)
+
+        # --- assignments
+        button = self.loader["assignments"]["button_execute"]
+        assignments = self.data.assignments
+        loading = bool(
+            assignments is not None
+            and assignments.path
+            and not assignments.status["loaded"]
+        )
+
+        if not loading and self.data.assignment_work_pending():
+            self._set_busy_icon(button, "Neuron registration scheduled or running…")
+            return
+
+        self._clear_busy_icon(button)
+        if loading:
+            set_button_icon(button, "folder-open", tooltip="Load assignments")
+        else:
+            set_button_icon(
+                button, "play", tooltip="Process missing or outdated neuron registrations"
+            )
+
+        # Registration needs match probabilities: a fitted (or imported) model.
+        model_ready = model is not None and model.fitted
+        button.setEnabled(
+            assignments is not None and (loading or (sessions_loaded and model_ready))
+        )
+        if not loading and not model_ready:
+            button.setToolTip(
+                "Process neuron registrations — fit or import a model first "
+                "(registration needs its match probabilities)."
+            )
+
+    def _set_busy_icon(self, button, tooltip):
+        spins = self.__dict__.setdefault("_busy_spins", {})
+        if button not in spins:
+            spin = qta.Spin(button, interval=40, step=12)
+            spins[button] = spin
+            button.setIcon(
+                qta.icon(
+                    "fa5s.spinner",
+                    color="white",
+                    color_disabled="white",
+                    animation=spin,
+                )
+            )
+        button.setToolTip(tooltip)
+        button.setEnabled(False)
+
+    def _clear_busy_icon(self, button):
+        spin = self.__dict__.get("_busy_spins", {}).pop(button, None)
+        if spin is not None:
+            # The animation timer would otherwise keep repainting.
+            for timer, *_ in spin.info.values():
+                timer.stop()
 
     def rebuild_selector(
         self, key: str, options: list[str], add_options: Optional[list[str]] = None

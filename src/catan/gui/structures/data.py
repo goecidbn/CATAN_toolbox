@@ -96,6 +96,14 @@ def read_assignments_provenance(path, *, ctx=None):
     return {"recipe": recipe, "model_path": model_path, "sessions_file": sessions_file}
 
 
+# Names of model / registration runs queued behind current processing.
+DEFERRED_MODEL_TASK = "Update model (after current processing)"
+DEFERRED_ASSIGNMENT_TASK = "Process neuron registrations (after current processing)"
+# Tasks that perform neuron registration (assignment) work.
+ASSIGNMENT_TASK_NAMES = ("Process pending neuron registrations",)
+ASSIGNMENT_TASK_PREFIXES = ("Register neurons for ",)
+
+
 def read_overview_background(path, *, ctx=None):
     """Overview background stored with saved assignments
     (background-only SessionData), or None. Call from a background worker."""
@@ -772,14 +780,30 @@ class Data(Tracking):
         tasks = self.state.tasks
 
         # This explicit processing run owns count updates and its final fit.
-        # Avoid overlapping an existing loading/count/registration operation.
+        # Do not overlap an existing loading/count/registration operation:
+        # queue it behind (the plan is rebuilt when it runs).
         if tasks.processing_busy():
-            self.state.issue(
-                "warning",
-                "Model update not started",
-                "Finish or cancel existing tasks first.",
+            name = DEFERRED_MODEL_TASK
+            if any(
+                task.after_processing and task.name == name
+                for task in tasks.tasks.values()
+            ):
+                return None
+
+            return tasks.queue_after_processing(
+                name,
+                lambda: self.queue_process_model(
+                    session_ids=session_ids,
+                    from_session_id=from_session_id,
+                    mode=mode,
+                    session_distances=session_distances,
+                    finished=finished,
+                ),
+                ready=lambda: (
+                    not self._model_fit_requested
+                    and self.state.current_request is None
+                ),
             )
-            return
 
         try:
             plan = self.plan_model_update(
@@ -1365,6 +1389,29 @@ class Data(Tracking):
         # Accepted explicitly by the user.
         background.status["aligned"] = True
         self.notify_change(C.OVERVIEW_BACKGROUND)
+
+    def model_work_pending(self):
+        """A model update (counts, fit) is running, queued or deferred."""
+        if self._model_fit_requested:
+            return True
+
+        return any(
+            not task.background
+            and (task.group == "model update" or task.name == DEFERRED_MODEL_TASK)
+            for task in self.state.tasks.tasks.values()
+        )
+
+    def assignment_work_pending(self):
+        """Neuron registration is running, queued or deferred."""
+        return any(
+            not task.background
+            and (
+                task.name == DEFERRED_ASSIGNMENT_TASK
+                or task.name in ASSIGNMENT_TASK_NAMES
+                or task.name.startswith(ASSIGNMENT_TASK_PREFIXES)
+            )
+            for task in self.state.tasks.tasks.values()
+        )
 
     def set_border_tolerance(self, value):
         """Number of sessions a pixel may lie outside of and still count as
@@ -2935,7 +2982,7 @@ class Data(Tracking):
             )
 
             return tasks.queue_after_processing(
-                "Process neuron registrations (after current processing)",
+                DEFERRED_ASSIGNMENT_TASK,
                 lambda: self.queue_process_assignments(
                     session_ids=session_ids,
                     from_session_id=from_session_id,

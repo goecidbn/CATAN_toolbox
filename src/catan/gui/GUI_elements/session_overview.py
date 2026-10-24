@@ -71,6 +71,7 @@ from .fragments.manual_alignment_dialog import (
     select_alignment_draft,
 )
 from .fragments.file_inspection import FileInspection
+from catan.gui.GUI_elements.utils.elided_label import ElidedLabel
 from catan.gui.GUI_elements.utils.paths import display_path
 
 
@@ -977,17 +978,22 @@ class LoadSessionRowWidget(QFrame):
         status_layout.setContentsMargins(0, 0, 0, 0)
         status_layout.setSpacing(3)
 
-        self.loading_status_title = QLabel()
-        self.loading_status_title.setTextFormat(Qt.TextFormat.PlainText)
-        self.loading_status_title.setWordWrap(True)
+        # Fixed height: one title line and the (always visible, disabled when
+        # idle) buttons; messages go to the main menu's status area
+        # (state.load_status_message → ResourceMonitor).
+        self.loading_status_title = ElidedLabel(lines=1)
         status_layout.addWidget(self.loading_status_title)
 
         self.loading_inspection = FileInspection(self.loading_status)
         self.loading_inspection.message_formatter = self._format_loading_message
+        self.loading_inspection.label.hide()
+        self.loading_inspection.text_changed.connect(
+            self.state.load_status_message.emit
+        )
         status_layout.addWidget(self.loading_inspection)
 
         self.loading_status_title.setText(self._idle_loading_text())
-        self.loading_inspection.hide()
+        self._clear_loading_message()
         self.loading_status.show()
         root_layout.addWidget(self.loading_status)
 
@@ -2132,7 +2138,7 @@ class LoadSessionRowWidget(QFrame):
         self._loading_status_task_ids.add(task_id)
 
         self.loading_status_title.setText(task.name)
-        self.loading_inspection.label.setText("Loading…")
+        self.loading_inspection.set_text("Loading…")
         self.loading_inspection.retry_button.setEnabled(False)
         self.loading_inspection.details_button.setEnabled(False)
         self.loading_inspection.cancel_button.setEnabled(True)
@@ -2157,7 +2163,7 @@ class LoadSessionRowWidget(QFrame):
 
         if batch is None:
             self.loading_status_title.setText(self._idle_loading_text())
-            self.loading_inspection.hide()
+            self._clear_loading_message()
             return
 
         pending = any(task.batch is batch for task in self.state.tasks.tasks.values())
@@ -2169,7 +2175,7 @@ class LoadSessionRowWidget(QFrame):
 
         if batch.cancelled:
             self.loading_status_title.setText("Loading stopped")
-            self.loading_inspection.label.setText(
+            self.loading_inspection.set_text(
                 "Previously completed sessions are retained. "
                 "Select unfinished sessions again to continue."
             )
@@ -2177,14 +2183,13 @@ class LoadSessionRowWidget(QFrame):
             self.loading_status_title.setText("Loading and registration")
         elif self._loading_had_error:
             self.loading_status_title.setText("Loading finished with an error")
-            self.loading_inspection.label.setText(
+            self.loading_inspection.set_text(
                 "Review the reported issue. After correcting the source or "
                 "configuration, use the session's open-folder button to retry."
             )
         else:
             self.loading_status_title.setText(self._idle_loading_text())
-            self.loading_inspection.label.clear()
-            self.loading_inspection.hide()
+            self._clear_loading_message()
 
         if not pending:
             self._loading_lifetime["batch"] = None
@@ -2194,7 +2199,17 @@ class LoadSessionRowWidget(QFrame):
                 self.loading_inspection.cancel_button,
                 self.loading_inspection.details_button,
             ):
-                button.hide()
+                button.setEnabled(False)
+
+    def _clear_loading_message(self):
+        """Idle: no message, buttons disabled (kept visible: no layout change)."""
+        self.loading_inspection.set_text("")
+        for button in (
+            self.loading_inspection.retry_button,
+            self.loading_inspection.cancel_button,
+            self.loading_inspection.details_button,
+        ):
+            button.setEnabled(False)
 
     def _format_loading_message(self, message):
         root = self.data.root

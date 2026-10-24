@@ -37,6 +37,9 @@ class FileInspection(QWidget):
     failed = Signal()
     cancelled = Signal()
     busy_changed = Signal(bool)
+    # Every change of the message text (also when the label is not shown,
+    # e.g. the session list forwards it to the main menu's status area).
+    text_changed = Signal(str)
 
     # Serialize metadata requests so creating several session rows
     # does not start a separate reader for every row at once.
@@ -116,8 +119,12 @@ class FileInspection(QWidget):
             else full_message
         )
 
-        self.label.setText(displayed)
-        self.label.setToolTip(full_message if displayed != full_message else "")
+        self.set_text(displayed, tooltip=full_message if displayed != full_message else "")
+
+    def set_text(self, text, *, tooltip=""):
+        self.label.setText(text)
+        self.label.setToolTip(tooltip)
+        self.text_changed.emit(text)
 
     def _set_busy(self, busy):
         self.cancel_button.setEnabled(busy)
@@ -135,7 +142,7 @@ class FileInspection(QWidget):
 
         self._details = ""
         self.details_button.setEnabled(False)
-        self.label.clear()
+        self.set_text("")
         self._set_busy(False)
 
     def start(self, operation, path, **parameters):
@@ -145,7 +152,7 @@ class FileInspection(QWidget):
         self._last_request = request
         self._pending = (self._generation, request)
 
-        self.label.setText("Waiting to inspect source…")
+        self.set_text("Waiting to inspect source…")
         self._set_busy(True)
         self._launch_pending()
 
@@ -163,7 +170,7 @@ class FileInspection(QWidget):
         self._last_request = request
         self._set_busy(False)
 
-        self.label.setText("Inspection cancelled. Retry when ready.")
+        self.set_text("Inspection cancelled. Retry when ready.")
         self.cancelled.emit()
 
     def _launch_pending(self):
@@ -234,17 +241,17 @@ class FileInspection(QWidget):
                     "recovery": recovery,
                 }
 
-                self.label.setText(
+                self.set_text(
                     f"{summary}\n{recovery}\n" "See Details for the underlying error."
                 )
                 self.failed.emit()
 
             elif worker.is_cancelled():
-                self.label.setText("Inspection cancelled. Retry when ready.")
+                self.set_text("Inspection cancelled. Retry when ready.")
                 self.cancelled.emit()
 
             else:
-                self.label.setText("Source inspected.")
+                self.set_text("Source inspected.")
                 self.result.emit(result)
 
         self._launch_pending()

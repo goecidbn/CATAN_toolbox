@@ -57,6 +57,8 @@ class AppState(QObject):
     alignment_failed = Signal(object, str, object)
     alignment_review_changed = Signal()
     alignment_review_finished = Signal(object)
+    # Message of the session list's loading block (main menu status area).
+    load_status_message = Signal(str)
 
     _issue_requested = Signal(str, str, str, object)
 

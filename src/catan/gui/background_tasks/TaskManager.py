@@ -640,6 +640,14 @@ class TaskManager(QObject):
         self._finishing_depth += 1
         try:
             self._pending_processing = None
+
+            # Batches first: their callbacks must not schedule follow-up work
+            # (e.g. further session registrations).
+            batches = {task.batch for task in self.tasks.values() if task.batch is not None}
+            batches |= {batch for _, batch, _ in self._processing_holds.values()}
+            for batch in batches:
+                self.cancel_batch(batch)
+
             for group in self.GROUPS:
                 self.cancel_group(group)
         finally:

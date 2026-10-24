@@ -10,8 +10,10 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QAbstractItemView,
     QSizePolicy,
+    QMessageBox,
 )
 from .toggle_option import ToggleOption
+from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 
 
 class TaskItemWidget(QWidget):
@@ -329,8 +331,18 @@ class TaskOverviewDisplay(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
+        # Always shown (fixed layout), enabled while tasks exist.
+        self.cancel_all_button = QToolButton(self)
+        self.cancel_all_button.setText("Cancel all")
+        self.cancel_all_button.setToolTip(
+            "Cancel all running and queued tasks (including queued session "
+            "registrations)."
+        )
+        self.cancel_all_button.clicked.connect(self._cancel_all)
+
         layout.addWidget(QLabel("Tasks"))
         layout.addWidget(self.summary_label, 1)
+        layout.addWidget(self.cancel_all_button)
         layout.addWidget(self.toggle_button)
 
         task_manager.queue_changed.connect(self.refresh_summary)
@@ -341,6 +353,27 @@ class TaskOverviewDisplay(QWidget):
         task_manager.scheduling_settled.connect(self.refresh_summary)
 
         self.refresh_summary()
+
+    def _cancel_all(self):
+        count = len(self.task_manager.tasks)
+        if not count:
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Cancel all tasks")
+        box.setText(f"Cancel all {count} running and queued tasks?")
+        box.setInformativeText(
+            "Running tasks stop at their next safe point; completed work "
+            "(e.g. already registered sessions) is kept."
+        )
+        cancel_all = box.addButton("Cancel all", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Keep running", QMessageBox.ButtonRole.RejectRole)
+        fit_message_box_buttons(box)
+        box.exec()
+
+        if box.clickedButton() is cancel_all:
+            self.task_manager.cancel_all()
 
     def _on_popup_toggled(self, expanded):
         if expanded:
@@ -373,3 +406,4 @@ class TaskOverviewDisplay(QWidget):
             parts.append("Waiting for display calculation")
 
         self.summary_label.setText(" · ".join(parts) or "Idle")
+        self.cancel_all_button.setEnabled(bool(self.task_manager.tasks))

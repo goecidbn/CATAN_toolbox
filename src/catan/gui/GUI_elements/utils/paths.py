@@ -39,3 +39,12 @@ def display_path(path, *, root=None):
         return text
 
     return relative.as_posix() if relative.parts else "."
+
+
+def shorten_paths(text):
+    """``text`` with absolute paths inside the root folder made relative."""
+    if not text or _display_root is None:
+        return text
+
+    root = str(_display_root).rstrip(os.sep) + os.sep
+    return text.replace(root, "")
