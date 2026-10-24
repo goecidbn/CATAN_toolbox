@@ -1311,7 +1311,9 @@ class Display(BasePlot.BaseCanvas):
 
         return similarity, d_shift, p_same
 
-    def add_set_info_str(self, menu, union_footprint, neuron_id, cmap=MATCH_QUALITY_CMAP):
+    def add_set_info_str(
+        self, menu, union_footprint, neuron_id, cmap=MATCH_QUALITY_CMAP
+    ):
         """add_info_str() for a set of footprints vs. a neuron's union."""
         similarity, shift, p_same = self.footprint_set_statistics(
             union_footprint, neuron_id
@@ -1499,7 +1501,7 @@ class Display(BasePlot.BaseCanvas):
         submenu.addSeparator()
 
         self.register_actions["toggle_included_neuron"] = QAction(
-            f"... as {"excluded" if self.data.is_included(neuron_id) else "included"}",
+            f"... as {'excluded' if self.data.is_included(neuron_id) else 'included'}",
             submenu,
         )
         submenu.addAction(self.register_actions["toggle_included_neuron"])
@@ -1537,7 +1539,7 @@ class Display(BasePlot.BaseCanvas):
 
         fp_id = self.display_footprint_id(component)
         self.register_actions["toggle_included"] = QAction(
-            f"... as {"excluded" if self.data.is_included(component) else "included"}",
+            f"... as {'excluded' if self.data.is_included(component) else 'included'}",
             submenu,
         )
         submenu.addAction(self.register_actions["toggle_included"])
@@ -1578,8 +1580,10 @@ class Display(BasePlot.BaseCanvas):
 
         self.request_display.set_request(request)
 
-        if request is not None and request.type == "neuron_merge" and (
-            request.highlight_mode == "footprints"
+        if (
+            request is not None
+            and request.type == "neuron_merge"
+            and (request.highlight_mode == "footprints")
         ):
             # Moved footprints as sources, the destination's as targets.
             roles = {c: "source" for c in request.origin}
@@ -1703,7 +1707,9 @@ class Display(BasePlot.BaseCanvas):
             ]
 
         role = self.state.highlight_roles.get(component)
-        described = f"highlighted {role} footprints" if role else "highlighted footprints"
+        described = (
+            f"highlighted {role} footprints" if role else "highlighted footprints"
+        )
         role_icon = self._role_icon(role)
 
         if highlighted:
@@ -1777,13 +1783,17 @@ class Display(BasePlot.BaseCanvas):
 
         submenu.addSeparator()
 
-        for neighbour, distance in sorted(zip(neighbours, distances), key=lambda x: x[1]):
+        for neighbour, distance in sorted(
+            zip(neighbours, distances), key=lambda x: x[1]
+        ):
             neighbour = int(neighbour)
 
             if not union.included[neighbour]:
                 continue
 
-            n_footprints = int(np.count_nonzero(self.display_assignments.ids[neighbour] >= 0))
+            n_footprints = int(
+                np.count_nonzero(self.display_assignments.ids[neighbour] >= 0)
+            )
             label = f"... to neuron {neighbour} ({n_footprints} footprints)"
             if neighbour == target_id:
                 label += " — selected"
@@ -2594,7 +2604,8 @@ class RequestDisplay(QFrame):
             sessions = ", ".join(str(c.session_id) for c in request.origin)
             self.origin_label.setText(
                 f"Move {len(request.origin)} footprints of neuron "
-                f"{request.source_id}" + (f" (sessions {sessions})" if sessions else "")
+                f"{request.source_id}"
+                + (f" (sessions {sessions})" if sessions else "")
                 + "\nClick its footprints to add or remove them."
             )
             self.destination_label.setText(
