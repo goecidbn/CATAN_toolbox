@@ -44,6 +44,8 @@ from catan.core.changes import (
 )
 from catan.core.structures import NeuronComponent, sessiondata_type
 from catan.core.redetection import infer_aligned_footprint
+from catan.core.structures.remap import Remapping
+from scipy.ndimage import map_coordinates
 from catan.gui.panels import BasePlot
 from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
@@ -486,6 +488,8 @@ class Display(BasePlot.BaseCanvas):
         else:
             self.clear_visuals()
 
+        self.plotting["alignment_preview"] = self.alignment_preview()
+
         assignments = self.display_assignments
         focused = self.display_focused_component
         selected = self.display_selected_components
@@ -609,7 +613,7 @@ class Display(BasePlot.BaseCanvas):
                 if rec is None:
                     continue
 
-                verts = self.plotting["data"][neuron].mesh_vertices[
+                verts = self.neuron_vertices(neuron)[
                     rec.vertex_start : rec.vertex_stop
                 ]
                 faces = (
@@ -624,7 +628,7 @@ class Display(BasePlot.BaseCanvas):
 
             else:
                 ## ... or select all, to display for all sessions
-                verts = self.plotting["data"][neuron].mesh_vertices
+                verts = self.neuron_vertices(neuron)
                 faces = self.plotting["data"][neuron].mesh_faces
                 cols = self.plotting["data"][neuron].mesh_colors_default
 
@@ -665,6 +669,96 @@ class Display(BasePlot.BaseCanvas):
 
         self.state.timeit("Plotted neurons")
         self.reset_camera(full=not self.camera_set)
+
+    def alignment_preview(self):
+        """(session ID, key, move) for the session being aligned, while an
+        alignment editor is open; None otherwise. ``move`` maps displayed
+        (applied alignment) x/y points to their draft-alignment position,
+        flow included; ``key`` identifies the preview. Display only."""
+        draft = self.state.alignment_draft
+
+        if (
+            draft is None
+            or getattr(draft, "external", False)
+            or not getattr(self.state, "alignment_editors", None)
+        ):
+            return None
+
+        session_id = draft.session_id
+
+        if not (
+            0 <= session_id < len(self.data.sessions)
+            and self.data.sessions[session_id] is draft.session
+            and np.isfinite(draft.values).all()
+        ):
+            return None
+
+        dx, dy, angle = draft.values
+        target = Remapping._rigid_matrix(draft.dims, (dy, dx), angle)
+        target_flow = draft.effective_flow
+
+        # Displayed footprints carry the applied alignment
+        # (Remapping.apply_remap: unchanged if unsuccessful).
+        applied = draft.session.remap
+        if applied is not None and applied.success:
+            current = np.asarray(applied.matrix, dtype=float)
+            current_flow = applied.flow
+        else:
+            current, current_flow = np.eye(3), None
+
+        if target_flow is current_flow and np.allclose(
+            target, current, rtol=0, atol=1e-6
+        ):
+            return None
+
+        key = (
+            session_id,
+            tuple(map(float, draft.values)),
+            id(target_flow),
+            id(applied),
+        )
+
+        def move(points):
+            return _move_points(points, current, current_flow, target, target_flow)
+
+        return session_id, key, move
+
+    def preview_points(self, key, points):
+        """Points of a footprint record, moved by the alignment preview.
+        Inferred footprints come from other sessions and stay."""
+        preview = self.plotting.get("alignment_preview")
+        record = self.plotting["data"].get(key)
+
+        if (
+            preview is None
+            or key[1] != preview[0]
+            or record is None
+            or record.inferred
+        ):
+            return points
+
+        points = np.array(points, dtype=np.float32, copy=True)
+        points[:, :2] = preview[2](points[:, :2])
+        return points
+
+    def neuron_vertices(self, neuron):
+        """Mesh vertices of a neuron, with the alignment preview applied."""
+        vertices = self.plotting["data"][neuron].mesh_vertices
+        preview = self.plotting.get("alignment_preview")
+
+        if preview is None:
+            return vertices
+
+        key = (neuron, preview[0])
+        record = self.plotting["data"].get(key)
+
+        if record is None or record.inferred:
+            return vertices
+
+        vertices = vertices.copy()
+        part = slice(record.vertex_start, record.vertex_stop)
+        vertices[part] = self.preview_points(key, vertices[part])
+        return vertices
 
     def reset_camera(self, full=False):
 
@@ -947,7 +1041,10 @@ class Display(BasePlot.BaseCanvas):
         if not keys:
             return None
         centers = np.asarray(
-            [self.plotting["data"][key].center_xyz for key in keys],
+            [
+                self.preview_points(key, self.plotting["data"][key].center_xyz[None])[0]
+                for key in keys
+            ],
             dtype=np.float32,
         )
 
@@ -971,7 +1068,8 @@ class Display(BasePlot.BaseCanvas):
             rec = self.plotting["data"][key]
 
             screen = click_events.visual_to_canvas(
-                self.plotting["visuals"][keys[int(i)][0]], rec.pick_points
+                self.plotting["visuals"][keys[int(i)][0]],
+                self.preview_points(key, rec.pick_points),
             )
 
             ddx = screen[:, 0] - mouse_pos[0]
@@ -1006,7 +1104,9 @@ class Display(BasePlot.BaseCanvas):
     def plot_data_from_rec(self, rec, style: str) -> dict[str, np.ndarray]:
 
         neuron_rec = self.plotting["data"][rec.neuron]
-        verts = neuron_rec.mesh_vertices[rec.vertex_start : rec.vertex_stop]
+        verts = self.preview_points(
+            rec.key, neuron_rec.mesh_vertices[rec.vertex_start : rec.vertex_stop]
+        )
         faces = neuron_rec.mesh_faces[rec.face_start : rec.face_stop] - rec.vertex_start
         cols = self.styles.get_color_array(style, verts[:, 2], alpha=0.6)
 
@@ -2072,6 +2172,11 @@ class Controller(BasePlot.CanvasController):
         )
 
         self.connect_signal(
+            self.state.alignment_draft_changed,
+            self._schedule_alignment_preview,
+        )
+
+        self.connect_signal(
             self.state.request_status_changed,
             self._on_request_status_changed,
             controls=True,
@@ -2250,6 +2355,28 @@ class Controller(BasePlot.CanvasController):
     def replot_neurons(self):
         self.canvas.plot_neurons(reset=True)
         self.update_styles()
+
+    def _schedule_alignment_preview(self):
+        # Coalesce the draft changes of one interaction (dragging, spin boxes).
+        if not getattr(self, "_alignment_preview_pending", False):
+            self._alignment_preview_pending = True
+            QTimer.singleShot(0, self._update_alignment_preview)
+
+    def _update_alignment_preview(self):
+        self._alignment_preview_pending = False
+
+        if self._deactivated:
+            return
+
+        preview = self.canvas.alignment_preview()
+        shown = self.canvas.plotting.get("alignment_preview")
+
+        unchanged = (None if preview is None else preview[1]) == (
+            None if shown is None else shown[1]
+        )
+
+        if not unchanged:
+            self.update_neuron_selection()
 
     def _on_request_status_changed(self):
         self.canvas.sync_request_display()
@@ -2878,6 +3005,44 @@ def add_surface_to_mesh(vertices_all, faces_all, colors_all, X, Y, Z, rgba):
 
 
 from scipy import sparse
+
+
+def _sample_flow(flow, points):
+    """Bilinear flow (dx, dy) at x/y points; nearest edge value outside."""
+    coordinates = [points[:, 1], points[:, 0]]
+    return np.column_stack(
+        [
+            map_coordinates(flow[..., channel], coordinates, order=1, mode="nearest")
+            for channel in (0, 1)
+        ]
+    )
+
+
+def _move_points(points, current, current_flow, target, target_flow, iterations=3):
+    """Aligned x/y points under one alignment -> under another.
+
+    An alignment samples the original image at inv(matrix) @ (p + flow(p))
+    for output point p. Back to the original image directly; forward by
+    fixed-point iteration p = matrix @ r - flow(p) (flows are smooth and
+    small, so a few steps suffice).
+    """
+    points = np.asarray(points, dtype=np.float64)
+
+    if current_flow is not None:
+        points = points + _sample_flow(current_flow, points)
+
+    inverse = np.linalg.inv(current)
+    original = points @ inverse[:2, :2].T + inverse[:2, 2]
+    rigid = original @ target[:2, :2].T + target[:2, 2]
+
+    if target_flow is None:
+        return rigid
+
+    moved = rigid
+    for _ in range(iterations):
+        moved = rigid - _sample_flow(target_flow, moved)
+
+    return moved
 
 
 def footprint_to_mesh(

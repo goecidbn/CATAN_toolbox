@@ -58,6 +58,44 @@ class AlignmentReport:
     method: str = "automatic"
 
 
+def summarize_rejections(candidates) -> str:
+    """One line per kind of rejection of the flow references, with the
+    number of references and the range of the measured values (instead
+    of one full reason per reference)."""
+    groups = {}
+    for record in candidates.values():
+        reason = record.get("reason") or "Candidate rejected."
+        # The first sentence names the kind; the rest are its numbers.
+        kind = reason.split(". ")[0].rstrip(".")
+        groups.setdefault(kind, []).append(record)
+
+    def value_range(records, key):
+        values = [float(r[key]) for r in records if r.get(key) is not None]
+        if not values:
+            return None
+        low, high = min(values), max(values)
+        return f"{low:.1f} px" if np.isclose(low, high) else f"{low:.1f}–{high:.1f} px"
+
+    lines = [f"No reference accepted ({len(candidates)} tried)."]
+    for kind, records in sorted(groups.items(), key=lambda item: -len(item[1])):
+        details = []
+        p95 = value_range(records, "p95_displacement")
+        if p95:
+            limit = records[0].get("p95_displacement_limit")
+            details.append(
+                f"95th percentile {p95}" + (f" (limit {limit:.0f} px)" if limit else "")
+            )
+        maximum = value_range(records, "max_displacement")
+        if maximum:
+            limit = records[0].get("hard_displacement_limit")
+            details.append(
+                f"maximum {maximum}" + (f" (hard limit {limit:.0f} px)" if limit else "")
+            )
+        count = f"{len(records)} reference" + ("s" if len(records) != 1 else "")
+        lines.append(f"• {kind}: {count}" + ("; " + "; ".join(details) if details else "") + ".")
+    return "\n".join(lines)
+
+
 @dataclass
 class Remapping:
 
@@ -118,11 +156,16 @@ class Remapping:
         rotation_step: float = 1.0,
         rotation_refine_step: float = 0.1,
         require_confirmation: bool = True,
+        allowed_offsets=(),
     ):
         """``require_confirmation``: a flow-only alignment departing from the
         default (see estimate_flow) is proposed unsuccessful, with the
         description in ``confirmation``, for the user to confirm. Otherwise
-        it is accepted and the description kept in flow_info["deviation"]."""
+        it is accepted and the description kept in flow_info["deviation"].
+
+        ``allowed_offsets``: further translations (dx, dy) in the common
+        frame around which shifts up to ``max_shift`` are accepted (e.g. the
+        imaging window jumped and stayed there); the origin always is."""
 
         # Transform from THIS SESSION'S original template
         # into CATAN's common/global coordinate system.
@@ -141,6 +184,10 @@ class Remapping:
         self.remap_data: dict[str, dict[str, Any]] = {}
 
         self.max_shift = float(max_shift)
+        self.allowed_offsets = np.vstack(
+            [np.zeros((1, 2))]
+            + [np.asarray(offset, dtype=float).reshape(1, 2) for offset in allowed_offsets]
+        )
         self.max_rotation = float(max_rotation)
         self.c_min = float(min_corr)
         self.min_zcorr = float(min_zcorr)
@@ -157,6 +204,20 @@ class Remapping:
 
         if evaluate and template is not None and references:
             self.evaluate(template, references, use_optical_flow=use_optical_flow)
+
+    def _allowed_offsets(self):
+        """Origin plus allowed offsets; older remaps have none."""
+        offsets = getattr(self, "allowed_offsets", None)
+        if offsets is None or np.size(offsets) == 0:
+            return np.zeros((1, 2))
+        return np.asarray(offsets, dtype=float).reshape(-1, 2)
+
+    def offset_distance(self, translation):
+        """Distance (px) of a translation (dx, dy) to the nearest allowed
+        position (origin or allowed offsets)."""
+        offsets = self._allowed_offsets()
+        translation = np.asarray(translation, dtype=float).reshape(1, 2)
+        return float(np.min(np.linalg.norm(offsets - translation, axis=1)))
 
     def register_data(self, **data):
         self.shift = data.get("shift")
@@ -262,6 +323,13 @@ class Remapping:
             global_matrix = reference_matrix @ result["matrix"]
 
             result["global_matrix"] = global_matrix
+
+            # Global translation (dx, dy) near the origin or an allowed offset.
+            global_shift, _ = self._rigid_parameters(self.dims, global_matrix)
+            if self.offset_distance(global_shift[::-1]) > self.max_shift:
+                result["success"] = False
+                result["reason"] = "shift_too_large"
+                continue
 
             global_candidates.append(global_matrix)
 
@@ -439,7 +507,11 @@ class Remapping:
         reason = None
         if not np.all(np.isfinite(shift)):
             reason = "shift_invalid"
-        elif total_shift > self.max_shift:
+        elif total_shift > self.max_shift + float(
+            np.max(np.linalg.norm(self._allowed_offsets(), axis=1))
+        ):
+            # Checked against the allowed positions in the common frame
+            # once the reference's transform is known (evaluate()).
             reason = "shift_too_large"
         elif abs(angle) > self.max_rotation:
             reason = "rotation_too_large"
@@ -581,12 +653,12 @@ class Remapping:
 
         if info.get("mode") == "flow_only":
             return (
-                "Flow-only alignment failed; this session is not aligned. "
+                "Flow-only alignment failed; this session is not aligned.\n"
                 + info.get("reason", "")
             )
 
         if status == "skipped":
-            return "Rigid alignment retained; flow correction skipped. " + info.get(
+            return "Rigid alignment retained; flow correction skipped.\n" + info.get(
                 "reason", ""
             )
 
@@ -620,23 +692,12 @@ class Remapping:
     ):
 
         ## compare correlation between template and reference to check for possible transposition
+        opts = {"shift": True, "mode": "cosine_weighted", "outside_weight": 0.5, "reference_threshold": 0.1}
         c_max, z_scored, shift = calculate_img_correlation(
-            reference,
-            template,
-            shift=True,
-            mode="cosine_weighted",
-            outside_weight=0.5,
-            reference_threshold=0.1,
-            # reference, template, mode="correlation"
+            reference,template,**opts
         )
         c_max_T, z_scored_T, shift_T = calculate_img_correlation(
-            reference,
-            template.T,
-            shift=True,
-            mode="cosine_weighted",
-            outside_weight=0.5,
-            reference_threshold=0.1,
-            # reference, template.T, mode="correlation"
+            reference,template.T,**opts
         )
 
         print(
@@ -853,7 +914,7 @@ class Remapping:
         return records
 
     @staticmethod
-    def _translation_prior(reference, reference_valid, template, limit):
+    def _translation_prior(reference, reference_valid, template, limit, offsets=None):
         """(translation matrix in the common frame, peak z-score) maximizing
         the cosine similarity of the high-passed ``template`` with the
         high-passed aligned ``reference``, within ``limit`` px. Without
@@ -873,9 +934,11 @@ class Remapping:
         )
         xs = np.arange(scores.shape[1]) - (moving.shape[1] - 1)
         ys = np.arange(scores.shape[0]) - (moving.shape[0] - 1)
-        allowed = np.isfinite(scores) & (
-            xs[None, :] ** 2 + ys[:, None] ** 2 <= float(limit) ** 2
-        )
+        offsets = np.zeros((1, 2)) if offsets is None else np.asarray(offsets, dtype=float)
+        near = np.zeros(scores.shape, dtype=bool)
+        for ox, oy in offsets:
+            near |= (xs[None, :] - ox) ** 2 + (ys[:, None] - oy) ** 2 <= float(limit) ** 2
+        allowed = np.isfinite(scores) & near
         if not allowed.any():
             raise ValueError("No translation could be estimated.")
 
@@ -986,8 +1049,13 @@ class Remapping:
         max_displacement=30.0,
         hard_max_displacement=50.0,
         residual=True,
+        zero_mean=False,
     ):
         """Select one flow against already aligned references.
+
+        ``zero_mean``: remove the mean displacement of the flow inside the
+        interior overlap, so that it keeps the given rigid geometry (manual
+        refinement of a chosen shift).
 
         References are supplied in session order; the most recent one is
         preferred. Only if it fails or agrees poorly (correlation below
@@ -1092,20 +1160,38 @@ class Remapping:
 
             record["flow_smoothing_sigma"] = smoothing_sigma
 
-            if residual:
-                flow = flow * taper[..., None]
+            if zero_mean:
+                interior = joint & (distance >= 8.0)
+                if np.any(interior):
+                    mean = flow[interior].mean(axis=0)
+                    flow = flow - mean
+                    record["removed_mean_flow"] = tuple(map(float, mean))
 
             if residual:
-                magnitude = np.linalg.norm(flow, axis=-1)
-            else:
-                # Total displacement: starting translation + flow.
-                _, _, source_x, source_y = self._flow_source_coordinates(flow)
-                magnitude = np.hypot(xx - source_x, yy - source_y)
+                flow = flow * taper[..., None]
 
             # Measure typical displacement inside valid overlap,
             # beyond the 8 px boundary taper. Use a fixed mask so
             # large displacements cannot exclude themselves.
             displacement_mask = joint & (distance >= 8.0)
+
+            if residual:
+                magnitude = np.linalg.norm(flow, axis=-1)
+            else:
+                # Total displacement: starting translation + flow, relative
+                # to the nearest allowed position (origin or offset).
+                _, _, source_x, source_y = self._flow_source_coordinates(flow)
+                shift_x, shift_y = xx - source_x, yy - source_y
+                offsets = self._allowed_offsets()
+                medians = [
+                    np.median(np.hypot(shift_x - ox, shift_y - oy)[displacement_mask])
+                    if np.any(displacement_mask)
+                    else np.inf
+                    for ox, oy in offsets
+                ]
+                ox, oy = offsets[int(np.argmin(medians))]
+                magnitude = np.hypot(shift_x - ox, shift_y - oy)
+                record["allowed_offset"] = (float(ox), float(oy))
 
             if np.count_nonzero(displacement_mask) < 16:
                 raise ValueError(
@@ -1305,7 +1391,11 @@ class Remapping:
                 # better agreement wins.
                 try:
                     prior, record["prior_zscore"] = self._translation_prior(
-                        reference, reference_valid, template, hard_max_displacement
+                        reference,
+                        reference_valid,
+                        template,
+                        hard_max_displacement,
+                        offsets=self._allowed_offsets(),
                     )
                     if np.abs(prior[:2, 2] - base_matrix[:2, 2]).max() > 1.0:
                         starts.append(("translation", prior))
@@ -1367,13 +1457,9 @@ class Remapping:
             )
         elif self.flow_info["candidates"]:
             self.matrix = base_matrix
-            reasons = sorted(
-                {
-                    item.get("reason", "Candidate rejected.")
-                    for item in self.flow_info["candidates"].values()
-                }
+            self.flow_info["reason"] = summarize_rejections(
+                self.flow_info["candidates"]
             )
-            self.flow_info["reason"] = " ".join(reasons)
 
     @property
     def report(self) -> AlignmentReport:

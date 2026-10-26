@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QSize, Qt, QEvent, QTimer, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
     QScrollArea,
@@ -14,11 +15,26 @@ from PySide6.QtWidgets import (
 from catan.gui.resources.get_icon import get_fa_icon
 
 
+def native_wayland():
+    return QGuiApplication.platformName().startswith("wayland")
+
+
 class OptionsPopup(QFrame):
+    """Options shown next to their button.
+
+    Native Wayland: a tool window instead of a popup. Wayland popups hold
+    an input grab that must come from a fresh user action: opened by code
+    (e.g. after a message box) they are dismissed at once, and dialogs
+    opened from them (field browser, name prompts) get no input.
+    """
+
     hidden = Signal()
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.WindowType.Popup)
+        super().__init__(
+            parent,
+            Qt.WindowType.Tool if native_wayland() else Qt.WindowType.Popup,
+        )
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay, True)
 
@@ -89,6 +105,8 @@ class ToggleOption(QToolButton):
         if popup:
             self._popup = OptionsPopup(self)
             self._popup.hidden.connect(self._popup_hidden)
+            # Shown as the title of the tool window on Wayland.
+            self._popup.setWindowTitle(tooltip or text or "Options")
 
             popup_layout = QVBoxLayout(self._popup)
             popup_layout.setContentsMargins(4, 4, 4, 4)

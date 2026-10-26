@@ -19,6 +19,7 @@ from catan.gui.panels import BasePlot
 from catan.gui.background_tasks.runtime import (
     TaskCancelled, current_task_context, progress_step,
 )
+from catan.tracking.analytics import two_noise_model
 
 PARAMETERS = (
     ("p_same", "Same-neuron fraction", 0.000001, 0.999999, 0.01),
@@ -38,7 +39,7 @@ def tooltip(text):
 
 
 PARAMETER_LABELS = {
-    "p_same": ("p(same)", "Prior fraction of pairs belonging to the same neuron."),
+    "p_same": ("π_same", "Prior: fraction of pairs that belong to the same neuron (not the p(same) map over distance and correlation)."),
     "h": ("h", "Hard-core distance for the different-neuron distribution."),
     "sigma_eff": ("σ_D", "Detection uncertainty. Currently the model uses a single effective distance spread (sigma_eff); detection uncertainty and centroid movement are not yet separate parameters."),
     "c_same_mean": ("μ_c (same)", "Mean footprint correlation for the same neuron."),
@@ -125,6 +126,9 @@ class Display(QWidget):
         self.dimension.addItems(["2D", "3D"])
         self.height_mode = QComboBox()
         self.height_mode.addItems(["Counts", "p(same)"])
+        self.fit_button = QPushButton("Fit model")
+        self.fit_button.setToolTip(tooltip("Fit the selected model to the available evidence (background task). Models loaded from a file cannot be refitted."))
+        form.addRow(self.fit_button)
         self.gaps = QComboBox()
         self.gaps.addItem("1", 1)
         form.addRow("Session difference", self.gaps)
@@ -140,7 +144,7 @@ class Display(QWidget):
         launch = QVBoxLayout(self.launcher)
         row = QHBoxLayout()
         self.options_button = ToggleOption(options, icon_name="gear",
-            tooltip="Model options", popup=True, popup_size=(310, 200), parent=self.launcher)
+            tooltip="Model options", popup=True, popup_size=(330, 220), parent=self.launcher)
         row.addWidget(self.options_button)
         self.reset_button = ResetViewButton(self.launcher, (0, 28), self.reset_view)
         self.reset_button.setFixedWidth(44)
@@ -162,44 +166,14 @@ class Display(QWidget):
         parameter_form.setContentsMargins(0, 0, 0, 0)
         parameter_form.setVerticalSpacing(3)
         parameter_form.setHorizontalSpacing(4)
-        parameter_form.setColumnMinimumWidth(2, 22)
-        parameter_form.setColumnStretch(5, 1)
-        positions = {"p_same": (0, 0), "h": (0, 3), "sigma_eff": (1, 0),
-                     "c_same_mean": (2, 0), "c_diff_mean": (2, 3),
-                     "c_same_sd": (3, 0), "c_diff_sd": (3, 3)}
+        self.parameter_form = parameter_form
+        self.editor_host = QWidget()
+        self.editor_layout = QVBoxLayout(self.editor_host)
+        self.editor_layout.setContentsMargins(0, 0, 0, 0)
+        parameter_form.addWidget(self.editor_host, 0, 0, 4, 5)
         self.editors = {}
-        for key, label, low, high, step in PARAMETERS:
-            editor = QDoubleSpinBox()
-            editor.setDecimals(3)
-            editor.setRange(max(low, .001) if low > 0 else low,
-                            min(high, .999) if high < 1 else high)
-            editor.setSingleStep(step)
-            editor.setKeyboardTracking(False)
-            self.editors[key] = editor
-            editor.setFixedWidth(76)
-            editor.setStyleSheet("QDoubleSpinBox { padding: 2px 5px; }")
-            short, description = PARAMETER_LABELS[key]
-            short = short.replace("σ_D", "σ<sub>D</sub>").replace("μ_c", "μ<sub>c</sub>").replace("σ_c", "σ<sub>c</sub>")
-            short = short.replace(" (same)", "").replace(" (diff)", "")
-            caption = QWidget()
-            caption_layout = QHBoxLayout(caption)
-            caption_layout.setContentsMargins(0, 0, 0, 0)
-            caption_layout.setSpacing(4)
-            if key.startswith("c_"):
-                swatch = QLabel()
-                swatch.setFixedSize(9, 9)
-                swatch.setStyleSheet("background: " + ("#159447" if "same" in key else "#c52c32") + "; border: none;")
-                swatch.setToolTip(tooltip(description))
-                caption_layout.addWidget(swatch)
-            text = QLabel(short)
-            text.setToolTip(tooltip(description))
-            caption_layout.addWidget(text)
-
-            caption.setToolTip(tooltip(description))
-            editor.setToolTip(tooltip(description))
-            r, c = positions[key]
-            parameter_form.addWidget(caption, r, c, alignment=Qt.AlignmentFlag.AlignRight)
-            parameter_form.addWidget(editor, r, c+1)
+        self.editor_kind = None
+        self.build_parameter_editors("two_noise")
         self.apply = QPushButton("Apply to model")
         parameter_form.addWidget(self.apply, 4, 0, 1, 5)
         self.status = QLabel()
@@ -211,6 +185,7 @@ class Display(QWidget):
         self.grid.addWidget(self.launcher, 0, 0)
         self.cards = []
         self._built = False
+        self._same_session = False
         self._model = None
         self._counts = None
         self._split = True
@@ -223,14 +198,75 @@ class Display(QWidget):
         self._surface_visual = None
         self._surface_labels = []
 
-    def set_session_count(self, count):
+    def build_parameter_editors(self, kind):
+        """Editors of the model kind's parameters (replaces earlier ones)."""
+        if kind == self.editor_kind:
+            return
+        self.editor_kind = kind
+        old = self.editor_layout.takeAt(0)
+        if old is not None and old.widget() is not None:
+            old.widget().deleteLater()
+        box = QWidget()
+        grid = QGridLayout(box)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setVerticalSpacing(3)
+        grid.setHorizontalSpacing(4)
+        grid.setColumnMinimumWidth(2, 22)
+        grid.setColumnStretch(5, 1)
+        self.editors = {}
+        if kind == "two_noise":
+            specs = []
+            for index, (key, (short, description, low, high, _)) in enumerate(two_noise_model.PARAMETERS.items()):
+                specs.append((key, short, description, low, high, max((high - low) / 100, .001), (index // 2, 3 * (index % 2))))
+        else:
+            positions = {"p_same": (0, 0), "h": (0, 3), "sigma_eff": (1, 0),
+                         "c_same_mean": (2, 0), "c_diff_mean": (2, 3),
+                         "c_same_sd": (3, 0), "c_diff_sd": (3, 3)}
+            specs = [(key, *PARAMETER_LABELS[key], low, high, step, positions[key]) for key, _, low, high, step in PARAMETERS]
+        for key, short, description, low, high, step, (r, c) in specs:
+            editor = QDoubleSpinBox()
+            editor.setDecimals(4 if kind == "two_noise" else 3)
+            editor.setRange(max(low, .001) if 0 < low < .001 else low,
+                            min(high, .999) if high < 1 else high)
+            editor.setSingleStep(step)
+            editor.setKeyboardTracking(False)
+            self.editors[key] = editor
+            editor.setFixedWidth(76)
+            editor.setStyleSheet("QDoubleSpinBox { padding: 2px 5px; }")
+            label = short.replace("π_same", "π<sub>same</sub>").replace("σ_D", "σ<sub>D</sub>").replace("μ_c", "μ<sub>c</sub>").replace("σ_c", "σ<sub>c</sub>")
+            label = label.replace(" (same)", "").replace(" (diff)", "")
+            caption = QWidget()
+            caption_layout = QHBoxLayout(caption)
+            caption_layout.setContentsMargins(0, 0, 0, 0)
+            caption_layout.setSpacing(4)
+            if key.startswith(("c_", "u_")):
+                swatch = QLabel()
+                swatch.setFixedSize(9, 9)
+                swatch.setStyleSheet("background: " + ("#159447" if "same" in key else "#c52c32") + "; border: none;")
+                swatch.setToolTip(tooltip(description))
+                caption_layout.addWidget(swatch)
+                label = label.replace(" same", "").replace(" diff", "")
+            text = QLabel(label)
+            text.setToolTip(tooltip(description))
+            caption_layout.addWidget(text)
+            caption.setToolTip(tooltip(description))
+            editor.setToolTip(tooltip(description))
+            grid.addWidget(caption, r, c, alignment=Qt.AlignmentFlag.AlignRight)
+            grid.addWidget(editor, r, c+1)
+        self.editor_layout.addWidget(box)
+
+    def set_session_count(self, count, kind="classic"):
         previous = self.gaps.currentData()
         self.gaps.blockSignals(True)
         self.gaps.clear()
         self.gaps.addItem("0 (same session)", 0)
-        for gap in range(1, max(2, count)):
-            self.gaps.addItem(str(gap), gap)
-        self.gaps.addItem("Any (sum over all)", None)
+        if kind == "two_noise":
+            # The two-noise evidence: delta s = 0 and 1 only.
+            self.gaps.addItem("1", 1)
+        else:
+            for gap in range(1, max(2, count)):
+                self.gaps.addItem(str(gap), gap)
+            self.gaps.addItem("Any (sum over all)", None)
         index = self.gaps.findData(previous)
         self.gaps.setCurrentIndex(index if index >= 0 else self.gaps.findData(1))
         self.gaps.blockSignals(False)
@@ -364,12 +400,6 @@ class Display(QWidget):
         self._bounds_key = key
         self.joint.camera.set_bounds((.5, 1.), (d[0], d[-1]), reset=reset)
         self._update_histograms(reset)
-        available = split and bool(model.p_same.get("joint") is not None)
-        self.height_mode.model().item(1).setEnabled(available)
-        if not available:
-            self.height_mode.blockSignals(True)
-            self.height_mode.setCurrentIndex(0)
-            self.height_mode.blockSignals(False)
         self._rgba = self._evidence_rgba(counts, split)
         self.image.set_data(self._rgba)
         self.image.transform = STTransform(scale=(np.diff(c)[0], np.diff(d)[0]), translate=(c[0], d[0]))
@@ -427,6 +457,15 @@ class Display(QWidget):
         self._model = model
         if not self._built or self._counts is None:
             return
+        # A fit can arrive without new evidence (e.g. after switching the
+        # model kind): the p(same) view follows the model.
+        available = self._split and model.p_same.get("joint") is not None
+        self.height_mode.model().item(1).setEnabled(available)
+        if not available and self.height_mode.currentIndex() == 1:
+            self.height_mode.blockSignals(True)
+            self.height_mode.setCurrentIndex(0)
+            self.height_mode.blockSignals(False)
+            self._update_joint_image()
         self._update_fit_lines(model, self._fit_lines)
         reference = self._reference if self._reference is not model else None
         if reference is not None:
@@ -459,7 +498,10 @@ class Display(QWidget):
             centers = (edges[:-1]+edges[1:])/2
             components = []
             for suffix, weight in (("same", 0 if self._same_session else model.parameters["p_same"]), ("diff", 1 if self._same_session else 1-model.parameters["p_same"])):
-                density = np.asarray(pdf[axis+"_"+suffix])
+                name = axis+"_"+suffix
+                if self._same_session and name+"_same_session" in pdf:
+                    name += "_same_session"
+                density = np.asarray(pdf[name])
                 grid = np.linspace(edges[0], edges[-1], len(density))
                 cdf = cumulative_trapezoid(density, grid, initial=0)
                 if not np.isfinite(cdf[-1]) or cdf[-1] <= 0:
@@ -571,14 +613,38 @@ class Controller(BasePlot.BaseDisplayController):
 
     def build_controls(self):
         w = self.display_widget
-        for key, editor in w.editors.items():
-            editor.valueChanged.connect(lambda value, key=key: self._edited(key))
+        self._connect_editors()
+        w.fit_button.clicked.connect(self._fit)
         w.dimension.currentIndexChanged.connect(w.show_dimension)
         w.height_mode.currentIndexChanged.connect(w.update_joint)
         w.gaps.currentIndexChanged.connect(self._redraw)
         w.calculate_evidence.clicked.connect(self._calculate_evidence)
         w.revert.triggered.connect(self.initialize_display)
         w.apply.clicked.connect(self._apply)
+
+    def _connect_editors(self):
+        for key, editor in self.display_widget.editors.items():
+            editor.valueChanged.connect(lambda value, key=key: self._edited(key))
+
+    def _sync_kind(self):
+        """Editors follow the model's kind (classic only for model files
+        saved with it)."""
+        w = self.display_widget
+        model = self.data.model
+        kind = "two_noise" if model is None else model.kind
+        w.fit_button.setEnabled(model is not None and not model.loaded)
+        if w.editor_kind != kind:
+            w.build_parameter_editors(kind)
+            self._connect_editors()
+        return kind
+
+    def _fit(self, *_):
+        try:
+            self.data.queue_fit_model()
+        except Exception as exc:
+            self.display_widget.status.setText(str(exc))
+            return
+        self.display_widget.status.setText("Fitting the model in the background…")
 
     def initialize_display(self, *_):
         if self._deactivated:
@@ -590,7 +656,8 @@ class Controller(BasePlot.BaseDisplayController):
         w = self.display_widget
         w._reference = self._source
         w.apply.setEnabled(False)
-        w.set_session_count(len(self.data.sessions))
+        kind = self._sync_kind()
+        w.set_session_count(len(self.data.sessions), kind)
         self._edited_keys = set()
         for key, editor in w.editors.items():
             editor.blockSignals(True)
@@ -659,7 +726,8 @@ class Controller(BasePlot.BaseDisplayController):
             # Active sessions only (inactive ones provide no evidence).
             order = self.data.active_session_order()
             gap = self.display_widget.gaps.currentData()
-            evidence_key = (id(self.data.model), tuple(order), gap)
+            kind = self.data.model.kind
+            evidence_key = (id(self.data.model), kind, tuple(order), gap)
             if self._evidence_key == evidence_key:
                 self.display_widget.update_model(model)
                 return
@@ -674,11 +742,12 @@ class Controller(BasePlot.BaseDisplayController):
                 w.status.setText(f"{len(self._missing_evidence)} evidence records missing or stale. Open options to calculate them.")
             else:
                 w.status.setText("Preview only. Apply updates tracking probabilities." if self._candidate is not None else "Showing the current model. Edits are previews until Apply.")
-            counts = aggregate["cross"].copy()
+            same_kind, cross_kind = ("same2", "cross2") if kind == "two_noise" else ("same", "cross")
+            counts = aggregate[cross_kind].copy()
             split = gap != 0
             if gap == 0:
                 counts[:] = 0
-                counts[..., 0] = aggregate["same"]
+                counts[..., 0] = aggregate[same_kind]
             elif gap is None:
                 # Same-session records have no NN/non-NN labels. Add their totals,
                 # but do not invent classifications or compare mixed evidence to a fit.
@@ -698,16 +767,17 @@ class Controller(BasePlot.BaseDisplayController):
         model = self.data.model
         sessions = self.data.sessions
         requests = []
+        same_kind, cross_kind = ("same2", "cross2") if model.kind == "two_noise" else ("same", "cross")
         # Pairs between active sessions; the gap counts active sessions.
         active = [j for j in self.data.active_session_ids() if sessions[j].path is not None]
         for position, j in enumerate(active):
             session = sessions[j]
             if gap in (0, None):
-                requests.append(("same", str(session.path), j, j))
+                requests.append((same_kind, str(session.path), j, j))
             if gap != 0:
                 for earlier, i in enumerate(active[:position]):
                     if gap is None or position - earlier == gap:
-                        requests.append(("cross", (str(sessions[i].path), str(session.path)), i, j))
+                        requests.append((cross_kind, (str(sessions[i].path), str(session.path)), i, j))
         missing = [r for r in requests if r[1] not in model.counts[r[0]] or r[1] in model.stale_counts[r[0]]]
         return missing, len(requests)
 
@@ -749,14 +819,24 @@ class Controller(BasePlot.BaseDisplayController):
             try:
                 results = []
                 for index, (kind, key, i, j) in enumerate(requests):
-                    label = (sessions[j].name if kind == "same"
+                    label = (sessions[j].name if kind in ("same", "same2")
                              else f"{sessions[i].name} → {sessions[j].name}")
                     with progress_step(index, len(requests),
                                        message=f"Evidence {index + 1}/{len(requests)}: {label}"):
+                        if kind == "same2":
+                            results.append((kind, key, i, j, self.data.calculate_two_noise_same_counts(
+                                sessions[j], ctx=current_task_context())))
+                            continue
                         result = self.data.calculate_model_counts(sessions[j],
-                            ref_data=sessions[i] if kind == "cross" else None, mode=kind,
+                            ref_data=sessions[i] if kind in ("cross", "cross2") else None,
+                            mode="same" if kind == "same" else "cross",
                             ctx=current_task_context())
-                    results.append((kind, key, i, j, result.counts))
+                    if kind == "cross2":
+                        # The vector evidence comes with it.
+                        for extra, counts in result.two_noise.items():
+                            results.append((extra, key, i, j, counts))
+                    else:
+                        results.append((kind, key, i, j, result.counts))
                 return results, None
             except TaskCancelled:
                 raise
@@ -790,8 +870,11 @@ class Controller(BasePlot.BaseDisplayController):
             for kind, key, i, j, counts in results:
                 if kind == "same":
                     source.set_same_counts(key, counts, source_revision=geometry[j])
-                else:
+                elif kind == "cross":
                     source.set_cross_counts(*key, counts, source_revisions=(geometry[i], geometry[j]))
+                else:
+                    source.set_record(kind, key, counts, source_revision=(
+                        geometry[j] if kind == "same2" else (geometry[i], geometry[j])))
             self._evidence_key = None
             self.data.notify_change(C.MODEL_COUNTS, C.PROCESSING_STATUS)
             self._redraw()

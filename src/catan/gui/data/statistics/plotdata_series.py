@@ -1,9 +1,9 @@
 from typing import Literal
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 
-from .dimensions import SESSION_DIMS, NEURON_DIMS
+from .dimensions import SESSION_DIMS, NEURON_DIMS, canonical_dim
 from .queries import (
     ReductionSpec,
     StatisticQuery,
@@ -19,7 +19,7 @@ ErrorMode = Literal["none", "std", "sem", "iqr"]
 @dataclass
 class SessionSeries:
     title: str
-    table: PickTable
+    table: PickTable | None
     session_dim: str
     session_ids: np.ndarray
     values: np.ndarray
@@ -384,3 +384,359 @@ def session_series_correlation(a: SessionSeries, b: SessionSeries):
 
     r = float(np.corrcoef(a_values[mask], b_values[mask])[0, 1])
     return r, n
+
+
+# ============================================================
+# Selection subsets
+# ============================================================
+
+
+def make_selection_query(engine_query: StatisticQuery | None) -> StatisticQuery | None:
+    """
+    The session-series engine query with its neuron reductions undone, so
+    that the rows of selected neurons can be reduced separately
+    (selected_rows, pair_selection_queries). Other dimensions are reduced as before.
+    """
+    if engine_query is None:
+        return None
+
+    reductions = engine_query.reduction_dict()
+    neuron_order = tuple(d for d in engine_query.reduction_order if d in NEURON_DIMS)
+
+    if not neuron_order:
+        return None
+
+    for dim in neuron_order:
+        reductions[dim] = ReductionSpec("keep")
+
+    # The session-series context would turn kept neuron dims back into
+    # reductions (normalize_footprint_pair_reductions).
+    return replace(
+        engine_query,
+        reductions=tuple(sorted(reductions.items())),
+        reduction_order=tuple(
+            d for d in engine_query.reduction_order if d not in NEURON_DIMS
+        ),
+        context="generic",
+    )
+
+
+def neuron_reductions(
+    engine_query: StatisticQuery,
+) -> tuple[tuple[str, ReductionSpec], ...]:
+    """Neuron reductions of a session-series engine query, in order."""
+    reductions = engine_query.reduction_dict()
+
+    return tuple(
+        (dim, reductions[dim])
+        for dim in engine_query.reduction_order
+        if dim in NEURON_DIMS
+    )
+
+
+def uses_pair_selection(engine_query: StatisticQuery) -> bool:
+    """
+    Whether the series reduces over neuron pairs. Keeping both neuron
+    dimensions would cost n² values per session, so such selections are
+    evaluated per selected neuron (pair_selection_queries) instead of
+    from one kept table.
+    """
+    neuron_order = [d for d in engine_query.reduction_order if d in NEURON_DIMS]
+
+    if len(neuron_order) < 2:
+        return False
+
+    # Pairs restricted to the same neuron have one neuron per row.
+    return not any(
+        f.target == "neuron" and f.relation == "same" and f.collapse_same
+        for f in engine_query.filters
+    )
+
+
+def pair_selection_queries(selection_query: StatisticQuery, neurons):
+    """
+    (fixed dim, neuron, query) evaluating the pair rows of each selected
+    neuron. Several neurons: pairs within the selection; one neuron: all
+    pairs involving it, in both orientations (as rows_matching_components).
+    """
+    reductions = selection_query.reduction_dict()
+    orientations = ("neuron_i", "neuron_j") if len(neurons) == 1 else ("neuron_i",)
+
+    for dim in orientations:
+        for neuron in neurons:
+            single = {**reductions, dim: ReductionSpec("single", index=int(neuron))}
+
+            yield dim, int(neuron), replace(
+                selection_query,
+                reductions=tuple(sorted(single.items())),
+            )
+
+
+def pair_selection_rows(table: PickTable, fixed_dim: str, neuron: int, neurons):
+    """Columns and values of one pair_selection_queries result."""
+    columns = table.refs_for_rows(np.arange(table.n_rows), include_fixed=True)
+    partner = columns["neuron_j" if fixed_dim == "neuron_i" else "neuron_i"]
+
+    if len(neurons) > 1:
+        keep = np.isin(partner, neurons)
+    elif fixed_dim == "neuron_j":
+        # The self pair was part of the first orientation.
+        keep = partner != neuron
+    else:
+        keep = np.ones(table.n_rows, dtype=bool)
+
+    return (
+        {name: np.asarray(column)[keep] for name, column in columns.items()},
+        np.asarray(table.values, dtype=float)[keep],
+    )
+
+
+def concatenate_rows(parts):
+    """Join (columns, values) parts with the same columns."""
+    if not parts:
+        return {}, np.empty(0)
+
+    names = parts[0][0].keys()
+
+    return (
+        {name: np.concatenate([columns[name] for columns, _ in parts]) for name in names},
+        np.concatenate([values for _, values in parts]),
+    )
+
+
+def selected_rows(table: PickTable, components):
+    """Columns and values of the rows matching the components."""
+    rows = table.rows_matching_components(components)
+
+    return (
+        {name: np.asarray(table.refs[name][rows]) for name in table.refs},
+        np.asarray(table.values[rows], dtype=float),
+    )
+
+
+def remaining_session_dim(table: PickTable) -> str | None:
+    return next((d for d in SESSION_DIMS if d in table.refs), None)
+
+
+def reduce_selected_rows(
+    columns: dict[str, np.ndarray],
+    values: np.ndarray,
+    reductions: tuple[tuple[str, ReductionSpec], ...],
+    *,
+    session_dim: str,
+    aliases: dict[str, str],
+    session_ids: np.ndarray,
+    title: str,
+) -> SessionSeries | None:
+    """
+    Session series of selected rows, reduced over the neuron dimensions
+    like the full series (StatisticArray.reduce_dimension per group).
+    """
+    if values.size == 0 or session_dim not in columns:
+        return None
+
+    errors_low = errors_high = n = None
+    reduced = set()
+
+    for dim, spec in reductions:
+        target = _column_for_dim(aliases, columns, dim)
+
+        if target is None or target in reduced:
+            continue
+
+        reduced.add(target)
+
+        keys = [column for name, column in columns.items() if name != target]
+        groups, first_rows = _group_rows(keys, values.size)
+        n_groups = first_rows.size
+
+        center = _grouped_center(values, groups, n_groups, spec.method)
+
+        if spec.error_method != "none":
+            errors_low, errors_high, n = _grouped_error(
+                values, groups, n_groups, center, spec.error_method
+            )
+        elif errors_low is not None:
+            # Errors of an earlier reduction are carried along, as in
+            # StatisticArray._reduce_existing_errors.
+            errors_low = _grouped_center(errors_low, groups, n_groups, spec.method)
+            errors_high = _grouped_center(errors_high, groups, n_groups, spec.method)
+            n = np.bincount(groups, weights=n, minlength=n_groups)
+
+        values = center
+        columns = {
+            name: column[first_rows]
+            for name, column in columns.items()
+            if name != target
+        }
+
+    index = {int(sid): i for i, sid in enumerate(session_ids)}
+
+    out_values = np.full(len(session_ids), np.nan)
+    out_low = None if errors_low is None else np.full(len(session_ids), np.nan)
+    out_high = None if errors_high is None else np.full(len(session_ids), np.nan)
+    out_n = None if n is None else np.zeros(len(session_ids), dtype=int)
+
+    for row, sid in enumerate(columns[session_dim]):
+        i = index.get(int(sid))
+
+        if i is None:
+            continue
+
+        out_values[i] = values[row]
+
+        if out_low is not None:
+            out_low[i] = errors_low[row]
+            out_high[i] = errors_high[row]
+
+        if out_n is not None:
+            out_n[i] = int(n[row])
+
+    return SessionSeries(
+        title=title,
+        table=None,
+        session_dim=session_dim,
+        session_ids=np.asarray(session_ids),
+        values=out_values,
+        errors_low=out_low,
+        errors_high=out_high,
+        n=out_n,
+    )
+
+
+def _column_for_dim(aliases, columns, dim: str) -> str | None:
+    if dim in columns:
+        return dim
+
+    alias = aliases.get(dim)
+
+    if alias in columns:
+        return alias
+
+    canonical = canonical_dim(dim)
+    return canonical if canonical in columns else None
+
+
+def _group_rows(keys, size):
+    """Group id per row and the first row of each group."""
+    if not keys:
+        return np.zeros(size, dtype=np.intp), np.zeros(min(size, 1), dtype=np.intp)
+
+    codes = []
+    shape = []
+
+    for key in keys:
+        uniques, inverse = np.unique(key, return_inverse=True)
+        codes.append(inverse.reshape(-1))
+        shape.append(uniques.size)
+
+    combined = np.ravel_multi_index(codes, shape)
+    _, first_rows, groups = np.unique(
+        combined, return_index=True, return_inverse=True
+    )
+    return groups.reshape(-1), first_rows
+
+
+def _sorted_groups(values, groups, n_groups):
+    """Finite values sorted by group and value, with group starts/counts."""
+    finite = np.isfinite(values)
+    values = values[finite]
+    groups = groups[finite]
+
+    order = np.lexsort((values, groups))
+    counts = np.bincount(groups, minlength=n_groups)
+    starts = np.cumsum(counts) - counts
+    return values[order], groups[order], starts, counts
+
+
+def _grouped_quantile(sorted_values, starts, counts, q):
+    """np.percentile (linear interpolation) per group; NaN if empty."""
+    out = np.full(counts.size, np.nan)
+    present = counts > 0
+
+    position = q * (counts[present] - 1)
+    low = np.floor(position).astype(np.intp)
+    high = np.minimum(low + 1, counts[present] - 1)
+    fraction = position - low
+
+    base = starts[present]
+    out[present] = (
+        sorted_values[base + low] * (1.0 - fraction)
+        + sorted_values[base + high] * fraction
+    )
+    return out
+
+
+def _grouped_center(values, groups, n_groups, method):
+    """Grouped version of StatisticArray._compute_center."""
+    values, sorted_groups, starts, counts = _sorted_groups(
+        np.asarray(values, dtype=float), groups, n_groups
+    )
+    present = counts > 0
+
+    if method in ("mean", "sum", "std"):
+        total = np.bincount(sorted_groups, weights=values, minlength=n_groups)
+
+        if method == "sum":
+            return np.where(present, total, np.nan)
+
+        mean = np.full(n_groups, np.nan)
+        mean[present] = total[present] / counts[present]
+
+        if method == "mean":
+            return mean
+
+        squares = np.bincount(
+            sorted_groups,
+            weights=(values - mean[sorted_groups]) ** 2,
+            minlength=n_groups,
+        )
+        std = np.full(n_groups, np.nan)
+        std[present] = np.sqrt(squares[present] / counts[present])
+        return std
+
+    if method == "median":
+        return _grouped_quantile(values, starts, counts, 0.5)
+
+    out = np.full(n_groups, np.nan)
+
+    if method == "min":
+        out[present] = values[starts[present]]
+        return out
+
+    if method == "max":
+        out[present] = values[starts[present] + counts[present] - 1]
+        return out
+
+    raise ValueError(f"Unknown reduction method: {method!r}")
+
+
+def _grouped_error(values, groups, n_groups, center, method):
+    """Grouped version of StatisticArray._compute_error."""
+    values, sorted_groups, starts, counts = _sorted_groups(
+        np.asarray(values, dtype=float), groups, n_groups
+    )
+
+    if method in ("std", "sem"):
+        total = np.bincount(sorted_groups, weights=values, minlength=n_groups)
+        mean = total / np.maximum(counts, 1)
+        squares = np.bincount(
+            sorted_groups,
+            weights=(values - mean[sorted_groups]) ** 2,
+            minlength=n_groups,
+        )
+
+        error = np.sqrt(squares / np.maximum(counts - 1, 1))
+
+        if method == "sem":
+            error = error / np.sqrt(np.maximum(counts, 1))
+
+        error = np.where(counts > 1, error, 0.0)
+        return error, error, counts
+
+    if method == "iqr":
+        q25 = _grouped_quantile(values, starts, counts, 0.25)
+        q75 = _grouped_quantile(values, starts, counts, 0.75)
+        return center - q25, q75 - center, counts
+
+    raise ValueError(f"Unknown error method: {method!r}")

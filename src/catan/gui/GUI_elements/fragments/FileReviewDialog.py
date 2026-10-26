@@ -59,19 +59,28 @@ class GlobReviewDialog(QDialog):
         self,
         paths: list[Path],
         parent=None,
+        *,
+        keep_order=False,
+        title="Review matched session files",
+        note=None,
     ):
+        """keep_order: list the paths as given (e.g. table rows) instead
+        of sorted; ``note`` is shown below the summary."""
         super().__init__(parent)
 
-        self.setWindowTitle("Review matched session files")
+        self.setWindowTitle(title)
         self.resize(800, 500)
 
         self.common_path = Path(os.path.commonpath(paths))
         self._original_paths = [path.relative_to(self.common_path) for path in paths]
-        self._original_paths.sort()
+        if not keep_order:
+            self._original_paths.sort()
 
         self.info_label = QLabel(
             f"{len(self._original_paths)} matching files found with common path {display_path(self.common_path)}."
+            + ("" if not note else f"\n{note}")
         )
+        self.info_label.setWordWrap(True)
 
         self.list_widget = SessionListWidget()
 

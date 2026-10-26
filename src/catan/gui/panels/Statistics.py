@@ -76,6 +76,9 @@ STATUS_PROGRESS_HEIGHT = 6
 
 SERIES_PRIMARY_COLOR = (0.0, 0.0, 0.0, 1.0)
 SERIES_SECONDARY_COLOR = (0.0, 0.35, 0.65, 1.0)
+# Series of the selected neurons only.
+SERIES_PRIMARY_SELECTED_COLOR = (0.9, 0.4, 0.0, 1.0)
+SERIES_SECONDARY_SELECTED_COLOR = (0.8, 0.1, 0.55, 1.0)
 SERIES_BAND_ALPHA = 0.18
 
 SeriesPoint = tuple[str, int]
@@ -844,11 +847,41 @@ class Display(BasePlot.BaseCanvas):
         left_y_range = _series_y_range(first)
 
         self._set_camera_ranges({"x": x_range, "y": left_y_range})
+        self.plotting["series_ranges"] = {"y": left_y_range}
 
         if is_dual:
             right_y_range = _series_y_range(second)
 
             self._set_camera_ranges({"x": x_range, "y_2nd": right_y_range})
+            self.plotting["series_ranges"]["y_2nd"] = right_y_range
+
+        # ---------- series of the selected neurons ----------
+        # Filled in by set_series_selection.
+        self.plotting["selection_series"] = {}
+        self.plotting["selection_data"] = {}
+
+        for slot, parent, color in (
+            ("y", self.plot_root, SERIES_PRIMARY_SELECTED_COLOR),
+            ("y_2nd", self.plot_root_right, SERIES_SECONDARY_SELECTED_COLOR),
+        ):
+            if slot == "y_2nd" and not is_dual:
+                continue
+
+            selected_visual = series_with_confidence.SeriesVisual(
+                parent=parent,
+                line_color=color,
+                band_color=(*color[:3], SERIES_BAND_ALPHA),
+                marker_size=7,
+                order=30,
+            )
+            selected_visual.clear()
+
+            self.plotting["visuals"][f"selected_base_{slot}"] = selected_visual.line
+            self.plotting["visuals"][f"selected_band_{slot}"] = selected_visual.band
+            self.plotting["visuals"][
+                f"selected_markers_{slot}"
+            ] = selected_visual.markers
+            self.plotting["selection_series"][slot] = selected_visual
 
         # ---------- update axes ----------
         # self.axes["x"]._view_changed()
@@ -953,6 +986,10 @@ class Display(BasePlot.BaseCanvas):
         style = "default" if self.state.selected_components is None else "background"
         plot_options = self.styles.get_plot_options(style, "marker", 0.7, size=5.0)
         plot_options.update(self._scatter_colors("default"))
+
+        if isinstance(self.plot_data, plotdata_scatter.AggregatedScatter):
+            # One marker per value pair, sized by its number of points.
+            plot_options["size"] = self.plot_data.marker_sizes()
 
         self.plotting["visuals"]["base"] = visuals.Markers(
             pos=np.column_stack((self.plot_data.x, self.plot_data.y)),
@@ -1553,6 +1590,9 @@ class Display(BasePlot.BaseCanvas):
             if style in {"selected", "focused", "hovered"}:
                 plot_options.update(self._scatter_colors(style))
 
+            if isinstance(self.plot_data, plotdata_scatter.AggregatedScatter):
+                plot_options["size"] = self.plot_data.marker_sizes()[marker_ids] + 3.0
+
             return {"pos": pos, **plot_options}
 
         return {}
@@ -1611,6 +1651,56 @@ class Display(BasePlot.BaseCanvas):
         self.hist_selected_layer.set_visible(np.any(selected_counts > 0))
 
         self.state.timeit("updated histogram mesh selection")
+
+    def set_series_selection(
+        self,
+        selected: dict[str, plotdata_series.SessionSeries],
+    ):
+        """Show the series of the selected neurons; missing slots are hidden."""
+        if not isinstance(self.plot_data, plotdata_series.PlotData):
+            return
+
+        self.plotting["selection_data"] = dict(selected)
+
+        for slot, visual in self.plotting.get("selection_series", {}).items():
+            series = selected.get(slot)
+
+            if series is None:
+                visual.clear()
+            else:
+                visual.set_data(
+                    session_ids=series.session_ids,
+                    values=series.values,
+                    errors_low=series.errors_low,
+                    errors_high=series.errors_high,
+                )
+
+            # Widen the y range while the selection lies outside it.
+            y_range = self.plotting.get("series_ranges", {}).get(slot)
+
+            if y_range is None:
+                continue
+
+            if series is not None:
+                low, high = _series_y_range(series)
+                y_range = (min(y_range[0], low), max(y_range[1], high))
+
+            self._fit_series_y_range(slot, y_range)
+
+        self.update()
+
+    def _fit_series_y_range(self, key, y_range):
+        if self._default_ranges[key] == y_range:
+            return
+
+        view = self.view if key == "y" else self.right_view
+        rect = view.camera.rect
+
+        # Keep the current x zoom.
+        view.camera.set_range(margin=0.0, x=(rect.left, rect.right), y=y_range)
+
+        self._default_ranges[key] = y_range
+        self.axes[key]._view_changed()
 
     def _histogram_base_colors_for_selection(self, selected_bins):
         colors = self._histogram_colors("default")
@@ -1810,28 +1900,32 @@ class Display(BasePlot.BaseCanvas):
         )
 
         lines = [self._session_label(session_id)]
+        selected = self.plotting.get("selection_data", {})
 
-        first = self.plot_data.first_series
-
-        idx = _session_index(
-            first,
-            session_id,
-        )
-
-        if idx is not None:
-            lines.append(first.tooltip_value_for_index(idx))
-
-        second = self.plot_data.second_series
-
-        if second is not None:
+        for slot, series in (
+            ("y", self.plot_data.first_series),
+            ("y_2nd", self.plot_data.second_series),
+        ):
+            if series is None:
+                continue
 
             idx = _session_index(
-                second,
+                series,
                 session_id,
             )
 
             if idx is not None:
-                lines.append(second.tooltip_value_for_index(idx))
+                lines.append(series.tooltip_value_for_index(idx))
+
+            selected_series = selected.get(slot)
+
+            if selected_series is not None:
+                idx = _session_index(selected_series, session_id)
+
+                if idx is not None and np.isfinite(selected_series.values[idx]):
+                    lines.append(
+                        "↳ " + selected_series.tooltip_value_for_index(idx)
+                    )
 
         return "\n".join(lines)
 
@@ -1883,6 +1977,9 @@ class Display(BasePlot.BaseCanvas):
 
         self.plotting["visuals"] = {}
         self.plotting["data"] = {}
+        self.plotting["selection_series"] = {}
+        self.plotting["selection_data"] = {}
+        self.plotting["series_ranges"] = {}
 
         # self.clear_overlays()
 
@@ -2153,6 +2250,18 @@ class Controller(BasePlot.CanvasController):
         self.controls["compare_scatter"] = compare_scatter
         self.controls["panel"].form.addRow(compare_scatter)
 
+        aggregate_scatter = QCheckBox("Aggregate equal values")
+        aggregate_scatter.setToolTip(
+            "Integer statistics: one point per value pair, sized by the "
+            "number of entries. Clicking a point selects all of them."
+        )
+        aggregate_scatter.setChecked(bool(self.config.get("aggregate_scatter", False)))
+        aggregate_scatter.toggled.connect(self._set_scatter_aggregation)
+        aggregate_scatter.setVisible(False)
+
+        self.controls["aggregate_scatter"] = aggregate_scatter
+        self.controls["panel"].form.addRow(aggregate_scatter)
+
         for slot in ("x", "y"):
             selector = self.controls[f"{slot}_selector"]
             selector.assignment_name = self.config.get(f"scatter_assignments_{slot}")
@@ -2269,6 +2378,10 @@ class Controller(BasePlot.CanvasController):
         self.config["compare_scatter"] = bool(enabled)
         self._sync_comparison_controls()
         self.recalculate_statistics(force=True)
+
+    def _set_scatter_aggregation(self, enabled):
+        self.config["aggregate_scatter"] = bool(enabled)
+        self.rebuild_plot()
 
     def _set_scatter_assignment(self, slot, name):
         self.config[f"scatter_assignments_{slot}"] = name
@@ -2471,6 +2584,12 @@ class Controller(BasePlot.CanvasController):
         if group != "calculating":
             return
 
+        selection_tasks = self._series_selection_state()["tasks"]
+
+        for selection_slot, running in selection_tasks.items():
+            if running is not None and running.task_id == task_id:
+                selection_tasks[selection_slot] = None
+
         slot = self._slot_for_task(task_id)
 
         if slot is None:
@@ -2631,6 +2750,14 @@ class Controller(BasePlot.CanvasController):
 
         if checkbox is not None:
             checkbox.setVisible(self.plot_type == "scatter")
+
+        aggregate = self.controls.get("aggregate_scatter")
+
+        # Shown again by _build_plot_data for integer scatters.
+        if aggregate is not None and (
+            self.plot_type != "scatter" or self._scatter_comparison_enabled()
+        ):
+            aggregate.setVisible(False)
 
         enabled = self._scatter_comparison_enabled()
 
@@ -2846,10 +2973,18 @@ class Controller(BasePlot.CanvasController):
                     self.data,
                 )
 
-            return plotdata_scatter.build_plot_data(
+            plot_data = plotdata_scatter.build_plot_data(
                 x_table=tables["x"],
                 y_table=tables["y"],
+                aggregate=bool(self.config.get("aggregate_scatter", False)),
             )
+
+            # Offered for integer values only.
+            points = getattr(plot_data, "points", plot_data)
+            self.controls["aggregate_scatter"].setVisible(
+                plotdata_scatter.integer_values(points)
+            )
+            return plot_data
 
         # This is an internal bug, NOT a user-facing plotting error.
         raise RuntimeError(f"Unknown plot type {self.plot_type!r}")
@@ -2880,6 +3015,196 @@ class Controller(BasePlot.CanvasController):
 
         elif isinstance(self.current_plot_data, plotdata_scatter.PlotData):
             self.update_styles()
+
+        elif isinstance(self.current_plot_data, plotdata_series.PlotData):
+            self._update_series_selection()
+
+    ### ================================================================== ###
+    ### ================== SESSION SERIES OF THE SELECTION =============== ###
+    ### ================================================================== ###
+
+    def _series_selection_state(self):
+        # Created lazily, so that hot-reloaded panels pick it up too.
+        state = getattr(self, "_series_selection", None)
+
+        if state is None:
+            state = {"results": {}, "tasks": {}}
+            self._series_selection = state
+
+        return state
+
+    def _update_series_selection(self):
+        """Show each session series restricted to the selected neurons."""
+        plot_data = self.current_plot_data
+        selected = self.state.selected_components
+        lines = {}
+
+        if selected:
+            # A selected footprint stands for its whole neuron.
+            neurons = tuple(sorted({int(component.neuron_id) for component in selected}))
+            title = f"{len(neurons)} selected neuron" + ("s" if len(neurons) > 1 else "")
+
+            for slot, series in (
+                ("y", plot_data.first_series),
+                ("y_2nd", plot_data.second_series),
+            ):
+                if series is None:
+                    continue
+
+                line = self._series_selection_line(slot, series, neurons, title)
+
+                if line is not None:
+                    lines[slot] = line
+
+        self.canvas.set_series_selection(lines)
+
+    def _series_selection_line(self, slot, series, neurons, title):
+        engine_query = self.displayed_results[slot].query
+        query = plotdata_series.make_selection_query(engine_query)
+
+        if query is None:
+            return None
+
+        def reduce(columns, values, session_dim, aliases):
+            return plotdata_series.reduce_selected_rows(
+                columns,
+                values,
+                plotdata_series.neuron_reductions(engine_query),
+                session_dim=session_dim,
+                aliases=aliases,
+                session_ids=series.session_ids,
+                title=title,
+            )
+
+        if plotdata_series.uses_pair_selection(engine_query):
+            # Pair rows depend on the selection: reduced in the background.
+            result = self._series_selection_result(slot, query, neurons, reduce)
+            return None if result is None or result.error else result.line
+
+        result = self._series_selection_result(slot, query, None, None)
+
+        if result is None or result.error is not None:
+            return None
+
+        columns, values = plotdata_series.selected_rows(
+            result.table,
+            [NeuronComponent(neuron_id, None) for neuron_id in neurons],
+        )
+        return reduce(columns, values, result.session_dim, result.aliases)
+
+    def _series_selection_result(self, slot, query, neurons, reduce):
+        """
+        Calculated in the background; None while pending (the selection
+        is updated once ready).
+
+        neurons=None: the series with its neuron dimension kept (.table),
+        shared by all selections. Otherwise the pair rows of these neurons,
+        already reduced to the selection line (.line).
+        """
+        engine = self.data.statistic_engine
+        key = (query, engine.query_revision(query), neurons)
+        state = self._series_selection_state()
+
+        cached = state["results"].get(slot)
+
+        if cached is not None and cached.key == key:
+            return cached
+
+        running = state["tasks"].get(slot)
+
+        if running is not None:
+            if running.key == key:
+                return None
+
+            self.state.tasks.cancel(running.task_id)
+
+        token = object()
+
+        def evaluate():
+            ctx = current_task_context()
+
+            try:
+                if neurons is None:
+                    table = engine.evaluate_table(query)
+                    tables = [] if table is None else [(None, None, table)]
+                else:
+                    tables = []
+
+                    for dim, neuron, single_query in (
+                        plotdata_series.pair_selection_queries(query, neurons)
+                    ):
+                        ctx.check_cancelled()
+                        ctx.message(f"Selected neuron {neuron}")
+
+                        # One-off queries must not evict the cached series.
+                        table = engine.evaluate_table(single_query, cache=False)
+
+                        if table is not None:
+                            tables.append((dim, neuron, table))
+
+                if not tables:
+                    raise ValueError("The statistic has no data.")
+
+                table = tables[0][2]
+                session_dim = plotdata_series.remaining_session_dim(table)
+                aliases = dict(table.stat.reduction_aliases)
+
+                if neurons is None:
+                    return SimpleNamespace(
+                        key=key,
+                        table=table,
+                        session_dim=session_dim,
+                        aliases=aliases,
+                        error=None,
+                    )
+
+                columns, values = plotdata_series.concatenate_rows(
+                    [
+                        plotdata_series.pair_selection_rows(part, dim, neuron, neurons)
+                        for dim, neuron, part in tables
+                    ]
+                )
+
+                return SimpleNamespace(
+                    key=key,
+                    line=reduce(columns, values, session_dim, aliases),
+                    error=None,
+                )
+
+            except TaskCancelled:
+                raise
+
+            except Exception as exc:
+                return SimpleNamespace(key=key, error=f"{type(exc).__name__}: {exc}")
+
+        def accept_result(selection_result):
+            current = state["tasks"].get(slot)
+
+            if current is None or current.token is not token:
+                return
+
+            state["tasks"][slot] = None
+            state["results"][slot] = selection_result
+
+            if selection_result.error is not None:
+                self.state.logger.warning(
+                    f"Session series of the selection ({slot}): "
+                    f"{selection_result.error}"
+                )
+
+            if not self._deactivated:
+                self.update_neuron_selection()
+
+        task_id = self.state.tasks.start(
+            "calculating",
+            f"Calculate {slot} selection: {query.statistic_key}",
+            evaluate,
+            on_result=accept_result,
+            background=True,
+        )
+
+        state["tasks"][slot] = SimpleNamespace(task_id=task_id, token=token, key=key)
+        return None
 
     def _on_selection_changed(self):
 
@@ -3422,6 +3747,15 @@ class Controller(BasePlot.CanvasController):
         for slot in self.statistic_tasks:
             self.statistic_tasks[slot] = None
             self._statistic_tokens[slot] = None
+
+        selection = self._series_selection_state()
+        task_ids += tuple(
+            running.task_id
+            for running in selection["tasks"].values()
+            if running is not None
+        )
+        selection["tasks"].clear()
+        selection["results"].clear()
 
         for task_id in task_ids:
             self.state.tasks.cancel(task_id)

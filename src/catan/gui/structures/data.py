@@ -177,6 +177,13 @@ class Data(Tracking):
         self.border_tolerance = max(
             0, state.settings.value("alignment/border_tolerance", 0, type=int)
         )
+        # Largest accepted session shift (px), around the origin and around
+        # each accepted position of the imaging window (alignment_offsets:
+        # (dx, dy) in the common frame, stored with the sessions).
+        self.max_session_shift = max(
+            1.0, state.settings.value("alignment/max_session_shift", 50.0, type=float)
+        )
+        self.alignment_offsets = []
 
         super().__init__()
 
@@ -395,6 +402,7 @@ class Data(Tracking):
 
         if "spatial" in fields_to_load:
             session.params["correct_rotation"] = correct_rotation
+            self.apply_alignment_settings(session)
 
         session.load_data(
             fields_to_load,
@@ -983,7 +991,8 @@ class Data(Tracking):
         )
 
         # Match the current minimum in Model.fit_model_to_counts().
-        if counts["cross"][..., 0].sum() < 20:
+        evidence = "cross2" if self.model.kind == "two_noise" else "cross"
+        if counts[evidence][..., 0].sum() < 20:
             return
 
         tasks.start(
@@ -991,6 +1000,45 @@ class Data(Tracking):
             "Fit model to data",
             self.fit_model,
             batch=fit_batch,
+        )
+
+    def set_model_kind(self, kind):
+        """Switch the model implementation (Model.set_kind). Parameters of
+        each kind are kept; assignments become outdated."""
+        model = self.model
+        if model is None:
+            raise ValueError("No model available.")
+        if kind == model.kind:
+            return
+
+        if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
+            raise ValueError("Wait for current processing to finish before switching.")
+
+        model.set_kind(kind)
+
+        paths = {
+            str(session.path) for session in self.sessions if session.path is not None
+        }
+        for name in self._assignments:
+            self._stale_assignments.setdefault(name, set()).update(paths)
+
+        self.notify_change(C.MODEL_PARAMETERS, C.PROCESSING_STATUS)
+
+    def queue_fit_model(self):
+        """Fit the current model kind to its evidence (background task)."""
+        if self.model is None:
+            raise ValueError("No model available.")
+        if self.model.loaded:
+            raise ValueError(
+                "This model was loaded from a file; fitting it is not allowed."
+            )
+        if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
+            raise ValueError("Wait for current processing to finish before fitting.")
+
+        return self.state.tasks.start(
+            "model update",
+            f"Fit model ({self.model.kind})",
+            self.fit_model,
         )
 
     def fit_model(self, **kwargs):
@@ -1021,6 +1069,7 @@ class Data(Tracking):
 
         fields = (
             "parameters",
+            "arrays",
             "distributions",
             "p_same",
             "distance_cutoff",
@@ -1237,6 +1286,14 @@ class Data(Tracking):
                 self._assignments[name] = candidate
                 self._current_assignments = name
 
+                # The registered source is not loaded yet: panels must not
+                # keep showing (and half-handling) the previous assignments.
+                ids = candidate.ids
+                if ids.ndim != 2 or ids.shape[1] != len(self.sessions):
+                    ids = np.full((0, len(self.sessions)), -1, dtype=int)
+                self.state.apply_assignment_rebuild(ids, {}, from_session_id=0)
+                self.notify_change(C.ASSIGNMENT_SET, *ASSIGNMENT_CONTENT_CHANGES)
+
             if on_loaded is not None:
                 on_loaded()
 
@@ -1258,6 +1315,7 @@ class Data(Tracking):
             raise ValueError("Update earlier stale alignments first.")
 
         references = self.alignment_references_for_session(session_id)
+        self.apply_alignment_settings(session)
 
         return session.propose_remapping(
             references,
@@ -1427,6 +1485,42 @@ class Data(Tracking):
             )
             for task in self.state.tasks.tasks.values()
         )
+
+    def set_max_session_shift(self, value):
+        value = max(1.0, float(value))
+        if value == self.max_session_shift:
+            return
+
+        self.max_session_shift = value
+        self.state.settings.setValue("alignment/max_session_shift", value)
+        self.notify_change(C.ALIGNMENT_SETTINGS)
+
+    def add_alignment_offset(self, offset, *, notify=True):
+        """Accept shifts around ``offset`` (dx, dy) for later alignments.
+        Returns True if it was new (not within 1 px of a known position)."""
+        offset = [float(offset[0]), float(offset[1])]
+        if not all(np.isfinite(offset)):
+            return False
+
+        known = [[0.0, 0.0], *self.alignment_offsets]
+        if any(np.hypot(offset[0] - x, offset[1] - y) < 1.0 for x, y in known):
+            return False
+
+        self.alignment_offsets.append(offset)
+        if notify:
+            self.notify_change(C.ALIGNMENT_SETTINGS)
+        return True
+
+    def clear_alignment_offsets(self):
+        if self.alignment_offsets:
+            self.alignment_offsets = []
+            self.notify_change(C.ALIGNMENT_SETTINGS)
+
+    def apply_alignment_settings(self, session):
+        """Alignment limits of the dataset for the next alignment of
+        ``session`` (Remapping reads them from the session parameters)."""
+        session.params["max_session_shift"] = float(self.max_session_shift)
+        session.params["alignment_offsets"] = [list(o) for o in self.alignment_offsets]
 
     def set_border_tolerance(self, value):
         """Number of sessions a pixel may lie outside of and still count as
@@ -1761,6 +1855,11 @@ class Data(Tracking):
 
                 if self.state.current_session_id is None:
                     self.state.current_session_id = added_ids[0]
+
+            # Positions of the imaging window accepted for these sessions.
+            for index in added_ids:
+                for offset in self.sessions[index].params.get("alignment_offsets", []) or []:
+                    self.add_alignment_offset(offset, notify=False)
 
             # Restored sessions match their file at this geometry revision.
             for index in added_ids:

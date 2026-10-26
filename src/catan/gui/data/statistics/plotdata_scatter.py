@@ -399,15 +399,128 @@ class PlotData:
         return int(candidates[distances == best].min())
 
 
+class AggregatedScatter(PlotData):
+    """One marker per distinct (x, y) value pair, for discrete values
+    (e.g. counts): overlapping points are drawn once, sized by their
+    number. Markers are value pairs; rows_for_markers() returns all rows
+    with these values, so picking a marker selects all of them.
+    """
+
+    __slots__ = ("points", "counts", "point_marker", "_marker_points", "_marker_starts")
+
+    def __init__(self, points: PlotData):
+        # The point-level scatter keeps row matching and neuron lookup.
+        self.points = points
+
+        self.x_table = points.x_table
+        self.y_table = points.y_table
+        self.row_matcher = points.row_matcher
+        self.title = points.title
+        self.x_rows = points.x_rows
+        self.y_rows = points.y_rows
+        self.marker_rows = points.marker_rows
+
+        values, point_marker, counts = np.unique(
+            np.column_stack([points.x, points.y]),
+            axis=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+
+        self.x = values[:, 0]
+        self.y = values[:, 1]
+        self.counts = counts
+        self.point_marker = point_marker.reshape(-1)
+
+        # Points of each marker: _marker_points[start:stop].
+        self._marker_points = np.argsort(self.point_marker, kind="stable")
+        self._marker_starts = np.r_[0, np.cumsum(counts)]
+
+        self.row_to_marker = np.full(self.n_rows, -1, dtype=int)
+        self.row_to_marker[points.marker_rows] = self.point_marker
+
+        self._neuron_index = {}
+        self._pick_tree = None
+
+        if self.n_markers:
+            self._pick_origin = np.array([self.x.min(), self.y.min()])
+            self._pick_scale = np.array([np.ptp(self.x), np.ptp(self.y)])
+            self._pick_scale[self._pick_scale == 0] = 1.0
+            self._pick_tree = cKDTree(
+                (np.column_stack([self.x, self.y]) - self._pick_origin)
+                / self._pick_scale
+            )
+
+    def marker_sizes(self, base=5.0, maximum=40.0):
+        """Marker diameters: area grows with the number of points."""
+        return np.minimum(base * np.sqrt(self.counts), maximum).astype(np.float32)
+
+    def _points_of_markers(self, marker_indices):
+        markers = np.atleast_1d(np.asarray(marker_indices, dtype=int))
+
+        if markers.size == 0:
+            return np.empty(0, dtype=int)
+
+        return np.concatenate(
+            [
+                self._marker_points[self._marker_starts[m] : self._marker_starts[m + 1]]
+                for m in markers
+            ]
+        )
+
+    def rows_for_markers(self, marker_indices):
+        return self.points.marker_rows[self._points_of_markers(marker_indices)]
+
+    def markers_matching_components(self, components):
+        point_markers = self.points.markers_matching_components(components)
+        return np.unique(self.point_marker[point_markers])
+
+    def tooltip_for_marker(self, marker_index):
+        count = int(self.counts[marker_index])
+        rows = self.rows_for_markers(marker_index)
+        x_refs, _ = self.ref_sets_for_rows(rows[:6])
+
+        neurons = x_refs.get("neuron", x_refs.get("neuron_i"))
+        listed = (
+            ""
+            if neurons is None
+            else ": "
+            + ", ".join(str(int(n)) for n in neurons[:5])
+            + (", …" if count > 5 else "")
+        )
+
+        return "\n".join(
+            [
+                f"{count} {'entry' if count == 1 else 'entries'}{listed}",
+                f"{self.title['x']}: {self.x[marker_index]:.4g}",
+                f"{self.title['y']}: {self.y[marker_index]:.4g}",
+            ]
+        )
+
+
+def integer_values(points: PlotData) -> bool:
+    """Both axes hold integer values (counts): points may coincide."""
+    return (
+        points.n_markers > 0
+        and bool(np.all(points.x == np.round(points.x)))
+        and bool(np.all(points.y == np.round(points.y)))
+    )
+
+
 def build_plot_data(
     x_table: PickTable,
     y_table: PickTable,
+    *,
+    aggregate: bool = False,
 ) -> PlotData:
-
-    return PlotData(
+    """aggregate: one marker per value pair (AggregatedScatter), for
+    integer values only."""
+    points = PlotData(
         x_table=x_table,
         y_table=y_table,
     )
+
+    return AggregatedScatter(points) if aggregate and integer_values(points) else points
 
 
 def _matching_rows(

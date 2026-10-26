@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QFileDialog,
     QGraphicsOpacityEffect,
+    QSpinBox,
 )
 
 
@@ -49,6 +50,13 @@ from catan.core.structures.load_config import FieldSpec
 from catan.core.structures.inclusion import has_exclusions
 from catan.core.io import resolve_source_path
 from catan.core.io.isolated_read import read_operation
+from catan.core.io.path_table import (
+    column_paths,
+    looks_like_path,
+)
+
+# Tables of session file paths (one table; optional header row).
+PATH_TABLE_SUFFIXES = (".csv", ".tsv")
 
 from catan.gui.structures import AppState, Data, SessionData
 from catan.gui.background_tasks.TaskManager import TaskBatch
@@ -1157,9 +1165,15 @@ class LoadSessionRowWidget(QFrame):
             lambda value: setattr(self.data, "background_orientation", value)
         )
         root_layout.addWidget(self.registration_action_selector)
+        root_layout.addWidget(self._build_max_shift_row())
         self._remembered_background_choice = None
 
         self.state.data_changed.connect(self._on_data_changed)
+        self.state.data_changed.connect(
+            lambda event: self._refresh_max_shift_row()
+            if event.has(C.ALIGNMENT_SETTINGS, *SESSION_STRUCTURE_CHANGES)
+            else None
+        )
 
         # layout.addStretch()
         self._update_background()
@@ -1570,6 +1584,13 @@ class LoadSessionRowWidget(QFrame):
         if not session_ids:
             return
 
+        # A session of this batch failed to align: wait for its review.
+        if self.__dict__.get("_reviews_pending", {}).get(batch):
+            self.__dict__.setdefault("_waiting_registrations", []).append(
+                (tuple(session_ids), set(actions), batch, force_first_session)
+            )
+            return
+
         # Normally prevented by the queue hold. This also protects against
         # another explicit load request while an inspection is pending.
         if self._loading_check is not None:
@@ -1928,7 +1949,9 @@ class LoadSessionRowWidget(QFrame):
             session.id,
             check["actions"],
             background_mode=background_mode,
-            on_alignment_error=self._show_alignment_error,
+            on_alignment_error=lambda session_id, report, batch=batch: (
+                self._show_alignment_error(session_id, report, batch=batch)
+            ),
             batch=batch,
         )
 
@@ -1950,9 +1973,96 @@ class LoadSessionRowWidget(QFrame):
         if batch is not None and not batch.cancelled:
             self._cancel_registration_batch(batch)
 
-    def _show_alignment_error(self, session_id: int, report):
+    def _build_max_shift_row(self):
+        row = QWidget(self)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(6)
+
+        # The label shows ⚠ while further positions are accepted; its menu
+        # clears them.
+        self.max_shift_label = QToolButton(row)
+        self.max_shift_label.setAutoRaise(True)
+        self.max_shift_label.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(self.max_shift_label)
+        self.clear_offsets_action = menu.addAction(
+            "Accept shifts around the origin only",
+            self.data.clear_alignment_offsets,
+        )
+        self.max_shift_label.setMenu(menu)
+        layout.addWidget(self.max_shift_label)
+
+        self.max_shift_spin = QSpinBox(row)
+        self.max_shift_spin.setRange(1, 1000)
+        self.max_shift_spin.setSuffix(" px")
+        self.max_shift_spin.setValue(int(round(self.data.max_session_shift)))
+        self.max_shift_spin.setToolTip(
+            "Largest shift accepted when aligning a session automatically "
+            "(around the origin and around accepted positions). Applies to "
+            "the following alignments."
+        )
+        self.max_shift_spin.setKeyboardTracking(False)
+        self.max_shift_spin.valueChanged.connect(self.data.set_max_session_shift)
+        layout.addWidget(self.max_shift_spin)
+        layout.addStretch()
+
+        self._refresh_max_shift_row()
+        return row
+
+    def _refresh_max_shift_row(self, *_):
+        offsets = list(getattr(self.data, "alignment_offsets", []))
+        spin = self.max_shift_spin
+        previous = spin.blockSignals(True)
+        spin.setValue(int(round(self.data.max_session_shift)))
+        spin.blockSignals(previous)
+
+        if offsets:
+            self.max_shift_label.setText("⚠ Max. shift")
+            self.max_shift_label.setToolTip(
+                "Shifts are also accepted around these positions of the imaging "
+                "window (dx, dy):\n"
+                + "\n".join(f"  ({x:+.0f}, {y:+.0f}) px" for x, y in offsets)
+                + "\n\nClick to accept shifts around the origin only."
+            )
+        else:
+            self.max_shift_label.setText("Max. shift")
+            self.max_shift_label.setToolTip(
+                "Shifts are accepted around the origin only."
+            )
+        self.clear_offsets_action.setEnabled(bool(offsets))
+
+    def _resume_after_alignment_review(self, session):
+        """The review of ``session`` ended (used, removed or postponed):
+        continue the registrations that waited for it."""
+        pending = self.__dict__.setdefault("_reviews_pending", {})
+        waiting = self.__dict__.setdefault("_waiting_registrations", [])
+
+        for batch, sessions in list(pending.items()):
+            sessions.discard(id(session))
+            if sessions and not batch.cancelled:
+                continue
+
+            del pending[batch]
+            for entry in [entry for entry in waiting if entry[2] is batch]:
+                waiting.remove(entry)
+                if not batch.cancelled:
+                    session_ids, actions, _, force_first_session = entry
+                    self._on_sessions_registered(
+                        session_ids,
+                        actions=actions,
+                        batch=batch,
+                        force_first_session=force_first_session,
+                    )
+
+    def _show_alignment_error(self, session_id: int, report, batch=None):
 
         session = self.data.sessions[session_id]
+
+        # While loading: the following sessions wait until this one is
+        # reviewed; they would otherwise align to the last aligned session.
+        if batch is not None and not batch.cancelled:
+            pending = self.__dict__.setdefault("_reviews_pending", {})
+            pending.setdefault(batch, set()).add(id(session))
         confirmation = getattr(session.remap, "confirmation", None)
 
         text = (
@@ -1995,7 +2105,7 @@ class LoadSessionRowWidget(QFrame):
             self,
             pick_dir=False,
             init_path=self.data.root,
-            display_text="Select session file or loading recipe",
+            display_text="Select session file, loading recipe (.json) or path table (.csv)",
             only_existing=True,
         )
         if path is None:
@@ -2023,6 +2133,22 @@ class LoadSessionRowWidget(QFrame):
             return
 
         path = Path(path)
+
+        if path.suffix.lower() in PATH_TABLE_SUFFIXES:
+            self.state.tasks.start(
+                "loading",
+                f"Reading path table: {path.name}",
+                self._read_path_table,
+                path,
+                batch=batch,
+                on_result=lambda table: self._choose_table_column(
+                    table,
+                    path,
+                    batch=batch,
+                    actions=actions,
+                ),
+            )
+            return
 
         if path.suffix.lower() == ".json":
             self.state.tasks.start(
@@ -2052,6 +2178,150 @@ class LoadSessionRowWidget(QFrame):
                 batch=batch,
             ),
         )
+
+    @staticmethod
+    def _read_path_table(path):
+        return read_operation(
+            "path_table",
+            str(path),
+            ctx=current_task_context(),
+            timeout=60.0,
+            retry_hint="Restore access to the table file, then select it again.",
+        )
+
+    def _choose_table_column(self, table, path, *, batch, actions):
+        """Column with the session paths: asked for when the table has a
+        header row, otherwise the first column."""
+        if batch.cancelled:
+            return
+
+        column = 0
+        header = table["header"]
+
+        if header is not None and len(header) > 1:
+            names = [name or f"Column {index + 1}" for index, name in enumerate(header)]
+
+            default = next(
+                (
+                    index
+                    for index, name in enumerate(header)
+                    if any(word in name.lower() for word in ("path", "file"))
+                ),
+                next(
+                    (
+                        index
+                        for index in range(len(header))
+                        if any(
+                            index < len(row) and looks_like_path(row[index])
+                            for row in table["rows"]
+                        )
+                    ),
+                    0,
+                ),
+            )
+
+            choice, accepted = QInputDialog.getItem(
+                self,
+                "Select path column",
+                f"Column of {path.name} with the session file paths:",
+                names,
+                default,
+                False,
+            )
+            if not accepted:
+                self._cancel_registration_batch(batch)
+                return
+
+            column = names.index(choice)
+
+        paths = column_paths(table, column)
+        if not paths:
+            self.state.issue(
+                "info",
+                "No paths in the table",
+                f"The selected column of {path.name} contains no paths.",
+                parent=self.window(),
+            )
+            return
+
+        root = str(self.data.root or path.parent)
+
+        self.state.tasks.start(
+            "loading",
+            f"Locating {len(paths)} session files",
+            self._resolve_table_paths,
+            root,
+            paths,
+            batch=batch,
+            on_result=lambda result: self._review_table_paths(
+                result,
+                path,
+                root=root,
+                batch=batch,
+                actions=actions,
+            ),
+        )
+
+    @staticmethod
+    def _resolve_table_paths(root, paths):
+        return read_operation(
+            "resolve_paths",
+            root,
+            paths=list(paths),
+            ctx=current_task_context(),
+            timeout=120.0,
+            retry_hint="Restore access to the root folder, then select the table again.",
+        )
+
+    def _review_table_paths(self, result, path, *, root, batch, actions):
+        if batch.cancelled:
+            return
+
+        missing = result["missing"]
+        missing_text = (
+            f"{len(missing)} paths were not found under {display_path(root)}:\n"
+            + "\n".join(missing[:10])
+            + ("\n…" if len(missing) > 10 else "")
+        )
+
+        if not result["paths"]:
+            self.state.issue(
+                "info",
+                "No session files found",
+                missing_text,
+                parent=self.window(),
+            )
+            return
+
+        notes = []
+        if result["removed"]:
+            notes.append(
+                f"Paths moved onto the root folder (removed {result['removed']})."
+            )
+        if missing:
+            notes.append(missing_text)
+
+        dialog = GlobReviewDialog(
+            [Path(item) for item in result["paths"]],
+            parent=self,
+            keep_order=True,
+            title=f"Review session files from {path.name}",
+            note="\n".join(notes) or None,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._cancel_registration_batch(batch)
+            return
+
+        for session_path in dialog.paths():
+            if batch.cancelled:
+                break
+
+            self._queue_registration_path(
+                session_path,
+                batch=batch,
+                actions=actions,
+                force_first_session=False,
+            )
 
     def _review_recipe(self, sessions, *, batch, actions):
         if batch.cancelled:
@@ -3095,6 +3365,9 @@ class SessionOverview(QWidget):
         self.state.alignment_review_changed.emit()
         self._schedule_alignment_review()
 
+        # Used, removed or postponed: the waiting sessions continue.
+        self.load_row._resume_after_alignment_review(session)
+
     def _open_next_alignment_failure(self):
         if self._alignment_popup_active:
             return
@@ -3135,6 +3408,7 @@ class SessionOverview(QWidget):
             ):
                 self._alignment_failures.pop(0)
                 self._schedule_alignment_review()
+                self.load_row._resume_after_alignment_review(session)
                 return
 
             parent = panels[0] if panels else self

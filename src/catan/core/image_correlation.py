@@ -33,12 +33,6 @@ def calculate_img_correlation(
                 A1 = A1 > np.median(A1_nnz)
                 A2 = A2 > np.median(A2_nnz)
 
-        # t_start = time.time()
-        # A1 = A1.reshape(dims) if not np.all(A1.shape == dims) else A1
-        # A2 = A2.reshape(dims) if not np.all(A2.shape == dims) else A2
-        # t_end = time.time()
-        # print('reshaping --- time taken: %5.3g'%(t_end-t_start))
-
         if crop:
             A1, A2 = crop_to_common_bbox(A1, A2)
         else:
@@ -49,7 +43,6 @@ def calculate_img_correlation(
 
         if mode == "correlation":
             C_max, C_zscored, img_shift = _from_correlation(A1, A2)
-
         elif mode == "cosine_union":
             C_max, C_zscored, img_shift = _from_cosine_union(A1, A2, **kwargs)
         elif mode == "cosine_weighted":
@@ -371,7 +364,13 @@ def subpixel_shift_from_score_map(
     score_map, shape2, window_radius=2, threshold_rel=0.5
 ):
     """
-    Estimate subpixel shift from a local weighted centroid around the peak.
+    Estimate the subpixel shift by a parabola through the peak and its two
+    neighbours, per axis.
+
+    The previous local weighted centroid (``window_radius``,
+    ``threshold_rel``, still accepted) pulled estimates of real footprints
+    strongly toward whole pixels; the parabolic fit has no such locking at
+    the same agreement with centroid displacements.
 
     Parameters
     ----------
@@ -379,17 +378,10 @@ def subpixel_shift_from_score_map(
         Robust score map on the full correlation grid.
     shape2 : tuple
         Shape of the second footprint, used to convert map index -> shift.
-    window_radius : int
-        Radius of local window around peak. 2 means a 5x5 window.
-    threshold_rel : float
-        Keep only values >= threshold_rel * local_max inside the window.
 
     Returns
     -------
-    dict with:
-        dy, dx          : subpixel shift
-        dy_int, dx_int  : integer peak shift
-        peak_score      : max score
+    (peak_score, zscored peak score, (dy, dx))
     """
     score_map = np.asarray(score_map, dtype=float)
     if not np.isfinite(score_map).any():
@@ -398,36 +390,19 @@ def subpixel_shift_from_score_map(
     iy0, ix0 = np.unravel_index(np.nanargmax(score_map), score_map.shape)
     score_max = float(score_map[iy0, ix0])
 
-    y0 = max(0, iy0 - window_radius)
-    y1 = min(score_map.shape[0], iy0 + window_radius + 1)
-    x0 = max(0, ix0 - window_radius)
-    x1 = min(score_map.shape[1], ix0 + window_radius + 1)
+    def vertex(values):
+        """Offset of the parabola vertex through three samples (-1, 0, 1)."""
+        low, centre, high = values
+        curvature = low - 2 * centre + high
+        if not np.isfinite(curvature) or curvature >= 0:
+            return 0.0
+        return float(np.clip(0.5 * (low - high) / curvature, -0.5, 0.5))
 
-    patch = score_map[y0:y1, x0:x1]
-
-    # local coordinates in full-map index space
-    Y, X = np.meshgrid(np.arange(y0, y1), np.arange(x0, x1), indexing="ij")
-
-    # threshold relative to local peak
-    w = np.nan_to_num(
-        patch,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-    w[w < threshold_rel * score_max] = 0.0
-
-    # optional baseline subtraction
-    positive = w > 0
-    if np.any(positive):
-        w[positive] = w[positive] - w[positive].min()
-
-    if w.sum() <= 0:
-        iy = float(iy0)
-        ix = float(ix0)
-    else:
-        iy = float((Y * w).sum() / w.sum())
-        ix = float((X * w).sum() / w.sum())
+    iy, ix = float(iy0), float(ix0)
+    if 0 < iy0 < score_map.shape[0] - 1:
+        iy += vertex(score_map[iy0 - 1 : iy0 + 2, ix0])
+    if 0 < ix0 < score_map.shape[1] - 1:
+        ix += vertex(score_map[iy0, ix0 - 1 : ix0 + 2])
 
     # convert map indices to shifts
     dy = iy - (shape2[0] - 1)

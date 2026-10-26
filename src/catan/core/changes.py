@@ -17,6 +17,8 @@ class ChangeKind(str, Enum):
     UNION_GEOMETRY = "union_geometry"
     # Shared imaging border settings (Data.border_tolerance).
     BORDER_SETTINGS = "border_settings"
+    # Session alignment limits (Data.max_session_shift, alignment_offsets).
+    ALIGNMENT_SETTINGS = "alignment_settings"
 
     TRACE_VALUES = "trace_values"
     QUALITY_VALUES = "quality_values"

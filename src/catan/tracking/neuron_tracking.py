@@ -48,6 +48,7 @@ def normalize_union_footprints(A):
     return A
 
 from .structures import Model, Assignments
+from .analytics import two_noise_model
 
 logging.basicConfig(level=logging.INFO)
 
@@ -65,6 +66,10 @@ class ModelCountCalculation:
     # calculate_statistics() call.
     idx_remove: np.ndarray
     remove_info: Any
+
+    # Two-noise model evidence from the same call (cross-session:
+    # "cross2" and "vector").
+    two_noise: dict | None = None
 
 
 @dataclass(slots=True)
@@ -986,8 +991,64 @@ class Tracking:
                 **histo_options,
             )[0].astype(int)
 
+        two_noise = None
+        if mode == "cross" and self.model is not None:
+            centroid_delta = (
+                this_data.centroids[None, :, :] - ref_data.centroids[:, None, :]
+            )
+            two_noise = dict(
+                zip(
+                    ("cross2", "vector"),
+                    two_noise_model.cross_session_histograms(
+                        centroid_distance=np.linalg.norm(centroid_delta, axis=-1),
+                        shift_distance=footprint_distances,
+                        correlation=footprint_correlations,
+                        # Shifts are (dy, dx); centroids (x, y).
+                        shifts=footprint_shifts[..., ::-1],
+                        centroid_delta=centroid_delta,
+                        nearest=is_NN,
+                        included_ref=idx_ref,
+                        included_this=idx_this,
+                        R=self.params.get("neighbor_distance", 25.0),
+                        settings=self.model.two_noise_settings,
+                    ),
+                )
+            )
+
         return ModelCountCalculation(
-            counts=counts, idx_remove=idx_remove, remove_info=remove_info
+            counts=counts,
+            idx_remove=idx_remove,
+            remove_info=remove_info,
+            two_noise=two_noise,
+        )
+
+    def calculate_two_noise_same_counts(self, this_data: SessionData, *, ctx=None):
+        """Two-noise delta s = 0 evidence: pairs of different footprints of
+        one session, measured like cross-session pairs (centroid distance,
+        shift-optimized correlation). Does not modify SessionData or Model."""
+        if self.model is None:
+            raise ValueError("No current model available.")
+
+        _, _, correlations, _, _ = calculate_statistics(
+            this_data,
+            this_data,
+            distance_threshold=self.params.get("neighbor_distance", 25.0),
+            nP=12,
+            params=self.params,
+            ctx=ctx,
+            force_cross=True,
+        )
+
+        centroid_distance = np.linalg.norm(
+            this_data.centroids[:, None, :] - this_data.centroids[None, :, :], axis=-1
+        )
+
+        return two_noise_model.same_session_histogram(
+            centroid_distance,
+            correlations,
+            np.asarray(this_data.included, dtype=bool),
+            self.params.get("neighbor_distance", 25.0),
+            self.model.two_noise_settings,
         )
 
     def update_model_pair_counts(
@@ -1018,15 +1079,25 @@ class Tracking:
             session, ref_data=reference, mode="cross", ctx=ctx
         )
 
+        revisions = (
+            self.geometry_revision(reference_session_id),
+            self.geometry_revision(session_id),
+        )
         self.model.set_cross_counts(
             str(reference.path),
             str(session.path),
             result.counts,
-            source_revisions=(
-                self.geometry_revision(reference_session_id),
-                self.geometry_revision(session_id),
-            ),
+            source_revisions=revisions,
         )
+
+        # Cheap by-products of the same calculation.
+        for kind, counts in (result.two_noise or {}).items():
+            self.model.set_record(
+                kind,
+                (str(reference.path), str(session.path)),
+                counts,
+                source_revision=revisions,
+            )
 
         return result
 
@@ -1054,6 +1125,15 @@ class Tracking:
             result.counts,
             source_revision=(self.geometry_revision(session_id)),
         )
+
+        # An extra calculation: only while the two-noise model is used.
+        if self.model.kind == "two_noise":
+            self.model.set_record(
+                "same2",
+                str(session.path),
+                self.calculate_two_noise_same_counts(session, ctx=ctx),
+                source_revision=self.geometry_revision(session_id),
+            )
 
         return result
 
@@ -1473,9 +1553,36 @@ class Tracking:
             session_distances=(session_distances),
         )
 
-        self.model.fit_model_to_counts(counts["cross"], use_cdf=use_cdf)
+        if self.model.kind == "two_noise":
+            self.model.two_noise_context = self.two_noise_context(session_order)
+            self.model.fit_two_noise(counts)
+        else:
+            self.model.fit_model_to_counts(counts["cross"], use_cdf=use_cdf)
 
         return counts
+
+    def two_noise_context(self, session_order):
+        """Measured inputs of the two-noise model: neuron density inside the
+        area covered by neurons, and the image window (model units)."""
+        paths = {str(path) for path in session_order}
+        sessions = [
+            session
+            for session in self.sessions
+            if str(session.path) in paths and session.n_neurons > 0
+        ]
+        if not sessions:
+            raise ValueError("The two-noise model needs sessions with neurons.")
+
+        scale = self.params.get("pxtomu", 1.0)
+        dims = tuple(float(size) * scale for size in sessions[0].dims)
+        lam, coverage = two_noise_model.neuron_intensity(
+            [
+                np.asarray(session.centroids)[np.asarray(session.included, dtype=bool)]
+                for session in sessions
+            ],
+            dims,
+        )
+        return {"lambda": lam, "window_dims": dims, "coverage": coverage}
 
     ### ============================================ ###
     ### =========== ASSIGNMENT FUNCTIONS =========== ###

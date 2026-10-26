@@ -11,7 +11,6 @@ from collections.abc import Callable
 import numpy as np
 from scipy import sparse, spatial
 
-from catan.core.image_correlation import calculate_img_correlation
 from catan.core.spatial_coverage import (
     session_valid_mask,
     signed_border_distance,

@@ -18,8 +18,22 @@ from catan.tracking.analytics.fit_model_theoretical import (
     fit_histogram_params,
 )
 from catan.tracking.utils_new.counts import scale_down_counts
+from catan.tracking.analytics import two_noise_model
 
 NATIVE_MODEL_CONFIG = "catan_model.json"
+
+MODEL_KINDS = {
+    "classic": "Classic (single distance spread)",
+    "two_noise": "Two-noise (detection + movement)",
+}
+
+# Evidence records: keyed by session path or by (reference, session) paths.
+PATH_KINDS = ("same", "same2")
+PAIR_KINDS = ("cross", "cross2", "vector")
+COUNT_KINDS = PATH_KINDS + PAIR_KINDS
+
+# Evidence each model kind is fitted to.
+FIT_KINDS = {"classic": ("cross",), "two_noise": ("same2", "cross2", "vector")}
 
 
 class Model:
@@ -45,20 +59,17 @@ class Model:
                 "L": 512,
             }
         )
-        self.counts = {
-            "same": {},
-            "cross": {},
-        }
+        self.counts = {kind: {} for kind in COUNT_KINDS}
+        self.count_revisions = {kind: {} for kind in COUNT_KINDS}
+        self.stale_counts = {kind: set() for kind in COUNT_KINDS}
 
-        self.count_revisions = {
-            "same": {},
-            "cross": {},
-        }
-
-        self.stale_counts = {
-            "same": set(),
-            "cross": set(),
-        }
+        # Model implementation: two-noise. The classic model remains only
+        # for model files saved with it (parameter_sets keeps the other).
+        self.kind = "two_noise"
+        self.parameter_sets = {}
+        self.two_noise_settings = two_noise_model.settings_with_defaults()
+        # Measured inputs of the two-noise model (neuron density, window).
+        self.two_noise_context = {}
 
         self.fit_stale = False
 
@@ -78,14 +89,10 @@ class Model:
 
     def clear_counts(self):
 
-        self.counts["same"].clear()
-        self.counts["cross"].clear()
-
-        self.count_revisions["same"].clear()
-        self.count_revisions["cross"].clear()
-
-        self.stale_counts["same"].clear()
-        self.stale_counts["cross"].clear()
+        for kind in COUNT_KINDS:
+            self.counts[kind].clear()
+            self.count_revisions[kind].clear()
+            self.stale_counts[kind].clear()
 
         self.fitted = False
         self.fit_stale = False
@@ -143,61 +150,105 @@ class Model:
         if self.fitted:
             self.fit_stale = True
 
+    def set_record(self, kind, key, counts, *, source_revision=None):
+        """Store one evidence record of any kind (see COUNT_KINDS)."""
+        if kind == "same":
+            return self.set_same_counts(key, counts, source_revision=source_revision)
+        if kind == "cross":
+            return self.set_cross_counts(*key, counts, source_revisions=source_revision)
+
+        if kind not in COUNT_KINDS:
+            raise ValueError(f"Unknown evidence kind {kind!r}.")
+
+        expected = two_noise_model.evidence_shapes(self.two_noise_settings)[kind]
+        counts = np.asarray(counts, dtype=int)
+        if counts.shape != expected:
+            raise ValueError(
+                f"{kind} evidence has shape {counts.shape}, expected {expected}."
+            )
+
+        key = str(key) if kind in PATH_KINDS else (str(key[0]), str(key[1]))
+        self.counts[kind][key] = counts.copy()
+        self.count_revisions[kind][key] = source_revision
+        self.stale_counts[kind].discard(key)
+
+        if self.fitted and kind in FIT_KINDS.get(self.kind, ()):
+            self.fit_stale = True
+
+    @staticmethod
+    def _involves(kind, key, paths):
+        if kind in PATH_KINDS:
+            return key in paths
+        return key[0] in paths or key[1] in paths
+
+    def _fit_kinds_changed(self, changed):
+        return any(changed[kind] for kind in FIT_KINDS.get(self.kind, ()))
+
     def invalidate_counts_for_paths(self, paths):
 
         paths = {str(path) for path in paths}
 
-        stale_same = {path for path in self.counts["same"] if path in paths}
-
-        stale_cross = {
-            key for key in self.counts["cross"] if (key[0] in paths or key[1] in paths)
+        stale = {
+            kind: {
+                key for key in self.counts[kind] if self._involves(kind, key, paths)
+            }
+            for kind in COUNT_KINDS
         }
 
-        self.stale_counts["same"].update(stale_same)
-        self.stale_counts["cross"].update(stale_cross)
+        for kind, keys in stale.items():
+            self.stale_counts[kind].update(keys)
 
-        if self.fitted and stale_cross:
+        if self.fitted and self._fit_kinds_changed(stale):
             self.fit_stale = True
 
-        return {"same": stale_same, "cross": stale_cross}
+        return stale
 
     def remove_counts_for_paths(self, paths):
         """Delete all count records of these sessions (e.g. removed sessions)."""
         paths = {str(path) for path in paths}
 
-        same = [path for path in self.counts["same"] if path in paths]
-        cross = [
-            key for key in self.counts["cross"] if key[0] in paths or key[1] in paths
-        ]
+        removed = {
+            kind: {
+                key for key in self.counts[kind] if self._involves(kind, key, paths)
+            }
+            for kind in COUNT_KINDS
+        }
 
-        for path in same:
-            self._drop_record("same", path)
-        for key in cross:
-            self._drop_record("cross", key)
+        for kind, keys in removed.items():
+            for key in keys:
+                self._drop_record(kind, key)
 
-        if self.fitted and cross:
+        if self.fitted and self._fit_kinds_changed(removed):
             self.fit_stale = True
 
-        return {"same": set(same), "cross": set(cross)}
+        return removed
 
     def remove_reversed_pairs(self, session_order):
         """Delete cross-session records whose sessions are now in reverse
         order; the counts are directional and never used reversed."""
         order = {str(path): index for index, path in enumerate(session_order)}
 
-        reversed_pairs = [
-            key
-            for key in self.counts["cross"]
-            if key[0] in order and key[1] in order and order[key[1]] <= order[key[0]]
-        ]
+        reversed_pairs = {
+            kind: {
+                key
+                for key in self.counts[kind]
+                if key[0] in order
+                and key[1] in order
+                and order[key[1]] <= order[key[0]]
+            }
+            for kind in PAIR_KINDS
+        }
 
-        for key in reversed_pairs:
-            self._drop_record("cross", key)
+        for kind, keys in reversed_pairs.items():
+            for key in keys:
+                self._drop_record(kind, key)
 
-        if self.fitted and reversed_pairs:
+        if self.fitted and any(
+            reversed_pairs[kind] for kind in FIT_KINDS.get(self.kind, ()) if kind in reversed_pairs
+        ):
             self.fit_stale = True
 
-        return set(reversed_pairs)
+        return set().union(*reversed_pairs.values())
 
     def _drop_record(self, kind, key):
         self.counts[kind].pop(key, None)
@@ -208,18 +259,16 @@ class Model:
 
         path = str(path)
 
-        if path in self.stale_counts["same"]:
-            return True
-
         return any(
-            (reference_path == path or session_path == path)
-            for (reference_path, session_path) in self.stale_counts["cross"]
+            self._involves(kind, key, {path})
+            for kind in COUNT_KINDS
+            for key in self.stale_counts[kind]
         )
 
     @property
     def has_stale_counts(self) -> bool:
 
-        return bool(self.stale_counts["same"] or self.stale_counts["cross"])
+        return any(self.stale_counts[kind] for kind in COUNT_KINDS)
 
     def aggregate_counts(
         self,
@@ -232,8 +281,14 @@ class Model:
 
         nbins = self.params["bins"]
 
-        same = np.zeros((nbins, nbins), dtype=int)
-        cross = np.zeros((nbins, nbins, 3), dtype=int)
+        totals = {
+            "same": np.zeros((nbins, nbins), dtype=int),
+            "cross": np.zeros((nbins, nbins, 3), dtype=int),
+        }
+        for kind, shape in two_noise_model.evidence_shapes(
+            self.two_noise_settings
+        ).items():
+            totals[kind] = np.zeros(shape, dtype=int)
 
         # ============================================
         # Explicit subset
@@ -276,27 +331,32 @@ class Model:
         # ============================================
         # Same-session counts
         # ============================================
-        for path, counts in self.counts["same"].items():
+        for kind in PATH_KINDS:
+            for path, counts in self.counts[kind].items():
 
-            if not include_stale and path in self.stale_counts["same"]:
-                continue
+                if not include_stale and path in self.stale_counts[kind]:
+                    continue
 
-            if allowed_paths is not None and path not in allowed_paths:
-                continue
+                if allowed_paths is not None and path not in allowed_paths:
+                    continue
 
-            if order_index is not None and path not in order_index:
-                continue
+                if order_index is not None and path not in order_index:
+                    continue
 
-            same += counts
+                totals[kind] += counts
 
         # ============================================
         # Cross-session counts
         # ============================================
-        for (reference_path, session_path), counts in self.counts["cross"].items():
+        for kind, (reference_path, session_path), counts in (
+            (kind, key, counts)
+            for kind in PAIR_KINDS
+            for key, counts in self.counts[kind].items()
+        ):
 
             if (
                 not include_stale
-                and (reference_path, session_path) in self.stale_counts["cross"]
+                and (reference_path, session_path) in self.stale_counts[kind]
             ):
                 continue
 
@@ -325,14 +385,31 @@ class Model:
                 if allowed_distances is not None and distance not in allowed_distances:
                     continue
 
-            cross += counts
+            totals[kind] += counts
 
-        return {"same": same, "cross": cross}
+        return totals
 
     def build_arrays(self):
 
         nbins = self.params["bins"]
         self.arrays = {}
+
+        if getattr(self, "kind", "classic") == "two_noise":
+            # The two-noise evidence grid (correlation from c_min).
+            settings = self.two_noise_settings
+            self.arrays["distance_bounds"] = np.linspace(
+                0, self.params["neighbor_distance"], settings["distance_bins"] + 1
+            )
+            self.arrays["correlation_bounds"] = np.linspace(
+                settings["c_min"], 1, settings["correlation_bins"] + 1
+            )
+            for key, bounds in (
+                ("distance", self.arrays["distance_bounds"]),
+                ("correlation", self.arrays["correlation_bounds"]),
+            ):
+                self.arrays[key] = 0.5 * (bounds[1:] + bounds[:-1])
+            return
+
         self.arrays["distance_bounds"] = np.linspace(
             0, self.params["neighbor_distance"], nbins + 1
         )
@@ -422,6 +499,66 @@ class Model:
             self.parameters = dict(p_init)
             self.fit_used_fallback = True
             self.build_from_parameters(use_cdf=use_cdf)
+
+    # ------------------------------------------------------------------
+    # Model kinds
+    # ------------------------------------------------------------------
+
+    def set_kind(self, kind):
+        """Switch the model implementation. The parameters of each kind are
+        kept, so switching back restores them (no refit needed)."""
+        if kind not in MODEL_KINDS:
+            raise ValueError(f"Unknown model kind {kind!r}.")
+
+        if kind == self.kind:
+            return
+
+        if self.parameters:
+            self.parameter_sets[self.kind] = dict(self.parameters)
+
+        stored = self.parameter_sets.get(kind, {})
+        self.kind = kind
+        self.reset()
+        self.build_arrays()
+
+        if stored:
+            self.parameters = dict(stored)
+            self.build_from_parameters(use_cdf=True)
+
+    def two_noise_ctx(self):
+        context = self.two_noise_context
+        if "lambda" not in context or "window_dims" not in context:
+            raise ValueError(
+                "The two-noise model needs the neuron density; fit it from "
+                "the current sessions first."
+            )
+        return two_noise_model.Context(
+            lam=float(context["lambda"]),
+            dims=tuple(context["window_dims"]),
+            R=float(self.params["neighbor_distance"]),
+            settings=self.two_noise_settings,
+        )
+
+    def fit_two_noise(self, evidence, min_counts=20):
+        if self.loaded:
+            print("Model was loaded from file - fitting to counts not allowed.")
+            return
+
+        if evidence["cross2"][..., 0].sum() < min_counts:
+            raise Exception(
+                f"Not enough data to fit model - at least {min_counts} counts in the "
+                f"cross-session histogram required (currently: "
+                f"{evidence['cross2'][..., 0].sum()})."
+            )
+
+        ctx = self.two_noise_ctx()
+        start = self.parameters if self.kind == "two_noise" else None
+
+        self.reset()
+        parameters, result = two_noise_model.fit(evidence, ctx, start=start)
+        self.fit_used_fallback = not result.success
+        self.parameters = parameters
+        self.build_from_parameters(use_cdf=True)
 
     def get_parameter_estimates(self, counts):
         """
@@ -522,6 +659,9 @@ class Model:
                 "Model parameters must be calculated before building the model."
             )
 
+        if self.kind == "two_noise":
+            return self._build_two_noise(use_cdf=use_cdf)
+
         self.use_cdf = bool(use_cdf)
         p_fit = self.parameters
 
@@ -584,7 +724,39 @@ class Model:
         self.p_same["joint"] = nangauss_filter(pdf_NN / (pdf_NN + pdf_nNN), sigma=0.5)
 
         self.set_f_same("joint")
+        self._set_distance_cutoff()
 
+    def _build_two_noise(self, use_cdf=True):
+        self.build_arrays()
+        ctx = self.two_noise_ctx()
+
+        missing = set(two_noise_model.PARAMETER_NAMES) - set(self.parameters)
+        if missing:
+            raise ValueError(
+                "Two-noise parameters missing: " + ", ".join(sorted(missing))
+            )
+
+        # Parameters of earlier versions (e.g. eps) are dropped.
+        theta = {name: float(self.parameters[name]) for name in two_noise_model.PARAMETER_NAMES}
+        self.parameters = dict(theta)
+
+        display = two_noise_model.display_densities(theta, ctx)
+        self.distributions = {"pdf": display["pdf"], "grid": display["grid"]}
+        self.use_cdf = bool(use_cdf)
+
+        joint = two_noise_model.posterior(
+            theta,
+            ctx,
+            self.arrays["distance"],
+            self.arrays["correlation"],
+            use_cdf=self.use_cdf,
+        )
+        self.p_same = {"joint": joint}
+        self.set_f_same("joint")
+        self._set_distance_cutoff()
+
+    def _set_distance_cutoff(self):
+        # The highest correlation is the most permissive for matches.
         p_same = self.f_same(self.arrays["distance_bounds"], 1.0)
 
         finite = np.isfinite(p_same)
@@ -609,6 +781,27 @@ class Model:
 
     def parameter_preview(self, parameters):
         from copy import copy
+
+        if self.kind == "two_noise":
+            names = set(two_noise_model.PARAMETER_NAMES)
+            if set(parameters) != names:
+                raise ValueError("Supply exactly the two-noise model parameters.")
+
+            values = {name: float(parameters[name]) for name in two_noise_model.PARAMETER_NAMES}
+            for name, value in values.items():
+                low, high = two_noise_model.PARAMETERS[name][2:4]
+                if not np.isfinite(value) or not low <= value <= high:
+                    raise ValueError(f"{name} must lie between {low:g} and {high:g}.")
+
+            candidate = copy(self)
+            candidate.params = dict(self.params)
+            candidate.parameters = values
+            candidate.distributions = {"pdf": {}, "cdf": {}}
+            candidate.p_same = {}
+            candidate.build_from_parameters(use_cdf=getattr(self, "use_cdf", True))
+            candidate.fit_stale = self.fit_stale
+            candidate.fit_used_fallback = False
+            return candidate
 
         names = (
             "p_same",
@@ -673,7 +866,24 @@ class Model:
 
     def set_f_same(self, model: str = "joint"):
 
-        if model == "joint":
+        if model == "joint" and self.kind == "two_noise":
+            # Evaluate inside the grid: no linear extrapolation of
+            # probabilities (correlations below c_min are different neurons).
+            def clamped(distance, correlation, arrays=self.arrays, joint=self.p_same["joint"]):
+                distance = np.clip(distance, arrays["distance"][0], arrays["distance"][-1])
+                correlation = np.clip(
+                    correlation, arrays["correlation"][0], arrays["correlation"][-1]
+                )
+                return interpolate.interpn(
+                    (arrays["distance"], arrays["correlation"]),
+                    joint,
+                    (distance, correlation),
+                    bounds_error=False,
+                    fill_value=None,
+                )
+
+            self.f_same = clamped
+        elif model == "joint":
             self.f_same = lambda distance, correlation: interpolate.interpn(
                 (
                     self.arrays["distance"],
@@ -729,6 +939,20 @@ class Model:
         # Saved settings define how both parameters and counts are interpreted.
         # Older files retain the settings provided when constructing the model.
         self.params.update(metadata.get("params", {}))
+
+        # Older files: the classic model.
+        self.kind = metadata.get("model_kind", "classic")
+        if self.kind not in MODEL_KINDS:
+            raise ValueError(f"Unknown model kind {self.kind!r} in the model file.")
+        self.two_noise_settings = two_noise_model.settings_with_defaults(
+            metadata.get("two_noise_settings")
+        )
+        self.two_noise_context = dict(metadata.get("two_noise_context", {}))
+        self.parameter_sets = {
+            kind: dict(values)
+            for kind, values in metadata.get("parameter_sets", {}).items()
+            if kind in MODEL_KINDS and kind != self.kind
+        }
         self.reset()
         self.clear_counts()
 
@@ -752,9 +976,9 @@ class Model:
             revision = record["revision"]
             counts = arrays[record["array"]]
 
-            if kind == "same" and len(paths) == 1:
+            if kind in PATH_KINDS and len(paths) == 1:
                 key = paths[0]
-            elif kind == "cross" and len(paths) == 2:
+            elif kind in PAIR_KINDS and len(paths) == 2:
                 key = tuple(paths)
             else:
                 raise ValueError("Invalid model count record.")
@@ -764,7 +988,16 @@ class Model:
                 raise ValueError(f"Duplicate model count record: {identity!r}")
             seen.add(identity)
 
-            if kind == "same":
+            if kind not in ("same", "cross"):
+                self.set_record(
+                    kind,
+                    key,
+                    counts,
+                    source_revision=(
+                        tuple(revision) if isinstance(revision, list) else revision
+                    ),
+                )
+            elif kind == "same":
                 self.set_same_counts(
                     key,
                     counts,
@@ -796,7 +1029,7 @@ class Model:
         records = []
 
         if include_counts:
-            for kind in ("same", "cross"):
+            for kind in COUNT_KINDS:
                 for key, counts in self.counts[kind].items():
                     name = f"record_{len(records):06d}"
                     arrays[name] = counts
@@ -805,7 +1038,7 @@ class Model:
                         {
                             "array": name,
                             "kind": kind,
-                            "paths": [key] if kind == "same" else list(key),
+                            "paths": [key] if kind in PATH_KINDS else list(key),
                             "revision": self.count_revisions[kind].get(key),
                             "stale": key in self.stale_counts[kind],
                         }
@@ -818,6 +1051,14 @@ class Model:
             "fit_used_fallback": bool(self.fit_used_fallback),
             "counts_included": bool(include_counts),
             "records": records,
+            "model_kind": self.kind,
+            "two_noise_settings": self.two_noise_settings,
+            "two_noise_context": self.two_noise_context,
+            "parameter_sets": {
+                kind: {name: float(value) for name, value in values.items()}
+                for kind, values in self.parameter_sets.items()
+                if kind != self.kind
+            },
         }
 
         def json_default(value):

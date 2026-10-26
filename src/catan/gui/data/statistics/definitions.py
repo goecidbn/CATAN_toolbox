@@ -14,6 +14,10 @@ from .union_similarity import (
     union_similarity_requested_pairs,
 )
 from .event_rate import calculate_event_rate, trace_keys
+from .assignment_difference import (
+    calculate_assignment_difference,
+    other_assignment_names,
+)
 from .match_statistics import (
     calculate_match_probability,
     match_probability_requested_pairs,
@@ -87,6 +91,43 @@ CALCULATED_STATISTICS = {
             "neuron": ReductionSpec("keep"),
             "session": ReductionSpec("sum"),
         },
+        foreground_safe=True,
+    ),
+    "assignment_difference": StatisticDefinition(
+        key="assignment_difference",
+        title="Assignment differences",
+        description=(
+            "Sessions in which a neuron's footprints differ from its best "
+            "match in another assignment set (most shared footprints, then "
+            "nearest union centroid)."
+        ),
+        dims=("neuron",),
+        category="neuron",
+        getter=calculate_assignment_difference,
+        parameters=(
+            StatisticParameter(
+                key="compare_with",
+                label="Compare with",
+                kind=str,
+                default="",
+                tooltip="Loaded assignment set compared with the current one.",
+                choices=other_assignment_names,
+            ),
+            StatisticParameter(
+                key="max_distance",
+                label="Match distance (px)",
+                kind=float,
+                default=10.0,
+                minimum=0.0,
+                step=1.0,
+                decimals=1,
+                tooltip=(
+                    "Neurons sharing no footprint match the nearest union "
+                    "centroid within this distance; otherwise all their "
+                    "footprints count as differences."
+                ),
+            ),
+        ),
         foreground_safe=True,
     ),
     "event_rate": StatisticDefinition(

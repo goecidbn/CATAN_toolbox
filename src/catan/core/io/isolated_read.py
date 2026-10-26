@@ -430,6 +430,16 @@ def _execute_request(request):
 
         return [str(match) for match in directory.glob(pattern) if match.is_file()]
 
+    if operation == "path_table":
+        from catan.core.io.path_table import read_path_table
+
+        return read_path_table(path)
+
+    if operation == "resolve_paths":
+        from catan.core.io.path_table import resolve_table_paths
+
+        return resolve_table_paths(request["parameters"]["paths"], path)
+
     if operation == "json":
         import json
 

@@ -44,6 +44,7 @@ REMAP_FIELDS = (
     "success",
     "dims",
     "max_shift",
+    "allowed_offsets",
     "max_rotation",
     "c_min",
     "min_zcorr",
@@ -90,7 +91,7 @@ def prepare_session_snapshot(
         "remap": (
             None
             if session.remap is None
-            else {key: getattr(session.remap, key) for key in REMAP_FIELDS}
+            else {key: getattr(session.remap, key, None) for key in REMAP_FIELDS}
         ),
         "processing": processing
         or {
@@ -200,7 +201,7 @@ def read_session_snapshot(backend, ref, *, root="/"):
         session.remap = Remapping(evaluate=False)
         for key in REMAP_FIELDS:
             if (
-                key in {"method", "flow_info", "confirmation"}
+                key in {"method", "flow_info", "confirmation", "allowed_offsets"}
                 and key not in payload["remap"]
             ):
                 continue  # Older snapshots retain the constructor default.
@@ -274,7 +275,7 @@ def prepare_background_snapshot(session):
         "remap": (
             None
             if session.remap is None
-            else {key: getattr(session.remap, key) for key in REMAP_FIELDS}
+            else {key: getattr(session.remap, key, None) for key in REMAP_FIELDS}
         ),
     }
     return {"document": json.dumps(payload, default=encode), "arrays": arrays}

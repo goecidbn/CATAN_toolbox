@@ -1,5 +1,6 @@
 from typing import Dict, List, Optional, Tuple, Any, Literal
 
+import logging
 import numpy as np
 from scipy import sparse
 from pathlib import Path
@@ -581,8 +582,23 @@ class SessionData:
         if image.size == 0:
             raise ValueError("Spatial background is empty.")
 
-        if not np.all(np.isfinite(image)):
-            raise ValueError("Spatial background contains NaN or Inf values.")
+        finite = np.isfinite(image)
+        if not finite.all():
+            if not finite.any():
+                raise ValueError("Spatial background contains no finite values.")
+
+            # E.g. CaImAn's local correlation image (Cn) is NaN where a pixel
+            # is constant over the whole movie (zero-padded borders after
+            # motion correction, dead regions): such pixels carry no signal
+            # and are shown/aligned as the darkest finite value.
+            invalid = int(np.count_nonzero(~finite))
+            logging.getLogger(__name__).warning(
+                "Spatial background: %d of %d pixels are NaN/Inf; filled with "
+                "the minimum finite value.",
+                invalid,
+                image.size,
+            )
+            image = np.where(finite, image, image[finite].min()).astype(np.float32)
 
         if image.ndim == 2:
             return image
@@ -884,6 +900,8 @@ class SessionData:
             rotation_step=self.params["rotation_step"],
             rotation_refine_step=self.params["rotation_refine_step"],
             require_confirmation=require_confirmation,
+            # Positions of the imaging window accepted by the user (dx, dy).
+            allowed_offsets=self.params.get("alignment_offsets", ()),
         )
 
     def align_to_reference(self, alignment_references, use_optical_flow=True):

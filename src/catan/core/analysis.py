@@ -64,6 +64,12 @@ def calculate_statistics(
         mode = "same"
     else:
         mode = "cross"
+
+    # force_cross: measure same-session pairs like cross-session ones
+    # (shift-optimized correlation), each unordered pair once.
+    identical = mode == "same"
+    if kwargs.get("force_cross", False):
+        mode = "cross"
     # print(
     #     f"Calculating statistics for {mode}-matching of {this_session.n_neurons} vs {reference_session.n_neurons} neurons"
     # )
@@ -92,6 +98,9 @@ def calculate_statistics(
 
         for j in np.where(local_distances < distance_threshold)[0]:
             if not this_session.included[j] or j in idx_remove:
+                continue
+
+            if identical and mode == "cross" and j <= i:
                 continue
 
             A_ref = reference_session.footprints[:, i]  # .toarray()

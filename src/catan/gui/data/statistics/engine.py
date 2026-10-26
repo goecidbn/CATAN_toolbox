@@ -404,13 +404,17 @@ class StatisticEngine(QObject):
     def evaluate(
         self,
         query: Optional[StatisticQuery],
+        *,
+        cache: bool = True,
     ) -> Optional[StatisticArray]:
+        """With cache=False, neither read nor fill the cache (one-off
+        queries that should not evict others)."""
         if self.data is None or len(self.data.sessions) == 0 or query is None:
             return None
 
         with self._cache_lock:
             definition, query, revision, key = self._query_cache_key(query)
-            if key in self._cache:
+            if cache and key in self._cache:
 
                 if TRACE_STATISTICS:
                     print(
@@ -433,7 +437,7 @@ class StatisticEngine(QObject):
         with self._cache_lock:
             # A relevant change during calculation must not repopulate
             # the cache with an obsolete result.
-            if self._revisions.get(query.statistic_key, 0) == revision:
+            if cache and self._revisions.get(query.statistic_key, 0) == revision:
                 if (
                     self.cache_max_entries > 0
                     and _retained_array_bytes(result) <= self.cache_max_bytes
@@ -581,7 +585,12 @@ class StatisticEngine(QObject):
 
     @trace_statistic_request
     @reports_progress("Building statistic table")
-    def evaluate_table(self, query: Optional[StatisticQuery]) -> Optional[PickTable]:
+    def evaluate_table(
+        self,
+        query: Optional[StatisticQuery],
+        *,
+        cache: bool = True,
+    ) -> Optional[PickTable]:
 
         if query is None:
             return None
@@ -590,7 +599,7 @@ class StatisticEngine(QObject):
             return None
 
         with progress_scope(0, 85):
-            stat = self.evaluate(query)
+            stat = self.evaluate(query, cache=cache)
         if stat is None:
             return None
 
@@ -990,7 +999,8 @@ def active_session_view(data, state):
 
     bound_data = copy(data)
     name = data._current_assignments
-    bound_data._assignments = {name: bound_assignments}
+    # Other sets stay available (e.g. for assignment comparisons).
+    bound_data._assignments = {**data._assignments, name: bound_assignments}
     bound_data.sessions = list(sessions)
     bound_data.state = bound_state
 

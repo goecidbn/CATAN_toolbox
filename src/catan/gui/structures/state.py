@@ -115,6 +115,8 @@ class AppState(QObject):
         # (session_id, reference_id) chosen in the session-correlation inset.
         self.alignment_pending_reference = None
         self.alignment_panels = WeakSet()
+        # Open alignment editors: Footprints previews their draft meanwhile.
+        self.alignment_editors = WeakSet()
         self.alignment_review = None
 
     def issue(self, level, title, message, *, parent=None):

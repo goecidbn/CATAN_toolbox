@@ -49,6 +49,25 @@ from catan.gui.GUI_elements.utils.vispy_axes import link_axis
 from catan.core.alignment import calculate_residual_flow
 
 
+_WARNING_WORDS = ("failed", "not aligned", "skipped", "disabled", "exceed", "insufficient", "too ", "stopped", "rejected")
+
+
+def _set_status(label, text):
+    """Show the first sentence of a status in one line (⚠ for problems,
+    ⓘ when there is more); the full text is the tooltip."""
+    text = str(text or "").strip()
+    first = text.split("\n", 1)[0]
+    short = first.split(". ", 1)[0]
+    if short != first:
+        short += "."
+    if len(short) > 90:
+        short = short[:87].rstrip() + "…"
+    more = short != text
+    warning = any(word in text.lower() for word in _WARNING_WORDS)
+    label.setText(("⚠ " if warning else "") + short + (" ⓘ" if more else ""))
+    label.setToolTip(text if more else "")
+
+
 class AlignmentCamera(scene.PanZoomCamera):
     def __init__(self):
         self._alignment_bounds = None
@@ -98,6 +117,11 @@ class ManualAlignmentEditor(QWidget):
         self.state = data.state
         self.draft = draft
         self._disposed = False
+
+        # Footprints shows the draft alignment while an editor is open.
+        editors = getattr(self.state, "alignment_editors", None)
+        if editors is not None:
+            editors.add(self)
 
         self._score_task_id = None
         self._score_generation = 0
@@ -535,6 +559,17 @@ class ManualAlignmentEditor(QWidget):
 
         self.apply_button = QPushButton("Apply", self)
         self.view_controls.layout().addWidget(self.apply_button)
+
+        # E.g. the imaging window jumped and stayed: later sessions near this
+        # position align automatically instead of failing.
+        self.accept_offset = QCheckBox("Accept shifts around this position", self)
+        self.accept_offset.setToolTip(
+            "On Apply, later sessions are also aligned automatically when "
+            "they lie within the maximum shift of this position (not only of "
+            "the origin). Listed and reset at 'Max. shift' in the session "
+            "loading panel."
+        )
+        self.view_controls.layout().addWidget(self.accept_offset)
         self.apply_button.clicked.connect(self._apply)
 
         self.review_message = QPlainTextEdit(self)
@@ -1497,7 +1532,7 @@ class ManualAlignmentEditor(QWidget):
         draft, reference, reference_id = self._comparison_context()
         applied_flow = draft.effective_flow
 
-        self.deformation_status.setText(
+        _set_status(self.deformation_status, 
             draft.flow_message
             + (
                 "\nCorrelation shows residual translation after the "
@@ -1605,7 +1640,7 @@ class ManualAlignmentEditor(QWidget):
         self.pair_arrow.visible = valid
         self.pair_tip.visible = valid
         if not valid:
-            self.score_status.setText(result["message"])
+            _set_status(self.score_status, result["message"])
 
         if valid:
             fit_needed = self._displayed_score_key != key
@@ -1671,7 +1706,7 @@ class ManualAlignmentEditor(QWidget):
         self._color_window = window
 
         if x1 <= x0 or y1 <= y0:
-            self.score_status.setText(result["message"] + "\nNo scores in view.")
+            _set_status(self.score_status, "No scores in view.\n" + result["message"])
             return
 
         # Bound the work during pan/zoom to approximately 65k samples.
@@ -1683,7 +1718,7 @@ class ManualAlignmentEditor(QWidget):
         values = values[np.isfinite(values)]
 
         if not values.size:
-            self.score_status.setText(result["message"] + "\nNo valid scores in view.")
+            _set_status(self.score_status, "No valid scores in view.\n" + result["message"])
             return
 
         low, high = map(float, np.percentile(values, (2, 99.5)))
@@ -1695,7 +1730,7 @@ class ManualAlignmentEditor(QWidget):
             low, high = low - padding, high + padding
 
         self.score_image.clim = (low, high)
-        self.score_status.setText(
+        _set_status(self.score_status, 
             result["message"] + f"\nVisible color range: {low:.5g} to {high:.5g}"
         )
 
@@ -1729,7 +1764,7 @@ class ManualAlignmentEditor(QWidget):
         dx, dy = map(float, draft.values[:2])
         residual_surface = flow is not None
 
-        self.score_status.setText("Calculating correlation surface…")
+        _set_status(self.score_status, "Calculating correlation surface…")
 
         def calculate():
             ctx = current_task_context()
@@ -1844,7 +1879,7 @@ class ManualAlignmentEditor(QWidget):
 
         self._score_task_id = None
         self._requested_score_key = None
-        self.score_status.setText(
+        _set_status(self.score_status, 
             "Calculation stopped. Change the method or display mode to retry."
         )
 
@@ -1888,7 +1923,7 @@ class ManualAlignmentEditor(QWidget):
             tuple(map(float, draft.values)),
             None if draft.effective_flow is None else draft.effective_flow.copy(),
         )
-        self.flow_status.setText("Waiting for alignment changes to settle…")
+        _set_status(self.flow_status, "Waiting for alignment changes to settle…")
         self._flow_timer.start()
 
     def _start_flow(self):
@@ -1901,7 +1936,7 @@ class ManualAlignmentEditor(QWidget):
         reference, template, dims, transpose, values, applied_flow = pending
         dx, dy, angle = values
 
-        self.flow_status.setText("Estimating residual flow…")
+        _set_status(self.flow_status, "Estimating residual flow…")
 
         def calculate():
             ctx = current_task_context()
@@ -2008,7 +2043,7 @@ class ManualAlignmentEditor(QWidget):
             return
 
         if "error" in result:
-            self.flow_status.setText(
+            _set_status(self.flow_status, 
                 f"Flow unavailable: {result['error']}\n"
                 "Check the backgrounds or adjust the alignment. "
                 "Switch display modes to retry."
@@ -2068,7 +2103,7 @@ class ManualAlignmentEditor(QWidget):
             )
             self.flow_arrows.visible = True
 
-        self.flow_status.setText(
+        _set_status(self.flow_status, 
             "Residual flow: reference → current session\n"
             f"Median: {result['median']:.3f} px · "
             f"95th percentile: {result['p95']:.3f} px\n"
@@ -2082,7 +2117,7 @@ class ManualAlignmentEditor(QWidget):
             return
 
         self._flow_task_id = None
-        self.flow_status.setText(
+        _set_status(self.flow_status, 
             "Flow calculation stopped. Switch display modes to retry."
         )
 
@@ -2213,6 +2248,10 @@ class ManualAlignmentEditor(QWidget):
             self.apply_button,
         ):
             widget.setEnabled(available)
+
+        # Session alignments only (not the overview background).
+        self.accept_offset.setVisible(not self.draft.external)
+        self.accept_offset.setEnabled(available)
 
         self.transpose_background.setEnabled(
             available and self.draft.can_transpose_background
@@ -2418,6 +2457,10 @@ class ManualAlignmentEditor(QWidget):
 
     def _apply(self):
         if self.can_apply() and self._blocking_alignment() is None:
+            if self.accept_offset.isChecked() and not self.draft.external:
+                dx, dy, _ = map(float, self.draft.values)
+                self.data.add_alignment_offset((dx, dy))
+                self.accept_offset.setChecked(False)
             self.apply_requested.emit()
 
     def dispose(self):
@@ -2461,6 +2504,12 @@ class ManualAlignmentEditor(QWidget):
         self.canvas.events.draw.disconnect(self._update_visible_clim)
 
         self.canvas.close()
+
+        editors = getattr(self.state, "alignment_editors", None)
+        if editors is not None:
+            editors.discard(self)
+            # Ends the footprint preview.
+            self.state.alignment_draft_changed.emit()
 
     def _session_mean_displacement(self, session_id):
         """Mean (dx, dy) of the complete stored or draft transformation."""
@@ -2841,7 +2890,7 @@ class ManualAlignmentEditor(QWidget):
 
         self._estimate_generation += 1
         generation = self._estimate_generation
-        self.estimate_status.setText(f"Estimating {kind}…")
+        _set_status(self.estimate_status, f"Estimating {kind}…")
 
         def calculate():
             ctx = current_task_context()
@@ -2880,6 +2929,8 @@ class ManualAlignmentEditor(QWidget):
                             }
                         },
                         residual=True,
+                        # Keep the chosen rigid shift: no net translation.
+                        zero_mean=True,
                     )
 
                     check_cancelled()
@@ -3001,18 +3052,18 @@ class ManualAlignmentEditor(QWidget):
                 best_angle = angle
                 best_score = score_rotation(angle)
 
-                for candidate in grid(lo, hi, coarse_step):
-                    value = score_rotation(candidate)
+                for trial_angle in grid(lo, hi, coarse_step):
+                    value = score_rotation(trial_angle)
                     if value > best_score + 1e-10:
-                        best_angle, best_score = float(candidate), value
+                        best_angle, best_score = float(trial_angle), value
 
                 fine_lo = max(lo, best_angle - coarse_step)
                 fine_hi = min(hi, best_angle + coarse_step)
 
-                for candidate in grid(fine_lo, fine_hi, fine_step):
-                    value = score_rotation(candidate)
+                for trial_angle in grid(fine_lo, fine_hi, fine_step):
+                    value = score_rotation(trial_angle)
                     if value > best_score + 1e-10:
-                        best_angle, best_score = float(candidate), value
+                        best_angle, best_score = float(trial_angle), value
 
                 if not np.isfinite(best_score):
                     raise ValueError(
@@ -3061,12 +3112,12 @@ class ManualAlignmentEditor(QWidget):
         self._estimate_task_id = None
 
         if not self.can_apply() or self._estimate_context() != context:
-            self.estimate_status.setText(
+            _set_status(self.estimate_status, 
                 "Estimate discarded because the alignment or comparison changed. "
                 "Click Estimate again."
             )
         elif "error" in result:
-            self.estimate_status.setText(f"Estimation failed: {result['error']}")
+            _set_status(self.estimate_status, f"Estimation failed: {result['error']}")
             self.state.issue(
                 "warning",
                 "Alignment estimation",
@@ -3081,7 +3132,7 @@ class ManualAlignmentEditor(QWidget):
             else:
                 self.draft.values[2] = result["values"][0]
 
-            self.estimate_status.setText(result["message"])
+            _set_status(self.estimate_status, result["message"])
             self.state.alignment_draft_changed.emit()
 
         self._update_availability()
@@ -3091,7 +3142,7 @@ class ManualAlignmentEditor(QWidget):
             return
 
         self._estimate_task_id = None
-        self.estimate_status.setText("Estimation stopped. Click Estimate to retry.")
+        _set_status(self.estimate_status, "Estimation stopped. Click Estimate to retry.")
         self._update_availability()
 
 
