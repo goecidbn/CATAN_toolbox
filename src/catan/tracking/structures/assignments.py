@@ -523,8 +523,10 @@ class Assignments:
         sessions=None,
         provenance=None,
         overview_background=None,
+        main_file=False,
     ):
-        """``provenance``: optional {"sessions_file": CATAN session file,
+        """``main_file``: mark the file as a CATAN project main file (root
+        attribute ``catan_main_file``). ``provenance``: optional {"sessions_file": CATAN session file,
         "loading_recipe": JSON text, "model_path": str} describing the
         sessions and model in use. ``overview_background``: optional
         background snapshot {"document", "arrays"}."""
@@ -601,6 +603,7 @@ class Assignments:
                 "attributes": {
                     "object_type": "AssignmentsData",
                     "format_version": 1,
+                    **({"catan_main_file": 1} if main_file else {}),
                 },
             }
         )

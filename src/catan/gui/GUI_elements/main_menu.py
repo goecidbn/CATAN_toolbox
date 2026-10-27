@@ -54,7 +54,9 @@ from catan.gui.GUI_elements.utils.paths import display_path
 from catan.gui.GUI_elements.utils.elided_label import ElidedLabel
 import qtawesome as qta
 
-selector_options = {
+# Source actions (row buttons, "+ from file"); the selectors list only the
+# loaded models / assignment sets.
+source_actions = {
     "model": [
         "Load ...",
         "Remove current…",
@@ -66,6 +68,7 @@ selector_options = {
         "Remove current…",
     ],
 }
+selector_options = {"model": [], "assignments": []}
 
 
 class MainMenu(QFrame):
@@ -108,10 +111,33 @@ class MainMenu(QFrame):
         # self.logging.currentTextChanged.connect(self.change_logging_level)
         # layout.addWidget(QLabel("Logging level:"))
         # layout.addWidget(self.logging)
-        layout.addWidget(self.build_root_selector())
-
         self.session_list = session_overview.SessionOverview(self)
-        layout.addWidget(self.session_list, stretch=1)
+        load_row = self.session_list.load_row
+        # "+ from file": a project opens the project; assignments / a model
+        # are imported into their sections.
+        load_row.projectFileSelected.connect(self.open_project)
+        load_row.sourceFileSelected.connect(self.import_source_file)
+        load_row.projectSaveRequested.connect(lambda save_as: self.save_project(save_as=save_as))
+        load_row.assignmentsExportRequested.connect(lambda: self.save_data("assignments"))
+        load_row.modelSaveRequested.connect(lambda: self.save_data("model"))
+
+        # Three sections: loading (top, with the root folder), sessions
+        # (status, alignment limits, list), then model and assignments.
+        self.session_list.layout().removeWidget(load_row)
+        load_row.setParent(self)
+        load_row.set_root_selector(self.build_root_selector())
+        layout.addWidget(load_row)
+
+        sessions_frame = QFrame()
+        sessions_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        sessions_layout = QVBoxLayout(sessions_frame)
+        sessions_layout.setContentsMargins(6, 6, 6, 6)
+        sessions_layout.setSpacing(4)
+        for widget in load_row.take_session_widgets():
+            widget.setParent(sessions_frame)
+            sessions_layout.addWidget(widget)
+        sessions_layout.addWidget(self.session_list, 1)
+        layout.addWidget(sessions_frame, stretch=1)
 
         layout.addWidget(self.build_app_mode_menu())
 
@@ -189,7 +215,10 @@ class MainMenu(QFrame):
         if self.data.assignments is None:
             return
         any_assigned = any(self.data.assignments.matched_status)
-        self.loader["assignments"]["button_save"].setEnabled(any_assigned)
+        # A project can be saved once there are sessions.
+        self.loader["assignments"]["button_save"].setEnabled(
+            sessions_loaded or any_assigned
+        )
         self.update_buttons()
 
         if event.has(C.ASSIGNMENT_SET):
@@ -200,15 +229,20 @@ class MainMenu(QFrame):
         self.paths_layout = QVBoxLayout(paths_menu)
         self.paths_layout.setContentsMargins(0, 0, 0, 0)
 
-        frame = QFrame()
-        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        def section(spacing=5):
+            frame = QFrame()
+            frame.setFrameShape(QFrame.Shape.StyledPanel)
+            form = QFormLayout(frame)
+            form.setContentsMargins(8, 8, 8, 8)
+            form.setHorizontalSpacing(6)
+            form.setVerticalSpacing(spacing)
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            return frame, form
 
-        form = QFormLayout(frame)
-        form.setContentsMargins(8, 8, 8, 8)
-        form.setHorizontalSpacing(6)
-        form.setVerticalSpacing(5)
-        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        # Model and assignments: one frame each.
+        model_frame, model_form = section()
+        frame, form = section()
         self.form = form
 
         def source_icon(icon_name, tooltip):
@@ -221,7 +255,7 @@ class MainMenu(QFrame):
 
         self.loader = {}
 
-        form.addRow(
+        model_form.addRow(
             source_icon("chart-column", "Model"),
             self.build_load_options(
                 "model",
@@ -231,6 +265,10 @@ class MainMenu(QFrame):
         )
 
         self.config_constructor = FieldConfigConstructor(self, self.data.assignments)
+        # The preset is chosen on loading; the configuration shows itself
+        # only for a loading problem (show_problems).
+        self.config_constructor.auto_hide = True
+        self.config_constructor.use_dialog("Assignments load configuration", self)
 
         form.addRow(
             source_icon("layer-group", "Assignments"),
@@ -238,7 +276,6 @@ class MainMenu(QFrame):
                 "assignments",
                 list(self.data.available_assignments),
                 add_options=selector_options["assignments"],
-                add_widgets=[self.config_constructor.toggle_config_options],
             ),
         )
 
@@ -256,6 +293,8 @@ class MainMenu(QFrame):
         self._update_review_counts()
 
         # Configuration content belongs to its popup, not this form.
+        self.paths_layout.setSpacing(8)
+        self.paths_layout.addWidget(model_frame)
         self.paths_layout.addWidget(frame)
         self.update_buttons()
         return paths_menu
@@ -462,6 +501,19 @@ class MainMenu(QFrame):
         menu.aboutToShow.connect(refresh_menu)
         refresh_menu()
 
+        if key == "model":
+            # Separate model files (the project save includes the model).
+            menu.addSeparator()
+            save_model = menu.addAction("Save model…", lambda: self.save_data("model"))
+
+            def refresh_model_actions():
+                model = self.data.model
+                save_model.setEnabled(
+                    model is not None and (model.fitted or any(model.counts.values()))
+                )
+
+            menu.aboutToShow.connect(refresh_model_actions)
+
     def build_load_options(
         self,
         key,
@@ -503,8 +555,16 @@ class MainMenu(QFrame):
         # selector.currentTextChanged.connect(
         #     lambda text: self._on_load_option_changed(key, text)
         # )
-        selector.currentTextChanged.connect(selector.setToolTip)
-        selector.setToolTip(selector.currentText())
+        def describe(text):
+            selector.setToolTip(
+                f"Active model: {text}. Used for evidence, fitting and registration."
+                if key == "model"
+                else f"Active assignments: {text}. Used for navigation, "
+                "selection, the panels and registration."
+            )
+
+        selector.currentTextChanged.connect(describe)
+        describe(selector.currentText())
 
         layout.addWidget(selector, 1)
 
@@ -514,11 +574,11 @@ class MainMenu(QFrame):
         execute.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         set_button_icon(
             execute,
-            "play" if key == "model" else "folder-open",
+            "play",
             tooltip=(
                 "Process pending model counts and fit"
                 if key == "model"
-                else "Load assignments"
+                else "Process missing or outdated neuron registrations"
             ),
         )
         execute.setIconSize(QSize(16, 16))
@@ -529,25 +589,50 @@ class MainMenu(QFrame):
         save = QToolButton(self)
         save.setAutoRaise(True)
         save.setFixedSize(26, 26)
-        set_button_icon(save, "floppy-disk", tooltip=f"Save {key} data")
         save.setIconSize(QSize(16, 16))
         save.setEnabled(False)
-        save.clicked.connect(lambda checked=False: self.save_data(key))
         self.loader[key]["button_save"] = save
-        layout.addWidget(save)
+        # Saved with the project (load section's save button / Ctrl+S); the
+        # model also via its process button's arrow menu.
+        save.setVisible(False)
 
-        # Both rows reserve exactly the same configuration-button space.
-        config_slot = QWidget()
-        config_slot.setFixedSize(28, 26)
-        config_layout = QHBoxLayout(config_slot)
-        config_layout.setContentsMargins(0, 0, 0, 0)
+        if key == "assignments":
+            create = QToolButton(self)
+            create.setAutoRaise(True)
+            create.setFixedSize(36, 26)
+            create.setIconSize(QSize(16, 16))
+            create.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            set_button_icon(create, "square-plus", tooltip="Create assignments")
+            create_menu = QMenu(create)
+            create_menu.addAction(
+                "New, empty…", lambda: self._on_load_option_changed(key, "Create new")
+            )
+            create_menu.addAction(
+                "Copy of the current…",
+                lambda: self._on_load_option_changed(key, "Create named copy…"),
+            )
+            create.setMenu(create_menu)
+            self.loader[key]["button_create"] = create
+            layout.insertWidget(1, create)
+
+        remove = make_icon_button(
+            "ban",
+            color="red",
+            tooltip=(
+                "Remove the current model from the workspace (files stay)"
+                if key == "model"
+                else "Remove the current assignments from the workspace (files stay)"
+            ),
+            size=26,
+        )
+        remove.clicked.connect(lambda: self._on_load_option_changed(key, "Remove current…"))
+        self.loader[key]["button_remove"] = remove
+        layout.addWidget(remove)
 
         for widget in add_widgets or ():
             widget.setFixedSize(28, 26)
             widget.setIconSize(QSize(16, 16))
-            config_layout.addWidget(widget)
-
-        layout.addWidget(config_slot)
+            layout.addWidget(widget)
 
         def execute_clicked():
             if key == "model":
@@ -558,9 +643,7 @@ class MainMenu(QFrame):
             if assignments is None:
                 return
 
-            if assignments.path and not assignments.status["loaded"]:
-                self._load_assignments_from_source()
-            else:
+            if not (assignments.path and not assignments.status["loaded"]):
                 self.data.queue_process_assignments(mode="pending")
 
         execute.clicked.connect(execute_clicked)
@@ -646,6 +729,107 @@ class MainMenu(QFrame):
             "Excluded footprints counts all currently excluded footprints "
             "across the loaded sessions, including original footprints "
             "replaced by splitting or merging."
+        )
+
+    def import_source_file(self, key, path):
+        """Import assignments or a model from ``path`` (named as with the
+        sections' Load …)."""
+        if key == "assignments":
+            name, ok, use_working = self._ask_assignments_import_name(path)
+            replace = False
+        else:
+            name, ok, replace = self._ask_model_import_name(path)
+            use_working = False
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        self.data.queue_import_source(
+            key,
+            path,
+            name,
+            use_as_working=use_working,
+            replace_empty_model=replace,
+            on_loaded=lambda: self._on_source_registered(key),
+        )
+
+    def save_project(self, *, save_as=False):
+        """Save the project (Data.queue_save_project). The first save, and
+        Save as, ask for the project name. Returns the path, or None."""
+        path = None if save_as else self.data.project_path()
+        if path is None:
+            path = self._ask_project_path()
+            if path is None:
+                return None
+        try:
+            self.data.queue_save_project(path)
+        except (ValueError, OSError) as exc:
+            self.state.issue("warning", "Project not saved", str(exc), parent=self.window())
+            return None
+        return path
+
+    def _ask_project_path(self):
+        folder = self.data.project_folder()
+        suffix = self.data.PROJECT_SUFFIX
+        name, accepted = QInputDialog.getText(
+            self,
+            "Save project",
+            f"Project name (saved as name{suffix} in\n{display_path(str(folder))}):",
+            text=self.data.default_project_name(),
+        )
+        name = name.strip() if accepted else ""
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+        if not name:
+            return None
+
+        path = folder / f"{name}{suffix}"
+        if path.exists() and str(path) != self.data.project_path():
+            answer = QMessageBox.question(
+                self.window(),
+                "Replace project?",
+                f"{display_path(str(path))} already exists. Replace it (and its "
+                f"{name}.sessions.hdf5 / {name}.model.hdf5 where they are saved again)?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+        return str(path)
+
+    def open_project(self, path=None):
+        """Open a project file (or a CATAN assignments file): its sessions
+        and model (referenced next to it) are loaded first, then the
+        assignments. Asks only if sessions or a model are loaded already.
+        Without ``path``, a file dialog."""
+        if path is None:
+            folder = self.data.project_folder()
+            path = choose_path(
+                self,
+                pick_dir=False,
+                init_path=str(folder if folder.is_dir() else self.data.root),
+                display_text="Open CATAN project",
+                only_existing=True,
+                file_filters=[("CATAN project", (f"*{self.data.PROJECT_SUFFIX}",))],
+                state=self.state,
+            )
+        if not path:
+            return
+
+        suffix = self.data.PROJECT_SUFFIX
+        base = Path(path).name
+        base = base[: -len(suffix)] if base.endswith(suffix) else Path(path).stem
+        use_working = self.data.can_use_working_assignments()
+        name, number = base, 2
+        while name in self.data.available_assignments:
+            name, number = f"{base} ({number})", number + 1
+
+        self._opening_project = True
+        self.data.queue_import_source(
+            "assignments",
+            path,
+            name,
+            use_as_working=use_working,
+            on_loaded=lambda: self._on_source_registered("assignments"),
         )
 
     def save_data(self, key):
@@ -741,7 +925,7 @@ class MainMenu(QFrame):
 
         name = None
         ok = False
-        if opt in selector_options[key]:
+        if opt in source_actions[key]:
             load_path = None
             if opt == "Load ...":
                 load_path = choose_path(
@@ -867,11 +1051,43 @@ class MainMenu(QFrame):
         name = target_name if replace else name_edit.text().strip()
         return name, accepted, replace
 
-    def _show_assignments_configuration(self):
+    ASSIGNMENT_CONFIG_HINT = (
+        "Select a matching preset or correct the IDs field, then click Load."
+    )
+
+    def _cancel_assignments_import(self, source):
+        """Drop an imported assignments file that was not loaded (no
+        orphaned file reference remains)."""
+        name = next(
+            (name for name, item in self.data._assignments.items() if item is source), None
+        )
+        if name is None or source.status["loaded"]:
+            return
+        self.data.remove_loaded_source(
+            "assignments",
+            name,
+            expected_source=source,
+            on_removed=lambda: self._refresh_source_selector("assignments"),
+        )
+
+    def _show_assignments_configuration(self, problems=None, hint=None):
+        """Open the assignments load configuration; ``problems`` (why
+        loading stopped) are shown in it, not in a separate message box."""
         constructor = self.config_constructor
-        constructor.update_source(self.data.assignments)
-        constructor.toggle_config_options.set_expanded(True)
-        constructor.expanded_changed.emit()
+        source = self.data.assignments
+        constructor.update_source(source)
+        if problems:
+            constructor.show_problems(
+                problems, self.ASSIGNMENT_CONFIG_HINT if hint is None else hint
+            )
+            # A file waiting to be loaded: confirm (Load) or drop (Cancel).
+            if source is not None and source.path and not source.status["loaded"]:
+                constructor.set_pending_load(
+                    on_load=self._load_assignments_from_source,
+                    on_cancel=lambda: self._cancel_assignments_import(source),
+                )
+        else:
+            constructor.open()
         self.update_buttons()
 
     def _load_assignments_from_source(self):
@@ -938,21 +1154,7 @@ class MainMenu(QFrame):
 
         if problems:
             source.status["loading_possible"] = False
-
-            self.state.issue(
-                "info",
-                "Choose or repair the assignments configuration",
-                "\n\n".join(problems)
-                + "\n\nSelect a matching preset or configure the IDs field. "
-                "Then click the assignments open-folder button to load.",
-                parent=self.window(),
-            )
-
-            # Open AFTER the message box closes.
-            # Its nested event loop may have changed the active source.
-            if isValid(self) and self.data.assignments is source:
-                self._show_assignments_configuration()
-
+            self._show_assignments_configuration(problems)
             return
 
         if not self._offer_assignments_provenance(source):
@@ -970,7 +1172,15 @@ class MainMenu(QFrame):
         """
         provenance = getattr(source, "provenance", None)
 
-        if not provenance:
+        for note in (provenance or {}).get("ignored", ()):
+            self.state.logger.warning("Stored reference ignored: %s", note)
+
+        if not provenance or not (
+            provenance.get("recipe") is not None
+            or provenance.get("model_path")
+            or provenance.get("sessions_file")
+        ):
+            self._opening_project = False
             return True
 
         sessions = []
@@ -1037,63 +1247,67 @@ class MainMenu(QFrame):
         if model_differs:
             stored.append(f"model {Path(model_path).name}")
 
-        dialog = QMessageBox(self.window())
-        dialog.setIcon(QMessageBox.Icon.Question)
-        dialog.setWindowTitle("Sessions and model of these assignments")
-        dialog.setText(
-            "These assignments were saved together with "
-            + " and ".join(stored)
-            + "."
-        )
+        # Opening a project into an empty workspace: load without asking.
+        opening = getattr(self, "_opening_project", False)
+        self._opening_project = False
+        if not (opening and not have_current):
+            dialog = QMessageBox(self.window())
+            dialog.setIcon(QMessageBox.Icon.Question)
+            dialog.setWindowTitle("Sessions and model of these assignments")
+            dialog.setText(
+                "These assignments were saved together with "
+                + " and ".join(stored)
+                + "."
+            )
 
-        details = []
-        if sessions_differ and sessions_file:
-            details.append(f"Session file:\n  {display_path(sessions_file)}")
-        elif sessions_differ:
-            details.append(
-                "Sessions:\n"
-                + "\n".join(
-                    f"  {display_path(session.path)}" for session in sessions[:8]
+            details = []
+            if sessions_differ and sessions_file:
+                details.append(f"Session file:\n  {display_path(sessions_file)}")
+            elif sessions_differ:
+                details.append(
+                    "Sessions:\n"
+                    + "\n".join(
+                        f"  {display_path(session.path)}" for session in sessions[:8]
+                    )
+                    + (f"\n  … {len(sessions) - 8} more" if len(sessions) > 8 else "")
                 )
-                + (f"\n  … {len(sessions) - 8} more" if len(sessions) > 8 else "")
-            )
-        if model_differs:
-            details.append(f"Model:\n  {display_path(model_path)}")
+            if model_differs:
+                details.append(f"Model:\n  {display_path(model_path)}")
 
-        if have_current:
-            dialog.setInformativeText(
-                "Keep the currently loaded sessions and model, or replace them? "
-                "Replacing removes the current sessions, including their "
-                "columns in all loaded assignments."
-            )
-            load_button = dialog.addButton(
-                "Replace with stored", QMessageBox.ButtonRole.DestructiveRole
-            )
-            keep_button = dialog.addButton(
-                "Keep current", QMessageBox.ButtonRole.AcceptRole
-            )
-        else:
-            dialog.setInformativeText("Load them before the assignments?")
-            load_button = dialog.addButton(
-                "Load stored sessions and model", QMessageBox.ButtonRole.AcceptRole
-            )
-            keep_button = dialog.addButton(
-                "Assignments only", QMessageBox.ButtonRole.RejectRole
-            )
+            if have_current:
+                dialog.setInformativeText(
+                    "Keep the currently loaded sessions and model, or replace them? "
+                    "Replacing removes the current sessions, including their "
+                    "columns in all loaded assignments."
+                )
+                load_button = dialog.addButton(
+                    "Replace with stored", QMessageBox.ButtonRole.DestructiveRole
+                )
+                keep_button = dialog.addButton(
+                    "Keep current", QMessageBox.ButtonRole.AcceptRole
+                )
+            else:
+                dialog.setInformativeText("Load them before the assignments?")
+                load_button = dialog.addButton(
+                    "Load stored sessions and model", QMessageBox.ButtonRole.AcceptRole
+                )
+                keep_button = dialog.addButton(
+                    "Assignments only", QMessageBox.ButtonRole.RejectRole
+                )
 
-        dialog.setDetailedText("\n\n".join(details))
-        cancel_button = dialog.addButton(QMessageBox.StandardButton.Cancel)
-        dialog.setDefaultButton(keep_button if have_current else load_button)
-        fit_message_box_buttons(dialog)
-        dialog.exec()
+            dialog.setDetailedText("\n\n".join(details))
+            cancel_button = dialog.addButton(QMessageBox.StandardButton.Cancel)
+            dialog.setDefaultButton(keep_button if have_current else load_button)
+            fit_message_box_buttons(dialog)
+            dialog.exec()
 
-        clicked = dialog.clickedButton()
+            clicked = dialog.clickedButton()
 
-        if clicked is cancel_button or not isValid(self):
-            return False
+            if clicked is cancel_button or not isValid(self):
+                return False
 
-        if clicked is keep_button:
-            return True
+            if clicked is keep_button:
+                return True
 
         if sessions_differ:
             for session_id in reversed(range(len(self.data.sessions))):
@@ -1181,19 +1395,22 @@ class MainMenu(QFrame):
             return
 
         self._clear_busy_icon(button)
-        if loading:
-            set_button_icon(button, "folder-open", tooltip="Load assignments")
-        else:
-            set_button_icon(
-                button, "play", tooltip="Process missing or outdated neuron registrations"
-            )
+        set_button_icon(
+            button, "play", tooltip="Process missing or outdated neuron registrations"
+        )
 
         # Registration needs match probabilities: a fitted (or imported) model.
+        # A file waiting to be loaded is confirmed in its configuration.
         model_ready = model is not None and model.fitted
         button.setEnabled(
-            assignments is not None and (loading or (sessions_loaded and model_ready))
+            assignments is not None and not loading and sessions_loaded and model_ready
         )
-        if not loading and not model_ready:
+        if loading:
+            button.setToolTip(
+                "Load or cancel the selected assignments file in its "
+                "configuration first."
+            )
+        elif not model_ready:
             button.setToolTip(
                 "Process neuron registrations — fit or import a model first "
                 "(registration needs its match probabilities)."

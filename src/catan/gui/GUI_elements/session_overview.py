@@ -59,6 +59,7 @@ from catan.core.io.path_table import (
 # Tables of session file paths (one table; optional header row).
 PATH_TABLE_SUFFIXES = (".csv", ".tsv")
 
+from catan.gui.GUI_elements.fragments.load_type_dialog import LoadTypeDialog
 from catan.gui.structures import AppState, Data, SessionData
 from catan.gui.background_tasks.TaskManager import TaskBatch
 from catan.gui.background_tasks.runtime import current_task_context
@@ -746,15 +747,16 @@ class SessionRowWidget(QFrame):
             )
 
         save_included = menu.addAction(
-            "Save included data…",
+            "Save footprint 'included' tags…",
             lambda: self.saveIncludedRequested.emit(self.index),
         )
         save_included.setEnabled(
             bool(self.session.path) and has_exclusions(self.session)
         )
         save_included.setToolTip(
-            "Save this session's inclusion mask. "
-            "Available when at least one footprint is excluded."
+            "Save which footprints of this session are included (one "
+            "true/false tag per footprint). Available when at least one "
+            "footprint is excluded."
         )
 
         export_seeds = menu.addAction(
@@ -930,14 +932,14 @@ class RegistrationActionSelector(QToolButton):
         actions = self.actions
 
         if not actions:
-            text = "On registration: none"
+            text = "On session registration: none"
 
         elif len(actions) == 1:
             key = next(iter(actions))
-            text = "On registration: " + REGISTRATION_ACTION_LABELS[key]
+            text = "On session registration: " + REGISTRATION_ACTION_LABELS[key]
 
         else:
-            text = f"On registration: {len(actions)} actions"
+            text = f"On session registration: {len(actions)} actions"
 
         self.setText(text)
 
@@ -983,6 +985,14 @@ class RegistrationActionSelector(QToolButton):
 class LoadSessionRowWidget(QFrame):
     loadRequested = Signal()
     loadConfigRequired = Signal(int)
+    # A CATAN project (main or assignments file) was chosen to load.
+    projectFileSelected = Signal(str)
+    # Assignments or a model chosen with "+ from file": (key, path).
+    sourceFileSelected = Signal(str, str)
+    # Save button: the project (save as?), assignments export, model file.
+    projectSaveRequested = Signal(bool)
+    assignmentsExportRequested = Signal()
+    modelSaveRequested = Signal()
 
     def __init__(self, parent: "SessionOverview"):
         super().__init__(parent)
@@ -992,9 +1002,11 @@ class LoadSessionRowWidget(QFrame):
 
         self.setObjectName("SessionRowWidget")
 
+        # The central loading section (main menu top): root folder, "+".
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(6, 3, 6, 5)
-        root_layout.setSpacing(4)
+        root_layout.setContentsMargins(8, 6, 8, 8)
+        root_layout.setSpacing(6)
+        self._root_layout = root_layout
 
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1053,7 +1065,14 @@ class LoadSessionRowWidget(QFrame):
         )
 
         load_button = make_icon_button(
-            "plus", tooltip="Register new session data…", icon_size=30
+            "plus",
+            tooltip=(
+                "Load data: a CATAN project (sessions, model and assignments), "
+                "session data, assignments, a model, a loading recipe (.json) "
+                "or a path table (.csv); or sessions matching a glob."
+            ),
+            size=36,
+            icon_size=30,
         )
         load_button.clicked.connect(self.on_register_session)
 
@@ -1106,21 +1125,36 @@ class LoadSessionRowWidget(QFrame):
             lambda text: self.edit_load_glob.setVisible(text == ".* (glob)")
         )
 
-        ## save button for sessions data
+        ## save: the project (click, Ctrl+S); separate files in the menu
         self.button_save_sessions = make_icon_button(
-            "floppy-disk", tooltip=f"Save sessions data", size=28, icon_size=22
+            "floppy-disk",
+            tooltip=(
+                "Save project (Ctrl+S): the assignments as main file "
+                "(name.catan.hdf5 in the root's catan folder) with the sessions "
+                "and the model. Arrow: save as, or separate files."
+            ),
+            size=28,
+            icon_size=22,
         )
         self.button_save_sessions.setFixedWidth(48)
         self.button_save_sessions.setEnabled(False)
         layout.addWidget(
             self.button_save_sessions, alignment=Qt.AlignmentFlag.AlignRight
         )
-        self.button_save_sessions.clicked.connect(lambda: self.save_data("sessions"))
+        self.button_save_sessions.clicked.connect(
+            lambda: self.projectSaveRequested.emit(False)
+        )
         save_menu = QMenu(self.button_save_sessions)
+        save_menu.addAction("Save project as…", lambda: self.projectSaveRequested.emit(True))
+        save_menu.addSeparator()
+        save_menu.addAction("Export assignments only…", self.assignmentsExportRequested.emit)
+        save_menu.addAction("Save model file…", self.modelSaveRequested.emit)
+        save_menu.addAction("Save sessions file…", lambda: self.save_data("sessions"))
+        save_menu.addSeparator()
         save_recipe_action = save_menu.addAction("Save loading recipe (.json)…")
         save_recipe_action.triggered.connect(self.save_loading_recipe)
 
-        save_included_action = save_menu.addAction("Save all included data…")
+        save_included_action = save_menu.addAction("Save footprint 'included' tags (all sessions)…")
         save_included_action.triggered.connect(self.save_all_included)
 
         export_seeds_action = save_menu.addAction(
@@ -1146,7 +1180,8 @@ class LoadSessionRowWidget(QFrame):
             lambda value: setattr(self.data, "background_orientation", value)
         )
         root_layout.addWidget(self.registration_action_selector)
-        root_layout.addWidget(self._build_max_shift_row())
+        self.max_shift_row = self._build_max_shift_row()
+        root_layout.addWidget(self.max_shift_row)
         self._remembered_background_choice = None
 
         self.state.data_changed.connect(self._on_data_changed)
@@ -1158,6 +1193,19 @@ class LoadSessionRowWidget(QFrame):
 
         # layout.addStretch()
         self._update_background()
+
+    def set_root_selector(self, widget):
+        """Put the root folder selection first in this section."""
+        widget.setObjectName("loadLine")
+        self._root_layout.insertWidget(0, widget)
+
+    def take_session_widgets(self):
+        """The loading status and the alignment limits, for the sessions
+        section (they concern the sessions, not the loading)."""
+        widgets = [self.loading_status, self.max_shift_row]
+        for widget in widgets:
+            self._root_layout.removeWidget(widget)
+        return widgets
 
     def _on_data_changed(self, input):
         # data_type, data_var = input
@@ -1171,8 +1219,8 @@ class LoadSessionRowWidget(QFrame):
         save_path = choose_path(
             self,
             pick_dir=False,
-            init_path=str(self.data.root),
-            display_text=f"Select folder to save {key} file to",
+            init_path=str(self.data.project_folder()),
+            display_text=f"Save {key} file",
             only_existing=False,
             default_suffix="hdf5",
             file_filters=[
@@ -1235,6 +1283,7 @@ class LoadSessionRowWidget(QFrame):
                 border-radius: 4px;
                 font-weight: bold;
             }}
+            QWidget#loadLine {{ background: transparent; }}
             """)
 
     def choose_sessions_from_glob(self):
@@ -1815,6 +1864,11 @@ class LoadSessionRowWidget(QFrame):
                 check["batch"],
                 "The selected configuration refers to required fields "
                 f"that are absent from the source:\n\n{details}",
+                problems=[
+                    f"{field.group}.{field.label}: {field.spec.path} not found"
+                    + (f" in {display_path(field.spec.source_path)}" if field.spec.source_path else "")
+                    for field in missing
+                ],
             )
             return
 
@@ -2005,19 +2059,9 @@ class LoadSessionRowWidget(QFrame):
         self.min_correlation_spin.valueChanged.connect(self.data.set_min_flow_correlation)
         layout.addWidget(self.min_correlation_spin)
 
-        layout.addSpacing(8)
-        self.refine_footprints_check = QCheckBox("Refine with footprints", row)
-        self.refine_footprints_check.setToolTip(
-            "Optional: after the background alignment of each new session, "
-            "correct a small rigid offset (≤ 5 px, slight rotation) between "
-            "its footprints and those of the reference sessions. Only applied "
-            "with enough matching cells and if it brings them closer."
-        )
-        self.refine_footprints_check.setChecked(self.data.refine_alignment_with_footprints)
-        self.refine_footprints_check.toggled.connect(
-            self.data.set_refine_alignment_with_footprints
-        )
-        layout.addWidget(self.refine_footprints_check)
+        # Footprint refinement: Session alignment panel (footprint
+        # correction / Refine all sessions); not during loading.
+        self.data.set_refine_alignment_with_footprints(False)
         layout.addStretch()
 
         self._refresh_max_shift_row()
@@ -2032,9 +2076,6 @@ class LoadSessionRowWidget(QFrame):
             previous = spin.blockSignals(True)
             spin.setValue(value)
             spin.blockSignals(previous)
-        previous = self.refine_footprints_check.blockSignals(True)
-        self.refine_footprints_check.setChecked(self.data.refine_alignment_with_footprints)
-        self.refine_footprints_check.blockSignals(previous)
 
         if offsets:
             self.max_shift_label.setText("⚠ Max. shift")
@@ -2121,21 +2162,65 @@ class LoadSessionRowWidget(QFrame):
         if opt.lower() != "from file":
             raise ValueError(f"Unknown option selected: {opt}")
 
+        folder = self.data.project_folder()
         path = choose_path(
             self,
             pick_dir=False,
-            init_path=self.data.root,
-            display_text="Select session file, loading recipe (.json) or path table (.csv)",
+            init_path=str(folder if folder.is_dir() else self.data.root),
+            display_text=(
+                "Select a CATAN project (.catan.hdf5), session file, "
+                "loading recipe (.json) or path table (.csv)"
+            ),
             only_existing=True,
         )
         if path is None:
             return
 
-        self._queue_registration_path(
-            Path(path),
-            batch=TaskBatch(),
-            actions=set(self.registration_action_selector.actions),
-            force_first_session=not self.data.sessions,
+        actions = set(self.registration_action_selector.actions)
+        first = not self.data.sessions
+
+        def route(kind):
+            # A project loads its sessions, model and assignments.
+            if kind == "project":
+                self.projectFileSelected.emit(str(path))
+            elif kind in ("assignments", "model"):
+                self.sourceFileSelected.emit(kind, str(path))
+            else:
+                # Sessions, recipe (.json) or path table (by suffix).
+                self._queue_registration_path(
+                    Path(path),
+                    batch=TaskBatch(),
+                    actions=actions,
+                    force_first_session=first,
+                )
+
+        def dispatch(result):
+            kind, presets = result
+            if kind is not None:
+                route(kind)
+                return
+            # Not identifiable: ask for its type and preset.
+            manager = self.state.config_manager
+            names = {
+                source_type: manager.names(public_only=False, source_type=source_type)
+                for source_type in ("session", "assignments")
+            }
+            dialog = LoadTypeDialog(path, presets, names, parent=self.window())
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            if dialog.preset_name:
+                # The next suggestion for this file format is this preset.
+                manager.remember_used_config(
+                    manager.resolve_file_format(path), manager.select(dialog.preset_name)
+                )
+            route(dialog.kind.currentData())
+
+        self.state.tasks.start(
+            "loading",
+            f"Inspecting {Path(path).name}",
+            self.data.identify_load_file,
+            path,
+            on_result=dispatch,
         )
 
     def _cancel_registration_batch(self, batch):
@@ -2418,30 +2503,15 @@ class LoadSessionRowWidget(QFrame):
                 ),
             )
 
-    def _request_load_configuration(self, session, batch, explanation):
+    def _request_load_configuration(self, session, batch, explanation, problems=None):
         # Stop downstream registration without discarding completed sessions.
         self.state.tasks.cancel_batch(batch)
         self._remembered_background_choice = None
 
         session.status["loading_possible"] = False
+        # Shown in the session's configuration (no separate message box).
+        session._load_config_problems = list(problems or [str(explanation)])
         self.loadConfigRequired.emit(session.id)
-
-        self.state.issue(
-            "info",
-            "Choose or repair the load configuration",
-            (
-                f"Session: {session.name}\n\n"
-                f"{explanation}\n\n"
-                "Loading has stopped before reading the session data. "
-                "Previously loaded sessions are retained.\n\n"
-                "Choose a matching preset or correct the required field "
-                "paths in the expanded configuration. Then click this "
-                "session's open-folder button to load it.\n\n"
-                "To resume the remaining batch, reopen the JSON recipe "
-                "or glob selection and select the unfinished sessions."
-            ),
-            parent=self.window(),
-        )
 
     def _set_loading_status_batch(self, batch):
         if self._loading_status_batch is not batch:
@@ -2603,7 +2673,7 @@ class LoadSessionRowWidget(QFrame):
             self,
             pick_dir=False,
             init_path=str(source.parent),
-            display_text=f"Save included data — {session.name}",
+            display_text=f"Save footprint 'included' tags — {session.name}",
             only_existing=False,
             default_suffix="hdf5",
             default_filename=filename,
@@ -2786,7 +2856,7 @@ class LoadSessionRowWidget(QFrame):
 
         prefix, accepted = QInputDialog.getText(
             self,
-            "Save all included data",
+            "Save footprint 'included' tags (all sessions)",
             "Filename prefix:\n"
             "Files will be saved in their source session folders.\n"
             "Existing files with the resulting names will be replaced.",
@@ -3219,9 +3289,24 @@ class SessionOverview(QWidget):
                 self.list_widget.scrollToItem(item)
                 break
 
+        session = self.data.sessions[session_id] if 0 <= session_id < len(self.data.sessions) else None
+        problems = list(getattr(session, "_load_config_problems", None) or [])
+
         def open_config():
-            if isValid(row):
-                row.config_constructor.toggle_config_options.set_expanded(True)
+            if not isValid(row):
+                return
+            constructor = row.config_constructor
+            if problems:
+                constructor.build_content()
+                constructor.show_problems(
+                    problems,
+                    "Choose a matching preset or correct the highlighted fields, "
+                    "then click this session's open-folder button. Loaded "
+                    "sessions are kept; reopen the recipe or glob selection "
+                    "to load the remaining ones.",
+                )
+            else:
+                constructor.toggle_config_options.set_expanded(True)
 
         QTimer.singleShot(0, open_config)
 

@@ -4,6 +4,7 @@ import threading
 from PySide6.QtCore import QCoreApplication, QSettings, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QFont, Qt, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
+    QMenu,
     QApplication,
     QAbstractSpinBox,
     QLineEdit,
@@ -80,6 +81,22 @@ class MainWindow(QMainWindow):
             reload_action.setShortcut("Ctrl+R")
             reload_action.triggered.connect(self.reload_logic)
             self.menuBar().addAction(reload_action)
+
+        # Project: the assignments file with its sessions and model.
+        # Owned by the window (kept alive with its actions and shortcuts).
+        self.file_menu = file_menu = QMenu("File", self)
+        self.menuBar().insertMenu(
+            self.menuBar().actions()[0] if self.menuBar().actions() else None, file_menu
+        )
+        menu = lambda: self.gui_elements["main_menu"]  # created later
+        for label, shortcut, slot in (
+            ("Open project…", "Ctrl+O", lambda: menu().open_project()),
+            ("Save project", "Ctrl+S", lambda: menu().save_project()),
+            ("Save project as…", "Ctrl+Shift+S", lambda: menu().save_project(save_as=True)),
+        ):
+            action = file_menu.addAction(label)
+            action.setShortcut(QKeySequence(shortcut))
+            action.triggered.connect(lambda checked=False, slot=slot: slot())
 
         print_debug = QAction("Print debug info", self)
         print_debug.setShortcut("Ctrl+D")
@@ -285,7 +302,7 @@ class MainWindow(QMainWindow):
         if clicked is not save_button:
             return True
 
-        path = self.gui_elements["main_menu"].save_data("assignments")
+        path = self.gui_elements["main_menu"].save_project()
 
         if path is None:
             # No file chosen: stay open.
@@ -304,13 +321,14 @@ class MainWindow(QMainWindow):
             if group != "saving":
                 return
 
-            # Saved-state bookkeeping runs right after this signal.
+            # Saved-state bookkeeping runs right after this signal. A project
+            # save writes sessions and model first: wait for the assignments.
             def check():
                 if current not in self.data.unsaved_assignments():
+                    disconnect()
                     self._closing_after_save = True
                     self.close()
 
-            disconnect()
             QTimer.singleShot(0, check)
 
         def on_failed(group, task_id):

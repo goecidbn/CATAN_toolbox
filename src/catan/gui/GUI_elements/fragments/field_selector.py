@@ -254,6 +254,8 @@ class FieldSelector(QWidget):
     """
 
     fields_changed = Signal()
+    # After each compatibility check: whether all required fields are found.
+    compatibility_checked = Signal(bool)
     loading_possible = bool
 
     def __init__(self, parent, source: SessionData | Assignments):
@@ -612,6 +614,7 @@ class FieldSelector(QWidget):
 
         self.source.status["loading_possible"] = loading_possible
         self._compatibility_dirty = False
+        self.compatibility_checked.emit(loading_possible)
 
     def _set_group_enabled(self, group_name: str, enabled: bool):
         if self.source is None or self.source.source_config is None:

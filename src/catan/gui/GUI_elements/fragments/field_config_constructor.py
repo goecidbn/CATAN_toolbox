@@ -52,6 +52,31 @@ class FieldConfigConstructor(QObject):
         self.config_layout.setContentsMargins(6, 6, 6, 6)
         self.config_layout.setSpacing(3)
 
+        # Why loading stopped (show_problems): shown here instead of a
+        # separate message box; required fields not found are red below.
+        self.problem_banner = QLabel(self.config_options)
+        self.problem_banner.setWordWrap(True)
+        self.problem_banner.setTextFormat(Qt.TextFormat.PlainText)
+        self.problem_banner.setStyleSheet(
+            "QLabel { color: #ffe1a3; background: #3a3226; border: 1px solid #b58b43;"
+            " border-radius: 4px; padding: 5px 7px; }"
+        )
+        self.problem_banner.hide()
+        self.config_layout.addWidget(self.problem_banner)
+
+        # Loading a file waiting for this configuration (set_pending_load).
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        self.pending_buttons = QDialogButtonBox(self.config_options)
+        self._load_button = self.pending_buttons.addButton(
+            "Load", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        self.pending_buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        self.pending_buttons.accepted.connect(lambda: self._finish_pending(True))
+        self.pending_buttons.rejected.connect(lambda: self._finish_pending(False))
+        self.pending_buttons.hide()
+        self._pending = None
+
         self._content_built = False
         if lazy:
             self.toggle_config_options.before_expand = self.build_content
@@ -76,7 +101,126 @@ class FieldConfigConstructor(QObject):
         if self.source is not None:
             self._on_source_changed()
 
+    _dialog = None
+
+    def use_dialog(self, title, parent):
+        """Show the configuration as a window of its own instead of the
+        button's popup (the button is not used)."""
+        from PySide6.QtWidgets import QDialog
+
+        self.toggle_config_options.set_container(None)
+        self.toggle_config_options.setVisible(False)
+        self._dialog = QDialog(parent)
+        self._dialog.setWindowTitle(title)
+        self._dialog.resize(480, 520)
+        layout = QVBoxLayout(self._dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.config_options)
+        self.config_options.show()
+        # Closing the window while a file waits: Cancel.
+        self._dialog.rejected.connect(
+            lambda: self._finish_pending(False) if self._pending is not None else None
+        )
+
+    def open(self):
+        if self._dialog is not None:
+            self.build_content()
+            self._dialog.show()
+            self._dialog.raise_()
+            self._dialog.activateWindow()
+        else:
+            self.toggle_config_options.set_expanded(True)
+        self.expanded_changed.emit()
+
+    def close_window(self):
+        if self._dialog is not None:
+            if self._dialog.isVisible():
+                self._dialog.hide()
+        else:
+            self.toggle_config_options.set_expanded(False)
+
+    MAX_PROBLEM_LINES = 4
+    # Show the configuration button only while a problem stands.
+    auto_hide = False
+
+    def show_problems(self, problems, hint=""):
+        """Show why loading stopped in the configuration (first lines; the
+        full text as tooltip), mark the configuration button and open it."""
+        problems = [str(problem).strip() for problem in problems if str(problem).strip()]
+        if not problems:
+            return
+
+        def short(problem):
+            # "group.label: path / Source: … / reason" -> label, path, reason
+            lines = [line.strip() for line in problem.splitlines() if line.strip()]
+            lines = [line for line in lines if not line.startswith("Source:")]
+            return " — ".join(lines[:2]) if len(lines) > 1 else lines[0]
+
+        shown = [short(problem) for problem in problems[: self.MAX_PROBLEM_LINES]]
+        if len(problems) > self.MAX_PROBLEM_LINES:
+            shown.append(f"… {len(problems) - self.MAX_PROBLEM_LINES} more (tooltip)")
+        text = "⚠ Loading stopped:\n" + "\n".join(f"• {line}" for line in shown)
+        if hint:
+            text += f"\n{hint}"
+
+        self._edited_since_problems = False
+        self.problem_banner.setText(text)
+        self.problem_banner.setToolTip("\n\n".join(problems) + (f"\n\n{hint}" if hint else ""))
+        self.problem_banner.show()
+        self._problem_tooltip = self.toggle_config_options.toolTip()
+        self.toggle_config_options.setToolTip("⚠ Loading stopped: see the configuration.")
+        self.toggle_config_options.setStyleSheet("QToolButton { border: 1px solid #e0a040; border-radius: 4px; }")
+        if self.auto_hide and self._dialog is None:
+            self.toggle_config_options.setVisible(True)
+        self.open()
+
+    def set_pending_load(self, *, on_load, on_cancel):
+        """Show Load / Cancel for a file waiting to be loaded with this
+        configuration: Load calls ``on_load``, Cancel ``on_cancel``."""
+        self._pending = (on_load, on_cancel)
+        self._load_button.setToolTip("Load the file with this configuration")
+        # Directly below the problems, above the configuration.
+        self.config_layout.removeWidget(self.pending_buttons)
+        self.config_layout.insertWidget(self.config_layout.indexOf(self.problem_banner) + 1, self.pending_buttons)
+        self.pending_buttons.show()
+        # Enabled by the compatibility check (no missing required field).
+        self._load_button.setEnabled(False)
+        self.build_content()
+        self.config_field_options._start_compatibility_check()
+
+    def _finish_pending(self, load):
+        pending, self._pending = self._pending, None
+        self.pending_buttons.hide()
+        if pending is None:
+            return
+        self.close_window()
+        if load:
+            self.clear_problems()
+            pending[0]()
+        else:
+            self.clear_problems()
+            pending[1]()
+
+    def clear_problems(self):
+        if not self.problem_banner.isVisible() and not self.problem_banner.text():
+            return
+        self.problem_banner.clear()
+        self.problem_banner.hide()
+        self.toggle_config_options.setStyleSheet("")
+        self.toggle_config_options.setToolTip(
+            getattr(self, "_problem_tooltip", None) or "Configure fields to load"
+        )
+        # Stays while a file waits for Load / Cancel.
+        if self.auto_hide and getattr(self, "_pending", None) is None:
+            self.close_window()
+            if self._dialog is None:
+                self.toggle_config_options.setVisible(False)
+
     def update_source(self, source: SessionData | Assignments | None):
+        if source is not self.source:
+            self.clear_problems()
+            self._pending = None
+            self.pending_buttons.hide()
         expanded = self.toggle_config_options.isChecked()
 
         self.source = source
@@ -262,6 +406,14 @@ class FieldConfigConstructor(QObject):
 
         self.config_field_options = FieldSelector(self._parent, self.source)
         self.config_field_options.fields_changed.connect(self._on_fields_changed)
+        # Fixed by an edit: a passing check after the configuration changed.
+        self.config_field_options.compatibility_checked.connect(
+            lambda possible: self.clear_problems()
+            if possible and getattr(self, "_edited_since_problems", False)
+            else None
+        )
+        # Load only without a missing required field (no red field).
+        self.config_field_options.compatibility_checked.connect(self._load_button.setEnabled)
         self.config_layout.addWidget(self.config_field_options)
 
     def on_save_load_config(self):
@@ -397,6 +549,7 @@ class FieldConfigConstructor(QObject):
 
     def _on_fields_changed(self):
         """Handle a field-change notification from FieldSelector."""
+        self._edited_since_problems = True
         self.refresh()
 
         if self.source is None or self.source.source_config is None:

@@ -50,6 +50,60 @@ from catan.gui.background_tasks.file_writes import (
 from catan.gui.data.assignment_comparison import AssignmentComparison
 
 
+def hdf5_object_type(path):
+    """The CATAN ``object_type`` root attribute of an HDF5 file, or None."""
+    path = Path(path)
+    if path.suffix.lower() not in {".hdf5", ".h5"}:
+        return None
+    try:
+        import h5py
+
+        with h5py.File(path, "r") as handle:
+            value = handle.attrs.get("object_type")
+    except OSError:
+        return None
+    if value is None:
+        return None
+    value = np.asarray(value).item() if np.ndim(value) == 0 else value
+    return (value.decode() if isinstance(value, bytes) else str(value)).strip()
+
+
+def catan_file_kind(path):
+    """What a file holds by its own description: "project" (CATAN main or
+    assignments file), "sessions" (CATAN session file), "model", "recipe"
+    (.json), "table" (.csv/.tsv), or None (not identifiable by itself).
+    Call from a worker."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return "recipe"
+    if suffix in {".csv", ".tsv"}:
+        return "table"
+    return {
+        "AssignmentsData": "project",
+        "SessionList": "sessions",
+        "SessionData": "sessions",
+        "ModelData": "model",
+    }.get(hdf5_object_type(path))
+
+
+def model_fingerprint(model):
+    """Hash of what a saved model file holds (kind, parameters, fit state,
+    evidence records), to tell whether it changed since saving/loading."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(model.kind).encode())
+    parameters = model.parameters if isinstance(model.parameters, dict) else {}
+    digest.update(repr(sorted((k, float(v)) for k, v in parameters.items())).encode())
+    digest.update(repr((bool(model.fitted), bool(model.fit_stale))).encode())
+    for kind in sorted(model.counts):
+        for key in sorted(model.counts[kind], key=str):
+            counts = np.ascontiguousarray(model.counts[kind][key])
+            digest.update(repr((kind, key, counts.shape)).encode())
+            digest.update(counts.tobytes())
+        digest.update(repr(sorted(map(str, model.stale_counts.get(kind, ())))).encode())
+    return digest.hexdigest()
+
+
 def read_assignments_provenance(path, *, ctx=None):
     """Sessions and model stored with saved assignments, or None.
 
@@ -86,15 +140,50 @@ def read_assignments_provenance(path, *, ctx=None):
     model_path = text(values.get("model_path"))
     sessions_file = text(values.get("sessions_file"))
 
+    # Project files reference relative to the main file.
+    folder = Path(path).expanduser().resolve().parent
+    model_path, sessions_file = (
+        None if value is None else str((folder / value).resolve())
+        for value in (model_path, sessions_file)
+    )
+
     try:
         recipe = None if recipe is None else json.loads(recipe)
     except ValueError:
         recipe = None
 
-    if recipe is None and model_path is None and sessions_file is None:
-        return None
+    # Only usable references: the right kind of CATAN file, not this one
+    # (older saves could name the assignments file as their model).
+    ignored = []
+    this = Path(path).expanduser().resolve()
+    for key, value, expected in (
+        ("model_path", model_path, {"ModelData"}),
+        ("sessions_file", sessions_file, {"SessionList", "SessionData"}),
+    ):
+        if value is None:
+            continue
+        target = Path(value)
+        reason = None
+        if target.resolve() == this:
+            reason = "refers to the assignments file itself"
+        elif target.is_file() and hdf5_object_type(target) not in expected:
+            reason = "is not a CATAN " + ("model" if key == "model_path" else "session") + " file"
+        if reason is not None:
+            ignored.append(f"{target.name} {reason}")
+            if key == "model_path":
+                model_path = None
+            else:
+                sessions_file = None
 
-    return {"recipe": recipe, "model_path": model_path, "sessions_file": sessions_file}
+    if recipe is None and model_path is None and sessions_file is None:
+        return {"recipe": None, "model_path": None, "sessions_file": None, "ignored": ignored} if ignored else None
+
+    return {
+        "recipe": recipe,
+        "model_path": model_path,
+        "sessions_file": sessions_file,
+        "ignored": ignored,
+    }
 
 
 # Names of model / registration runs queued behind current processing.
@@ -1306,6 +1395,8 @@ class Data(Tracking):
                 return
 
             if key == "model":
+                # Unchanged since loading: a project save references the file.
+                candidate._saved_fingerprint = model_fingerprint(candidate)
                 # Passing an object avoids the synchronous file-loading path.
                 self.add_model(name, candidate)
             else:
@@ -2037,7 +2128,9 @@ class Data(Tracking):
         return registered_ids
 
     @after_display_tasks
-    def queue_save_sessions(self, path, *, mat_version="7.3"):
+    def queue_save_sessions(self, path, *, mat_version="7.3", finished=None):
+        """Save the sessions as detected: synthetic components and
+        inclusion belong to the assignment sets (saved with them)."""
         tasks = self.state.tasks
 
         if tasks.processing_busy():
@@ -2067,6 +2160,8 @@ class Data(Tracking):
                 session._catan_file = target
                 session._catan_file_index = index
                 session._catan_file_revision = revision
+            if finished is not None:
+                finished()
 
         try:
             snapshots = []
@@ -2076,7 +2171,7 @@ class Data(Tracking):
 
                 snapshots.append(
                     prepare_session_snapshot(
-                        session,
+                        self._detected_session_copy(session),
                         processing={
                             "geometry_revision": processing.geometry_revision,
                             "alignment_stale": processing.alignment_stale,
@@ -2166,6 +2261,177 @@ class Data(Tracking):
 
         return provenance
 
+    # ------------------------------------------------------------------
+    # Project: the assignments file as main file (name.catan.hdf5 in the
+    # root folder's "catan" folder), the sessions and model next to it.
+    # ------------------------------------------------------------------
+
+    PROJECT_SUFFIX = ".catan.hdf5"
+
+    def project_folder(self):
+        root = self.root or str(self._default_matching_directory())
+        return Path(root).expanduser() / "catan"
+
+    def default_project_name(self):
+        current = self.project_path()
+        if current is not None:
+            return Path(current).name[: -len(self.PROJECT_SUFFIX)]
+        root = self.root or str(self._default_matching_directory())
+        return Path(root).expanduser().resolve().name or "catan"
+
+    def project_path(self):
+        """Main file of the active assignments, or None (not saved yet)."""
+        path = getattr(self.assignments, "path", None)
+        if path and str(path).endswith(self.PROJECT_SUFFIX):
+            return str(path)
+        return None
+
+    def preset_matches(self, path, config):
+        """Whether the required fields of ``config`` exist in ``path``."""
+        from catan.core.io.inspection import check_fields_compatibility
+
+        if config is None:
+            return False
+        required = {}
+        for group, specs in config.get_fields_to_load().items():
+            selected = {
+                label: spec
+                for label, spec in specs.items()
+                if spec.required or (group == "assignments" and label == "ids")
+            }
+            if selected:
+                required[group] = selected
+        if not required:
+            return False
+        try:
+            report = check_fields_compatibility(path, required, refresh=True)
+        except Exception:
+            return False
+        return bool(report.fields) and all(field.available for field in report.fields)
+
+    def identify_load_file(self, path, *, ctx=None):
+        """(kind, presets) for a file chosen to load. ``kind`` as
+        catan_file_kind; files not describing themselves are tested with the
+        suggested session and assignments presets: "sessions" or
+        "assignments" if exactly one matches, else None (ask). ``presets``:
+        {source type: suggested LoadConfig}."""
+        kind = catan_file_kind(path)
+        manager = self.state.config_manager
+        presets = {
+            source_type: manager.suggest_config_for(path, source_type, ctx=ctx)
+            for source_type in ("session", "assignments")
+        }
+        if kind is not None:
+            return kind, presets
+        matching = [
+            source_type
+            for source_type in ("session", "assignments")
+            if self.preset_matches(path, presets[source_type])
+        ]
+        if matching == ["session"]:
+            return "sessions", presets
+        if matching == ["assignments"]:
+            return "assignments", presets
+        return None, presets
+
+    def _detected_session_copy(self, session):
+        """A copy of ``session`` as detected: without synthetic components,
+        all components included (both belong to the assignment sets)."""
+        item = copy(session)
+        item._traces = dict(session._traces)
+        item.quality = dict(session.quality)
+        if session.status["spatial_loaded"]:
+            item.remove_synthetic_components()
+            item.included = np.ones(item.n_neurons, dtype=bool)
+            item.synthetic = np.zeros(item.n_neurons, dtype=bool)
+        return item
+
+    def model_needs_saving(self, model=None):
+        model = self.model if model is None else model
+        if model is None or not (model.fitted or any(model.counts.values())):
+            return False
+        path = getattr(model, "path", None)
+        return (
+            not path
+            or not Path(path).is_file()
+            or getattr(model, "_saved_fingerprint", None) != model_fingerprint(model)
+        )
+
+    @after_display_tasks
+    def queue_save_project(self, path, *, finished=None):
+        """Save the active assignments to the main file ``path`` with the
+        sessions and the model next to it (``<name>.sessions.hdf5``,
+        ``<name>.model.hdf5``). Unchanged sessions/model already in a file
+        are referenced instead of written again. References are relative
+        to the main file."""
+        tasks = self.state.tasks
+        if tasks.processing_busy():
+            self.state.issue(
+                "info",
+                "Cannot save while processing",
+                "Finish or cancel the current processing tasks, then save again.",
+            )
+            return
+        if self.assignments is None:
+            self.state.issue("info", "Nothing to save", "No assignments are available.")
+            return
+
+        path = Path(path).expanduser().resolve()
+        if not path.name.endswith(self.PROJECT_SUFFIX):
+            raise ValueError(f"A project file ends with {self.PROJECT_SUFFIX}.")
+        folder = path.parent
+        name = path.name[: -len(self.PROJECT_SUFFIX)]
+        folder.mkdir(parents=True, exist_ok=True)
+
+        steps = []
+        sessions_file = self.catan_sessions_file() if self.sessions else None
+        if self.sessions and sessions_file is None:
+            sessions_file = str(folder / f"{name}.sessions.hdf5")
+            steps.append(lambda then, target=sessions_file: self.queue_save_sessions(target, finished=then))
+
+        model_file = None
+        if self.model is not None and (self.model.fitted or any(self.model.counts.values())):
+            if self.model_needs_saving():
+                model_file = str(folder / f"{name}.model.hdf5")
+                steps.append(
+                    lambda then, target=model_file: self.queue_save_result("model", target, finished=then)
+                )
+            else:
+                model_file = str(self.model.path)
+
+        def relative(target):
+            return os.path.relpath(Path(target).resolve(), folder)
+
+        provenance = self.assignments_provenance()
+        provenance.pop("model_path", None)
+        provenance.pop("sessions_file", None)
+        if sessions_file:
+            provenance["sessions_file"] = relative(sessions_file)
+        if model_file:
+            provenance["model_path"] = relative(model_file)
+
+        source = self.assignments
+
+        def assignments_saved():
+            source.path = str(path)
+            self.notify_change(C.ASSIGNMENT_SET)
+            if finished is not None:
+                finished()
+
+        steps.append(
+            lambda then: self.queue_save_result(
+                "assignments", str(path), provenance=provenance, finished=then, main_file=True
+            )
+        )
+
+        def run(index):
+            if index == len(steps):
+                assignments_saved()
+                return
+            steps[index](lambda: run(index + 1))
+
+        run(0)
+
     def _overview_background_snapshot(self):
         """The loaded overview background, stored with saved assignments."""
         from catan.core.structures.session_snapshot import (
@@ -2202,7 +2468,10 @@ class Data(Tracking):
         return names
 
     @after_display_tasks
-    def queue_save_result(self, key, path):
+    def queue_save_result(self, key, path, *, provenance=None, finished=None, main_file=False):
+        """Save the model or the assignments. ``provenance`` (assignments):
+        references stored with them (default: assignments_provenance());
+        ``finished`` runs after a successful save."""
         if key not in {"model", "assignments"}:
             raise ValueError(f"Unsupported result type: {key}")
 
@@ -2235,8 +2504,11 @@ class Data(Tracking):
             prepared = (
                 source.prepare_save(
                     sessions=tuple(self.sessions),
-                    provenance=self.assignments_provenance(),
+                    provenance=(
+                        self.assignments_provenance() if provenance is None else provenance
+                    ),
                     overview_background=self._overview_background_snapshot(),
+                    main_file=main_file,
                 )
                 if key == "assignments"
                 else source.prepare_save()
@@ -2255,12 +2527,18 @@ class Data(Tracking):
 
             def saved():
                 self.mark_assignments_saved(source, fingerprint)
+                if finished is not None:
+                    finished()
 
         else:
+            fingerprint = model_fingerprint(source)
 
             def saved():
                 # Referenced by assignments saved later.
                 source.path = os.path.abspath(os.path.expanduser(str(path)))
+                source._saved_fingerprint = fingerprint
+                if finished is not None:
+                    finished()
 
         return tasks.start(
             "saving",
@@ -3012,13 +3290,15 @@ class Data(Tracking):
             return
 
         if source.source_config is None:
+            # The configuration shows why (else a message).
             if on_config_required is not None:
-                on_config_required()
-            self.state.issue(
-                "warning",
-                "Assignment loading not started",
-                "Select a load configuration first.",
-            )
+                on_config_required(["No load configuration is selected."])
+            else:
+                self.state.issue(
+                    "warning",
+                    "Assignment loading not started",
+                    "Select a load configuration first.",
+                )
             return
 
         assignment_name = self.current_assignments
@@ -3148,16 +3428,17 @@ class Data(Tracking):
                 source.status["loading_possible"] = False
                 source._load_config_problems = list(result["config_problems"])
 
-                self.state.issue(
-                    "info",
-                    "Repair the assignments load configuration",
-                    "\n\n".join(result["config_problems"])
-                    + "\n\nSelect a matching preset or correct the IDs field, "
-                    "then click the assignments open-folder button to load again.",
-                )
-
+                # The configuration shows the problems (else a message).
                 if on_config_required is not None and self.assignments is source:
-                    on_config_required()
+                    on_config_required(list(result["config_problems"]))
+                else:
+                    self.state.issue(
+                        "info",
+                        "Repair the assignments load configuration",
+                        "\n\n".join(result["config_problems"])
+                        + "\n\nSelect a matching preset or correct the IDs field, "
+                        "then click the assignments open-folder button to load again.",
+                    )
 
                 return
 
