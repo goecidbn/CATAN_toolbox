@@ -722,6 +722,39 @@ class SessionData:
     ### ================== ALTERATION METHODS =================== ###
     ### ========================================================= ###
 
+    def remove_synthetic_components(self):
+        """Drop all synthetic components (appended after the detected
+        ones, see append_synthetic_component): the session as detected,
+        before the manipulations of an assignment set."""
+        if not self.status.get("spatial_loaded", False) or self.synthetic is None:
+            return
+        synthetic = np.asarray(self.synthetic, dtype=bool)
+        if not synthetic.any():
+            return
+
+        count = int(np.argmax(synthetic))
+        if not synthetic[count:].all():
+            raise ValueError(
+                f"Session {self.name}: synthetic components are not the last ones."
+            )
+
+        self.footprints = sparse.csc_matrix(self.footprints)[:, :count]
+        self.centroids = np.asarray(self.centroids)[:count]
+        self.included = np.asarray(self.included, dtype=bool)[:count].copy()
+        self.synthetic = synthetic[:count].copy()
+        self.n_neurons = count
+        for key in list(self._traces):
+            self._traces[key] = np.asarray(self._traces[key])[:count]
+        for key in list(self.quality):
+            values = self.quality[key]
+            if values is not None and np.ndim(values) and len(values) > count:
+                self.quality[key] = np.asarray(values)[:count]
+
+    def session_inclusion(self):
+        """Inclusion independent of any assignment set: all components
+        (filtering happens at detection or in an assignment set's curation)."""
+        return np.ones(self.n_neurons, dtype=bool)
+
     def append_synthetic_component(self, footprint: sparse.csc_matrix) -> int:
         """
         Append one synthetic component.
@@ -850,6 +883,7 @@ class SessionData:
         use_optical_flow=True,
         correct_rotation: bool | None = None,
         require_confirmation: bool | None = None,
+        moving_centroids=None,
     ) -> Remapping:
         """
         Calculate a candidate remapping without
@@ -902,7 +936,68 @@ class SessionData:
             require_confirmation=require_confirmation,
             # Positions of the imaging window accepted by the user (dx, dy).
             allowed_offsets=self.params.get("alignment_offsets", ()),
+            min_flow_correlation=self.params.get("min_flow_correlation", 0.10),
+            moving_centroids=(
+                self.template_centroids() if moving_centroids is None else moving_centroids
+            ),
         )
+
+    def template_centroids(self):
+        """Included neurons' centroids (x, y) in the unaligned template's
+        pixel frame, or None; for footprints already warped by a successful
+        alignment, by inverting it."""
+        from catan.core import footprint_alignment
+
+        if self.centroids is None or not len(self.centroids):
+            return None
+        points = np.asarray(self.centroids, dtype=np.float64)
+        points = points / self.params.get("pxtomu", 1.0)
+        if self.included is not None and len(self.included) == len(points):
+            points = points[np.asarray(self.included, dtype=bool)]
+        points = points[np.isfinite(points).all(axis=1)]
+
+        remap = self.remap
+        if remap is None or not remap.success:
+            return points
+        if remap.flow is not None:
+            points = points + footprint_alignment.sample_flow(remap.flow, points)
+        inverse = np.linalg.inv(np.asarray(remap.matrix, dtype=np.float64))
+        points = points @ inverse[:2, :2].T + inverse[:2, 2]
+        return points[:, ::-1] if remap.transpose else points
+
+    def refine_remap_with_footprints(self, remap, alignment_references, *, use_optical_flow=True):
+        """``remap`` corrected by the rigid offset between this session's
+        footprint centroids (raw footprints, mapped through ``remap``) and
+        the references' aligned centroids (core.footprint_alignment).
+        The outcome is recorded in flow_info["footprint_refinement"]."""
+        from catan.core import footprint_alignment
+
+        references = [
+            np.asarray(entry["centroids"])
+            for entry in (alignment_references or {}).values()
+            if entry.get("centroids") is not None and len(entry["centroids"])
+        ]
+        if not references or self.footprints is None or self.footprints.shape[1] == 0:
+            return remap
+
+        raw = center_of_mass(self.footprints, *self.dims, convert=1.0)
+        if remap.transpose:
+            raw = raw[:, ::-1]
+        points = footprint_alignment.map_points(
+            raw, remap.matrix, remap.flow if use_optical_flow else None
+        )
+        center = (self.dims[1] / 2, self.dims[0] / 2)
+        result = footprint_alignment.estimate_correction(points, references, center)
+
+        if result["accepted"]:
+            remap = footprint_alignment.compose_correction(remap, result["matrix"])
+
+        remap.flow_info = dict(remap.flow_info or {})
+        remap.flow_info["footprint_refinement"] = {
+            key: result.get(key)
+            for key in ("parameters", "accepted", "reason", "references", "matches", "median_before", "median_after")
+        }
+        return remap
 
     def align_to_reference(self, alignment_references, use_optical_flow=True):
 
@@ -917,6 +1012,13 @@ class SessionData:
             alignment_references,
             use_optical_flow=use_optical_flow,
         )
+
+        # Optional: correct the cell positions against the references'
+        # footprints before the single warp.
+        if self.params.get("refine_alignment_with_footprints", False) and self.remap.success:
+            self.remap = self.refine_remap_with_footprints(
+                self.remap, alignment_references, use_optical_flow=use_optical_flow
+            )
 
         # During INITIAL loading these footprints are still raw, so
         # applying the transform once is correct.

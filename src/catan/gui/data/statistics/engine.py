@@ -652,7 +652,12 @@ class StatisticEngine(QObject):
         bound_data = copy(self.data)
         bound_data._current_assignments = assignment_name
         bound_data._assignments = {assignment_name: bound_assignments}
-        bound_data.sessions = list(self.data.sessions)
+        # Sessions with this set's synthetic components and inclusion.
+        bound_data.sessions = (
+            self.data.staged_sessions_for(assignments)
+            if hasattr(self.data, "staged_sessions_for")
+            else list(self.data.sessions)
+        )
         bound_data.state = bound_state
 
         registry = self.registry_factory(bound_data, bound_state)

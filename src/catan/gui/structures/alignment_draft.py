@@ -2,6 +2,7 @@ import numpy as np
 from copy import deepcopy
 
 from catan.core.structures.remap import Remapping
+from catan.core import footprint_alignment
 
 
 class AlignmentDraft:
@@ -33,6 +34,12 @@ class AlignmentDraft:
         self.initial = np.array([shift[1], shift[0], angle], dtype=float)
         self.values = self.initial.copy()
         self._refined_flow = None
+        # Session compared against when applied (ManualAlignmentEditor.
+        # record_reference): the manual alignment's reference.
+        self.reference_path = None
+        # Footprint correction calculated for a base geometry; toggled by
+        # set_footprint_correction.
+        self._footprint = None
 
     @property
     def template(self):
@@ -82,6 +89,69 @@ class AlignmentDraft:
     def clear_refined_flow(self):
         self._refined_flow = None
 
+    def store_footprint_correction(self, remap, result):
+        """Cache the footprint correction ``result``
+        (footprint_alignment.estimate_correction) calculated for ``remap``,
+        the alignment made from the current values (make_remap)."""
+        corrected = footprint_alignment.compose_correction(remap, result["matrix"])
+        shift, angle = Remapping._rigid_parameters(self.dims, corrected.matrix)
+        flow_info = deepcopy(remap.flow_info or {})
+        flow_info["footprint_refinement"] = {
+            key: result.get(key)
+            for key in ("parameters", "accepted", "reason", "references", "matches", "median_before", "median_after")
+        }
+        self._footprint = {
+            "base": (self.values.copy(), self._refined_flow),
+            "values": np.array([shift[1], shift[0], angle], dtype=float),
+            "flow": corrected.flow,
+            "flow_info": flow_info,
+            "applied_flow": None,
+            "result": result,
+        }
+
+    @property
+    def footprint_correction(self):
+        """The cached footprint correction result, or None."""
+        return None if self._footprint is None else self._footprint["result"]
+
+    @property
+    def footprint_correction_cached(self):
+        """A correction is cached for the current (uncorrected) geometry."""
+        footprint = self._footprint
+        return (
+            footprint is not None
+            and np.array_equal(self.values, footprint["base"][0])
+            and self._refined_flow is footprint["base"][1]
+        )
+
+    @property
+    def footprint_correction_applied(self):
+        footprint = self._footprint
+        return (
+            footprint is not None
+            and np.array_equal(self.values, footprint["values"])
+            and self._refined_flow is footprint["applied_flow"]
+        )
+
+    def set_footprint_correction(self, enabled):
+        """Add (from the cached base geometry) or remove (back to it) the
+        footprint correction."""
+        footprint = self._footprint
+        if footprint is None:
+            return
+        if enabled and self.footprint_correction_cached:
+            self.values[:] = footprint["values"]
+            # The flow moves with the correction; keyed to the new geometry.
+            self._refined_flow = (
+                None
+                if footprint["flow"] is None
+                else (self.geometry_key, footprint["flow"], footprint["flow_info"])
+            )
+            footprint["applied_flow"] = self._refined_flow
+        elif not enabled and self.footprint_correction_applied:
+            self.values[:] = footprint["base"][0]
+            self._refined_flow = footprint["base"][1]
+
     def is_current(self, data):
         if self.external:
             # Session edits do not invalidate the background being edited.
@@ -125,6 +195,15 @@ class AlignmentDraft:
         else:
             remap.flow_info = deepcopy(
                 getattr(self.source_remap, "flow_info", {}) or {}
+            )
+
+        remap.flow_info["references_used"] = (
+            [] if self.reference_path is None else [self.reference_path]
+        )
+
+        if self.footprint_correction_applied:
+            remap.flow_info["footprint_refinement"] = deepcopy(
+                self._footprint["flow_info"]["footprint_refinement"]
             )
         return remap
 

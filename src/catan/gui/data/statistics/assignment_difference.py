@@ -127,32 +127,22 @@ def calculate_assignment_difference(
     if compare_with == getattr(data, "current_assignments", None):
         raise ValueError("Choose an assignment set other than the current one.")
 
-    reference = np.asarray(state.assignments)
-    n_sessions = reference.shape[1]
+    # Each set with its own exclusions; synthetic components (specific to
+    # a set) are not comparable (Data.comparison_ids).
+    n_sessions = np.asarray(state.assignments).shape[1]
     other_set = sets[compare_with]
-    other = _session_columns(other_set.ids, n_sessions)
-
-    reference = reference.copy()
+    if hasattr(data, "comparison_ids") and data.assignments is not None:
+        reference = _session_columns(data.comparison_ids(data.assignments), n_sessions)
+        other = _session_columns(data.comparison_ids(other_set), n_sessions)
+    else:
+        reference = np.asarray(state.assignments).copy()
+        other = _session_columns(other_set.ids, n_sessions)
 
     for index, session in enumerate(data.sessions[:n_sessions]):
         # Inactive sessions are absent in both sets.
         if not getattr(session, "active", True):
             other[:, index] = -1
             reference[:, index] = -1
-            continue
-
-        # Excluded footprints belong to neither set (AssignmentComparison).
-        included = getattr(session, "included", None)
-        if included is None:
-            continue
-
-        included = np.asarray(included, dtype=bool)
-        for ids in (reference, other):
-            column = ids[:, index]
-            present = column >= 0
-            excluded = present.copy()
-            excluded[present] = ~included[column[present]]
-            column[excluded] = -1
 
     # Excluded neurons of the other set are no partners.
     other_included = getattr(other_set.union, "included", None)

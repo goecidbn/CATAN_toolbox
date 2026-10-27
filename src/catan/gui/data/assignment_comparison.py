@@ -15,16 +15,19 @@ class AssignmentPartner:
 class AssignmentComparison:
     """Correspondence between assignments using the same loaded sessions."""
 
-    def __init__(self, source, target, sessions):
+    def __init__(self, source, target, sessions, *, source_ids=None, target_ids=None):
+        """``source_ids`` / ``target_ids``: ids prepared for comparison
+        (Data.comparison_ids: each set's own exclusions and synthetic
+        components removed); else the live sessions' inclusion is used."""
         self.source = source
         self.target = target
 
-        self.source_rows, _ = self._index(source, sessions)
-        self.target_rows, self.target_owners = self._index(target, sessions)
+        self.source_rows, _ = self._index(source, sessions, source_ids)
+        self.target_rows, self.target_owners = self._index(target, sessions, target_ids)
 
     @staticmethod
-    def _index(assignments, sessions):
-        ids = np.asarray(assignments.ids)
+    def _index(assignments, sessions, prepared=None):
+        ids = np.asarray(assignments.ids if prepared is None else prepared)
 
         if ids.ndim != 2 or ids.shape[1] > len(sessions):
             raise ValueError("Assignments do not match the loaded session columns.")
@@ -47,7 +50,7 @@ class AssignmentComparison:
             if session is None:
                 continue
 
-            mask = session.included
+            mask = session.included if prepared is None else None
 
             for neuron in np.flatnonzero(keep):
                 footprint = int(ids[neuron, sid])
@@ -55,7 +58,7 @@ class AssignmentComparison:
                 if footprint < 0:
                     continue
 
-                if footprint >= session.n_neurons:
+                if prepared is None and footprint >= session.n_neurons:
                     raise ValueError(f"Invalid footprint {footprint} in session {sid}.")
 
                 if mask is not None and not mask[footprint]:

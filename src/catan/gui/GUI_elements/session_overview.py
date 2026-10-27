@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGraphicsOpacityEffect,
     QSpinBox,
+    QDoubleSpinBox,
 )
 
 
@@ -441,27 +442,7 @@ class SessionRowWidget(QFrame):
         outdated = []
 
         if self.data.alignment_is_stale(session_id):
-            blocker = next(
-                (
-                    sid
-                    for sid in range(session_id)
-                    if self.data.alignment_is_stale(sid) and self.data.session_is_active(sid)
-                ),
-                None,
-            )
-
-            if blocker is not None:
-                return (
-                    "stale",
-                    f"Alignment outdated — review S{blocker} first",
-                    "#f2b84b",
-                )
-
-            return (
-                "stale",
-                "Alignment needs review — blocks later sessions",
-                "#f2b84b",
-            )
+            return ("stale", "Alignment outdated — needs review", "#f2b84b")
 
         if (
             model is not None
@@ -2004,6 +1985,39 @@ class LoadSessionRowWidget(QFrame):
         self.max_shift_spin.setKeyboardTracking(False)
         self.max_shift_spin.valueChanged.connect(self.data.set_max_session_shift)
         layout.addWidget(self.max_shift_spin)
+
+        layout.addSpacing(8)
+        correlation_label = QLabel("Min. corr.", row)
+        layout.addWidget(correlation_label)
+        self.min_correlation_spin = QDoubleSpinBox(row)
+        self.min_correlation_spin.setRange(0.0, 1.0)
+        self.min_correlation_spin.setDecimals(2)
+        self.min_correlation_spin.setSingleStep(0.05)
+        self.min_correlation_spin.setValue(self.data.min_flow_correlation)
+        self.min_correlation_spin.setKeyboardTracking(False)
+        tip = (
+            "Smallest background correlation (after warping onto a "
+            "reference) for which an automatic alignment is accepted. "
+            "Applies to the following alignments."
+        )
+        self.min_correlation_spin.setToolTip(tip)
+        correlation_label.setToolTip(tip)
+        self.min_correlation_spin.valueChanged.connect(self.data.set_min_flow_correlation)
+        layout.addWidget(self.min_correlation_spin)
+
+        layout.addSpacing(8)
+        self.refine_footprints_check = QCheckBox("Refine with footprints", row)
+        self.refine_footprints_check.setToolTip(
+            "Optional: after the background alignment of each new session, "
+            "correct a small rigid offset (≤ 5 px, slight rotation) between "
+            "its footprints and those of the reference sessions. Only applied "
+            "with enough matching cells and if it brings them closer."
+        )
+        self.refine_footprints_check.setChecked(self.data.refine_alignment_with_footprints)
+        self.refine_footprints_check.toggled.connect(
+            self.data.set_refine_alignment_with_footprints
+        )
+        layout.addWidget(self.refine_footprints_check)
         layout.addStretch()
 
         self._refresh_max_shift_row()
@@ -2011,10 +2025,16 @@ class LoadSessionRowWidget(QFrame):
 
     def _refresh_max_shift_row(self, *_):
         offsets = list(getattr(self.data, "alignment_offsets", []))
-        spin = self.max_shift_spin
-        previous = spin.blockSignals(True)
-        spin.setValue(int(round(self.data.max_session_shift)))
-        spin.blockSignals(previous)
+        for spin, value in (
+            (self.max_shift_spin, int(round(self.data.max_session_shift))),
+            (self.min_correlation_spin, self.data.min_flow_correlation),
+        ):
+            previous = spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(previous)
+        previous = self.refine_footprints_check.blockSignals(True)
+        self.refine_footprints_check.setChecked(self.data.refine_alignment_with_footprints)
+        self.refine_footprints_check.blockSignals(previous)
 
         if offsets:
             self.max_shift_label.setText("⚠ Max. shift")

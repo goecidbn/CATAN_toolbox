@@ -1,3 +1,4 @@
+import numpy as np
 from PySide6.QtCore import QObject, QTimer, Qt
 from PySide6.QtWidgets import (
     QWidget,
@@ -55,7 +56,9 @@ class Display(QWidget):
             "The overview background is a display-only image loaded in the "
             "Overview options (Background: from file)."
         )
-        display_section.x_options_layout.insertWidget(0, self.target)
+        # In the editor's options while an editor is shown (_place_target).
+        self._x_options_layout = display_section.x_options_layout
+        self._x_options_layout.insertWidget(0, self.target)
         self.target.currentIndexChanged.connect(lambda _: self._schedule_current())
         self._update_target_options()
 
@@ -136,6 +139,12 @@ class Display(QWidget):
 
         self.update_stale.setVisible(len(self.data.sessions) > 1)
         self.update_stale.setEnabled(idle)
+        if self.editor is not None:
+            self.editor.set_refine_all_available(
+                idle and not stale and len(self.data.sessions) > 1,
+                self.editor.refine_all_action.toolTip().split("\n\n")[0]
+                + ("\n\nUpdate the outdated alignments first." if stale else ""),
+            )
         self.realign_all_action.setEnabled(idle)
 
         if stale:
@@ -154,6 +163,106 @@ class Display(QWidget):
             self.update_stale.setToolTip(
                 "No outdated alignments. Arrow: realign all sessions."
             )
+
+    def _refine_from_footprints(self):
+        tasks = self.state.tasks
+        if tasks.processing_busy() or tasks.processing_requested:
+            return
+
+        expected_version = self.state.data_version
+        if self.editor is not None:
+            self.editor.set_refine_all_available(False)
+
+        def estimate():
+            try:
+                return self.data.estimate_footprint_corrections(), None
+            except ValueError as exc:
+                return None, str(exc)
+
+        tasks.start(
+            "calculating",
+            "Estimate footprint refinement",
+            estimate,
+            on_result=lambda result: self._show_footprint_refinement(
+                result, expected_version
+            ),
+        )
+
+    def _show_footprint_refinement(self, result, expected_version):
+        if self._disposed:
+            return
+        self._refresh_stale_button()
+
+        results, error = result
+        if error is not None:
+            self.state.issue("info", "Footprint refinement", error, parent=self)
+            return
+        if self.state.data_version != expected_version:
+            self.state.issue(
+                "info",
+                "Footprint refinement",
+                "The data changed during the estimate. Run it again.",
+                parent=self,
+            )
+            return
+
+        lines = []
+        accepted = 0
+        for sid, entry in sorted(results.items()):
+            if entry is None:
+                continue
+            dx, dy, angle = entry["parameters"]
+            name = self.data.sessions[sid].name
+            if entry["accepted"]:
+                accepted += 1
+                lines.append(
+                    f"S{sid} {name}: dx {dx:+.2f}, dy {dy:+.2f} px, "
+                    f"rotation {angle:+.2f}° ({entry.get('matches')} cells)"
+                )
+            else:
+                lines.append(f"S{sid} {name}: not refined — {entry.get('reason')}")
+
+        largest = max(
+            (np.hypot(*entry["parameters"][:2]) for entry in results.values() if entry and entry["accepted"]),
+            default=0.0,
+        )
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Refine alignments from footprints")
+        box.setText(
+            f"Corrections for {accepted} of {len(results)} sessions "
+            f"(largest shift {largest:.2f} px)."
+        )
+        box.setInformativeText(
+            "Each session is corrected against the footprints of all others; "
+            "the mean correction is zero. Applying rebuilds the corrected "
+            "sessions from their original footprints; their model evidence "
+            "and assignments become outdated. Later alignments stay current."
+        )
+        box.setDetailedText("\n".join(lines))
+        apply = box.addButton(
+            f"Apply to {accepted} sessions", QMessageBox.ButtonRole.AcceptRole
+        )
+        apply.setEnabled(accepted > 0)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        fit_message_box_buttons(box)
+        box.exec()
+
+        if box.clickedButton() is not apply or self._disposed:
+            return
+
+        try:
+            self.data.queue_apply_footprint_corrections(
+                results,
+                finished=lambda count: self.state.issue(
+                    "info",
+                    "Footprint refinement",
+                    f"Refined the alignment of {count} sessions.",
+                ),
+            )
+        except ValueError as exc:
+            self.state.issue("warning", "Footprint refinement", str(exc), parent=self)
 
     def _update_stale_alignments(self):
         stale = self._stale_sessions()
@@ -237,8 +346,7 @@ class Display(QWidget):
             )
             self.placeholder.show()
             self.toolbar.hide()
-            if self.editor is not None:
-                self.editor.hide()
+            self._hide_editor()
             return
 
         old = self.state.alignment_draft
@@ -260,8 +368,7 @@ class Display(QWidget):
                 self.placeholder.setText("Waiting for processing to finish…")
                 self.placeholder.show()
                 self.toolbar.hide()
-                if self.editor is not None:
-                    self.editor.hide()
+                self._hide_editor()
             return
 
         draft = select_alignment_draft(self.data, sid, self)
@@ -302,8 +409,7 @@ class Display(QWidget):
             )
             self.placeholder.show()
             self.toolbar.hide()
-            if self.editor is not None:
-                self.editor.hide()
+            self._hide_editor()
             return
 
         self._sync_draft()
@@ -338,16 +444,38 @@ class Display(QWidget):
             self.toolbar_layout.addWidget(self.editor.view_controls)
             self.editor.apply_requested.connect(self._apply)
             self.editor.popout_requested.connect(self._open_window)
+            self.editor.refine_all_requested.connect(self._refine_from_footprints)
             self.editor_layout.addWidget(self.editor)
+            self._refresh_stale_button()
         else:
             self.editor.set_draft(draft)
 
         self.placeholder.hide()
         self.editor.show()
         self.toolbar.show()
+        self._place_target()
+
+    def _hide_editor(self):
+        if self.editor is not None:
+            self.editor.hide()
+        self._place_target()
+
+    def _place_target(self):
+        """Target selection in the editor's options while it is shown, else
+        in the panel's options row (to switch to the overview background)."""
+        if self.editor is not None and not self.editor.isHidden():
+            self.editor.set_target_widget(self.target)
+        else:
+            if self.editor is not None:
+                self.editor.release_target_widget(self.target)
+            if self._x_options_layout.indexOf(self.target) < 0:
+                self._x_options_layout.insertWidget(0, self.target)
+        self.target.show()
 
     def _remove_editor(self):
         if self.editor is not None:
+            self.editor.release_target_widget(self.target)
+            self.target.setParent(self.toolbar.parentWidget())
             self.editor.dispose()
             self.editor_layout.removeWidget(self.editor)
             self.editor.deleteLater()

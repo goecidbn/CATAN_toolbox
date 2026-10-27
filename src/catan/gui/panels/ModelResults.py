@@ -136,7 +136,7 @@ class Display(QWidget):
         self.evidence.setWordWrap(True)
         form.addRow(self.evidence)
         self.calculate_evidence = QPushButton("Calculate missing evidence")
-        self.calculate_evidence.setToolTip(tooltip("Calculate missing or stale count records for the selected session difference. This does not refit the model or remove footprints."))
+        self.calculate_evidence.setToolTip(tooltip("Calculate missing or stale evidence records the fit uses (delta s = 0 and 1) and those of the displayed session difference. This does not refit the model."))
         self.calculate_evidence.hide()
         form.addRow(self.calculate_evidence)
         # Keep the launcher in the empty upper-left quadrant.
@@ -639,6 +639,11 @@ class Controller(BasePlot.BaseDisplayController):
         return kind
 
     def _fit(self, *_):
+        # Never fit to part of the evidence: calculate what is missing first.
+        if self.data.model is not None and not self.data.model.loaded and self._fit_evidence_missing():
+            self.display_widget.status.setText("Calculating missing evidence before fitting…")
+            self._calculate_evidence(then=self._fit)
+            return
         try:
             self.data.queue_fit_model()
         except Exception as exc:
@@ -735,11 +740,14 @@ class Controller(BasePlot.BaseDisplayController):
                 session_paths=order,
                 session_distances=(gap,) if gap is not None and gap > 0 else None)
             self._missing_evidence, total_records = self._evidence_records(gap)
+            fit_missing = self._fit_evidence_missing()
             w = self.display_widget
-            w.calculate_evidence.setVisible(bool(self._missing_evidence))
+            w.calculate_evidence.setVisible(bool(self._missing_evidence or fit_missing))
             w.calculate_evidence.setEnabled(not self._counts_running)
             if self._missing_evidence:
                 w.status.setText(f"{len(self._missing_evidence)} evidence records missing or stale. Open options to calculate them.")
+            elif fit_missing:
+                w.status.setText(f"{len(fit_missing)} evidence records for the fit (delta s = 0 and 1) missing or stale. Open options to calculate them.")
             else:
                 w.status.setText("Preview only. Apply updates tracking probabilities." if self._candidate is not None else "Showing the current model. Edits are previews until Apply.")
             same_kind, cross_kind = ("same2", "cross2") if kind == "two_noise" else ("same", "cross")
@@ -763,25 +771,37 @@ class Controller(BasePlot.BaseDisplayController):
         except Exception as exc:
             self.display_widget.status.setText(str(exc))
 
-    def _evidence_records(self, gap):
+    # Evidence the fit uses: delta s = 0 (two-noise) and delta s = 1.
+    FIT_GAPS = (0, 1)
+
+    def _evidence_records(self, gap, gaps=None):
+        """(missing records, number of records) for the displayed ``gap``,
+        or for several ``gaps`` (e.g. FIT_GAPS together with it)."""
         model = self.data.model
         sessions = self.data.sessions
         requests = []
         same_kind, cross_kind = ("same2", "cross2") if model.kind == "two_noise" else ("same", "cross")
+        gaps = (gap,) if gaps is None else tuple(dict.fromkeys((*gaps, gap)))
         # Pairs between active sessions; the gap counts active sessions.
         active = [j for j in self.data.active_session_ids() if sessions[j].path is not None]
         for position, j in enumerate(active):
             session = sessions[j]
-            if gap in (0, None):
+            if any(g in (0, None) for g in gaps):
                 requests.append((same_kind, str(session.path), j, j))
-            if gap != 0:
-                for earlier, i in enumerate(active[:position]):
-                    if gap is None or position - earlier == gap:
-                        requests.append((cross_kind, (str(sessions[i].path), str(session.path)), i, j))
+            for earlier, i in enumerate(active[:position]):
+                if any(g is None or (g != 0 and position - earlier == g) for g in gaps):
+                    requests.append((cross_kind, (str(sessions[i].path), str(session.path)), i, j))
         missing = [r for r in requests if r[1] not in model.counts[r[0]] or r[1] in model.stale_counts[r[0]]]
         return missing, len(requests)
 
-    def _calculate_evidence(self, *_, offer_alignment=True):
+    def _fit_evidence_missing(self):
+        """Records the fit needs (FIT_GAPS) that are missing or stale."""
+        gaps = self.FIT_GAPS if self.data.model.kind == "two_noise" else (1,)
+        return self._evidence_records(gaps[0], gaps)[0]
+
+    def _calculate_evidence(self, *_, offer_alignment=True, then=None):
+        """Calculate missing or stale evidence; ``then`` runs after it was
+        stored (e.g. the fit)."""
         if self._counts_running or self._deactivated:
             return
         tasks = self.state.tasks
@@ -789,8 +809,12 @@ class Controller(BasePlot.BaseDisplayController):
             self.display_widget.status.setText("Wait for current processing before calculating evidence.")
             return
         source = self.data.model
-        requests, _ = self._evidence_records(self.display_widget.gaps.currentData())
+        # Everything the fit needs, plus the displayed difference.
+        gaps = self.FIT_GAPS if source.kind == "two_noise" else (1,)
+        requests, _ = self._evidence_records(self.display_widget.gaps.currentData(), gaps)
         if not requests:
+            if then is not None:
+                then()
             return
         # Moving / removing sessions marks later alignments outdated; the
         # evidence needs current ones. Offer to update them first.
@@ -878,6 +902,8 @@ class Controller(BasePlot.BaseDisplayController):
             self._evidence_key = None
             self.data.notify_change(C.MODEL_COUNTS, C.PROCESSING_STATUS)
             self._redraw()
+            if then is not None:
+                then()
         tasks.task_cancelled.connect(stopped)
         tasks.task_failed.connect(stopped)
         task["connected"] = True

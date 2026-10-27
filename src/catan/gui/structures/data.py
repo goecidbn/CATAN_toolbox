@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Dict, Optional, Tuple, List, Union
 from catan.tracking.structures.model import Model
 import numpy as np
@@ -184,6 +185,15 @@ class Data(Tracking):
             1.0, state.settings.value("alignment/max_session_shift", 50.0, type=float)
         )
         self.alignment_offsets = []
+        # Optional rigid correction of each new alignment from footprints.
+        self.refine_alignment_with_footprints = state.settings.value(
+            "alignment/refine_with_footprints", False, type=bool
+        )
+        # Background correlation a flow alignment needs (after warping).
+        self.min_flow_correlation = min(
+            1.0,
+            max(0.0, state.settings.value("alignment/min_flow_correlation", 0.10, type=float)),
+        )
 
         super().__init__()
 
@@ -317,8 +327,8 @@ class Data(Tracking):
         self.state.data_version += 1
         self.state.data_changed.emit(event)
 
-    def mark_geometry_changed(self, session_id: int):
-        affected_paths = super().mark_geometry_changed(session_id)
+    def mark_geometry_changed(self, session_id: int, *, all_later: bool = False):
+        affected_paths = super().mark_geometry_changed(session_id, all_later=all_later)
 
         path = self.sessions[session_id].path
 
@@ -655,7 +665,7 @@ class Data(Tracking):
         if len(active) < 2:
             return
 
-        self.mark_geometry_changed(active[0])
+        self.mark_geometry_changed(active[0], all_later=True)
 
         return self.queue_process_alignments(
             session_ids=active[1:],
@@ -664,9 +674,14 @@ class Data(Tracking):
 
     @after_display_tasks
     def queue_process_alignments(
-        self, *, session_ids, finished=None, replace_manual=False
+        self, *, session_ids, finished=None, replace_manual=False, skipped=()
     ):
-        """Repair required alignments and stale predecessors in session order."""
+        """Align the given sessions where outdated or unaligned, in session
+        order. Sessions are aligned in the common frame against any current
+        earlier session, so outdated earlier ones neither block nor are
+        realigned implicitly. A session needing review is queued for it
+        (``skipped``) and the others continue; ``finished`` runs only if
+        none needed review."""
         tasks = self.state.tasks
 
         if tasks.processing_busy():
@@ -685,16 +700,15 @@ class Data(Tracking):
             if any(index < 0 or index >= len(self.sessions) for index in required):
                 raise IndexError("Invalid alignment session selection.")
 
-            last = max(required, default=-1)
-
             # Inactive sessions are skipped (they keep their state).
             pending = [
                 index
-                for index in range(last + 1)
+                for index in required
                 if self.session_is_active(index)
+                and index not in skipped
                 and (
                     self.alignment_is_stale(index)
-                    or (index in required and not self.sessions[index].status["aligned"])
+                    or not self.sessions[index].status["aligned"]
                 )
             ]
 
@@ -714,7 +728,7 @@ class Data(Tracking):
             return
 
         if not pending:
-            if finished is not None:
+            if finished is not None and not skipped:
                 finished()
             return
 
@@ -754,7 +768,11 @@ class Data(Tracking):
                 return {
                     "alignment_failure": (
                         session,
-                        message + "\nDependent processing stopped.",
+                        message
+                        + (
+                            "\nThe other sessions continue; dependent processing "
+                            "waits for this review."
+                        ),
                         remap,
                     )
                 }
@@ -773,6 +791,13 @@ class Data(Tracking):
                     item is session for item in self.sessions
                 ):
                     self.state.alignment_failed.emit(session, message, proposal)
+                    # Skip it: the remaining sessions do not depend on it.
+                    self.queue_process_alignments(
+                        session_ids=required,
+                        finished=finished,
+                        replace_manual=replace_manual,
+                        skipped=(*skipped, session_id),
+                    )
                 return
 
             if self._publish_realignment_update(result, expected_version):
@@ -781,6 +806,7 @@ class Data(Tracking):
                     session_ids=required,
                     finished=finished,
                     replace_manual=replace_manual,
+                    skipped=skipped,
                 )
 
         return tasks.start(
@@ -1284,7 +1310,7 @@ class Data(Tracking):
                 self.add_model(name, candidate)
             else:
                 self._assignments[name] = candidate
-                self._current_assignments = name
+                self._activate_assignments(name)
 
                 # The registered source is not loaded yet: panels must not
                 # keep showing (and half-handling) the previous assignments.
@@ -1292,7 +1318,10 @@ class Data(Tracking):
                 if ids.ndim != 2 or ids.shape[1] != len(self.sessions):
                     ids = np.full((0, len(self.sessions)), -1, dtype=int)
                 self.state.apply_assignment_rebuild(ids, {}, from_session_id=0)
-                self.notify_change(C.ASSIGNMENT_SET, *ASSIGNMENT_CONTENT_CHANGES)
+                self.notify_change(
+                    C.ASSIGNMENT_SET, C.INCLUSION, C.FOOTPRINT_GEOMETRY,
+                    *ASSIGNMENT_CONTENT_CHANGES,
+                )
 
             if on_loaded is not None:
                 on_loaded()
@@ -1307,13 +1336,8 @@ class Data(Tracking):
     def propose_session_remapping(self, session_id: int, *, background_template=None):
 
         session = self.sessions[session_id]
-        # Inactive sessions are not references; their state does not block.
-        if any(
-            self.alignment_is_stale(i) and self.session_is_active(i)
-            for i in range(session_id)
-        ):
-            raise ValueError("Update earlier stale alignments first.")
-
+        # Outdated earlier sessions are no references
+        # (alignment_references_for_session); they do not block.
         references = self.alignment_references_for_session(session_id)
         self.apply_alignment_settings(session)
 
@@ -1495,6 +1519,142 @@ class Data(Tracking):
         self.state.settings.setValue("alignment/max_session_shift", value)
         self.notify_change(C.ALIGNMENT_SETTINGS)
 
+    # ------------------------------------------------------------------
+    # Footprint refinement of all alignments (optional)
+    # ------------------------------------------------------------------
+
+    def footprint_refinement_sessions(self):
+        """Active, aligned, current sessions with loaded footprints."""
+        return [
+            sid
+            for sid, session in enumerate(self.sessions)
+            if self.session_is_active(sid)
+            and session.status["spatial_loaded"]
+            and session.status["aligned"]
+            and not self.alignment_is_stale(sid)
+            and session.centroids is not None
+            and session.remap is not None
+        ]
+
+    def estimate_footprint_corrections(self):
+        """Rigid corrections of all refinable sessions against all others
+        (core.footprint_alignment.global_corrections). Returns
+        {session_id: result}; runs in a worker."""
+        from catan.core import footprint_alignment
+
+        session_ids = self.footprint_refinement_sessions()
+        if len(session_ids) < 2:
+            raise ValueError("Footprint refinement needs at least two aligned sessions.")
+
+        points = [
+            np.asarray(self.sessions[sid].centroids)[
+                np.asarray(self.sessions[sid].included, dtype=bool)
+            ]
+            / self.sessions[sid].params.get("pxtomu", 1.0)
+            for sid in session_ids
+        ]
+        dims = self.sessions[session_ids[0]].dims
+        center = (dims[1] / 2, dims[0] / 2)
+        results = footprint_alignment.global_corrections(points, center)
+        return dict(zip(session_ids, results))
+
+    def queue_apply_footprint_corrections(self, results, *, minimum=0.05, finished=None):
+        """Apply accepted corrections (larger than ``minimum`` px at the
+        image corners) one session after the other. Each is an isolated
+        realignment: later alignments stay current; the session's evidence
+        and assignments become outdated."""
+        from catan.core import footprint_alignment
+
+        tasks = self.state.tasks
+        if tasks.processing_busy() or tasks.processing_requested:
+            raise ValueError("Finish or cancel the current processing first.")
+
+        sessions = list(self.sessions)
+        dims = None
+        pending = []
+        for sid, result in sorted(results.items()):
+            if result is None or not result["accepted"]:
+                continue
+            session = self.sessions[sid]
+            dims = session.dims
+            corners = np.array([[0, 0], [dims[1], 0], [0, dims[0]], [dims[1], dims[0]]], float)
+            matrix = np.asarray(result["matrix"])
+            moved = corners @ matrix[:2, :2].T + matrix[:2, 2]
+            if np.abs(moved - corners).max() >= minimum:
+                pending.append((session, matrix, result))
+
+        if not pending:
+            if finished is not None:
+                finished(0)
+            return 0
+
+        def step(index):
+            if index >= len(pending):
+                if finished is not None:
+                    finished(len(pending))
+                return
+
+            session, matrix, result = pending[index]
+            if any(a is not b for a, b in zip(self.sessions, sessions)) or len(self.sessions) != len(sessions):
+                self.state.issue(
+                    "warning",
+                    "Footprint refinement stopped",
+                    "The sessions changed while applying the refinement.",
+                )
+                return
+
+            sid = self.sessions.index(session)
+            remap = footprint_alignment.compose_correction(session.remap, matrix)
+            remap.flow_info = dict(remap.flow_info or {})
+            remap.flow_info["footprint_refinement"] = {
+                "parameters": tuple(result["parameters"]),
+                "accepted": True,
+                "reason": None,
+                "references": result.get("references"),
+                "matches": result.get("matches"),
+                "mode": "all sessions",
+            }
+
+            # Later alignments do not depend on this correction.
+            self._processing_state(sid).alignment_isolated = True
+            expected_version = self.state.data_version
+
+            def publish(update):
+                if self._publish_realignment_update(update, expected_version):
+                    step(index + 1)
+
+            tasks.start(
+                "loading",
+                f"Refine alignment from footprints: {session.name}",
+                self._build_realignment_update,
+                sid,
+                background_template=session.background_template,
+                remap=remap,
+                background_spec=None,
+                on_result=publish,
+            )
+
+        step(0)
+        return len(pending)
+
+    def set_refine_alignment_with_footprints(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.refine_alignment_with_footprints:
+            return
+
+        self.refine_alignment_with_footprints = enabled
+        self.state.settings.setValue("alignment/refine_with_footprints", enabled)
+        self.notify_change(C.ALIGNMENT_SETTINGS)
+
+    def set_min_flow_correlation(self, value):
+        value = min(1.0, max(0.0, float(value)))
+        if value == self.min_flow_correlation:
+            return
+
+        self.min_flow_correlation = value
+        self.state.settings.setValue("alignment/min_flow_correlation", value)
+        self.notify_change(C.ALIGNMENT_SETTINGS)
+
     def add_alignment_offset(self, offset, *, notify=True):
         """Accept shifts around ``offset`` (dx, dy) for later alignments.
         Returns True if it was new (not within 1 px of a known position)."""
@@ -1521,6 +1681,10 @@ class Data(Tracking):
         ``session`` (Remapping reads them from the session parameters)."""
         session.params["max_session_shift"] = float(self.max_session_shift)
         session.params["alignment_offsets"] = [list(o) for o in self.alignment_offsets]
+        session.params["min_flow_correlation"] = float(self.min_flow_correlation)
+        session.params["refine_alignment_with_footprints"] = bool(
+            self.refine_alignment_with_footprints
+        )
 
     def set_border_tolerance(self, value):
         """Number of sessions a pixel may lie outside of and still count as
@@ -2759,7 +2923,7 @@ class Data(Tracking):
         ), "Failed to determine source config for the assignments file."
 
         self._assignments[name] = assignments
-        self._current_assignments = name
+        self._activate_assignments(name)
 
     def load_assignments(self):
         if self.assignments is None:
@@ -3089,6 +3253,142 @@ class Data(Tracking):
             *ASSIGNMENT_CONTENT_CHANGES
         )  # Notify that assignments have changed
 
+    # ------------------------------------------------------------------
+    # Session state of an assignment set
+    # ------------------------------------------------------------------
+    # Inclusion and manipulations belong to an assignment set: the sessions
+    # show the active set's synthetic components and inclusion. Switching
+    # stores the inclusion of the previous set, removes all synthetic
+    # components, replays the manipulations of the new one and applies its
+    # inclusion (stored, else from its file, else the session-level one).
+
+    def _store_session_inclusion(self, assignments=None):
+        assignments = self.assignments if assignments is None else assignments
+        if assignments is None:
+            return
+        assignments.session_inclusion = {
+            str(session.path): np.asarray(session.included, dtype=bool).copy()
+            for session in self.sessions
+            if session.status["spatial_loaded"] and session.included is not None
+        }
+
+    def comparison_ids(self, assignments):
+        """Footprint ids of ``assignments`` for comparing sets: footprints
+        it excludes (its own inclusion) and its synthetic components (they
+        exist only with the set and are not comparable) are -1."""
+        ids = np.asarray(assignments.ids, dtype=np.int64).copy()
+        stored = getattr(assignments, "session_inclusion", None) or {}
+        active = assignments is self.assignments
+
+        for sid, session in enumerate(self.sessions[: ids.shape[1]]):
+            column = ids[:, sid]
+            if not session.status["spatial_loaded"]:
+                continue
+            synthetic = np.asarray(session.synthetic, dtype=bool)
+            detected = int(session.n_neurons - synthetic.sum())
+            mask = session.included if active else stored.get(str(session.path))
+
+            present = column >= 0
+            invalid = present & (column >= detected)
+            if mask is not None:
+                mask = np.asarray(mask, dtype=bool)
+                check = present & ~invalid
+                excluded = np.zeros_like(present)
+                excluded[check] = ~mask[np.minimum(column[check], len(mask) - 1)]
+                invalid |= excluded
+            column[invalid] = -1
+
+        return ids
+
+    def inactive_view(self, assignments):
+        """``assignments`` as seen with the active set's sessions: a shallow
+        copy whose synthetic components (they exist only while the set is
+        active) are -1. The active set itself is returned unchanged."""
+        if assignments is None or assignments is self.assignments:
+            return assignments
+        key = (id(assignments), self.state.data_version)
+        cache = getattr(self, "_inactive_views", {})
+        if key not in cache:
+            ids = np.asarray(assignments.ids, dtype=np.int64).copy()
+            for sid, session in enumerate(self.sessions[: ids.shape[1]]):
+                if not session.status["spatial_loaded"]:
+                    continue
+                detected = int(session.n_neurons - np.asarray(session.synthetic, dtype=bool).sum())
+                column = ids[:, sid]
+                column[column >= detected] = -1
+            view = copy(assignments)
+            view.ids = ids
+            cache = {key: view}
+            self._inactive_views = cache
+        return cache[key]
+
+    def staged_sessions_for(self, assignments):
+        """Copies of the sessions with the state of ``assignments`` (its
+        synthetic components and inclusion); the live sessions are
+        untouched. The active set gets the live sessions."""
+        if assignments is self.assignments:
+            return list(self.sessions)
+
+        staged = []
+        for session in self.sessions:
+            item = copy(session)
+            item.included = None if session.included is None else np.asarray(session.included).copy()
+            item._traces = dict(session._traces)
+            item.quality = dict(session.quality)
+            staged.append(item)
+
+        worker = copy(self)
+        worker.sessions = staged
+        worker._assignments = {"__staged__": assignments}
+        worker._current_assignments = "__staged__"
+        worker.state = SimpleNamespace(issue=lambda *args, **kwargs: None)
+        worker._apply_assignment_session_state()
+        return staged
+
+    def _activate_assignments(self, name):
+        """Make ``name`` the active set, with its session state."""
+        self._store_session_inclusion()
+        self._current_assignments = name
+        self._apply_assignment_session_state()
+
+    def _apply_assignment_session_state(self):
+        loaded = [session for session in self.sessions if session.status["spatial_loaded"]]
+        for session in loaded:
+            session.remove_synthetic_components()
+            session.included = session.session_inclusion()
+
+        source = self.assignments
+        if source is None:
+            return
+
+        try:
+            self.restore_manipulations()
+        except (ValueError, IndexError) as exc:
+            self.state.issue(
+                "warning",
+                "Manipulations not restored",
+                f"The manipulations of '{self.current_assignments}' could not "
+                f"be replayed on the current sessions:\n{exc}",
+            )
+
+        stored = getattr(source, "session_inclusion", None)
+        if stored:
+            for session in loaded:
+                mask = stored.get(str(session.path))
+                if mask is not None and mask.shape == (session.n_neurons,):
+                    session.included = mask & session.session_inclusion()
+            return
+
+        if source.session_included is not None and source.ids.shape[1] == len(self.sessions):
+            try:
+                masks = inclusion_to_restore(source.session_included, self.sessions)
+            except ValueError:
+                masks = None
+            if masks is not None:
+                for session, mask in zip(self.sessions, masks):
+                    if session.status["spatial_loaded"]:
+                        session.included = np.asarray(mask, dtype=bool) & session.session_inclusion()
+
     def change_assignments(self, name: str):
         if name == self.current_assignments:
             return True
@@ -3145,7 +3445,9 @@ class Data(Tracking):
             )
             return False
 
+        self._store_session_inclusion()
         super().change_assignments(name)
+        self._apply_assignment_session_state()
 
         self.state.apply_assignment_rebuild(
             self.assignments.ids,
@@ -3154,7 +3456,9 @@ class Data(Tracking):
             component_id_map=component_map,
         )
 
-        self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
+        self.notify_change(
+            C.INCLUSION, C.FOOTPRINT_GEOMETRY, *ASSIGNMENT_CONTENT_CHANGES
+        )
         return True
 
     def can_use_working_assignments(self):
@@ -3191,6 +3495,8 @@ class Data(Tracking):
                 source,
                 target,
                 self.sessions,
+                source_ids=self.comparison_ids(source),
+                target_ids=self.comparison_ids(target),
             )
             self._comparison_cache[key] = comparison
 
@@ -3593,6 +3899,14 @@ class Data(Tracking):
 
             self._assignments[name] = candidate
             self._stale_assignments[name] = stale
+
+            # The copy starts with the source's inclusion.
+            if source is self.assignments:
+                self._store_session_inclusion(candidate)
+            else:
+                candidate.session_inclusion = deepcopy(
+                    getattr(source, "session_inclusion", None)
+                )
 
             # Do not change the active assignments or selection.
             self.notify_change(C.ASSIGNMENT_SET)

@@ -30,22 +30,37 @@ from catan.core.progress import ProgressRange
 from catan.core.alignment import _shift_sparse_bilinear, calculate_img_correlation
 
 
-def normalize_union_footprints(A):
+# Union values below this fraction of a footprint's peak are dropped. Each
+# union update shifts (bilinear) and blends, so supports would otherwise
+# spread with ever smaller values (845ad: 48 % of union values below 1e-3 of
+# the peak, down to 1e-79, vs 2.6 % for session footprints); they inflated
+# the supports in the similarity measure and its FFTs turned them into
+# spurious peaks.
+UNION_PRUNE_THRESHOLD = 1e-3
+
+
+def normalize_union_footprints(A, prune=UNION_PRUNE_THRESHOLD):
     """Scale each column to a peak of 1, so footprints of any scale blend
-    comparably. (A percentile of all positive values is unsuitable: the
-    many small tail values of a blended union lower it and inflate the
-    union relative to the new footprint.)"""
+    comparably, and drop values below ``prune`` (of the peak). (A
+    percentile of all positive values is unsuitable: the many small tail
+    values of a blended union lower it and inflate the union relative to
+    the new footprint.)"""
     A = sparse.csc_matrix(A, dtype=np.float64, copy=True)
     A.sum_duplicates()
 
-    for column in range(A.shape[1]):
-        start, stop = A.indptr[column], A.indptr[column + 1]
-        peak = A.data[start:stop].max(initial=0.0)
-
-        if peak > 0:
-            A.data[start:stop] /= peak
+    counts = np.diff(A.indptr)
+    if A.nnz:
+        columns = np.repeat(np.arange(A.shape[1]), counts)
+        peaks = np.zeros(A.shape[1])
+        np.maximum.at(peaks, columns, A.data)
+        scale = np.where(peaks > 0, peaks, 1.0)
+        A.data /= scale[columns]
+        if prune:
+            A.data[A.data < prune] = 0.0
+            A.eliminate_zeros()
 
     return A
+
 
 from .structures import Model, Assignments
 from .analytics import two_noise_model
@@ -61,11 +76,6 @@ FLOW_REFERENCE_SESSIONS = 10
 class ModelCountCalculation:
 
     counts: np.ndarray
-
-    # These originate from the same expensive
-    # calculate_statistics() call.
-    idx_remove: np.ndarray
-    remove_info: Any
 
     # Two-noise model evidence from the same call (cross-session:
     # "cross2" and "vector").
@@ -456,13 +466,15 @@ class Tracking:
                 "realign this session before further processing."
             )
 
-    def mark_geometry_changed(self, session_id: int):
+    def mark_geometry_changed(self, session_id: int, *, all_later: bool = False):
         """
         Mark dependencies invalid after the aligned geometry of one session has changed.
 
         The changed session itself is assumed to have a valid newly committed alignment.
 
-        All later sessions have stale alignment because their remapping may depend on this session.
+        Later sessions aligned against it (Remapping.reference_paths,
+        transitively) have stale alignments, with ``all_later`` all later
+        sessions (realign all); later assignments are stale.
         """
 
         if not (0 <= session_id < len(self.sessions)):
@@ -483,16 +495,33 @@ class Tracking:
         # ============================================
         # Downstream remappings
         # ============================================
+        # Alignments are in the common frame: only later sessions aligned
+        # against a changed one (directly or through another outdated one)
+        # become outdated (Remapping.reference_paths; unknown: outdated).
+        dependents = []
         if not isolated:
+            changed_paths = {str(changed.path)}
             for downstream_id in range(session_id + 1, len(self.sessions)):
+                downstream = self.sessions[downstream_id]
+                remap = downstream.remap
+                references = None if remap is None else remap.reference_paths()
+                if (
+                    not all_later
+                    and references is not None
+                    and not (references & changed_paths)
+                ):
+                    continue
                 self._processing_state(downstream_id).alignment_stale = True
+                dependents.append(downstream)
+                if downstream.path is not None:
+                    changed_paths.add(str(downstream.path))
         elif self.assignments is not None:
             changed_state.assignment_isolated = True
 
         # ============================================
-        # Model evidence
+        # Model evidence: pairs involving changed geometry
         # ============================================
-        affected_sessions = [changed] if isolated else self.sessions[session_id:]
+        affected_sessions = [changed, *dependents]
         affected_paths = {
             str(session.path)
             for session in affected_sessions
@@ -503,11 +532,21 @@ class Tracking:
             model.invalidate_counts_for_paths(affected_paths)
 
         # ============================================
-        # Assignments
+        # Assignments: registration builds the union in session order, so
+        # all later sessions are affected.
         # ============================================
+        assignment_paths = (
+            affected_paths
+            if isolated
+            else {
+                str(session.path)
+                for session in self.sessions[session_id:]
+                if session.path is not None
+            }
+        )
         for name in self._assignments:
 
-            self._stale_assignments.setdefault(name, set()).update(affected_paths)
+            self._stale_assignments.setdefault(name, set()).update(assignment_paths)
 
         # Compatibility flags for existing GUI code.
         for session in affected_sessions:
@@ -665,6 +704,26 @@ class Tracking:
 
         return this_data.id
 
+    def reference_centroids(self, session_id: int, count: int = 10):
+        """Aligned centroids (px) of the ``count`` most recent active, aligned
+        sessions before ``session_id`` (footprint refinement)."""
+        points = []
+        for sid in reversed(range(min(session_id, len(self.sessions)))):
+            session = self.sessions[sid]
+            if (
+                not self.session_is_active(sid)
+                or not session.status["aligned"]
+                or self.alignment_is_stale(sid)
+                or session.centroids is None
+                or len(session.included) != len(session.centroids)
+            ):
+                continue
+            centroids = np.asarray(session.centroids)[np.asarray(session.included, dtype=bool)]
+            points.append(centroids / session.params.get("pxtomu", 1.0))
+            if len(points) == count:
+                break
+        return points
+
     def alignment_references_for_session(self, session_id: int | None = None):
         stop = len(self.sessions) if session_id is None else session_id
         if not 0 <= stop <= len(self.sessions):
@@ -709,6 +768,15 @@ class Tracking:
                 # This session's own accepted alignment quality.
                 "alignment_correlation": (
                     None if remap is None else remap.alignment_correlation
+                ),
+                # Aligned footprint positions (px), for footprint refinement.
+                "centroids": (
+                    None
+                    if session.centroids is None
+                    else np.asarray(session.centroids)[
+                        np.asarray(session.included, dtype=bool)
+                    ]
+                    / session.params.get("pxtomu", 1.0)
                 ),
             }
 
@@ -832,7 +900,6 @@ class Tracking:
         align_to_reference=True,
         *,
         session_distances=(1,),
-        apply_removals=True,
         ctx=None,
     ):
 
@@ -853,7 +920,6 @@ class Tracking:
         return self.update_model_counts(
             session_id,
             session_distances=(session_distances),
-            apply_removals=(apply_removals),
             ctx=ctx,
         )
 
@@ -892,34 +958,18 @@ class Tracking:
             footprint_shifts,
             footprint_distances,
             footprint_correlations,
-            idx_remove,
-            remove_info,
         ) = calculate_statistics(
             this_data,
             ref_data,
             distance_threshold=self.params.get("neighbor_distance", 25.0),
-            nP=12,
-            params=self.params,
             ctx=ctx,
         )
-
-        idx_remove = np.asarray(idx_remove, dtype=int).reshape(-1)
 
         # ============================================
         # Local inclusion masks
         # ============================================
-        #
-        # For same-session calculations, removal candidates do not
-        # participate in the NN mask used below.
-
         idx_this = np.asarray(this_data.included, dtype=bool).copy()
         idx_ref = np.asarray(ref_data.included, dtype=bool).copy()
-
-        if mode == "same" and idx_remove.size:
-            idx_this[idx_remove] = False
-
-            # ref_data is this_data in same mode.
-            idx_ref = idx_this
 
         # ============================================
         # Neighbours / nearest neighbours
@@ -1015,12 +1065,7 @@ class Tracking:
                 )
             )
 
-        return ModelCountCalculation(
-            counts=counts,
-            idx_remove=idx_remove,
-            remove_info=remove_info,
-            two_noise=two_noise,
-        )
+        return ModelCountCalculation(counts=counts, two_noise=two_noise)
 
     def calculate_two_noise_same_counts(self, this_data: SessionData, *, ctx=None):
         """Two-noise delta s = 0 evidence: pairs of different footprints of
@@ -1029,12 +1074,10 @@ class Tracking:
         if self.model is None:
             raise ValueError("No current model available.")
 
-        _, _, correlations, _, _ = calculate_statistics(
+        _, _, correlations = calculate_statistics(
             this_data,
             this_data,
             distance_threshold=self.params.get("neighbor_distance", 25.0),
-            nP=12,
-            params=self.params,
             ctx=ctx,
             force_cross=True,
         )
@@ -1101,9 +1144,7 @@ class Tracking:
 
         return result
 
-    def update_model_same_counts(
-        self, session_id: int, *, apply_removals=True, ctx=None
-    ):
+    def update_model_same_counts(self, session_id: int, *, ctx=None):
 
         if self.model is None:
             raise ValueError("No current model available.")
@@ -1116,9 +1157,6 @@ class Tracking:
             raise ValueError(f"Session {session_id} has no path.")
 
         result = self.calculate_model_counts(session, mode="same", ctx=ctx)
-
-        if apply_removals and result.idx_remove.size:
-            session.included[result.idx_remove] = False
 
         self.model.set_same_counts(
             str(session.path),
@@ -1142,7 +1180,6 @@ class Tracking:
         session_id: int,
         *,
         session_distances=(1,),
-        apply_removals: bool = True,
         ctx=None,
     ):
 
@@ -1183,7 +1220,6 @@ class Tracking:
         # ============================================
         results["same"] = self.update_model_same_counts(
             session_id,
-            apply_removals=apply_removals,
             ctx=progress.step(
                 0, total, message=f"Same-session evidence: {session.name}"
             ),
@@ -1424,7 +1460,6 @@ class Tracking:
         for index, session_id in enumerate(plan["same_sessions"]):
             self.update_model_same_counts(
                 session_id,
-                apply_removals=False,
                 ctx=progress.step(
                     index,
                     total,
@@ -1989,13 +2024,11 @@ class Tracking:
                 )
 
             ### obtain matching probability from cross session statistics and model
-            footprint_shifts, footprint_distances, footprint_correlations, _, _ = (
+            footprint_shifts, footprint_distances, footprint_correlations = (
                 calculate_statistics(
                     this_data,
                     self.assignments.union,
                     distance_threshold=self.model.distance_cutoff,
-                    nP=12,
-                    # params=self.params,
                     ctx=progress.range(0, 85, "Comparing footprints with union"),
                 )
             )
@@ -2235,45 +2268,64 @@ class Tracking:
         if weights is None:
             weights = np.full(nA_post, 1.0)
 
-        fp_updated: List[sparse.csc_matrix] = []
-        for n_idx, fp_idx in enumerate(assignments_new):
+        # All neurons at once, column-wise as _union_update_step: matched
+        # neurons blend the union (moved by the measured shift, if over
+        # 0.5 px) with the new footprint, both normalized; new neurons take
+        # the normalized footprint; absent ones keep theirs (or stay empty).
+        assignments_new = np.asarray(assignments_new, dtype=np.int64)
+        n_pixels = footprints_new.shape[0]
+        present = assignments_new >= 0
+        existed = np.zeros(nA_post, dtype=bool)
+        existed[:nA_prev] = previous_mass[:nA_prev] > 0
 
-            footprint_existed = n_idx < nA_prev and previous_mass[n_idx] > 0
+        matched = present & existed
+        new = present & ~existed
+        retain = ~present & existed
 
-            if fp_idx < 0 and footprint_existed:
-                # print(f"Neuron {n_idx} not present in session, retaining existing footprint.")
-                ## neuron not present in session:
-                ## retain existing footprint
-                fp_updated.append(self.assignments.union.footprints[:, n_idx])
+        union_previous = sparse.csc_matrix(self.assignments.union.footprints)
+        if union_previous.shape[0] != n_pixels:
+            union_previous = sparse.csc_matrix((n_pixels, 0))
+        if union_previous.shape[1] < nA_post:
+            union_previous = sparse.hstack(
+                [
+                    union_previous,
+                    sparse.csc_matrix((n_pixels, nA_post - union_previous.shape[1])),
+                ],
+                format="csc",
+            )
+        union_previous = union_previous[:, :nA_post]
 
-            elif fp_idx < 0 and not footprint_existed:
-                # print(f"Neuron {n_idx} not present in session and not detected before, creating dummy footprint.")
-                ## neuron not present in session and not detected before:
-                ## create dummy entry
-                fp_updated.append(sparse.csc_matrix((footprints_new.shape[0], 1)))
+        # Session footprints per neuron (empty where absent).
+        selected = sparse.csc_matrix(footprints_new)[:, np.where(present, assignments_new, 0)]
+        selected = selected @ sparse.diags(present.astype(float))
 
-            elif fp_idx >= 0 and footprint_existed:
-                # print(f"Neuron {n_idx} matched to previous, updating footprint.")
-                ## neuron matched to previous:
-                ## update footprint accordingly
-                fp_updated.append(
-                    self._union_update_step(
-                        self.assignments.union.footprints[:, n_idx],
-                        footprints_new[:, fp_idx],
-                        shifts[n_idx],
-                        weights[n_idx],
-                        self.assignments.union.dims,
-                    )
-                )
+        shifts = np.nan_to_num(
+            np.asarray(shifts, dtype=float).reshape(nA_post, 2),
+            nan=0.0, posinf=0.0, neginf=0.0,
+        )
+        move = matched & (np.hypot(shifts[:, 0], shifts[:, 1]) > 0.5)
+        moved = union_previous
+        if move.any():
+            moved = _shift_sparse_bilinear(
+                union_previous @ sparse.diags(matched.astype(float)),
+                self.assignments.union.dims,
+                np.where(move, shifts[:, 0], 0.0),
+                np.where(move, shifts[:, 1], 0.0),
+                order="C",
+            )
 
-            elif fp_idx >= 0 and not footprint_existed:
-                # print(f"Neuron {n_idx} new in session, assigning current footprint.")
-                ## neuron new in session:
-                ## assign current footprint
-                fp_updated.append(normalize_union_footprints(footprints_new[:, fp_idx]))
+        weights = np.asarray(weights, dtype=float).reshape(nA_post)
+        weights = np.where(np.isfinite(weights), weights, 1.0)
+        strength = float(self.params.get("union_update_strength", 0.5))
+        a = np.clip(strength * weights, 0.0, 1.0)
 
-        # ## update union data
-        combined = sparse.hstack(fp_updated, format="csc")
+        combined = (
+            union_previous @ sparse.diags(retain.astype(float))
+            + normalize_union_footprints(moved) @ sparse.diags(np.where(matched, 1 - a, 0.0))
+            + normalize_union_footprints(selected)
+            @ sparse.diags(np.where(matched, a, 0.0) + new)
+        ).tocsc()
+        combined.eliminate_zeros()
 
         if finalize:
             self.assignments.union.update_footprints(

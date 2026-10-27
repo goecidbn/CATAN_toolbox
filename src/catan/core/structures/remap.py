@@ -32,9 +32,16 @@ MIN_CORRELATION_HISTORY = 3
 AGREEMENT_REFERENCES = 3
 AGREEMENT_MIN = 2
 AGREEMENT_PX = 3.0
-# An older reference replaces the most recent one only if its correlation
-# is higher by more than this.
+# An older reference replaces the most recent one only if its score
+# (correlation + neuron agreement) is higher by more than this.
 FLOW_PREFERENCE_MARGIN = 0.05
+# Flow candidates always evaluated (most recent first): a neighbouring
+# session may image the plane worse than an older one (ID28 S9: 20240727
+# correlation 0.72 / 16 % of neurons matched, 20240726 0.87 / 30 %).
+FLOW_RECENT_REFERENCES = 5
+# Neuron agreement: fraction of mutual nearest centroid pairs within this
+# distance (px) after mapping, among the smaller of the two populations.
+NEURON_MATCH_PX = 3.0
 
 MatrixT = TypeVar("MatrixT", sparse.csc_matrix, np.ndarray)
 
@@ -157,6 +164,8 @@ class Remapping:
         rotation_refine_step: float = 0.1,
         require_confirmation: bool = True,
         allowed_offsets=(),
+        min_flow_correlation: float = 0.10,
+        moving_centroids=None,
     ):
         """``require_confirmation``: a flow-only alignment departing from the
         default (see estimate_flow) is proposed unsuccessful, with the
@@ -165,7 +174,14 @@ class Remapping:
 
         ``allowed_offsets``: further translations (dx, dy) in the common
         frame around which shifts up to ``max_shift`` are accepted (e.g. the
-        imaging window jumped and stayed there); the origin always is."""
+        imaging window jumped and stayed there); the origin always is.
+
+        ``min_flow_correlation``: background correlation (after warping)
+        a flow alignment needs against a reference.
+
+        ``moving_centroids``: neuron centroids (x, y) in the template's
+        pixel frame; scored against the references' "centroids" when
+        choosing among flow candidates (not stored)."""
 
         # Transform from THIS SESSION'S original template
         # into CATAN's common/global coordinate system.
@@ -189,6 +205,7 @@ class Remapping:
             + [np.asarray(offset, dtype=float).reshape(1, 2) for offset in allowed_offsets]
         )
         self.max_rotation = float(max_rotation)
+        self.min_flow_correlation = float(min_flow_correlation)
         self.c_min = float(min_corr)
         self.min_zcorr = float(min_zcorr)
 
@@ -199,6 +216,11 @@ class Remapping:
         self.dims = None
 
         self.require_confirmation = bool(require_confirmation)
+        self.moving_centroids = (
+            None
+            if moving_centroids is None or not len(moving_centroids)
+            else np.asarray(moving_centroids, dtype=np.float64).reshape(-1, 2)
+        )
         # Why the proposed alignment needs the user's confirmation, or None.
         self.confirmation = None
 
@@ -262,6 +284,7 @@ class Remapping:
                     max_displacement=self.max_shift,
                     hard_max_displacement=1.5 * self.max_shift,
                     residual=False,
+                    min_correlation=getattr(self, "min_flow_correlation", 0.10),
                 )
             finally:
                 self.success = self.flow is not None
@@ -277,7 +300,8 @@ class Remapping:
 
                 deviation = self.flow_info.get("deviation")
                 if deviation and self.require_confirmation:
-                    self.confirmation = deviation
+                    note = self.flow_info.get("reference_note")
+                    self.confirmation = f"{deviation} {note}" if note else deviation
                     self.success = False
 
             return
@@ -370,7 +394,11 @@ class Remapping:
         self.success = True
 
         if use_optical_flow:
-            self.estimate_flow(template, references)
+            self.estimate_flow(
+                template,
+                references,
+                min_correlation=getattr(self, "min_flow_correlation", 0.10),
+            )
 
     def _estimate_pairwise(
         self,
@@ -637,19 +665,38 @@ class Remapping:
 
     @property
     def flow_message(self):
+        message = self._flow_message()
+        refinement = (self.flow_info or {}).get("footprint_refinement")
+        if refinement:
+            dx, dy, angle = refinement.get("parameters") or (0.0, 0.0, 0.0)
+            message += (
+                f"\nFootprint refinement: dx {dx:+.2f} px, dy {dy:+.2f} px, "
+                f"rotation {angle:+.2f}°"
+                + (f" ({refinement['matches']} matched cells)." if refinement.get("matches") else ".")
+                if refinement.get("accepted")
+                else f"\nFootprint refinement not applied: {refinement.get('reason')}."
+            )
+        return message
+
+    def _flow_message(self):
         info = self.flow_info or {}
         status = info.get("status")
 
         if self.flow is not None:
             reference = info.get("reference")
+            label = ""
             if reference:
+                record = info.get("candidates", {}).get(reference, {})
                 # Session name ("S12 Session13") rather than its file path.
-                reference = (
-                    info.get("candidates", {}).get(reference, {}).get("name")
-                    or Path(str(reference)).name
-                )
-            label = f" Reference: {reference}." if reference else ""
-            return "Flow correction applied." + label
+                name = record.get("name") or Path(str(reference)).name
+                quality = []
+                if record.get("correlation_after") is not None:
+                    quality.append(f"correlation {record['correlation_after']:.2f}")
+                if record.get("neuron_agreement") is not None:
+                    quality.append(f"{100 * record['neuron_agreement']:.0f} % of neurons matched")
+                label = f" Reference: {name}" + (f" ({', '.join(quality)})" if quality else "") + "."
+            note = info.get("reference_note")
+            return "Flow correction applied." + label + (f" {note}" if note else "")
 
         if info.get("mode") == "flow_only":
             return (
@@ -962,15 +1009,18 @@ class Remapping:
         candidates = self.flow_info["candidates"]
         notes = []
 
+        # Choosing the best of the recent references (also an older one) is
+        # automatic: only doubts about the selected alignment itself need
+        # confirmation. Why an older one was used is kept for the message.
+        newest = candidates[preferred]
         if path != preferred:
-            newest = candidates[preferred]
             why = (
                 f"correlation {newest['correlation_after']:.2f}"
                 if newest.get("correlation_after") is not None
                 and not newest.get("exceeds_limit")
                 else (newest.get("reason") or "rejected").split(". ")[0]
             )
-            notes.append(
+            self.flow_info["reference_note"] = (
                 f"Aligned to an older session ({record['name']}) instead of the "
                 f"most recent one ({newest['name']}: {why})."
             )
@@ -1030,6 +1080,53 @@ class Remapping:
             "distances": distances,
         }
 
+    def _score_neuron_agreement(self, record, flow, reference_data):
+        """record["score"]: background correlation plus the fraction of
+        neurons agreeing with the reference (mutual nearest centroids within
+        NEURON_MATCH_PX); neurons carry the alignment where the background
+        is dominated by vessels or diffuse signal."""
+        record["score"] = record["correlation_after"]
+        points = getattr(self, "moving_centroids", None)
+        reference = reference_data.get("centroids")
+        if points is None or reference is None or not len(reference):
+            return
+
+        from catan.core import footprint_alignment
+
+        if self.transpose:
+            points = points[:, ::-1]
+        mapped = footprint_alignment.map_points(points, record["prior_matrix"], flow)
+        i, _ = footprint_alignment.mutual_matches(
+            mapped, np.asarray(reference, dtype=np.float64), NEURON_MATCH_PX
+        )
+        agreement = len(i) / max(1, min(len(points), len(reference)))
+        record.update(
+            neuron_agreement=float(agreement),
+            neuron_matches=int(len(i)),
+            score=record["correlation_after"] + agreement,
+        )
+
+    def reference_paths(self):
+        """Paths of the sessions this alignment was derived from, or None
+        if unknown (then everything earlier counts). Manual alignments
+        record the session compared against on Apply ("references_used";
+        none: placed freely in the common frame)."""
+        info = self.flow_info or {}
+        if "references_used" in info:
+            return {str(path) for path in info["references_used"]}
+        if getattr(self, "method", "automatic") == "manual":
+            return set()
+        paths = set()
+        if info.get("reference") and self.flow is not None:
+            paths.add(str(info["reference"]))
+        if info.get("mode") != "flow_only":
+            paths.update(
+                str(path)
+                for path, record in (self.remap_data or {}).items()
+                if record.get("success", True)
+            )
+        return paths or None
+
     @property
     def alignment_correlation(self):
         """Background correlation of the selected flow alignment, or None."""
@@ -1057,17 +1154,20 @@ class Remapping:
         interior overlap, so that it keeps the given rigid geometry (manual
         refinement of a chosen shift).
 
-        References are supplied in session order; the most recent one is
-        preferred. Only if it fails or agrees poorly (correlation below
+        References are supplied in session order. The FLOW_RECENT_REFERENCES
+        most recent ones are evaluated, older ones only while none of these
+        aligns well (accepted, correlation at least
         RELATIVE_FLOW_CORRELATION × the median "alignment_correlation" of the
-        references) are the older ones evaluated, and the most recent
-        candidate within FLOW_PREFERENCE_MARGIN of the best correlation is
-        used; a low correlation is then checked for agreement with other
-        references (_reference_agreement). Without ``residual`` (flow-only alignment) a
+        references). Candidates are scored by background correlation plus
+        neuron agreement (_score_neuron_agreement); the most recent one
+        within FLOW_PREFERENCE_MARGIN of the best score is used; a low
+        correlation is then checked for agreement with other references
+        (_reference_agreement). Without ``residual`` (flow-only alignment) a
         candidate beyond ``max_displacement`` (but within the hard limit)
-        stays usable. Any departure from the default (older reference,
-        displacement beyond the limit, low correlation) is described in
-        ``flow_info["deviation"]``.
+        stays usable. Doubts about the selected alignment (displacement
+        beyond the limit, low correlation not backed by other references)
+        are described in ``flow_info["deviation"]``; using an older
+        reference is not one (``flow_info["reference_note"]``).
         """
         self.flow = None
         self.flow_info = {
@@ -1355,9 +1455,23 @@ class Remapping:
 
             return flow
 
+        def well_aligned(record):
+            return record["accepted"] and (
+                good_correlation is None
+                or record["correlation_after"] >= good_correlation
+            )
+
+        evaluated = 0
         for path, reference_data in reversed(list(references.items())):
             if not reference_data.get("flow_candidate", False):
                 continue
+            # Beyond the most recent references only while none of them
+            # aligns well.
+            if evaluated >= FLOW_RECENT_REFERENCES and any(
+                well_aligned(record) for _, _, record in usable
+            ):
+                break
+            evaluated += 1
 
             record = {
                 "accepted": False,
@@ -1421,22 +1535,15 @@ class Remapping:
             record["prior_matrix"] = np.asarray(matrix, dtype=np.float64).copy()
 
             record["accepted"] = not record.get("exceeds_limit", False)
+            self._score_neuron_agreement(record, flow, reference_data)
             usable.append((str(path), flow, record))
 
-            # The most recent reference agrees well: the default.
-            if (
-                str(path) == preferred
-                and record["accepted"]
-                and (good_correlation is None or after >= good_correlation)
-            ):
-                break
-
         if usable:
-            best = max(record["correlation_after"] for _, _, record in usable)
+            best = max(record["score"] for _, _, record in usable)
             path, flow, record = next(
                 item
                 for item in usable
-                if item[2]["correlation_after"] >= best - FLOW_PREFERENCE_MARGIN
+                if item[2]["score"] >= best - FLOW_PREFERENCE_MARGIN
             )
             record["selected"] = True
             if (

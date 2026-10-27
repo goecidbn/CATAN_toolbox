@@ -25,10 +25,13 @@ from PySide6.QtWidgets import (
     QStyle,
     QPlainTextEdit,
     QSizePolicy,
+    QMenu,
 )
 
 from catan.core.image_correlation import calculate_shift_score_map
 from catan.core.structures.remap import Remapping
+from catan.core import footprint_alignment
+from catan.gui.resources.get_icon import get_fa_icon
 from catan.core.spatial_geometry import bounded_view
 
 from catan.gui.structures.alignment_draft import AlignmentDraft
@@ -108,6 +111,8 @@ class AlignmentCamera(scene.PanZoomCamera):
 class ManualAlignmentEditor(QWidget):
     apply_requested = Signal()
     popout_requested = Signal()
+    # Footprint correction menu: refine all sessions (handled by the panel).
+    refine_all_requested = Signal()
     review_closed = Signal()
 
     def __init__(self, data, draft, parent=None):
@@ -130,6 +135,7 @@ class ManualAlignmentEditor(QWidget):
         self._score_result = None
         self._displayed_score_key = None
         self._estimate_task_id = None
+        self._estimate_kind = None
         self._estimate_generation = 0
 
         self._pair_shift_task_id = None
@@ -222,7 +228,7 @@ class ManualAlignmentEditor(QWidget):
             "transform coordinates remain global."
         )
 
-        form.addRow("Display", self.view_mode)
+        form.addRow("View", self.view_mode)
         self.flow_scale = QDoubleSpinBox(self.options)
         self.flow_scale.setRange(0.1, 1000.0)
         self.flow_scale.setDecimals(1)
@@ -344,12 +350,12 @@ class ManualAlignmentEditor(QWidget):
 
         self.edit_rotation.toggled.connect(lambda _checked: self._update_availability())
 
-        estimate_row = QWidget(self.options)
-        estimate_layout = QHBoxLayout(estimate_row)
-        estimate_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.estimate_rotation_button = QPushButton("Estimate rotation")
-        self.estimate_shift_button = QPushButton("Estimate shift")
+        # Automatic estimates next to the values they set.
+        self.estimate_shift_button = QToolButton(self.shift_controls)
+        self.estimate_rotation_button = QToolButton(self.shift_controls)
+        for button in (self.estimate_shift_button, self.estimate_rotation_button):
+            button.setIcon(get_fa_icon("wand-magic-sparkles", "#e8eaed"))
+            button.setFixedWidth(24)
 
         self.estimate_rotation_button.setToolTip(
             "Estimate rotation near the current angle, keeping dx and dy fixed. "
@@ -360,11 +366,8 @@ class ManualAlignmentEditor(QWidget):
             "Uses whole-image cosine similarity."
         )
 
-        self.estimate_rotation_button.setText("Auto ↻")
-        self.estimate_rotation_button.setFixedWidth(58)
+        coordinates.addWidget(self.estimate_shift_button, 1, 2)
         coordinates.addWidget(self.estimate_rotation_button, 2, 2)
-        estimate_layout.addWidget(self.estimate_shift_button)
-        form.addRow(estimate_row)
 
         self.estimate_status = QLabel(self.options)
         self.estimate_status.setWordWrap(True)
@@ -388,6 +391,38 @@ class ManualAlignmentEditor(QWidget):
         self.refine_flow_button.clicked.connect(
             lambda: self._estimate_alignment("flow")
         )
+
+        self.footprint_button = QToolButton(self.shift_controls)
+        self.footprint_button.setText("Footprint correction")
+        self.footprint_button.setCheckable(True)
+        self.footprint_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup
+        )
+        self.footprint_button.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        footprint_menu = QMenu(self.footprint_button)
+        self.refine_all_action = footprint_menu.addAction(
+            "Refine all sessions…", self.refine_all_requested.emit
+        )
+        self.refine_all_action.setToolTip(
+            "Estimate small rigid corrections (shift, slight rotation) of all "
+            "aligned sessions from their footprints, each against all others "
+            "(removes drift that accumulates over chained alignments). The "
+            "result is shown before anything is applied."
+        )
+        footprint_menu.setToolTipsVisible(True)
+        # Enabled by a panel that handles it (set_refine_all_available).
+        self.refine_all_action.setEnabled(False)
+        self.footprint_button.setMenu(footprint_menu)
+        self.footprint_button.setToolTip(
+            "Move the alignment (background, flow and footprints together) by "
+            "the rigid offset that best matches this session's footprints to "
+            "the earlier sessions' footprints. Calculated once; click again "
+            "to remove or add it."
+        )
+        coordinates.addWidget(self.footprint_button, 4, 0, 1, 3)
+        self.footprint_button.toggled.connect(self._toggle_footprint_correction)
 
         grid = self.canvas.central_widget.add_grid(spacing=0)
 
@@ -569,7 +604,7 @@ class ManualAlignmentEditor(QWidget):
             "the origin). Listed and reset at 'Max. shift' in the session "
             "loading panel."
         )
-        self.view_controls.layout().addWidget(self.accept_offset)
+        form.addRow(self.accept_offset)
         self.apply_button.clicked.connect(self._apply)
 
         self.review_message = QPlainTextEdit(self)
@@ -604,10 +639,6 @@ class ManualAlignmentEditor(QWidget):
         self.later_button.clicked.connect(self._review_later)
         self.view_controls.layout().insertWidget(0, self.later_button)
 
-        self.blocker_button = QPushButton(self)
-        self.blocker_button.hide()
-        self.blocker_button.clicked.connect(self._open_blocking_alignment)
-        self.view_controls.layout().insertWidget(0, self.blocker_button)
 
         self.view_mode.currentIndexChanged.connect(self._on_view_mode_changed)
         self.correlation_method.currentIndexChanged.connect(self._render_preview)
@@ -633,15 +664,15 @@ class ManualAlignmentEditor(QWidget):
         # Inset: mean shifts (editable) or the session × session raster of
         # background correlations; the choice is remembered.
         self.inset_mode = QComboBox(self.options)
-        self.inset_mode.addItem("Mean shifts", "shifts")
         self.inset_mode.addItem("Session correlations", "correlations")
+        self.inset_mode.addItem("Mean shifts", "shifts")
         self.inset_mode.addItem("None", "none")
         self.inset_mode.setToolTip(
             "Mean shifts: each session's mean displacement (editable). Session "
             "correlations: correlation of all pairs of aligned backgrounds; "
             "click a cell to compare that pair."
         )
-        saved = self.state.settings.value("alignment/inset", "shifts", type=str)
+        saved = self.state.settings.value("alignment/inset", "correlations", type=str)
         self.inset_mode.setCurrentIndex(max(0, self.inset_mode.findData(saved)))
         self.inset_mode.currentIndexChanged.connect(self._on_inset_mode_changed)
         form.addRow("Inset", self.inset_mode)
@@ -658,6 +689,7 @@ class ManualAlignmentEditor(QWidget):
 
         self._refresh_shift_inset(fit=True)
         self._apply_inset_mode()
+        self._arrange_options()
 
         self._correlation_drag = None
         self._correlation_mouse_connections = (
@@ -734,6 +766,92 @@ class ManualAlignmentEditor(QWidget):
 
         self.options.show()
         self._position_options()
+
+    def _arrange_options(self, target=None):
+        """Options in two sections: alignment (what and how to align) and
+        display (views of the comparison). ``target``: a widget choosing
+        what to align (placed first)."""
+        form = self.options.form
+        labels = {}
+        while form.rowCount():
+            row = form.takeRow(0)
+            field = row.fieldItem.widget() if row.fieldItem is not None else None
+            label = row.labelItem.widget() if row.labelItem is not None else None
+            if field is None:
+                field, label = label, None
+            if field is not None:
+                labels[field] = label
+
+        def header(text):
+            label = QLabel(text, self.options)
+            label.setStyleSheet(
+                "QLabel { font-weight: 600; color: #aab2bd; padding-top: 4px;"
+                " border-bottom: 1px solid #59616c; }"
+            )
+            form.addRow(label)
+
+        alignment = [
+            self.transpose_background,
+            self.accept_offset,
+            self.estimate_status,
+            self.deformation_status,
+        ]
+        display = [
+            self.view_mode,
+            self.flow_scale,
+            self.flow_status,
+            self.correlation_method,
+            self.score_status,
+            self.inset_mode,
+            self.pair_shift_status,
+            self.recalculate_pair_shifts,
+        ]
+        header("Alignment")
+        if target is not None:
+            previous = labels.pop(target, None)
+            if previous is not None:
+                previous.deleteLater()
+            form.addRow("Align", target)
+        for title, section in (("", alignment), ("Display", display)):
+            if title:
+                header(title)
+            for widget in section:
+                label = labels.pop(widget, None)
+                if label is not None:
+                    form.addRow(label, widget)
+                else:
+                    form.addRow(widget)
+        # Anything else keeps its place at the end.
+        for widget, label in labels.items():
+            if isinstance(widget, QLabel) and widget.text() in ("Alignment", "Display", "Align"):
+                widget.deleteLater()  # previous headers
+                continue
+            if label is not None:
+                form.addRow(label, widget)
+            else:
+                form.addRow(widget)
+        self._position_options()
+
+    def set_target_widget(self, widget):
+        """Place the panel's target selection (session / overview
+        background) into the alignment options."""
+        if self.options.form.indexOf(widget) < 0:
+            self._arrange_options(widget)
+
+    def release_target_widget(self, widget):
+        """Remove the target selection again (before it is reparented)."""
+        form = self.options.form
+        if form.indexOf(widget) < 0:
+            return
+        row, _ = form.getWidgetPosition(widget)
+        taken = form.takeRow(row)
+        if taken.labelItem is not None and taken.labelItem.widget() is not None:
+            taken.labelItem.widget().deleteLater()
+
+    def set_refine_all_available(self, enabled, tooltip=None):
+        self.refine_all_action.setEnabled(enabled)
+        if tooltip is not None:
+            self.refine_all_action.setToolTip(tooltip)
 
     def _set_background_transposed(self, checked):
         if not self.can_apply() or not self.draft.can_transpose_background:
@@ -1442,6 +1560,25 @@ class ManualAlignmentEditor(QWidget):
             ],
             current=None if self.draft.external else self.draft.session_id,
         )
+        self._update_correlation_highlights()
+
+    def _update_correlation_highlights(self):
+        """Compared pair and each session's alignment references in the
+        correlation inset."""
+        sessions = self.data.sessions
+        index = {str(session.path): i for i, session in enumerate(sessions)}
+        references = {}
+        for i, session in enumerate(sessions):
+            remap = session.remap
+            paths = None if remap is None else remap.reference_paths()
+            references[i] = sorted(index[path] for path in (paths or ()) if path in index)
+
+        compared = None
+        if not self.draft.external:
+            _, _, reference_id = self._comparison_context()
+            if reference_id is not None and reference_id != self.draft.session_id:
+                compared = (self.draft.session_id, reference_id)
+        self.correlation_inset.set_highlights(compared, references)
 
     def _on_correlation_data_changed(self, event=None):
         if self.inset_mode.currentData() == "correlations":
@@ -1450,6 +1587,7 @@ class ManualAlignmentEditor(QWidget):
     def _update_correlation_current(self, *_):
         if not self.draft.external:
             self.correlation_inset.set_current(self.draft.session_id)
+        self._update_correlation_highlights()
 
     def _choose_correlation_pair(self, row, column):
         later, earlier = max(row, column), min(row, column)
@@ -1528,6 +1666,10 @@ class ManualAlignmentEditor(QWidget):
         reference_index = self.reference.currentIndex()
         if reference_index < 0:
             return
+
+        # The compared pair (also while hovering another comparison).
+        if self.inset_mode.currentData() == "correlations":
+            self._update_correlation_highlights()
 
         draft, reference, reference_id = self._comparison_context()
         applied_flow = draft.effective_flow
@@ -2230,8 +2372,23 @@ class ManualAlignmentEditor(QWidget):
         available = self.can_apply() and not previewing_other
 
         can_estimate = available and self._estimate_task_id is None
-        self.estimate_rotation_button.setEnabled(can_estimate)
+        self.estimate_rotation_button.setEnabled(
+            can_estimate and self.edit_rotation.isChecked()
+        )
         self.estimate_shift_button.setEnabled(can_estimate)
+
+        # Session alignments only; checked while the correction is applied.
+        self.footprint_button.setVisible(not self.draft.external)
+        applied = self.draft.footprint_correction_applied
+        computing = self._estimate_kind == "footprints"
+        previous = self.footprint_button.blockSignals(True)
+        self.footprint_button.setChecked(applied or computing)
+        self.footprint_button.blockSignals(previous)
+        self.footprint_button.setEnabled(
+            available
+            and (applied or can_estimate)
+            and not self.draft.background_transposed
+        )
 
         _, _, reference_id = self._comparison_context()
         self.refine_flow_button.setEnabled(
@@ -2312,36 +2469,12 @@ class ManualAlignmentEditor(QWidget):
             "Use alignment" if needs_acceptance else "Apply changes"
         )
 
-        blocker = self._blocking_alignment()
-        messages = []
-
-        if blocker is not None:
-            session = self.data.sessions[blocker]
-            messages.append(
-                f"Cannot accept S{self.draft.session_id} yet: "
-                f"S{blocker} ({session.name}) has an outdated alignment.\n"
-                f"Review and apply S{blocker} first, then return here."
-            )
-
-        if reviewing:
-            messages.append(review["message"])
-
-        text = "\n\n".join(messages)
+        text = review["message"] if reviewing else ""
         if self.review_message.toPlainText() != text:
             self.review_message.setPlainText(text)
         self.review_message.setVisible(bool(text))
 
-        self.blocker_button.setVisible(blocker is not None)
-        self.blocker_button.setEnabled(idle)
-        if blocker is not None:
-            self.blocker_button.setText(f"Review blocking S{blocker}")
-
-        # Editing remains possible; committing waits for upstream geometry.
-        self.apply_button.setEnabled(available and blocker is None)
-        if blocker is not None:
-            self.apply_button.setToolTip(
-                f"Review and apply the outdated alignment of S{blocker} first."
-            )
+        self.apply_button.setEnabled(available)
 
         self.remove_button.setVisible(needs_acceptance)
         self.remove_button.setEnabled(available)
@@ -2455,8 +2588,28 @@ class ManualAlignmentEditor(QWidget):
         self._refresh_shift_inset(fit=True)
         self._fit_view()
 
+    def record_reference(self):
+        """Remember the session compared against (the alignment's
+        reference, Remapping.reference_paths) for Apply."""
+        index = self.reference.currentIndex()
+        reference_id = (
+            self._reference_session_ids[index]
+            if 0 <= index < len(self._reference_session_ids)
+            else None
+        )
+        valid = (
+            reference_id is not None
+            and 0 <= reference_id < len(self.data.sessions)
+            and reference_id != self.draft.session_id
+            and self.data.sessions[reference_id].path is not None
+        )
+        self.draft.reference_path = (
+            str(self.data.sessions[reference_id].path) if valid else None
+        )
+
     def _apply(self):
-        if self.can_apply() and self._blocking_alignment() is None:
+        if self.can_apply():
+            self.record_reference()
             if self.accept_offset.isChecked() and not self.draft.external:
                 dx, dy, _ = map(float, self.draft.values)
                 self.data.add_alignment_offset((dx, dy))
@@ -2816,24 +2969,25 @@ class ManualAlignmentEditor(QWidget):
         self._correlation_drag = None
         self.view.camera.interactive = camera_interactive
 
-    def _blocking_alignment(self):
-        return next(
-            (
-                sid
-                for sid in range(self.draft.session_id)
-                if self.data.alignment_is_stale(sid)
-            ),
-            None,
-        )
-
-    def _open_blocking_alignment(self):
-        sid = self._blocking_alignment()
-        if sid is None:
+    def _toggle_footprint_correction(self, checked):
+        """Add the footprint correction (calculated on first use for the
+        current geometry) or remove it."""
+        if not self.can_apply():
+            self._update_availability()
             return
-
-        draft = select_alignment_draft(self.data, sid, self)
-        if draft is not None:
-            self.set_draft(draft)
+        if checked and not self.draft.footprint_correction_cached:
+            self._estimate_alignment("footprints")
+            return
+        self.draft.set_footprint_correction(checked)
+        result = self.draft.footprint_correction
+        if result is not None:
+            cx, cy, rotation = result["parameters"]
+            _set_status(
+                self.estimate_status,
+                f"Footprint correction (dx={cx:+.2f}, dy={cy:+.2f} px, {rotation:+.2f}°) "
+                + ("added." if checked else "removed."),
+            )
+        self.state.alignment_draft_changed.emit()
 
     def _estimate_context(self):
         draft, _, reference_id = self._comparison_context()
@@ -2864,6 +3018,19 @@ class ManualAlignmentEditor(QWidget):
         candidate = None
         reference_remap = None
         reference_path = None
+
+        if kind == "footprints":
+            # Cell positions in the template frame, references' aligned ones.
+            points = draft.session.template_centroids()
+            references = self.data.reference_centroids(draft.session_id)
+            candidate = draft.make_remap()
+            if points is None or not references:
+                _set_status(
+                    self.estimate_status,
+                    "Footprint correction needs footprints of this and earlier sessions.",
+                )
+                self._update_availability()
+                return
 
         if kind == "flow":
             if reference_id is None or self.data.alignment_is_stale(reference_id):
@@ -2911,6 +3078,28 @@ class ManualAlignmentEditor(QWidget):
                     raise ValueError(
                         "Both backgrounds need finite, nonconstant image data."
                     )
+
+                if kind == "footprints":
+                    mapped = footprint_alignment.map_points(
+                        points, candidate.matrix, candidate.flow
+                    )
+                    result = footprint_alignment.estimate_correction(
+                        mapped, references, (dims[1] / 2, dims[0] / 2)
+                    )
+                    if not result["accepted"]:
+                        raise ValueError(f"No footprint correction: {result['reason']}.")
+                    cx, cy, rotation = result["parameters"]
+                    return {
+                        "kind": kind,
+                        "remap": candidate,
+                        "result": result,
+                        "message": (
+                            f"Footprint correction: dx={cx:+.2f}, dy={cy:+.2f} px, "
+                            f"{rotation:+.2f}° ({result['matches']} matched cells per "
+                            f"reference; median distance {result['median_before']:.2f} → "
+                            f"{result['median_after']:.2f} px). Click again to remove."
+                        ),
+                    }
 
                 if kind == "flow":
                     valid_mask = (
@@ -3094,6 +3283,7 @@ class ManualAlignmentEditor(QWidget):
             except Exception as exc:
                 return {"error": f"{type(exc).__name__}: {exc}"}
 
+        self._estimate_kind = kind
         self._estimate_task_id = self.state.tasks.start(
             "calculating",
             f"Estimating alignment {kind}",
@@ -3110,12 +3300,16 @@ class ManualAlignmentEditor(QWidget):
             return
 
         self._estimate_task_id = None
+        kind, self._estimate_kind = self._estimate_kind, None
 
         if not self.can_apply() or self._estimate_context() != context:
             _set_status(self.estimate_status, 
                 "Estimate discarded because the alignment or comparison changed. "
                 "Click Estimate again."
             )
+        elif "error" in result and kind == "footprints":
+            # "ValueError: No footprint correction: …"
+            _set_status(self.estimate_status, result["error"].split(": ", 1)[-1])
         elif "error" in result:
             _set_status(self.estimate_status, f"Estimation failed: {result['error']}")
             self.state.issue(
@@ -3125,7 +3319,10 @@ class ManualAlignmentEditor(QWidget):
                 parent=self.window(),
             )
         else:
-            if result["kind"] == "flow":
+            if result["kind"] == "footprints":
+                self.draft.store_footprint_correction(result["remap"], result["result"])
+                self.draft.set_footprint_correction(True)
+            elif result["kind"] == "flow":
                 self.draft.accept_refined_flow(result["remap"])
             elif result["kind"] == "shift":
                 self.draft.values[:2] = result["values"]
@@ -3142,6 +3339,7 @@ class ManualAlignmentEditor(QWidget):
             return
 
         self._estimate_task_id = None
+        self._estimate_kind = None
         _set_status(self.estimate_status, "Estimation stopped. Click Estimate to retry.")
         self._update_availability()
 
@@ -3267,6 +3465,7 @@ class ManualAlignmentDialog(QDialog):
 
     def _apply(self):
         if self.editor.can_apply():
+            self.editor.record_reference()
             self.result_remap = self.editor.draft.make_remap()
             self.accept()
 

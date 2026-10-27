@@ -4,6 +4,7 @@ __pycache__/
 *.so
 *.zip
 *.npy
+*.npz
 
 # Virtual environments
 .venv/

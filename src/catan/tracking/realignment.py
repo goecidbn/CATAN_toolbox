@@ -131,12 +131,7 @@ def build_realignment_update(
         raise ValueError("Load spatial data before realigning this session.")
     if not remap.report.success:
         raise ValueError("Cannot commit an unsuccessful alignment proposal.")
-    # Inactive sessions are not references; their state does not block.
-    if any(
-        tracking.alignment_is_stale(i) and tracking.session_is_active(i)
-        for i in range(session_id)
-    ):
-        raise ValueError("Update earlier stale alignments first.")
+    # Alignments are in the common frame: outdated earlier sessions do not block.
     if session.source_config is None or session.path is None:
         raise ValueError("The original footprint source is not configured.")
 

@@ -483,11 +483,13 @@ def compact_positive_footprint(column, dims):
     return patch
 
 
-def compact_positive_footprints(footprints, columns, dims):
+def compact_positive_footprints(footprints, columns, dims, *, origins=False):
     """compact_positive_footprint() for many columns of one footprint matrix.
 
     Converts and sorts the selected columns once; each patch is identical
-    to the single-column result. Returns a list aligned with ``columns``.
+    to the single-column result. Returns a list aligned with ``columns``;
+    with ``origins`` also the (row, column) image position of each patch
+    (None for empty footprints).
     """
     dims = tuple(int(value) for value in dims)
 
@@ -511,6 +513,7 @@ def compact_positive_footprints(footprints, columns, dims):
         raise ValueError("Footprint contains NaN or Inf values.")
 
     patches = []
+    positions = []
 
     for index in range(len(columns)):
         start, stop = selected.indptr[index], selected.indptr[index + 1]
@@ -519,6 +522,7 @@ def compact_positive_footprints(footprints, columns, dims):
 
         if not np.any(positive):
             patches.append(None)
+            positions.append(None)
             continue
 
         pixels = selected.indices[start:stop][positive]
@@ -526,14 +530,16 @@ def compact_positive_footprints(footprints, columns, dims):
 
         # Same C-order interpretation as _as_dense_image(...).reshape(dims).
         rows, cols = np.divmod(pixels, dims[1])
-        rows = rows - rows.min()
-        cols = cols - cols.min()
+        origin = (int(rows.min()), int(cols.min()))
+        rows = rows - origin[0]
+        cols = cols - origin[1]
 
         patch = np.zeros((int(rows.max()) + 1, int(cols.max()) + 1), dtype=np.float64)
         patch[rows, cols] = values
         patches.append(patch)
+        positions.append(origin)
 
-    return patches
+    return (patches, positions) if origins else patches
 
 
 def footprint_similarity_peak(left, right, *, gamma=0.1):
@@ -603,25 +609,49 @@ def footprint_similarity_peak(left, right, *, gamma=0.1):
     return peak if np.isfinite(peak) and peak != 0 else np.nan
 
 
-def footprint_similarity_peaks(
+FFT_BUCKET = 16
+
+
+def _fft_bucket(full_shape):
+    """Common FFT shape for pairs of similar size: each axis rounded up to a
+    multiple of FFT_BUCKET (then a fast length). Any size of at least the
+    full correlation shape gives the same linear correlation, so merging
+    sizes only allows larger batches."""
+    return tuple(
+        fft.next_fast_len(int(-(-size // FFT_BUCKET) * FFT_BUCKET), real=True)
+        for size in full_shape
+    )
+
+
+def footprint_pair_peaks(
     lefts,
     rights,
     *,
     gamma=0.1,
-    max_batch_bytes=8 * 1024**2,
+    max_batch_bytes=16 * 1024**2,
     workers=None,
+    on_chunk=None,
 ):
-    """Batched footprint_similarity_peak() for many patch pairs.
+    """Shift-optimized cosine-union similarity (as calculate_img_correlation
+    with mode="cosine_union", shift_optimized=True) for many patch pairs.
 
-    Pairs sharing an FFT shape are transformed together, using exactly the
-    transform sizes of the single-pair function, so results are identical.
-    Batches run on a thread pool (NumPy/SciPy release the GIL).
-    Returns one peak per pair (NaN where the single-pair function does).
+    Pairs are grouped by a common FFT shape (_fft_bucket) and transformed
+    together; groups run on a thread pool (NumPy/SciPy release the GIL).
+    ``on_chunk(done, total)`` is called on the calling thread after each
+    batch (progress, cancellation).
+
+    Returns (peaks, shifts): the peak score per pair (NaN for empty patches
+    or a zero peak) and the (dy, dx) shift of the left patch relative to
+    the right one in patch coordinates (parabolic subpixel peak, as
+    subpixel_shift_from_score_map); add the difference of the patch
+    origins for image coordinates.
     """
     if len(lefts) != len(rights):
         raise ValueError("Expected the same number of left and right patches.")
 
-    peaks = np.full(len(lefts), np.nan, dtype=np.float64)
+    count = len(lefts)
+    peaks = np.full(count, np.nan, dtype=np.float64)
+    shifts = np.full((count, 2), np.nan, dtype=np.float64)
     groups = {}
 
     for index, (left, right) in enumerate(zip(lefts, rights)):
@@ -629,21 +659,18 @@ def footprint_similarity_peaks(
             continue
 
         full_shape = tuple(x + y - 1 for x, y in zip(np.shape(left), np.shape(right)))
-        fft_shape = tuple(fft.next_fast_len(size, real=True) for size in full_shape)
-        groups.setdefault(fft_shape, []).append(index)
+        groups.setdefault(_fft_bucket(full_shape), []).append(index)
 
     chunks = []
-
     for fft_shape, members in groups.items():
         # Roughly 16 real-valued arrays of the FFT shape per pair.
         step = max(1, int(max_batch_bytes // (16 * 8 * fft_shape[0] * fft_shape[1])))
-
         for start in range(0, len(members), step):
             chunks.append((fft_shape, members[start : start + step]))
 
     def run(chunk):
         fft_shape, members = chunk
-        peaks[members] = _footprint_similarity_peak_batch(
+        peaks[members], shifts[members] = _pair_peak_batch(
             [lefts[index] for index in members],
             [rights[index] for index in members],
             fft_shape,
@@ -652,17 +679,33 @@ def footprint_similarity_peaks(
 
     workers = _fft_workers() if workers is None else max(1, int(workers))
 
-    if workers == 1 or len(chunks) == 1:
-        for chunk in chunks:
+    if workers == 1 or len(chunks) <= 1:
+        for done, chunk in enumerate(chunks, start=1):
             run(chunk)
+            if on_chunk is not None:
+                on_chunk(done, len(chunks))
     else:
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         with ThreadPoolExecutor(max_workers=min(workers, len(chunks))) as pool:
-            for _ in pool.map(run, chunks):
-                pass
+            futures = [pool.submit(run, chunk) for chunk in chunks]
+            try:
+                for done, future in enumerate(as_completed(futures), start=1):
+                    future.result()
+                    if on_chunk is not None:
+                        on_chunk(done, len(chunks))
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
 
-    return peaks
+    return peaks, shifts
+
+
+def footprint_similarity_peaks(lefts, rights, *, gamma=0.1, **options):
+    """footprint_similarity_peak() for many patch pairs (batched,
+    footprint_pair_peaks). Returns one peak per pair (NaN where the
+    single-pair function does)."""
+    return footprint_pair_peaks(lefts, rights, gamma=gamma, **options)[0]
 
 
 def _fft_workers():
@@ -677,7 +720,7 @@ def _fft_workers():
     return max(1, available - 1)
 
 
-def _footprint_similarity_peak_batch(lefts, rights, fft_shape, gamma):
+def _pair_peak_batch(lefts, rights, fft_shape, gamma):
     count = len(lefts)
     shape = (count, *fft_shape)
     axes = (1, 2)
@@ -686,6 +729,7 @@ def _footprint_similarity_peak_batch(lefts, rights, fft_shape, gamma):
     a_values, a_squares, a_support = (np.zeros(shape) for _ in range(3))
     b_values, b_squares, b_support = (np.zeros(shape) for _ in range(3))
     full_shapes = np.empty((count, 2), dtype=np.int64)
+    right_shapes = np.empty((count, 2), dtype=np.int64)
     support_mass = np.empty(count, dtype=np.float64)
 
     for k, (left, right) in enumerate(zip(lefts, rights)):
@@ -710,6 +754,7 @@ def _footprint_similarity_peak_batch(lefts, rights, fft_shape, gamma):
         b_support[k, :hb, :wb] = mb[::-1, ::-1]
 
         full_shapes[k] = (ha + hb - 1, wa + wb - 1)
+        right_shapes[k] = (hb, wb)
         support_mass[k] = max(min(ma.sum(), mb.sum()), eps)
 
     workers = 1  # Parallelized across batches instead.
@@ -744,6 +789,33 @@ def _footprint_similarity_peak_batch(lefts, rights, fft_shape, gamma):
     ) & (np.arange(fft_shape[1])[None, None, :] < full_shapes[:, 1, None, None])
     score[~inside] = -np.inf
 
-    peaks = score.reshape(count, -1).max(axis=1)
+    k = np.arange(count)
+    iy, ix = np.unravel_index(score.reshape(count, -1).argmax(axis=1), fft_shape)
+    peaks = score[k, iy, ix]
 
-    return np.where(np.isfinite(peaks) & (peaks != 0), peaks, np.nan)
+    def vertex(low, centre, high):
+        """Parabola vertex offsets through (-1, 0, 1) samples, as
+        subpixel_shift_from_score_map."""
+        curvature = low - 2 * centre + high
+        with np.errstate(invalid="ignore", divide="ignore"):
+            offset = np.clip(0.5 * (low - high) / curvature, -0.5, 0.5)
+        return np.where(np.isfinite(curvature) & (curvature < 0), offset, 0.0)
+
+    fy = np.zeros(count)
+    fx = np.zeros(count)
+    inner_y = (iy > 0) & (iy < full_shapes[:, 0] - 1)
+    inner_x = (ix > 0) & (ix < full_shapes[:, 1] - 1)
+    ky, kx = k[inner_y], k[inner_x]
+    fy[inner_y] = vertex(
+        score[ky, iy[ky] - 1, ix[ky]], peaks[ky], score[ky, iy[ky] + 1, ix[ky]]
+    )
+    fx[inner_x] = vertex(
+        score[kx, iy[kx], ix[kx] - 1], peaks[kx], score[kx, iy[kx], ix[kx] + 1]
+    )
+
+    shifts = np.column_stack(
+        [iy + fy - (right_shapes[:, 0] - 1), ix + fx - (right_shapes[:, 1] - 1)]
+    )
+    found = np.isfinite(peaks) & (peaks != 0)
+    shifts[~found] = np.nan
+    return np.where(found, peaks, np.nan), shifts

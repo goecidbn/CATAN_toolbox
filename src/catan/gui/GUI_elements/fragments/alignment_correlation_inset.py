@@ -116,6 +116,11 @@ class AlignmentCorrelationInset(QWidget):
         self.labels = []
         self.outdated = set()
         self.current = None
+        # Pair compared in the editor (session, reference) and each
+        # session's alignment references {session: [sessions]}.
+        self.compared = None
+        self.references = {}
+        self._hover_row = None
         self.message = "Calculating session correlations…"
         self._image = None
         self._range = (0.0, 1.0)
@@ -144,6 +149,14 @@ class AlignmentCorrelationInset(QWidget):
 
         self._image = self._render()
         self.update()
+
+    def set_highlights(self, compared=None, references=None):
+        compared = None if compared is None else tuple(compared)
+        references = dict(references or {})
+        if compared != self.compared or references != self.references:
+            self.compared = compared
+            self.references = references
+            self.update()
 
     def set_current(self, current):
         if current != self.current:
@@ -249,6 +262,30 @@ class AlignmentCorrelationInset(QWidget):
             painter.drawRect(int(rect.left()), int(top), rect.width(), max(1, int(cell)))
             painter.drawRect(int(left), int(rect.top()), max(1, int(cell)), rect.height())
 
+        def outline(row, column, pen):
+            if not (0 <= row < n and 0 <= column < n):
+                return
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for r, c in {(row, column), (column, row)}:
+                painter.drawRect(
+                    int(rect.left() + c * cell),
+                    int(rect.top() + r * cell),
+                    max(1, int(cell) - 1),
+                    max(1, int(cell) - 1),
+                )
+
+        # Alignment references of the hovered (else current) session: thin
+        # dashed outline, colouring stays visible.
+        owner = self._hover_row if self._hover_row is not None else self.current
+        dashed = QPen(QColor("#ffd166"), 1, Qt.PenStyle.DashLine)
+        for reference in self.references.get(owner, ()):
+            outline(owner, reference, dashed)
+
+        # Pair compared in the editor.
+        if self.compared is not None:
+            outline(*self.compared, QPen(QColor("#ff6b6b"), 1))
+
         # Colour scale.
         low, high = self._range
         bar = QRect(rect.right() - 90, self.height() - 12, 60, 8)
@@ -275,10 +312,16 @@ class AlignmentCorrelationInset(QWidget):
     def mouseMoveEvent(self, event):
         cell = self._cell_at(event.position().toPoint())
         if cell is None or self.correlation is None:
+            if self._hover_row is not None:
+                self._hover_row = None
+                self.update()
             QToolTip.hideText()
             return
 
         row, column = cell
+        if row != self._hover_row:
+            self._hover_row = row
+            self.update()
         value = self.correlation[row, column]
         text = f"{self.labels[row]}  ↔  {self.labels[column]}\n"
         if row == column:
@@ -293,6 +336,9 @@ class AlignmentCorrelationInset(QWidget):
         outdated = [i for i in (row, column) if i in self.outdated]
         if outdated:
             text += "\nOutdated alignment: " + ", ".join(f"S{i}" for i in outdated)
+        references = self.references.get(row)
+        if references:
+            text += "\nAligned against: " + ", ".join(f"S{i}" for i in references)
         if row != column:
             text += "\nClick: align the later session against the earlier one."
 
@@ -307,5 +353,8 @@ class AlignmentCorrelationInset(QWidget):
         event.accept()
 
     def leaveEvent(self, event):
+        if self._hover_row is not None:
+            self._hover_row = None
+            self.update()
         QToolTip.hideText()
         super().leaveEvent(event)

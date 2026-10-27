@@ -4,6 +4,10 @@ from scipy import sparse, spatial
 
 from catan.core.structures.session import SessionData
 from catan.core.alignment import calculate_img_correlation
+from catan.core.image_correlation import (
+    compact_positive_footprints,
+    footprint_pair_peaks,
+)
 
 from typing import Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,7 +22,6 @@ def calculate_statistics(
     *,
     ctx=None,
     **kwargs,
-    # mode: str = "cross",
 ):
     """
     function to calculate footprint correlations used for the matching procedure for
@@ -27,13 +30,21 @@ def calculate_statistics(
 
     footprint correlations are calculated as shifted and non-shifted (depending on model used)
 
-    ``ctx`` (optional, see catan.core.progress) receives progress per
-    processed reference neuron and is checked for cancellation.
+    ``ctx`` (optional, see catan.core.progress) receives progress and is
+    checked for cancellation.
 
     this method is used both for comparing statistics
       - referencing previous session (used for matching)
-      - referencing itself (used for removal of duplicated footprints and kernel calculation)
+      - referencing itself (same-session evidence)
 
+    Returns (shifts, distances, correlations), (reference, this) neurons.
+
+    Pairs closer than ``distance_threshold`` (centroids) are compared:
+    cross-session (and ``force_cross``) by the shift-optimized cosine-union
+    similarity of all pairs at once (image_correlation.footprint_pair_peaks;
+    the distance becomes the length of the optimal shift), same-session
+    without shift from sparse products (_unshifted_cosine_union). Values
+    equal calculate_img_correlation per pair.
     """
 
     if this_session.footprints is None or reference_session.footprints is None:
@@ -49,7 +60,7 @@ def calculate_statistics(
             f"{this_session.dims} and {reference_session.dims}."
         )
 
-    if (
+    identical = this_session is reference_session or (
         this_session.footprints.shape == reference_session.footprints.shape
         and len(this_session.footprints.indices)
         == len(reference_session.footprints.indices)
@@ -60,221 +71,114 @@ def calculate_statistics(
             this_session.footprints.indptr == reference_session.footprints.indptr
         )
         and np.allclose(this_session.footprints.data, reference_session.footprints.data)
-    ):
-        mode = "same"
-    else:
-        mode = "cross"
+    )
 
     # force_cross: measure same-session pairs like cross-session ones
     # (shift-optimized correlation), each unordered pair once.
-    identical = mode == "same"
-    if kwargs.get("force_cross", False):
-        mode = "cross"
-    # print(
-    #     f"Calculating statistics for {mode}-matching of {this_session.n_neurons} vs {reference_session.n_neurons} neurons"
-    # )
-    # calculate distance between footprints and identify NN
+    mode = "cross" if (not identical or kwargs.get("force_cross", False)) else "same"
+
     centroid_distance = spatial.distance.cdist(
         reference_session.centroids, this_session.centroids
     )
+    n_reference, n_this = centroid_distance.shape
 
-    def process_neuron(i):
-        """Process a single reference neuron against all nearby neurons in this_session"""
-        local_removals = []
-        local_remove_info = []
-        local_distances = centroid_distance[i, :].copy()
-        local_correlations = np.full(this_session.n_neurons, np.nan)
-        local_shifts = np.full((this_session.n_neurons, 2), np.nan)
+    centroid_shift = np.full((n_reference, n_this, 2), np.nan)
+    footprint_correlation = np.full((n_reference, n_this), np.nan)
 
-        if not reference_session.included[i] or i in idx_remove:
-            return (
-                i,
-                local_shifts,
-                local_distances,
-                local_correlations,
-                local_removals,
-                local_remove_info,
-            )
-
-        for j in np.where(local_distances < distance_threshold)[0]:
-            if not this_session.included[j] or j in idx_remove:
-                continue
-
-            if identical and mode == "cross" and j <= i:
-                continue
-
-            A_ref = reference_session.footprints[:, i]  # .toarray()
-
-            ## calculate pairwise correlation between reference and current set of neuron footprints
-            local_correlations[j], _, local_shifts[j, :] = calculate_img_correlation(
-                this_session.footprints[:, j],  # .toarray(),
-                A_ref,
-                dims=dims,
-                crop=True,
-                shift=True,  # (key == "shifted"),
-                # binary=params.get("binary", False),
-                mode="cosine_union",
-                gamma=0.1 if mode == "cross" else 0.9,
-                shift_optimized=mode == "cross",
-            )
-            if mode == "cross":
-                local_distances[j] = np.sqrt(np.sum([s**2 for s in local_shifts[j, :]]))
-
-            if (
-                (mode != "same")
-                or (i == j)
-                or (this_session.trace is None)
-                or (not isinstance(this_session.quality, dict))
-                or (this_session.quality.get("SNR_comp", None) is None)
-            ):
-                continue
-
-            remove_id, remove_info = check_removal(
-                # footprint_correlation["shifted"][(i, j)],
-                local_correlations[j],
-                this_session.trace,
-                this_session.quality["SNR_comp"],
-                i,
-                j,
-            )
-            if remove_id is not None:
-                local_removals.append(remove_id)
-                local_remove_info.append(remove_info)
-
-        return (
-            i,
-            local_shifts,
-            local_distances,
-            local_correlations,
-            local_removals,
-            local_remove_info,
+    with np.errstate(invalid="ignore"):
+        candidates = (
+            (centroid_distance < distance_threshold)
+            & np.asarray(reference_session.included, dtype=bool)[:, None]
+            & np.asarray(this_session.included, dtype=bool)[None, :]
         )
+    if identical and mode == "cross":
+        candidates &= np.arange(n_this)[None, :] > np.arange(n_reference)[:, None]
 
-    ## prepare arrays to hold statistics
-    centroid_shift = np.full(
-        (reference_session.n_neurons, this_session.n_neurons, 2), np.nan
-    )
-    footprint_correlation = np.full(
-        (reference_session.n_neurons, this_session.n_neurons), np.nan
-    )
-    idx_remove = []  # only gets populated, when 'same' is True
-    remove_info = {}  # only gets populated, when 'same' is True
+    I, J = np.nonzero(candidates)
 
-    n_reference = reference_session.n_neurons
-
-    def report(done):
-        if ctx is not None and (done % 16 == 0 or done == n_reference):
+    def report(fraction):
+        if ctx is not None:
             ctx.check_cancelled()
-            ctx.progress(100 * done / max(1, n_reference))
+            ctx.progress(100 * fraction)
 
-    # Execute in parallel with progress bar
-    max_workers = kwargs.get("nP", 12)
-    if max_workers > 1:
+    if mode == "same":
+        report(0.0)
+        scores = _unshifted_cosine_union(this_session.footprints, I, J, gamma=0.9)
+        # A zero score (no common support) is no measurement (NaN), as per pair.
+        measured = scores > 0
+        footprint_correlation[I[measured], J[measured]] = scores[measured]
+        centroid_shift[I[measured], J[measured]] = 0.0
+        report(1.0)
+        return centroid_shift, centroid_distance, footprint_correlation
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(process_neuron, i): i
-                for i in range(reference_session.n_neurons)
-            }
+    rows, row_origins = compact_positive_footprints(
+        reference_session.footprints, np.unique(I), dims, origins=True
+    )
+    columns, column_origins = compact_positive_footprints(
+        this_session.footprints, np.unique(J), dims, origins=True
+    )
+    row_index = {i: k for k, i in enumerate(np.unique(I))}
+    column_index = {j: k for k, j in enumerate(np.unique(J))}
+    a = [column_index[j] for j in J]
+    b = [row_index[i] for i in I]
 
-            for done, future in enumerate(
-                tqdm(
-                    as_completed(futures),
-                    total=reference_session.n_neurons,
-                    desc="calculating footprint correlation of %d neurons"
-                    % reference_session.included.sum(),
-                    leave=False,
-                ),
-                start=1,
-            ):
-                try:
-                    report(done)
-                except BaseException:
-                    # Do not wait for queued neurons of a cancelled task.
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    raise
-
-                (
-                    i,
-                    local_shifts,
-                    local_distances,
-                    local_correlations,
-                    local_removals,
-                    local_remove_info,
-                ) = future.result()
-
-                # Merge results into global arrays
-                centroid_shift[i, :] = local_shifts
-                centroid_distance[i, :] = local_distances
-                footprint_correlation[i, :] = local_correlations
-                idx_remove.extend(local_removals)
-
-                for j, id in enumerate(local_removals):
-                    remove_info[id] = local_remove_info[j]
-    else:
-        for i in tqdm(
-            range(reference_session.n_neurons),
-            desc="calculating footprint correlation of %d neurons"
-            % reference_session.included.sum(),
-            leave=False,
-        ):
-            report(i)
-            (
-                _,
-                local_shifts,
-                local_distances,
-                local_correlations,
-                local_removals,
-                local_remove_info,
-            ) = process_neuron(i)
-
-            centroid_shift[i, ...] = local_shifts
-            centroid_distance[i, :] = local_distances
-            footprint_correlation[i, :] = local_correlations
-
-            idx_remove.extend(local_removals)
-
-            for j, id in enumerate(local_removals):
-                remove_info[id] = local_remove_info[j]
-    # Remove duplicates from idx_remove
-    idx_remove = list(set(idx_remove))
-
-    return (
-        centroid_shift,
-        centroid_distance,
-        footprint_correlation,
-        idx_remove,
-        remove_info,
+    report(0.0)
+    peaks, shifts = footprint_pair_peaks(
+        [columns[k] for k in a],
+        [rows[k] for k in b],
+        gamma=0.1,
+        on_chunk=lambda done, total: report(done / total),
     )
 
+    # Patch shifts -> image shifts: add the difference of patch positions.
+    offsets = np.array(
+        [
+            (np.subtract(column_origins[ka], row_origins[kb]) if column_origins[ka] is not None and row_origins[kb] is not None else (np.nan, np.nan))
+            for ka, kb in zip(a, b)
+        ],
+        dtype=float,
+    ).reshape(-1, 2)
+    shifts = shifts + offsets
 
-def check_removal(
-    fp_corr: float, trace: np.ndarray, SNR_comp: np.ndarray, i: int, j: int
-) -> Tuple[Optional[int], Tuple]:
+    footprint_correlation[I, J] = peaks
+    centroid_shift[I, J] = shifts
+    centroid_distance[I, J] = np.hypot(shifts[:, 0], shifts[:, 1])
 
-    thr_fp_corr = [0.3, 0.7]
-    thr_trace_corr = [0.3, 0.7]
-    # tag footprints for removal when calculating statistics for self-matching and they pass some criteria:
-    # 1) significant overlap with closeby neuron ("contestant")
-    if np.isnan(fp_corr) or fp_corr < thr_fp_corr[0]:
-        return None, ()
+    return centroid_shift, centroid_distance, footprint_correlation
 
-    # 2) high correlation of neuronal activity ("trace") (or very high footprint correlation!)
-    trace_corr = np.corrcoef(trace[i, :], trace[j, :])[0, 1]
-    if trace_corr > thr_trace_corr[1] or (
-        fp_corr > thr_fp_corr[1] and trace_corr > thr_trace_corr[0]
-    ):
 
-        # 3) lower SNR than contestant
-        return int(j) if SNR_comp[i] > SNR_comp[j] else int(i), (
-            (int(i), int(j)),
-            fp_corr,
-            trace_corr,
-            (SNR_comp[i], SNR_comp[j]),
-        )
-        # print('removing neuron %d (%d vs %d) from data (Acorr: %.3f, Ccorr: %.3f; SNR: %.2f vs %.2f)'%(idx_remove[-1],i,j,footprint_correlation[1,i,j],C_corr,SNR_comp[i],SNR_comp[j]))
+def _unshifted_cosine_union(footprints, I, J, *, gamma, eps=1e-12):
+    """Cosine-union similarity without shift (calculate_img_correlation
+    with mode="cosine_union", shift=True, shift_optimized=False) of
+    footprints[:, J] (left) and footprints[:, I] (right) for all pairs at
+    once: every term is a sum over pixels, i.e. a sparse product."""
+    A = sparse.csc_matrix(footprints, dtype=np.float64, copy=True)
+    A.sum_duplicates()
+    A.data = np.where(A.data > 0, A.data, 0.0)
+    A.eliminate_zeros()
+    M = A.copy()
+    M.data[:] = 1.0
+    A2 = A.multiply(A).tocsc()
 
-    return None, ()
+    def pair_sums(left, right):
+        # sum over pixels of left[:, J] * right[:, I], pair by pair
+        product = (right.T @ left).tocsr()
+        return np.asarray(product[I, J]).ravel()
+
+    N = pair_sums(A, A)
+    S1 = pair_sums(A2, M)  # left squared over the right support
+    S2 = pair_sums(M, A2)
+    inter = pair_sums(M, M)
+    support = np.asarray(M.sum(axis=0)).ravel()
+
+    denominator = np.sqrt(S1 * S2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cosine = np.clip(N / denominator, 0.0, 1.0)
+        overlap = np.clip(inter / np.maximum(np.minimum(support[J], support[I]), eps), 0.0, 1.0)
+    score = cosine * np.power(overlap, gamma)
+    # No common support or degenerate: 0.
+    score[(inter == 0) | ~(denominator >= eps)] = 0.0
+    return np.clip(score, 0.0, 1.0)
 
 
 def calculate_p(d_ROIs, fp_corr, p_model, neighbor_distance=12):

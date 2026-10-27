@@ -45,7 +45,7 @@ from catan.core.changes import (
 from catan.core.structures import NeuronComponent, sessiondata_type
 from catan.core.redetection import infer_aligned_footprint
 from catan.core.structures.remap import Remapping
-from scipy.ndimage import map_coordinates
+from catan.core.footprint_alignment import move_points as _move_points
 from catan.gui.panels import BasePlot
 from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 from catan.gui.panels.helper import ReviewStatusFilter, ControlPanel
@@ -339,7 +339,8 @@ class Display(BasePlot.BaseCanvas):
 
     @property
     def display_assignments(self):
-        return self.data._assignments.get(self.assignment_name)
+        # Another set: without its synthetic components (Data.inactive_view).
+        return self.data.inactive_view(self.data._assignments.get(self.assignment_name))
 
     @property
     def displays_active_assignments(self):
@@ -3005,44 +3006,6 @@ def add_surface_to_mesh(vertices_all, faces_all, colors_all, X, Y, Z, rgba):
 
 
 from scipy import sparse
-
-
-def _sample_flow(flow, points):
-    """Bilinear flow (dx, dy) at x/y points; nearest edge value outside."""
-    coordinates = [points[:, 1], points[:, 0]]
-    return np.column_stack(
-        [
-            map_coordinates(flow[..., channel], coordinates, order=1, mode="nearest")
-            for channel in (0, 1)
-        ]
-    )
-
-
-def _move_points(points, current, current_flow, target, target_flow, iterations=3):
-    """Aligned x/y points under one alignment -> under another.
-
-    An alignment samples the original image at inv(matrix) @ (p + flow(p))
-    for output point p. Back to the original image directly; forward by
-    fixed-point iteration p = matrix @ r - flow(p) (flows are smooth and
-    small, so a few steps suffice).
-    """
-    points = np.asarray(points, dtype=np.float64)
-
-    if current_flow is not None:
-        points = points + _sample_flow(current_flow, points)
-
-    inverse = np.linalg.inv(current)
-    original = points @ inverse[:2, :2].T + inverse[:2, 2]
-    rigid = original @ target[:2, :2].T + target[:2, 2]
-
-    if target_flow is None:
-        return rigid
-
-    moved = rigid
-    for _ in range(iterations):
-        moved = rigid - _sample_flow(target_flow, moved)
-
-    return moved
 
 
 def footprint_to_mesh(

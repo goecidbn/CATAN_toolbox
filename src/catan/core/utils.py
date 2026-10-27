@@ -20,20 +20,36 @@ def normalize_sparse_array(A, relative_threshold=0.001, minimum_nonzero_entries=
           fraction of peak value, at below which entries are considered to be 0
       - minimum_nonzero_entries: int
           minimum number of nonzero entries of the footprint to be considered for further analyses
+
+    Each column: entries above relative_threshold × peak, divided by the sum
+    of entries above 0.001 × peak; columns with at most
+    minimum_nonzero_entries positive entries become empty. (Vectorized over
+    columns.)
     """
-    return sparse.vstack(
-        [
-            # a.multiply(a>relative_threshold*a.max())/a.max()  # threshold footprint
-            (
-                a.multiply(a > relative_threshold * a.max())
-                / a[a > 0.001 * a.max()].sum()  # threshold footprint
-                if (a > 0).sum()
-                > minimum_nonzero_entries  # require minimum non-zero entries ...
-                else sparse.csr_matrix(a.shape)
-            )  # ... otherwise return empty slice
-            for a in A.T  # loop through all footprints
-        ]
-    ).T
+    A = sparse.csc_matrix(A, dtype=np.float64, copy=True)
+    A.sum_duplicates()
+    n = A.shape[1]
+    counts = np.diff(A.indptr)
+    columns = np.repeat(np.arange(n), counts)
+
+    # Peak as the column maximum including implicit zeros.
+    peak = np.zeros(n)
+    filled = counts > 0
+    if A.nnz:
+        peak[filled] = np.maximum(np.maximum.reduceat(A.data, A.indptr[:-1][filled]), 0.0)
+
+    data = A.data
+    positive = np.bincount(columns, weights=(data > 0), minlength=n)
+    denominator = np.bincount(
+        columns, weights=np.where(data > 0.001 * peak[columns], data, 0.0), minlength=n
+    )
+    valid = positive > minimum_nonzero_entries
+
+    keep = (data > relative_threshold * peak[columns]) & valid[columns]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        A.data = np.where(keep, data / denominator[columns], 0.0)
+    A.eliminate_zeros()
+    return A
 
 
 def nangauss_filter(X, sigma=None, mode="nearest", truncate=2):

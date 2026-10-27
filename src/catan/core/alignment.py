@@ -51,7 +51,8 @@ def _shift_sparse_bilinear(
         (height, width)
 
     dy, dx:
-        Shift in image coordinates.
+        Shift in image coordinates (scalars, or arrays with one value
+        per column).
         Positive dy moves footprints down.
         Positive dx moves footprints right.
 
@@ -79,8 +80,11 @@ def _shift_sparse_bilinear(
     else:
         raise ValueError("order must be 'C' or 'F'.")
 
-    y = y.astype(float) + dy
-    x = x.astype(float) + dx
+    # Scalars, or one shift per column (neuron).
+    dy = np.asarray(dy, dtype=float)
+    dx = np.asarray(dx, dtype=float)
+    y = y.astype(float) + (dy[neuron] if dy.ndim else dy)
+    x = x.astype(float) + (dx[neuron] if dx.ndim else dx)
 
     y0 = np.floor(y).astype(np.int64)
     x0 = np.floor(x).astype(np.int64)
