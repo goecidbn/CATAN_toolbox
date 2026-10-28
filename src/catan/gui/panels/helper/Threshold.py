@@ -47,6 +47,11 @@ class ThresholdSpec:
     reference: PercentileReference | ModelDistanceReference | None = None
     upper_reference: PercentileReference | ModelDistanceReference | None = None
 
+    # Unit of the fixed values of distance / area statistics ("px", "µm",
+    # "px²", "µm²"; gui/data/units.py); converted to the display unit on
+    # evaluation. None: unitless.
+    unit: str | None = None
+
     def validate(self):
         if self.direction not in ("greater", "less", "between"):
             raise ValueError(f"Unknown threshold direction: {self.direction}")

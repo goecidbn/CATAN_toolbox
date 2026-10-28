@@ -20,6 +20,13 @@ from catan.gui.background_tasks.runtime import (
     TaskCancelled, current_task_context, progress_step,
 )
 from catan.tracking.analytics import two_noise_model
+from catan.gui.data.units import DisplayUnits
+
+# Parameters in px (power of the length unit), shown in the display unit.
+PARAMETER_UNIT_POWERS = {
+    "h": 1, "sigma_h": 1, "sigma_det": 1, "sigma_move": 1, "sigma_eff": 1,
+    "u_same_slope": -2,
+}
 
 PARAMETERS = (
     ("p_same", "Same-neuron fraction", 0.000001, 0.999999, 0.01),
@@ -89,7 +96,12 @@ class BoundedCamera(scene.PanZoomCamera):
                 start = low if axis == self.count_axis else float(np.clip(start, low, high-size))
                 coords.append((start, size))
             r = Rect(coords[0][0], coords[1][0], coords[0][1], coords[1][1])
-        scene.PanZoomCamera.rect.fset(self, r)
+        try:
+            scene.PanZoomCamera.rect.fset(self, r)
+        except np.linalg.LinAlgError:
+            # A collapsed view (or a linked one) has no invertible
+            # transform yet; the rect applies once it is resized.
+            self._rect = r
 
     def set_bounds(self, x, y, count_axis=None, reset=False):
         self.limits = (tuple(map(float, x)), tuple(map(float, y)))
@@ -173,6 +185,7 @@ class Display(QWidget):
         parameter_form.addWidget(self.editor_host, 0, 0, 4, 5)
         self.editors = {}
         self.editor_kind = None
+        self.units = DisplayUnits()
         self.build_parameter_editors("two_noise")
         self.apply = QPushButton("Apply to model")
         parameter_form.addWidget(self.apply, 4, 0, 1, 5)
@@ -193,6 +206,7 @@ class Display(QWidget):
         self._hist_visuals = []
         self._fit_lines = {}
         self._reference_lines = {}
+        self._distance_axes = []
         self._reference = None
         self._reference_surface = None
         self._surface_visual = None
@@ -223,12 +237,16 @@ class Display(QWidget):
                          "c_same_mean": (2, 0), "c_diff_mean": (2, 3),
                          "c_same_sd": (3, 0), "c_diff_sd": (3, 3)}
             specs = [(key, *PARAMETER_LABELS[key], low, high, step, positions[key]) for key, _, low, high, step in PARAMETERS]
+        self._editor_specs = {}
         for key, short, description, low, high, step, (r, c) in specs:
             editor = QDoubleSpinBox()
             editor.setDecimals(4 if kind == "two_noise" else 3)
-            editor.setRange(max(low, .001) if 0 < low < .001 else low,
-                            min(high, .999) if high < 1 else high)
-            editor.setSingleStep(step)
+            self._editor_specs[key] = (
+                max(low, .001) if 0 < low < .001 else low,
+                min(high, .999) if high < 1 else high,
+                step,
+                description,
+            )
             editor.setKeyboardTracking(False)
             self.editors[key] = editor
             editor.setFixedWidth(76)
@@ -250,10 +268,42 @@ class Display(QWidget):
             text.setToolTip(tooltip(description))
             caption_layout.addWidget(text)
             caption.setToolTip(tooltip(description))
-            editor.setToolTip(tooltip(description))
             grid.addWidget(caption, r, c, alignment=Qt.AlignmentFlag.AlignRight)
             grid.addWidget(editor, r, c+1)
         self.editor_layout.addWidget(box)
+        self._apply_editor_units()
+
+    def parameter_factor(self, key):
+        """px parameter × factor = shown value."""
+        power = PARAMETER_UNIT_POWERS.get(key)
+        return 1.0 if power is None else self.units.factor("distance") ** power
+
+    def _apply_editor_units(self):
+        unit = self.units.label("distance")
+        for key, editor in self.editors.items():
+            low, high, step, description = self._editor_specs[key]
+            factor = self.parameter_factor(key)
+            blocked = editor.blockSignals(True)
+            editor.setRange(low * factor, high * factor)
+            editor.setSingleStep(step * factor)
+            editor.blockSignals(blocked)
+            editor.setToolTip(tooltip(
+                description.replace("(px)", f"({unit})").replace("1/px²", f"1/{unit}²")
+            ))
+
+    def set_units(self, units):
+        """Show distances in ``units`` (editor values are set by the
+        controller)."""
+        self.units = units
+        self._apply_editor_units()
+        label = f"Distance ({units.label('distance')})"
+        for axis in self._distance_axes:
+            axis.axis.axis_label = label
+        self._surface_label_key = None
+
+    def _bounds(self, model, axis):
+        edges = np.asarray(model.arrays[axis + "_bounds"], dtype=float)
+        return edges * self.units.factor("distance") if axis == "distance" else edges
 
     def set_session_count(self, count, kind="classic"):
         previous = self.gaps.currentData()
@@ -315,6 +365,9 @@ class Display(QWidget):
                 grid.add_widget(axis, row=r, col=c)
                 if label == "Correlation":
                     axis.axis.ticker = CorrelationTicker(axis.axis)
+                if label == "Distance":
+                    axis.axis.axis_label = f"Distance ({self.units.label('distance')})"
+                    self._distance_axes.append(axis)
                 axis.link_view(view)
         button = QToolButton(canvas.native)
         button.setText("ⓘ")
@@ -393,8 +446,8 @@ class Display(QWidget):
         self._counts = counts
         self._split = split
         self._same_session = same_session
-        d = model.arrays["distance_bounds"]
-        c = model.arrays["correlation_bounds"]
+        d = self._bounds(model, "distance")
+        c = self._bounds(model, "correlation")
         key = (tuple(c), tuple(d))
         reset = key != self._bounds_key
         self._bounds_key = key
@@ -420,7 +473,7 @@ class Display(QWidget):
         self._hist_visuals.clear()
         for axis, view in (("distance", self.left), ("correlation", self.top)):
             horizontal = axis == "distance"
-            edges = self._model.arrays[axis+"_bounds"]
+            edges = self._bounds(self._model, axis)
             hist = self._counts.sum(axis=1 if horizontal else 0)
             maximum = max(1., float(hist[:, 0].max()))*1.1
             xlim = (0, maximum) if horizontal else (.5, 1.)
@@ -478,7 +531,7 @@ class Display(QWidget):
             joint = source.p_same.get("joint") if source is not None and self._split else None
             visual.visible = joint is not None and np.isfinite(joint).any()
             if visual.visible:
-                c = source.arrays["correlation_bounds"]; d = source.arrays["distance_bounds"]
+                c = self._bounds(source, "correlation"); d = self._bounds(source, "distance")
                 visual.set_data(np.asarray(joint))
                 visual.transform = STTransform(scale=(np.diff(c)[0], np.diff(d)[0]), translate=(c[0]+np.diff(c)[0]/2, d[0]+np.diff(d)[0]/2))
         if self.height_mode.currentIndex() == 1:
@@ -494,7 +547,7 @@ class Display(QWidget):
                 line.visible = False
             if (not self._split and not self._same_session) or not pdf:
                 continue
-            edges = model.arrays[axis+"_bounds"]
+            edges = self._bounds(model, axis)
             centers = (edges[:-1]+edges[1:])/2
             components = []
             for suffix, weight in (("same", 0 if self._same_session else model.parameters["p_same"]), ("diff", 1 if self._same_session else 1-model.parameters["p_same"])):
@@ -578,7 +631,7 @@ class Display(QWidget):
         elif self._reference_surface is not None:
             self._reference_surface.visible = False
         # Tick labels only need updating when the units/ranges change.
-        c = self._model.arrays["correlation_bounds"]; d = self._model.arrays["distance_bounds"]
+        d = self._bounds(self._model, "distance")
         label_key = (.5, 1., float(d[0]), float(d[-1]), maximum, probability)
         if getattr(self, '_surface_label_key', None) == label_key:
             return
@@ -586,7 +639,8 @@ class Display(QWidget):
         for visual in self._surface_labels:
             visual.parent = None
         self._surface_labels.clear()
-        for axis, limits, label in ((0, (.5, 1.), "Correlation"), (1, (d[0], d[-1]), "Distance"), (2, (0, maximum), "p(same)" if probability else "Counts")):
+        distance_label = f"Distance ({self.units.label('distance')})"
+        for axis, limits, label in ((0, (.5, 1.), "Correlation"), (1, (d[0], d[-1]), distance_label), (2, (0, maximum), "p(same)" if probability else "Counts")):
             end = np.zeros(3); end[axis] = 1
             self._surface_labels.append(scene.visuals.Line(np.array([np.zeros(3), end]), color="#555555", parent=self.surface_view.scene))
             for fraction in (0., .5, 1.):
@@ -599,8 +653,10 @@ class Display(QWidget):
 class Controller(BasePlot.BaseDisplayController):
     def configure_display(self):
         self.display_widget = Display(self.section)
+        self.display_widget.set_units(self.data.units)
         self.section.set_display_widget(self.display_widget)
         self._serial = 0
+        self._edited_keys = set()
         self._candidate = None
         self._source = None
         self._evidence_key = None
@@ -666,7 +722,7 @@ class Controller(BasePlot.BaseDisplayController):
         self._edited_keys = set()
         for key, editor in w.editors.items():
             editor.blockSignals(True)
-            editor.setValue(0 if self._source is None else self._source.parameters.get(key, 0))
+            editor.setValue(0 if self._source is None else self._source.parameters.get(key, 0) * w.parameter_factor(key))
             editor.setEnabled(self._source is not None and bool(self._source.parameters))
             editor.blockSignals(False)
         w.status.setText("No fitted model available." if self._source is None or not self._source.parameters
@@ -674,10 +730,29 @@ class Controller(BasePlot.BaseDisplayController):
         self._redraw()
 
     def _on_data_changed(self, event):
+        if event.has(C.DISPLAY_UNITS):
+            self._set_units()
         if event.has(C.MODEL_COUNTS):
             self._evidence_key = None
         if event.has(C.MODEL_COUNTS, C.MODEL_PARAMETERS):
             self.initialize_display()
+
+    def _set_units(self):
+        """Rescale the shown distances; parameter edits are kept."""
+        w = self.display_widget
+        if w.units == self.data.units:
+            return
+        edited = {k: w.editors[k].value() / w.parameter_factor(k) for k in self._edited_keys}
+        w.set_units(self.data.units)
+        for key, editor in w.editors.items():
+            value = edited.get(key)
+            if value is None:
+                value = 0 if self._source is None else self._source.parameters.get(key, 0)
+            blocked = editor.blockSignals(True)
+            editor.setValue(value * w.parameter_factor(key))
+            editor.blockSignals(blocked)
+        self._evidence_key = None
+        self._redraw()
 
     def _edited(self, key):
         self._edited_keys.add(key)
@@ -695,7 +770,8 @@ class Controller(BasePlot.BaseDisplayController):
         revision = self.state.data_version
         # Preserve full precision for fields the user has not edited.
         parameters = dict(source.parameters)
-        parameters.update({k: self.display_widget.editors[k].value() for k in self._edited_keys})
+        w = self.display_widget
+        parameters.update({k: w.editors[k].value() / w.parameter_factor(k) for k in self._edited_keys})
         # Capture the model settings before starting the worker.
         snapshot = copy(source)
         snapshot.params = dict(source.params)

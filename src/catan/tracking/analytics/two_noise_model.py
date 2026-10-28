@@ -45,8 +45,8 @@ DEFAULT_SETTINGS = {
     "vector_bins": 40,
     "vector_range": 5.0,
     "vector_max_distance": 4.0,
-    # Imaged slab: +/- 5 µm around the focal plane (model units: µm with
-    # a calibrated pixel size, px with pxtomu = 1). Fixed, not fitted.
+    # Imaged slab: +/- 5 µm around the focal plane (µm; the model works in
+    # px, see Context.slab_thickness_px). Fixed, not fitted.
     "slab_thickness": 10.0,
 }
 
@@ -79,6 +79,12 @@ class Context:
     dims: tuple
     R: float
     settings: dict
+    # Pixel size: converts the physical slab thickness to px.
+    um_per_px: float = 1.0
+
+    @property
+    def slab_thickness_px(self):
+        return self.settings["slab_thickness"] / self.um_per_px
 
     @property
     def d_edges(self):
@@ -264,7 +270,7 @@ def distance_densities(theta, ctx, parts=None):
     poisson = d_true * window
 
     g = pair_correlation(
-        d_true, ctx.lam, theta["h"], theta["sigma_h"], ctx.settings["slab_thickness"]
+        d_true, ctx.lam, theta["h"], theta["sigma_h"], ctx.slab_thickness_px
     )
     f_diff = poisson * g
 

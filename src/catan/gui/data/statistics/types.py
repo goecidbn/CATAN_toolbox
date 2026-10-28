@@ -560,10 +560,11 @@ class StatisticDefinition:
     # Statistics menu section (GROUP_TITLES); None: see statistic_group().
     group: str | None = None
 
-    # What the values measure, for thresholds derived from other sources:
-    # "distance": centroid distances in px (model distance recipes, see
-    # threshold_references); None: anything else.
-    value_kind: Literal["distance"] | None = None
+    # What the values measure: "distance" (px) or "area" (px²) are shown
+    # in the display unit (gui/data/units.py; the engine scales them) and
+    # distances accept model distance recipes (threshold_references);
+    # None: anything else.
+    value_kind: Literal["distance", "area"] | None = None
 
     def is_affected_by(self, event: DataChange) -> bool:
         if self.dependencies is None:

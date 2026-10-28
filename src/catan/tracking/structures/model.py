@@ -55,7 +55,6 @@ class Model:
                 "bins": 64,
                 "n_threads": 1,
                 "use_kde": False,
-                "pxtomu": 1.0,
                 "L": 512,
             }
         )
@@ -537,6 +536,7 @@ class Model:
             dims=tuple(context["window_dims"]),
             R=float(self.params["neighbor_distance"]),
             settings=self.two_noise_settings,
+            um_per_px=float(context.get("um_per_px", 1.0)),
         )
 
     def fit_two_noise(self, evidence, min_counts=20):

@@ -1,4 +1,5 @@
 import numpy as np
+from dataclasses import replace
 from functools import partial
 
 from .definitions import CALCULATED_STATISTICS
@@ -90,5 +91,15 @@ def build_statistics_registry(
     # Registration statistics are not exposed as loaded statistics: the
     # match probability is the calculated pair statistic
     # "match_probability"; the shifts are only used for union construction.
+
+    # Distances and areas are titled with the display unit.
+    units = getattr(data, "units", None)
+    if units is not None:
+        for key, definition in registry.items():
+            if definition.value_kind is not None:
+                registry[key] = replace(
+                    definition,
+                    title=f"{definition.title} ({units.label(definition.value_kind)})",
+                )
 
     return registry

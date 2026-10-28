@@ -123,7 +123,6 @@ class SessionData:
     def set_parameters(self, **input):
 
         self.params = {
-            "pxtomu": 1.0,  # transformation from pixels to microns
             # alignment parameters
             "max_session_shift": 50.0,
             "min_session_correlation": 0.3,
@@ -624,13 +623,13 @@ class SessionData:
 
             self.footprints = footprints
             self.centroids = center_of_mass(
-                self.footprints, *self.dims, convert=self.params.get("pxtomu", 1.0)
+                self.footprints, *self.dims
             )
         elif mode == "append":
             n_new = footprints.get_shape()[1]
             self.footprints = sparse.hstack([self.footprints, footprints], format="csc")
             centroids = center_of_mass(
-                footprints, *self.dims, convert=self.params.get("pxtomu", 1.0)
+                footprints, *self.dims
             )
             self.centroids = np.vstack([self.centroids, centroids])
         else:
@@ -676,7 +675,7 @@ class SessionData:
         self.synthetic = np.zeros(self.n_neurons, dtype=bool)
 
         self.centroids = center_of_mass(
-            self.footprints, *self.dims, convert=self.params.get("pxtomu", 1.0)
+            self.footprints, *self.dims
         )
         # self.evaluate_components_from_footprints(reset=True)
         # self.get_idx_kde()
@@ -784,8 +783,7 @@ class SessionData:
 
         centroid = center_of_mass(
             footprint,
-            *self.dims,
-            convert=self.params.get("pxtomu", 1.0),
+            *self.dims
         )
 
         if self.centroids is None:
@@ -951,7 +949,6 @@ class SessionData:
         if self.centroids is None or not len(self.centroids):
             return None
         points = np.asarray(self.centroids, dtype=np.float64)
-        points = points / self.params.get("pxtomu", 1.0)
         if self.included is not None and len(self.included) == len(points):
             points = points[np.asarray(self.included, dtype=bool)]
         points = points[np.isfinite(points).all(axis=1)]
@@ -980,7 +977,7 @@ class SessionData:
         if not references or self.footprints is None or self.footprints.shape[1] == 0:
             return remap
 
-        raw = center_of_mass(self.footprints, *self.dims, convert=1.0)
+        raw = center_of_mass(self.footprints, *self.dims)
         if remap.transpose:
             raw = raw[:, ::-1]
         points = footprint_alignment.map_points(

@@ -46,14 +46,14 @@ CALCULATED_STATISTICS = {
     "footprint_size": StatisticDefinition(
         key="footprint_size",
         title="Footprint size",
-        description="Size of the neuron footprint in pixels.",
+        description="Area of the neuron footprint (pixels above threshold).",
         dims=("neuron", "session"),
         category="neuron",
         getter=calculations.calculate_footprint_size,
     ),
     "border_proximity": StatisticDefinition(
         key="border_proximity",
-        title="Border distance (px)",
+        title="Border distance",
         description=(
             "Signed distance of aligned neuron centroids to the imaging "
             "boundary: positive inside, negative outside."
@@ -275,13 +275,13 @@ CALCULATED_STATISTICS = {
 
 # Preserve the existing key and dimensions for saved configurations.
 definition = CALCULATED_STATISTICS["distances"]
-definition.title = "Within-session distances (px)"
+definition.title = "Within-session distances"
 definition.query_getter = partial(distance_query, mode="within")
 definition.independent_pairs = True
 definition.compact_values = True
 
 definition = CALCULATED_STATISTICS["centroid_shift"]
-definition.title = "Within-neuron displacement (px)"
+definition.title = "Within-neuron displacement"
 definition.query_getter = partial(
     distance_query,
     mode="displacement",
@@ -307,7 +307,7 @@ CALCULATED_STATISTICS.update(
     {
         "cross_session_distances": StatisticDefinition(
             key="cross_session_distances",
-            title="Cross-session distances (px)",
+            title="Cross-session distances",
             description=(
                 "Distances between aligned session footprints. "
                 "The identical footprint is omitted; other footprints "
@@ -328,7 +328,7 @@ CALCULATED_STATISTICS.update(
         ),
         "footprint_union_distance": StatisticDefinition(
             key="footprint_union_distance",
-            title="Footprint → union distance (px)",
+            title="Footprint → union distance",
             description=(
                 "Distance from a session footprint of neuron_i "
                 "to the union centroid of neuron_j."
@@ -347,7 +347,7 @@ CALCULATED_STATISTICS.update(
         ),
         "union_distances": StatisticDefinition(
             key="union_distances",
-            title="Union-centroid distances (px)",
+            title="Union-centroid distances",
             description=(
                 "Distances between the existing union centroids. "
                 "Identical-neuron comparisons are omitted."
@@ -376,6 +376,9 @@ for key in (
     "union_distances",
 ):
     CALCULATED_STATISTICS[key].value_kind = "distance"
+
+CALCULATED_STATISTICS["border_proximity"].value_kind = "distance"
+CALCULATED_STATISTICS["footprint_size"].value_kind = "area"
 
 definition = CALCULATED_STATISTICS["footprint_union_distance"]
 definition.component_axes = (("neuron_i", "session"),)
@@ -443,7 +446,7 @@ CALCULATED_STATISTICS["union_similarity"] = StatisticDefinition(
 # Neurons assembled from two cells: best two-group partition of the footprints.
 CALCULATED_STATISTICS["track_split"] = StatisticDefinition(
     key="track_split",
-    title="Track split (px)",
+    title="Track split",
     description=(
         "Best partition of a neuron's footprints into two groups by centroid "
         "position, maximizing the gap (smallest distance between the "
@@ -763,6 +766,7 @@ CALCULATED_STATISTICS["match_probability"] = StatisticDefinition(
 # Track statistics (a neuron's footprints across sessions) belong to neurons.
 CALCULATED_STATISTICS["centroid_shift"].group = "neuron"
 CALCULATED_STATISTICS["track_split"].group = "neuron"
+CALCULATED_STATISTICS["track_split"].value_kind = "distance"
 
 CALCULATED_STATISTICS["cooccurrence"] = StatisticDefinition(
     key="cooccurrence",

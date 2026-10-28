@@ -23,13 +23,8 @@ from .sparse_pairs import SparsePairCollector
 NAMES = ("neuron_i", "neuron_j", "session")
 
 
-def _positions_px(centroids, params):
-    scale = float(params.get("pxtomu", 1.0))
-
-    if not np.isfinite(scale) or scale <= 0:
-        raise ValueError("pxtomu must be finite and positive.")
-
-    return np.asarray(centroids, dtype=np.float64) / scale
+def _positions_px(centroids):
+    return np.asarray(centroids, dtype=np.float64)
 
 
 def _union_inputs(data, n):
@@ -45,7 +40,7 @@ def _union_inputs(data, n):
             "Build the union before calculating footprint–union similarity."
         )
 
-    positions = _positions_px(union.centroids, union.params)
+    positions = _positions_px(union.centroids)
     usable = np.all(np.isfinite(positions), axis=1)
 
     if union.included is not None:
@@ -102,7 +97,7 @@ def union_similarity_values(
         if not len(group):
             continue
 
-        positions = _positions_px(session.centroids, session.params)[footprints]
+        positions = _positions_px(session.centroids)[footprints]
         distance = np.linalg.norm(positions - union_positions[nj[group]], axis=1)
         close = np.isfinite(distance) & (distance < neighborhood_thr)
         group, footprints = group[close], footprints[close]
@@ -215,7 +210,7 @@ def footprint_union_pairs(
         if relation == "same":
             ni = nj = np.intersect1d(present, targets)
         else:
-            positions = _positions_px(session.centroids, session.params)[
+            positions = _positions_px(session.centroids)[
                 ids[present, session_id]
             ]
             finite = np.all(np.isfinite(positions), axis=1)

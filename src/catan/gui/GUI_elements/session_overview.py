@@ -1182,12 +1182,19 @@ class LoadSessionRowWidget(QFrame):
         root_layout.addWidget(self.registration_action_selector)
         self.max_shift_row = self._build_max_shift_row()
         root_layout.addWidget(self.max_shift_row)
+        self.units_row = self._build_units_row()
+        root_layout.addWidget(self.units_row)
         self._remembered_background_choice = None
 
         self.state.data_changed.connect(self._on_data_changed)
         self.state.data_changed.connect(
             lambda event: self._refresh_max_shift_row()
             if event.has(C.ALIGNMENT_SETTINGS, *SESSION_STRUCTURE_CHANGES)
+            else None
+        )
+        self.state.data_changed.connect(
+            lambda event: self._refresh_units_row()
+            if event.has(C.DISPLAY_UNITS, *SESSION_STRUCTURE_CHANGES)
             else None
         )
 
@@ -1202,7 +1209,7 @@ class LoadSessionRowWidget(QFrame):
     def take_session_widgets(self):
         """The loading status and the alignment limits, for the sessions
         section (they concern the sessions, not the loading)."""
-        widgets = [self.loading_status, self.max_shift_row]
+        widgets = [self.loading_status, self.max_shift_row, self.units_row]
         for widget in widgets:
             self._root_layout.removeWidget(widget)
         return widgets
@@ -2066,6 +2073,57 @@ class LoadSessionRowWidget(QFrame):
 
         self._refresh_max_shift_row()
         return row
+
+    def _build_units_row(self):
+        """Pixel size of the dataset and the unit distances are shown in
+        (all calculations stay in px; switching only rescales)."""
+        row = QWidget(self)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(6)
+
+        label = QLabel("Pixel size", row)
+        layout.addWidget(label)
+
+        self.pixel_size_spin = QDoubleSpinBox(row)
+        self.pixel_size_spin.setRange(0.001, 100.0)
+        self.pixel_size_spin.setDecimals(4)
+        self.pixel_size_spin.setSingleStep(0.01)
+        self.pixel_size_spin.setSuffix(" µm/px")
+        self.pixel_size_spin.setKeyboardTracking(False)
+        tip = (
+            "Size of one image pixel, stored with the sessions. Distances, "
+            "sizes, model parameters and thresholds are calculated in px "
+            "and converted for display; a two-noise model fitted with "
+            "another pixel size needs a refit (its slab thickness is "
+            "physical), the evidence stays valid."
+        )
+        self.pixel_size_spin.setToolTip(tip)
+        label.setToolTip(tip)
+        self.pixel_size_spin.valueChanged.connect(self.data.set_um_per_px)
+        layout.addWidget(self.pixel_size_spin)
+
+        layout.addSpacing(8)
+        self.show_um_check = QCheckBox("Distances in µm", row)
+        self.show_um_check.setToolTip(
+            "Show distances, footprint sizes, model distances and distance "
+            "thresholds in µm instead of px. Nothing is recalculated."
+        )
+        self.show_um_check.toggled.connect(self.data.set_show_um)
+        layout.addWidget(self.show_um_check)
+        layout.addStretch()
+
+        self._refresh_units_row()
+        return row
+
+    def _refresh_units_row(self, *_):
+        for widget, setter, value in (
+            (self.pixel_size_spin, "setValue", self.data.um_per_px),
+            (self.show_um_check, "setChecked", self.data.show_um),
+        ):
+            previous = widget.blockSignals(True)
+            getattr(widget, setter)(value)
+            widget.blockSignals(previous)
 
     def _refresh_max_shift_row(self, *_):
         offsets = list(getattr(self.data, "alignment_offsets", []))

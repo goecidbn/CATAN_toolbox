@@ -19,6 +19,8 @@ class ChangeKind(str, Enum):
     BORDER_SETTINGS = "border_settings"
     # Session alignment limits (Data.max_session_shift, alignment_offsets).
     ALIGNMENT_SETTINGS = "alignment_settings"
+    # Pixel size and distance display unit (Data.um_per_px, show_um).
+    DISPLAY_UNITS = "display_units"
 
     TRACE_VALUES = "trace_values"
     QUALITY_VALUES = "quality_values"

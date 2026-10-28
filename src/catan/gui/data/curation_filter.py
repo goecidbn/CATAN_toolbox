@@ -1,3 +1,4 @@
+from copy import deepcopy
 from catan.gui.background_tasks.runtime import (
     current_task_context, progress_scope, progress_step, progress_iter, reports_progress,
 )
@@ -428,6 +429,10 @@ class CurationFilterEvaluator:
         condition_results = {}
         group_results = {}
 
+        # Thresholds are resolved on a copy; the caller's filter keeps its
+        # recipes and units.
+        root = deepcopy(root)
+
         self._bound_inspections = {}
 
         if root.apply_to != "same":
@@ -478,12 +483,14 @@ class CurationFilterEvaluator:
 
     def resolve_thresholds(self, root):
         """Resolve the threshold recipes (threshold_references) of all
-        conditions in ``root``: their values are set in place.
+        conditions in ``root`` and convert fixed values given in another
+        unit to the display unit: their values are set in place.
 
         Returns {condition id: (value, upper_value)} of the conditions
         with recipes.
         """
         resolved = {}
+        units = getattr(self.engine.data, "units", None)
 
         def visit(node):
             if is_filter_group(node):
@@ -492,6 +499,17 @@ class CurationFilterEvaluator:
                 return
 
             threshold = node.threshold
+            definition = self.engine.registry.get(node.query.statistic_key)
+            kind = None if definition is None else definition.value_kind
+
+            if units is not None and threshold.unit is not None and kind is not None:
+                if threshold.reference is None:
+                    threshold.value = units.convert(threshold.value, kind, threshold.unit)
+                if threshold.direction == "between" and threshold.upper_reference is None:
+                    threshold.upper_value = units.convert(
+                        threshold.upper_value, kind, threshold.unit
+                    )
+                threshold.unit = units.label(kind)
 
             if threshold.reference is None and (
                 threshold.direction != "between" or threshold.upper_reference is None
@@ -2498,6 +2516,9 @@ def curation_filter_node_to_dict(
             else:
                 threshold_data["upper_reference"] = threshold.upper_reference.to_dict()
 
+        if threshold.unit is not None:
+            threshold_data["unit"] = threshold.unit
+
         # Curator thresholds are currently axis-independent,
         # but retain this if ThresholdSpec has an axis field.
         axis = getattr(
@@ -2566,6 +2587,7 @@ def curation_filter_node_from_dict(data: dict):
             "upper_reference": reference_from_dict(
                 threshold_data.get("upper_reference")
             ),
+            "unit": threshold_data.get("unit"),
         }
         if threshold_data.get("upper_value") is not None:
             threshold_kwargs["upper_value"] = float(threshold_data["upper_value"])

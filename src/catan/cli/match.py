@@ -72,7 +72,7 @@ def add_match_parser(
         "--neighbor-distance",
         type=float,
         default=25.0,
-        help="Maximum neighbour distance in micrometres. Default: %(default)s",
+        help="Maximum neighbour distance in pixels. Default: %(default)s",
     )
 
     parser.add_argument(

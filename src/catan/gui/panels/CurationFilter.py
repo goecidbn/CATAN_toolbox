@@ -695,7 +695,8 @@ class CurationFilterConditionPopup(QDialog):
 
         model = getattr(self.engine.data, "model", None)
         fitted = model is not None and model.fitted and model.kind == "two_noise"
-        scale = float(self.engine.data.params.get("pxtomu", 1.0))
+        units = self.engine.data.units
+        unit = units.label("distance")
 
         from catan.tracking.analytics.two_noise_model import PARAMETERS
 
@@ -704,7 +705,8 @@ class CurationFilterConditionPopup(QDialog):
             description = PARAMETERS[name][1]
             term.setToolTip(
                 f"{MODEL_DISTANCE_TERMS[name]} = "
-                f"{float(model.parameters[name]) / scale:.3g} px\n{description}"
+                f"{units.to_display(float(model.parameters[name]), 'distance'):.3g} "
+                f"{unit}\n{description}"
                 if fitted
                 else f"{description}\nNo fitted two-noise model."
             )
@@ -715,7 +717,7 @@ class CurationFilterConditionPopup(QDialog):
 
             value = self._resolve_model(bound)
             preview.setText(
-                "= ? (no fitted model)" if value is None else f"= {value:.3g} px"
+                "= ? (no fitted model)" if value is None else f"= {value:.3g} {unit}"
             )
 
     def _set_mode(self, mode):
@@ -877,14 +879,22 @@ class CurationFilterConditionPopup(QDialog):
             self.direction_selector.findData(condition.threshold.direction)
         )
 
+        # Values in the display unit (the condition's may differ).
+        definition = self.engine.registry.get(condition.query.statistic_key)
+        kind = None if definition is None else definition.value_kind
+        threshold = condition.threshold
+        units = self.engine.data.units
+        value = threshold.value
+        upper = threshold.upper_value
+        if threshold.unit is not None and kind is not None:
+            value = units.convert(value, kind, threshold.unit)
+            if upper is not None:
+                upper = units.convert(upper, kind, threshold.unit)
+
         self._setting_values = True
         try:
-            self.threshold_value.setValue(condition.threshold.value)
-            self.threshold_upper.setValue(
-                condition.threshold.upper_value
-                if condition.threshold.upper_value is not None
-                else max(1.0, condition.threshold.value)
-            )
+            self.threshold_value.setValue(value)
+            self.threshold_upper.setValue(upper if upper is not None else max(1.0, value))
         finally:
             self._setting_values = False
 
@@ -968,6 +978,12 @@ class CurationFilterConditionPopup(QDialog):
                 "upper": self.threshold_upper.value(),
             }
 
+        query = self.query_selector.effective_query()
+        definition = (
+            None if query is None else self.engine.registry.get(query.statistic_key)
+        )
+        kind = None if definition is None else definition.value_kind
+
         return ThresholdSpec(
             axis=(None if self.condition is None else self.condition.threshold.axis),
             value=values["lower"],
@@ -976,6 +992,8 @@ class CurationFilterConditionPopup(QDialog):
             upper_value=values["upper"] if interval else None,
             reference=references["lower"],
             upper_reference=references["upper"] if interval else None,
+            # Fixed values are entered in the display unit.
+            unit=None if kind is None else self.engine.data.units.label(kind),
         )
 
     def _update_threshold_controls(self, *_):
@@ -1573,7 +1591,9 @@ class Display(QWidget):
             stat_def,
         )
 
-        threshold, notes = self._display_threshold(condition.threshold)
+        threshold, notes = self._display_threshold(
+            condition.threshold, stat_def.value_kind
+        )
         text = threshold.expression(query_title, precision=4)
 
         lines = [
@@ -1607,11 +1627,22 @@ class Display(QWidget):
 
         return text, "\n".join(lines)
 
-    def _display_threshold(self, threshold):
-        """A copy of ``threshold`` with model recipes resolved for the
-        current model, and notes on its recipes."""
+    def _display_threshold(self, threshold, kind=None):
+        """A copy of ``threshold`` in the display unit, with model recipes
+        resolved for the current model, and notes on its recipes."""
         threshold = replace(threshold)
         notes = []
+
+        units = self.data.units
+        if threshold.unit is not None and kind is not None:
+            if threshold.reference is None:
+                threshold.value = units.convert(threshold.value, kind, threshold.unit)
+            if threshold.direction == "between" and threshold.upper_reference is None:
+                threshold.upper_value = units.convert(
+                    threshold.upper_value, kind, threshold.unit
+                )
+            if threshold.unit != units.label(kind):
+                notes.append(f"Set in {threshold.unit}; shown in {units.label(kind)}.")
 
         for reference, attribute in (
             (threshold.reference, "value"),
@@ -2375,8 +2406,12 @@ class Controller(BasePlot.ControlsController):
         # Show the values the threshold recipes resolved to.
         for condition_id, (value, upper_value) in result.resolved_thresholds.items():
             condition = self._find_condition(condition_id)
-            if condition is not None:
+            if condition is None:
+                continue
+            # Only recipe bounds: fixed values keep their own unit.
+            if condition.threshold.reference is not None:
                 condition.threshold.value = value
+            if condition.threshold.upper_reference is not None:
                 condition.threshold.upper_value = upper_value
         if result.resolved_thresholds:
             self.menu.refresh_condition_availability()

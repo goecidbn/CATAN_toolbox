@@ -37,11 +37,7 @@ def geometry(data, state):
         ):
             continue
 
-        scale = float(session.params.get("pxtomu", 1.0))
-        if not np.isfinite(scale) or scale <= 0:
-            raise ValueError("pxtomu must be finite and positive.")
-
-        centers = np.asarray(session.centroids, dtype=np.float32) / scale
+        centers = np.asarray(session.centroids, dtype=np.float32)
 
         present = ids[:, sid] >= 0
         fp = ids[present, sid]
@@ -84,12 +80,7 @@ def union_positions(data, n):
     if union is None or union.centroids is None:
         raise ValueError("Build the union before calculating union-centroid distances.")
 
-    scale = float(union.params.get("pxtomu", 1.0))
-
-    if not np.isfinite(scale) or scale <= 0:
-        raise ValueError("Union pxtomu must be finite and positive.")
-
-    result = np.array(union.centroids, dtype=np.float32, copy=True) / scale
+    result = np.array(union.centroids, dtype=np.float32, copy=True)
 
     if result.shape != (n, 2):
         raise ValueError("Union centroids do not match the current assignments.")

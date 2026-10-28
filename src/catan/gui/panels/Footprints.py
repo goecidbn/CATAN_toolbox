@@ -1384,7 +1384,7 @@ class Display(BasePlot.BaseCanvas):
             + f"({session_id})"
         )
         html_probability, html_similarity, html_shift = match_quality_html(
-            similarity, shift, p_same, cmap
+            similarity, shift, p_same, cmap, units=self.data.units
         )
 
         add_label_to_menu(
@@ -1436,7 +1436,7 @@ class Display(BasePlot.BaseCanvas):
             return
 
         html_probability, html_similarity, html_shift = match_quality_html(
-            similarity, shift, p_same, cmap
+            similarity, shift, p_same, cmap, units=self.data.units
         )
         add_label_to_menu(
             menu,
@@ -1886,7 +1886,9 @@ class Display(BasePlot.BaseCanvas):
             # Moved footprints vs. the footprints that would remain.
             rest = self.data.partial_union_footprint(source_id, remaining)
             similarity, shift, p_same = self._set_statistics_between(moved_union, rest)
-            html = match_quality_html(similarity, shift, p_same, MATCH_QUALITY_CMAP)
+            html = match_quality_html(
+                similarity, shift, p_same, MATCH_QUALITY_CMAP, units=self.data.units
+            )
             add_label_to_menu(
                 submenu,
                 f"\u25c6 {html[0] or 'p=–'} - {len(remaining)} remaining footprints,\t{html[1]},\t{html[2]}",
@@ -2947,8 +2949,9 @@ class FootprintParametersController(ControlPanel.ControlPanel):
         super()._on_session_only_changed()
 
 
-def match_quality_html(similarity, shift, p_same, cmap=MATCH_QUALITY_CMAP):
-    """Coloured p / c / shift labels of the reassignment menus."""
+def match_quality_html(similarity, shift, p_same, cmap=MATCH_QUALITY_CMAP, units=None):
+    """Coloured p / c / shift labels of the reassignment menus (the shift
+    in px, shown in ``units``; the colour scale stays in px)."""
     html_probability = ""
     html_similarity = ""
     html_shift = ""
@@ -2966,7 +2969,13 @@ def match_quality_html(similarity, shift, p_same, cmap=MATCH_QUALITY_CMAP):
 
     if shift is not None:
         html_shift = "shift=" + get_colored_label(
-            f"{shift:.2f}px", float(np.clip(shift / 10.0, 0.0, 1.0)), cmap
+            (
+                f"{shift:.2f}px"
+                if units is None
+                else f"{units.to_display(shift, 'distance'):.2f}{units.label('distance')}"
+            ),
+            float(np.clip(shift / 10.0, 0.0, 1.0)),
+            cmap,
         )
 
     return html_probability, html_similarity, html_shift

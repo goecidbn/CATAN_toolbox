@@ -290,8 +290,7 @@ def build_realignment_update(
         item = sessions[sid]
         values["centroids"] = center_of_mass(
             values["footprints"],
-            *item.dims,
-            convert=item.params.get("pxtomu", 1.0),
+            *item.dims
         )
         values["status"] = dict(item.status, registered_to_model=False)
         if sid == session_id:

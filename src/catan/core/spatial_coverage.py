@@ -51,13 +51,7 @@ def distances_at_centroids(session, distance_map):
     if centroids is None:
         return None
 
-    scale = float(session.params.get("pxtomu", 1.0))
-
-    if not np.isfinite(scale) or scale <= 0:
-        raise ValueError("pxtomu must be finite and positive.")
-
-    # Stored centroids include pxtomu; the map is indexed in pixels.
-    xy = np.asarray(centroids, dtype=float) / scale
+    xy = np.asarray(centroids, dtype=float)
 
     height, width = distance_map.shape
 

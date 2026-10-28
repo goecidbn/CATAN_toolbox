@@ -1202,8 +1202,8 @@ class TrackingAnalysis(Tracking):
             )  # linewidth=2)
         plt.setp(
             ax_3D,
-            xlim=[0, 512 * self.params["pxtomu"]],
-            ylim=[0, 512 * self.params["pxtomu"]],
+            xlim=[0, 512 * self.params.get("um_per_px", 1.0)],
+            ylim=[0, 512 * self.params.get("um_per_px", 1.0)],
             xlabel="x [$\\mu$m]",
             ylabel="y [$\\mu$m]",
             zlabel="session",
@@ -1219,7 +1219,7 @@ class TrackingAnalysis(Tracking):
         # ax = plt.subplot(243)
         ax = fig.add_axes((0.65, 0.65, 0.125, 0.275))
         # add_number(fig, ax, order=2, offset=[-50, 25])
-        dx = np.diff(centroids[..., 0], axis=1) * self.params["pxtomu"]
+        dx = np.diff(centroids[..., 0], axis=1) * self.params.get("um_per_px", 1.0)
         ax.hist(
             dx.flatten(), np.linspace(-10, 10, 101), facecolor="tab:blue", alpha=0.5
         )
@@ -1239,7 +1239,7 @@ class TrackingAnalysis(Tracking):
 
         # ax = plt.subplot(244)
         ax = fig.add_axes((0.8, 0.65, 0.125, 0.275))
-        dy = np.diff(centroids[..., 1], axis=1) * self.params["pxtomu"]
+        dy = np.diff(centroids[..., 1], axis=1) * self.params.get("um_per_px", 1.0)
         ax.hist(
             dy.flatten(), np.linspace(-10, 10, 101), facecolor="tab:blue", alpha=0.5
         )
@@ -2140,7 +2140,7 @@ class TrackingAnalysis(Tracking):
                 )
 
             margin = 15
-            com = self.union.centroids  # / self.params["pxtomu"]
+            com = self.union.centroids  # / self.params.get("um_per_px", 1.0)
             ax.update_layout(
                 scene=dict(
                     xaxis=dict(range=[com[0] - margin, com[0] + margin]),

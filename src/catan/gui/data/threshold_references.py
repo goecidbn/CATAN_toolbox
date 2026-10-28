@@ -3,7 +3,8 @@
 - PercentileReference: a percentile of a suggestion sample of the
   condition's statistic (engine.sample_values; e.g. "Same neuron").
 - ModelDistanceReference: a linear combination of the fitted two-noise
-  model's distance parameters, converted to px (distance statistics only).
+  model's distance parameters (px), in the display unit (distance
+  statistics only).
 
 Presets store the recipe; the value is resolved whenever the curation
 filter is evaluated, so it follows the current data and model.
@@ -76,7 +77,8 @@ class ModelDistanceReference:
         return " ".join(parts)
 
     def resolve(self, data):
-        """The combination in px for the current model of ``data``."""
+        """The combination for the current model of ``data``, in the
+        display unit of distances (gui/data/units.py)."""
         model = getattr(data, "model", None)
 
         if model is None or not model.fitted or model.kind != "two_noise":
@@ -89,9 +91,9 @@ class ModelDistanceReference:
             for name, coefficient in self.coefficients
         )
 
-        # Model distances are in session units (µm with pxtomu µm/px).
-        scale = float(data.params.get("pxtomu", 1.0))
-        return value / scale
+        # Model distances are in px, like all statistics before display.
+        units = getattr(data, "units", None)
+        return value if units is None else units.to_display(value, "distance")
 
     def to_dict(self):
         return {"kind": "model_distance", "coefficients": dict(self.coefficients)}

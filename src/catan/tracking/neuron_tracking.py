@@ -114,7 +114,7 @@ class Tracking:
         bins=64,
         n_threads=1,
         use_kde=False,
-        pxtomu=1.0,
+        um_per_px=1.0,
         L=512,
         logLevel=logging.ERROR,
     ):
@@ -125,7 +125,7 @@ class Tracking:
         ----------
 
         neighbor_distance : float = 25.
-            the distance (in mu m) up to where neuron similarities and distances are calculated and registered for model building (shouldn't be much smaller, as the distance model requires at least some further ranging data)
+            the distance (in px) up to where neuron similarities and distances are calculated and registered for model building (shouldn't be much smaller, as the distance model requires at least some further ranging data)
 
         bins : int = 64
             number of bins used for model building and count registration. Should be a number 2^n to allow scaling down.
@@ -136,8 +136,10 @@ class Tracking:
         use_kde: bool = False
             specifies, whether neurons from areas of lowest and highest neuron density are excluded when building the probabilistic model. Costly, but can avoid some weird behavior
 
-        pxtomu: float = 1.
-            the factor to transform pixels to micrometer (mu m) distance
+        um_per_px: float = 1.
+            pixel size in µm. All distances are calculated in px; this only
+            converts them for display and gives physical model constants
+            (the two-noise slab thickness) in px.
 
         L: int = 512
             number of pixels along one dimension (actually - this should rather be the window length in mu m)
@@ -150,7 +152,7 @@ class Tracking:
         self.params["bins"] = bins
         self.params["n_threads"] = n_threads
         self.params["use_kde"] = use_kde
-        self.params["pxtomu"] = pxtomu
+        self.params["um_per_px"] = um_per_px
         self.params["L"] = L
 
         # Registration: matches need p_same above match_threshold; an
@@ -719,7 +721,7 @@ class Tracking:
             ):
                 continue
             centroids = np.asarray(session.centroids)[np.asarray(session.included, dtype=bool)]
-            points.append(centroids / session.params.get("pxtomu", 1.0))
+            points.append(centroids)
             if len(points) == count:
                 break
         return points
@@ -776,7 +778,6 @@ class Tracking:
                     else np.asarray(session.centroids)[
                         np.asarray(session.included, dtype=bool)
                     ]
-                    / session.params.get("pxtomu", 1.0)
                 ),
             }
 
@@ -1557,7 +1558,7 @@ class Tracking:
 
         if grids and not self.model.loaded:
             self.model.params["window_dims"] = tuple(
-                value * self.params.get("pxtomu", 1.0) for value in grids.pop()
+                float(value) for value in grids.pop()
             )
 
         # Current session order is deliberately supplied here,
@@ -1608,8 +1609,7 @@ class Tracking:
         if not sessions:
             raise ValueError("The two-noise model needs sessions with neurons.")
 
-        scale = self.params.get("pxtomu", 1.0)
-        dims = tuple(float(size) * scale for size in sessions[0].dims)
+        dims = tuple(float(size) for size in sessions[0].dims)
         lam, coverage = two_noise_model.neuron_intensity(
             [
                 np.asarray(session.centroids)[np.asarray(session.included, dtype=bool)]
@@ -1617,7 +1617,12 @@ class Tracking:
             ],
             dims,
         )
-        return {"lambda": lam, "window_dims": dims, "coverage": coverage}
+        return {
+            "lambda": lam,
+            "window_dims": dims,
+            "coverage": coverage,
+            "um_per_px": float(self.params.get("um_per_px", 1.0)),
+        }
 
     ### ============================================ ###
     ### =========== ASSIGNMENT FUNCTIONS =========== ###
@@ -2839,8 +2844,7 @@ class Tracking:
 
         union.centroids[neuron_ids, :] = center_of_mass(
             new_block,
-            *union.dims,
-            convert=union.params.get("pxtomu", 1.0),
+            *union.dims
         )
 
         union.n_neurons = n_neurons
@@ -3504,6 +3508,8 @@ class Tracking:
 
             for session_id, session in enumerate(self.sessions):
                 state = self._processing_state(session_id)
+                # The dataset's pixel size travels with its sessions.
+                session.params["um_per_px"] = float(self.params.get("um_per_px", 1.0))
 
                 write_session_snapshot(
                     backend,

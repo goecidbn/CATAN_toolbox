@@ -291,7 +291,7 @@ def run_matching(
         bins=config.bins,
         n_threads=config.n_threads,
         use_kde=config.use_kde,
-        pxtomu=config.pixel_size,
+        um_per_px=config.pixel_size,
     )
 
     path_iteration = tqdm(

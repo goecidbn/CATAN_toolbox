@@ -1,5 +1,6 @@
 import numpy as np
 from typing import Optional
+from catan.core.changes import ChangeKind
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -79,6 +80,13 @@ class NeuronNavigationBar(QWidget):
         self.adj_radius_spin.valueChanged.connect(
             lambda value: self.update_adj_radius(value)
         )
+        # Shown in the display unit; the state keeps px.
+        self._show_adj_radius()
+        self.state.data_changed.connect(
+            lambda event: self._show_adj_radius()
+            if event.has(ChangeKind.DISPLAY_UNITS)
+            else None
+        )
 
         self.state.data_changed.connect(self._on_data_changed)
         self.state.focused_component_changed.connect(self._on_focus_changed)
@@ -92,7 +100,17 @@ class NeuronNavigationBar(QWidget):
         # return selector_layout
 
     def update_adj_radius(self, value: float):
-        self.state.adjacency_radius = value
+        self.state.adjacency_radius = self.data.units.from_display(value, "distance")
+
+    def _show_adj_radius(self):
+        units = self.data.units
+        blocked = self.adj_radius_spin.blockSignals(True)
+        self.adj_radius_spin.setRange(0.0, units.to_display(50.0, "distance"))
+        self.adj_radius_spin.setSuffix(f" {units.label('distance')}")
+        self.adj_radius_spin.setValue(
+            units.to_display(self.state.adjacency_radius, "distance")
+        )
+        self.adj_radius_spin.blockSignals(blocked)
 
     def _on_selection_changed(self):
         self.update_neuron_count_label()

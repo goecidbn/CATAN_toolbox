@@ -48,6 +48,7 @@ from catan.gui.background_tasks.file_writes import (
 )
 
 from catan.gui.data.assignment_comparison import AssignmentComparison
+from catan.gui.data.units import DisplayUnits
 
 
 def hdf5_object_type(path):
@@ -283,6 +284,9 @@ class Data(Tracking):
             1.0,
             max(0.0, state.settings.value("alignment/min_flow_correlation", 0.10, type=float)),
         )
+
+        # Distances are shown in µm (pixel size um_per_px) instead of px.
+        self.show_um = state.settings.value("units/show_um", False, type=bool)
 
         super().__init__()
 
@@ -1601,6 +1605,60 @@ class Data(Tracking):
             for task in self.state.tasks.tasks.values()
         )
 
+    # ------------------------------------------------------------------
+    # Pixel size and distance display unit (gui/data/units.py)
+    # ------------------------------------------------------------------
+
+    @property
+    def um_per_px(self):
+        return float(self.params.get("um_per_px", 1.0))
+
+    @property
+    def units(self):
+        return DisplayUnits(self.um_per_px, bool(self.show_um))
+
+    def set_um_per_px(self, value, *, notify=True):
+        """Pixel size (µm/px) of the dataset, stored with the sessions.
+        Only rescales shown distances; a two-noise fit made with another
+        pixel size is outdated (its slab thickness is physical)."""
+        value = float(value)
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("The pixel size must be finite and positive.")
+        if value == self.um_per_px:
+            return
+
+        self.params["um_per_px"] = value
+        for session in self.sessions:
+            session.params["um_per_px"] = value
+
+        model = self.model
+        model_changed = False
+        if model is not None and model.kind == "two_noise" and model.fitted:
+            fitted_with = float(model.two_noise_context.get("um_per_px", 1.0))
+            if fitted_with != value:
+                model.fit_stale = True
+                model.stale_for_pixel_size = True
+            elif getattr(model, "stale_for_pixel_size", False):
+                model.fit_stale = False
+                model.stale_for_pixel_size = False
+            model_changed = True
+
+        if notify:
+            # Separate events: a unit change alone rescales cached values
+            # (StatisticEngine); the model state has its own consumers.
+            self.notify_change(C.DISPLAY_UNITS)
+            if model_changed:
+                self.notify_change(C.MODEL_PARAMETERS)
+
+    def set_show_um(self, show_um):
+        show_um = bool(show_um)
+        if show_um == self.show_um:
+            return
+
+        self.show_um = show_um
+        self.state.settings.setValue("units/show_um", show_um)
+        self.notify_change(C.DISPLAY_UNITS)
+
     def set_max_session_shift(self, value):
         value = max(1.0, float(value))
         if value == self.max_session_shift:
@@ -1641,7 +1699,6 @@ class Data(Tracking):
             np.asarray(self.sessions[sid].centroids)[
                 np.asarray(self.sessions[sid].included, dtype=bool)
             ]
-            / self.sessions[sid].params.get("pxtomu", 1.0)
             for sid in session_ids
         ]
         dims = self.sessions[session_ids[0]].dims
@@ -1771,6 +1828,7 @@ class Data(Tracking):
         """Alignment limits of the dataset for the next alignment of
         ``session`` (Remapping reads them from the session parameters)."""
         session.params["max_session_shift"] = float(self.max_session_shift)
+        session.params["um_per_px"] = self.um_per_px
         session.params["alignment_offsets"] = [list(o) for o in self.alignment_offsets]
         session.params["min_flow_correlation"] = float(self.min_flow_correlation)
         session.params["refine_alignment_with_footprints"] = bool(
@@ -2110,6 +2168,13 @@ class Data(Tracking):
 
                 if self.state.current_session_id is None:
                     self.state.current_session_id = added_ids[0]
+
+            # Pixel size stored with the restored sessions.
+            for index in added_ids:
+                stored = self.sessions[index].params.get("um_per_px")
+                if stored is not None:
+                    self.set_um_per_px(stored)
+                    break
 
             # Positions of the imaging window accepted for these sessions.
             for index in added_ids:
@@ -4806,7 +4871,7 @@ class Data(Tracking):
 
                 column = self._build_union_footprint_for_neuron(source_id)
                 union.centroids[source_id] = center_of_mass(
-                    column, *union.dims, convert=union.params.get("pxtomu", 1.0)
+                    column, *union.dims
                 )[0]
                 return self.neuron_merge_distance(source_id, target_id)
             finally:
@@ -4822,14 +4887,8 @@ class Data(Tracking):
         ):
             return np.inf
 
-        # Union centroids use the pixel-to-micron conversion.
-        scale = float(union.params.get("pxtomu", 1.0))
-        if not np.isfinite(scale) or scale <= 0:
-            return np.inf
-
-        distance = (
-            np.linalg.norm(union.centroids[source_id] - union.centroids[target_id])
-            / scale
+        distance = np.linalg.norm(
+            union.centroids[source_id] - union.centroids[target_id]
         )
         return float(distance) if np.isfinite(distance) else np.inf
 

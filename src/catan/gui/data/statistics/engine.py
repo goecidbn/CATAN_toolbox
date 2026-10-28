@@ -198,6 +198,20 @@ class StatisticEngine(QObject):
         if not isinstance(event, DataChange):
             raise TypeError("data_changed must carry a DataChange.")
 
+        if event.has(ChangeKind.DISPLAY_UNITS):
+            # Unit titles; cached px-based values are rescaled on request
+            # (_cached), nothing is recalculated.
+            self.refresh_registry()
+            if all(change.kind == ChangeKind.DISPLAY_UNITS for change in event.changes):
+                scaled = frozenset(
+                    key
+                    for key, definition in self.registry.items()
+                    if definition.value_kind is not None
+                )
+                if scaled:
+                    self.values_changed.emit(scaled)
+                return
+
         check_registry = event.has(
             ChangeKind.SESSION_ADDED,
             ChangeKind.SESSION_REMOVED,
@@ -312,8 +326,15 @@ class StatisticEngine(QObject):
             self._registry_signatures = signatures
             self.registry_changes = changed
 
-            if changed:
-                self._invalidate(changed)
+            # A new title (e.g. the display unit) keeps the values.
+            outdated = frozenset(
+                key
+                for key in changed
+                if (previous.get(key) or (None,))[1:]
+                != (signatures.get(key) or (None,))[1:]
+            )
+            if outdated:
+                self._invalidate(outdated)
 
         if changed and emit:
             self.registry_changed.emit()
@@ -371,9 +392,40 @@ class StatisticEngine(QObject):
         )
 
         revision = self._revisions.get(query.statistic_key, 0)
-        key = (query, revision)
+        key = (query, revision, self._unit_factor(definition))
 
         return definition, query, revision, key
+
+    def _unit_factor(self, definition):
+        """Display scale of the definition's values (gui/data/units.py)."""
+        units = getattr(self.data, "units", None)
+        if units is None or definition is None:
+            return 1.0
+        return units.factor(definition.value_kind)
+
+    def _cached(self, key):
+        """Cached result for ``key``, also from a result cached in another
+        display unit (rescaled, then cached). Caller holds _cache_lock."""
+        if key in self._cache:
+            result = self._cache.pop(key)
+            self._cache[key] = result
+            return True, result
+
+        query, revision, factor = key
+        for (other_query, other_revision, other_factor), result in list(
+            self._cache.items()
+        ):
+            if other_query == query and other_revision == revision and result is not None:
+                definition = self.registry[query.statistic_key]
+                rescaled = result.copy()
+                _scale_statistic(rescaled, factor / other_factor)
+                rescaled.title = definition.title_with_parameters(dict(query.parameters))
+                if definition.compact_values:
+                    _compact_statistic_values(rescaled)
+                self._cache[key] = rescaled
+                return True, rescaled
+
+        return False, None
 
     def peek_cached(self, query):
         """Return (found, result) without calculating or submitting work."""
@@ -391,13 +443,8 @@ class StatisticEngine(QObject):
 
             _, _, _, key = self._query_cache_key(query)
 
-            if key not in self._cache:
-                return False, None
-
             # Keep the same recency policy as evaluate(), including cached None.
-            result = self._cache.pop(key)
-            self._cache[key] = result
-            return True, result
+            return self._cached(key)
 
     @trace_statistic_request
     @reports_progress("Evaluating statistic")
@@ -414,7 +461,8 @@ class StatisticEngine(QObject):
 
         with self._cache_lock:
             definition, query, revision, key = self._query_cache_key(query)
-            if cache and key in self._cache:
+            found, result = self._cached(key) if cache else (False, None)
+            if found:
 
                 if TRACE_STATISTICS:
                     print(
@@ -422,9 +470,6 @@ class StatisticEngine(QObject):
                         flush=True,
                     )
 
-                ## move entry to the end of the dict
-                result = self._cache.pop(key)
-                self._cache[key] = result
                 return result
 
         # Calculation happens outside the cache lock.
@@ -476,6 +521,13 @@ class StatisticEngine(QObject):
         if stat_def is None:
             stat_def = self.registry[query.statistic_key]
 
+        # Values are calculated in px and shown in the display unit;
+        # value selections compare displayed values.
+        factor = self._unit_factor(stat_def)
+        if factor != 1.0 and select_values is not None:
+            select_px = select_values
+            select_values = lambda values: select_px(np.asarray(values) * factor)
+
         reductions = query.reduction_dict()
         if stat_def.independent_pairs:
 
@@ -526,6 +578,7 @@ class StatisticEngine(QObject):
             stat.relationship_axes = stat_def.relationship_axes
             stat.validate()
 
+            _scale_statistic(stat, factor)
             return stat
 
         indexers = {
@@ -581,6 +634,8 @@ class StatisticEngine(QObject):
             ):
                 stat.reduce_dimension(target, spec)
 
+        _scale_statistic(stat, factor)
+        stat.title = stat_def.title_with_parameters(dict(query.parameters))
         return stat
 
     @trace_statistic_request
@@ -856,7 +911,7 @@ class StatisticEngine(QObject):
         with self._cache_lock:
             definition, query, _, _ = self._query_cache_key(query)
             revisions = self._sample_revisions(definition)
-            key = (query, revisions, int(max_samples), seed)
+            key = (query, revisions, int(max_samples), seed, self._unit_factor(definition))
 
             for full in (allow_full, True):
                 cached_budget, result = self._sample_cache.get(
@@ -930,6 +985,18 @@ class StatisticEngine(QObject):
                 for spec in query.reduction_dict().values()
             )
         )
+
+
+def _scale_statistic(stat, factor):
+    """Scale values (and error bounds) by the display unit factor."""
+    if stat is None or factor == 1.0:
+        return
+
+    stat.values = np.asarray(stat.values, dtype=np.float64) * factor
+    for name in ("errors_low", "errors_high"):
+        errors = getattr(stat, name, None)
+        if errors is not None:
+            setattr(stat, name, np.asarray(errors, dtype=np.float64) * factor)
 
 
 @reports_progress("Compacting statistic values")
