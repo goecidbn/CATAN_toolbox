@@ -1,7 +1,8 @@
 import importlib
 from copy import deepcopy
+from dataclasses import replace
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent
 from PySide6.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -23,6 +24,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLineEdit,
     QDialogButtonBox,
+    QFrame,
+    QGraphicsOpacityEffect,
 )
 
 from catan.gui.data.curation_filter import (
@@ -39,6 +42,13 @@ from catan.core.structures import NeuronComponent
 from catan.core.changes import ChangeKind, DataChange
 from catan.gui.panels import StatisticsData
 from catan.gui.panels.helper.Threshold import ThresholdSpec
+from catan.gui.data.threshold_references import (
+    MODEL_DISTANCE_TERMS,
+    ModelDistanceReference,
+    PercentileReference,
+    ThresholdReferenceError,
+    is_distance_query,
+)
 from catan.gui.data.curation_filter import CurationFilterCondition
 from catan.gui.data.curation_results import RetainedResults
 from catan.gui.GUI_elements.fragments.curation_filter_group import (
@@ -67,13 +77,86 @@ from catan.gui.GUI_elements.fragments.curator_interaction_guard import (
     CuratorInteractionGuard,
 )
 from catan.gui.background_tasks.runtime import TaskCancelled
-from catan.gui.data.statistics.sampling import SUGGESTION_PERCENTILES
+from catan.gui.data.statistics.sampling import (
+    SUGGESTION_PERCENTILES,
+    SUGGESTION_SAMPLES,
+)
 
 from catan.gui.panels import BasePlot
 
 importlib.reload(StatisticsData)
 
-SUGGESTION_SAMPLES = 4000
+
+class ThresholdSourceSection(QFrame):
+    """Framed source of a condition's threshold values with a title and
+    explanation. Inactive sections are faded and their controls disabled;
+    a click anywhere on one (disabled controls pass it on) activates it."""
+
+    activated = Signal()
+
+    def __init__(self, title, explanation, parent=None):
+        super().__init__(parent)
+        self.setObjectName("thresholdSource")
+        self.setStyleSheet("""
+            QFrame#thresholdSource {
+                border: 1px solid #454b54;
+                border-radius: 6px;
+                background: transparent;
+            }
+            QFrame#thresholdSource[active="true"] {
+                border: 1px solid #5b8bd6;
+                background: rgba(91, 139, 214, 0.10);
+            }
+            QLabel#thresholdSourceTitle { font-weight: bold; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+
+        self.title = QLabel(title)
+        self.title.setObjectName("thresholdSourceTitle")
+        self.explanation = QLabel(explanation)
+        self.explanation.setWordWrap(True)
+        self.explanation.setObjectName("curationConditionDescription")
+        layout.addWidget(self.title)
+        layout.addWidget(self.explanation)
+
+        self.content = QWidget()
+        self.body = QVBoxLayout(self.content)
+        self.body.setContentsMargins(0, 2, 0, 0)
+        self.body.setSpacing(4)
+        layout.addWidget(self.content)
+
+        self._fade = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._fade)
+
+        self.active = None
+        self.set_active(False)
+
+    def set_active(self, active):
+        active = bool(active)
+        if active == self.active:
+            return
+
+        self.active = active
+        self.setProperty("active", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+        self.content.setEnabled(active)
+        self._fade.setOpacity(1.0 if active else 0.5)
+        self.setCursor(
+            Qt.CursorShape.ArrowCursor if active else Qt.CursorShape.PointingHandCursor
+        )
+        self.setToolTip("" if active else "Click to use this source.")
+
+    def mousePressEvent(self, event):
+        if not self.active and event.button() == Qt.MouseButton.LeftButton:
+            self.activated.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class CurationFilterConditionPopup(QDialog):
@@ -100,6 +183,12 @@ class CurationFilterConditionPopup(QDialog):
         self._suggestion_token = None
         self._suggestion_task_id = None
         self._closed = False
+
+        # Percentiles (threshold_references) of the lower (or single) and
+        # upper bound in value mode; None: the spin box value is used.
+        self._percentiles = {"lower": None, "upper": None}
+        self._setting_values = False
+        self._fit_pending = False
 
         self.setWindowTitle(
             "Edit filter condition" if condition is not None else "Add filter condition"
@@ -171,11 +260,11 @@ class CurationFilterConditionPopup(QDialog):
         threshold_group = QGroupBox("Threshold")
         threshold_group.setObjectName("curationThresholdGroup")
 
-        threshold_layout = QHBoxLayout(threshold_group)
+        threshold_layout = QVBoxLayout(threshold_group)
+        threshold_layout.setSpacing(6)
 
-        threshold_layout.addWidget(QLabel("Match when:"))
-
-        # ... direction selector + spin box
+        direction_row = QHBoxLayout()
+        direction_row.addWidget(QLabel("Match when:"))
 
         self.direction_selector = QComboBox()
         self.direction_selector.addItem("≥", "greater")
@@ -202,6 +291,25 @@ class CurationFilterConditionPopup(QDialog):
                 selection-color: white;
             }
         """)
+        direction_row.addWidget(self.direction_selector)
+        direction_row.addStretch()
+        threshold_layout.addLayout(direction_row)
+
+        # Where the bound values come from: a number / sampled percentile,
+        # or the fitted model (distance statistics). One is active.
+        self.value_section = ThresholdSourceSection(
+            "Number or distribution percentile",
+            "Type a fixed number, or pick a percentile of the sampled "
+            "values: a percentile is resampled on every evaluation.",
+        )
+        self.model_section = ThresholdSourceSection(
+            "From the fitted model",
+            "Distances of the two-noise model in px, following refits. "
+            "Negative factors subtract.",
+        )
+        self.value_section.activated.connect(lambda: self._set_mode("value"))
+        self.model_section.activated.connect(lambda: self._set_mode("model"))
+        self._mode = "value"
 
         self.threshold_value = QDoubleSpinBox()
         self.threshold_value.setDecimals(3)
@@ -221,20 +329,39 @@ class CurationFilterConditionPopup(QDialog):
 
         self.interval_separator = QLabel("and")
 
-        layout.addWidget(threshold_group)
-        threshold_layout.addWidget(self.direction_selector)
-        threshold_layout.addWidget(self.threshold_value, stretch=1)
+        value_row = QHBoxLayout()
+        value_row.addWidget(self.threshold_value, stretch=1)
+        value_row.addWidget(self.interval_separator)
+        value_row.addWidget(self.threshold_upper, stretch=1)
+        self.value_section.body.addLayout(value_row)
 
-        threshold_layout.addWidget(self.interval_separator)
-        threshold_layout.addWidget(self.threshold_upper, stretch=1)
+        percentile_row = QHBoxLayout()
+        self.percentile_label = QLabel()
+        self.percentile_label.setWordWrap(True)
+        self.percentile_label.setObjectName("curationConditionDescription")
+        self.percentile_clear = QToolButton()
+        self.percentile_clear.setText("Use fixed number")
+        self.percentile_clear.setAutoRaise(True)
+        self.percentile_clear.setToolTip(
+            "Keep the shown number instead of the percentile."
+        )
+        self.percentile_clear.clicked.connect(self._clear_percentiles)
+        percentile_row.addWidget(self.percentile_label, stretch=1)
+        percentile_row.addWidget(self.percentile_clear)
+        self.value_section.body.addLayout(percentile_row)
+
+        self._build_suggestions(self.value_section.body, value_row)
+        self._build_model_recipe(self.model_section.body)
+
+        threshold_layout.addWidget(self.value_section)
+        threshold_layout.addWidget(self.model_section)
+        layout.addWidget(threshold_group)
 
         self.threshold_error = QLabel()
         self.threshold_error.setWordWrap(True)
         self.threshold_error.setStyleSheet("color: #ef9a9a;")
         self.threshold_error.hide()
         layout.addWidget(self.threshold_error)
-
-        self._build_suggestions(layout)
 
         # ---------------------------------------------
         # Buttons
@@ -267,20 +394,29 @@ class CurationFilterConditionPopup(QDialog):
         self.direction_selector.currentIndexChanged.connect(
             self._update_threshold_controls
         )
-        self.threshold_value.valueChanged.connect(self._update_threshold_controls)
-        self.threshold_upper.valueChanged.connect(self._update_threshold_controls)
+        self.threshold_value.valueChanged.connect(
+            lambda: self._on_value_edited("lower")
+        )
+        self.threshold_upper.valueChanged.connect(
+            lambda: self._on_value_edited("upper")
+        )
 
-        self._update_threshold_controls()
+        self._set_mode("value")
 
-    def _build_suggestions(self, layout):
-        row = QHBoxLayout()
+    def _build_suggestions(self, layout, button_row):
+        """The suggest button joins ``button_row`` (the value inputs);
+        the sampling status and the percentile table follow below."""
+        self.suggest_status_row = QWidget()
+        row = QHBoxLayout(self.suggest_status_row)
+        row.setContentsMargins(0, 0, 0, 0)
 
-        self.suggest_button = QPushButton("Suggest")
+        self.suggest_button = QPushButton("Suggest from distribution percentile")
         self.suggest_button.setAutoDefault(False)
         self.suggest_button.setToolTip(
             "Sample this statistic's values (about 2 s) and show percentiles. "
             "Pair statistics show same-neuron and nearest-other-neuron pairs. "
-            "Click a value to use it as threshold."
+            "Click a value to use its percentile as threshold: it is "
+            "resampled whenever the filter is evaluated."
         )
 
         self.suggest_more_button = QPushButton("Sample more")
@@ -291,10 +427,11 @@ class CurationFilterConditionPopup(QDialog):
         self.suggest_status.setWordWrap(True)
         self.suggest_status.setObjectName("curationConditionDescription")
 
-        row.addWidget(self.suggest_button)
-        row.addWidget(self.suggest_more_button)
+        button_row.addWidget(self.suggest_button)
         row.addWidget(self.suggest_status, stretch=1)
-        layout.addLayout(row)
+        row.addWidget(self.suggest_more_button)
+        layout.addWidget(self.suggest_status_row)
+        self.suggest_status_row.hide()
 
         self.suggestion_panel = QWidget()
         self.suggestion_grid = QGridLayout(self.suggestion_panel)
@@ -323,7 +460,12 @@ class CurationFilterConditionPopup(QDialog):
 
         self.suggestion_panel.hide()
         self.suggest_more_button.hide()
-        self.suggest_status.setText(status)
+        self._set_suggest_status(status)
+        self._schedule_fit()
+
+    def _set_suggest_status(self, text):
+        self.suggest_status.setText(text)
+        self.suggest_status_row.setVisible(bool(text))
 
     def _cancel_suggestions(self):
         task_id = self._suggestion_task_id
@@ -398,22 +540,22 @@ class CurationFilterConditionPopup(QDialog):
         self._clear_suggestions()
 
         if error is not None:
-            self.suggest_status.setText(error)
+            self._set_suggest_status(error)
             return
 
         if result is None:
-            self.suggest_status.setText("No data loaded.")
+            self._set_suggest_status("No data loaded.")
             return
 
         if result.method == "unsupported":
-            self.suggest_status.setText(result.note)
+            self._set_suggest_status(result.note)
             self._more_request = {"budget": budget, "allow_full": True}
             self.suggest_more_button.setText("Calculate all")
             self.suggest_more_button.setVisible(not allow_full)
             return
 
         if not result.samples:
-            self.suggest_status.setText(result.note or "No values to suggest from.")
+            self._set_suggest_status(result.note or "No values to suggest from.")
             return
 
         grid = self.suggestion_grid
@@ -454,17 +596,21 @@ class CurationFilterConditionPopup(QDialog):
                 button.setFlat(True)
                 button.setToolTip(
                     f"{sample.label}, p{level}: {value:.6g}\n"
-                    "Click: set threshold. Shift+click: set upper bound."
+                    "Click: use this percentile as threshold. "
+                    "Shift+click: as upper bound."
                 )
                 button.clicked.connect(
-                    lambda _=False, value=float(value): self._apply_suggestion(value)
+                    lambda _=False, value=float(value), reference=PercentileReference(
+                        sample.label, float(level)
+                    ): self._apply_percentile(reference, value)
                 )
                 grid.addWidget(button, row, column)
 
         self.suggestion_panel.show()
+        self._schedule_fit()
 
         complete = all(sample.exact for sample in result.samples)
-        self.suggest_status.setText(
+        self._set_suggest_status(
             ("All values" if complete else "Sampled")
             + f" in {result.elapsed:.1f} s."
             + (f" {result.note}" if result.note else "")
@@ -481,17 +627,185 @@ class CurationFilterConditionPopup(QDialog):
             )
         )
 
-    def _apply_suggestion(self, value):
+    def _build_model_recipe(self, layout):
+        """Distance statistics: bounds from the fitted model,
+        a·h + b·σ_det + c·σ_move + d·σ_h (px), resolved on evaluation."""
+        # Per bound: (row widget, bound label, {term: spin box}, preview).
+        self.model_rows = {}
+        self.model_term_labels = []
+
+        for bound, defaults in (
+            ("lower", {"h": 1.0}),
+            ("upper", {"h": 1.0, "sigma_h": 2.0}),
+        ):
+            widget = QWidget()
+            row = QHBoxLayout(widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(3)
+
+            bound_label = QLabel("Lower:" if bound == "lower" else "Upper:")
+            row.addWidget(bound_label)
+
+            spins = {}
+
+            for index, (name, label) in enumerate(MODEL_DISTANCE_TERMS.items()):
+                if index:
+                    row.addWidget(QLabel("+"))
+
+                spin = QDoubleSpinBox()
+                spin.setDecimals(2)
+                spin.setRange(-20.0, 20.0)
+                spin.setSingleStep(0.5)
+                spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+                spin.setAlignment(Qt.AlignmentFlag.AlignRight)
+                spin.setFixedWidth(46)
+                spin.setToolTip("Factor (scroll or type; negative subtracts)")
+                spin.setValue(defaults.get(name, 0.0))
+                spin.valueChanged.connect(self._update_threshold_controls)
+                spins[name] = spin
+
+                term = QLabel(f"·{label}")
+                term.setProperty("term", name)
+                self.model_term_labels.append(term)
+
+                row.addWidget(spin)
+                row.addWidget(term)
+
+            preview = QLabel()
+            preview.setObjectName("curationConditionDescription")
+            row.addWidget(preview, stretch=1)
+
+            layout.addWidget(widget)
+            self.model_rows[bound] = (widget, bound_label, spins, preview)
+
+    def _model_reference(self, bound):
+        _, _, spins, _ = self.model_rows[bound]
+        return ModelDistanceReference.from_mapping(
+            {name: spin.value() for name, spin in spins.items()}
+        )
+
+    def _resolve_model(self, bound):
+        try:
+            return self._model_reference(bound).resolve(self.engine.data)
+        except ThresholdReferenceError:
+            return None
+
+    def _update_model_section(self):
+        interval = self.direction_selector.currentData() == "between"
+
+        model = getattr(self.engine.data, "model", None)
+        fitted = model is not None and model.fitted and model.kind == "two_noise"
+        scale = float(self.engine.data.params.get("pxtomu", 1.0))
+
+        from catan.tracking.analytics.two_noise_model import PARAMETERS
+
+        for term in self.model_term_labels:
+            name = term.property("term")
+            description = PARAMETERS[name][1]
+            term.setToolTip(
+                f"{MODEL_DISTANCE_TERMS[name]} = "
+                f"{float(model.parameters[name]) / scale:.3g} px\n{description}"
+                if fitted
+                else f"{description}\nNo fitted two-noise model."
+            )
+
+        for bound, (widget, bound_label, _, preview) in self.model_rows.items():
+            widget.setVisible(bound == "lower" or interval)
+            bound_label.setVisible(interval)
+
+            value = self._resolve_model(bound)
+            preview.setText(
+                "= ? (no fitted model)" if value is None else f"= {value:.3g} px"
+            )
+
+    def _set_mode(self, mode):
+        if mode == "model" and self.model_section.isHidden():
+            mode = "value"
+
+        self._mode = mode
+        self.value_section.set_active(mode == "value")
+        self.model_section.set_active(mode == "model")
+        self._update_threshold_controls()
+
+    def _apply_percentile(self, reference, value):
         shift = bool(
             QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
         )
+        bound = "upper" if shift else "lower"
 
-        if shift:
-            index = self.direction_selector.findData("between")
-            self.direction_selector.setCurrentIndex(index)
-            self.threshold_upper.setValue(value)
-        else:
-            self.threshold_value.setValue(value)
+        self._setting_values = True
+        try:
+            if shift:
+                index = self.direction_selector.findData("between")
+                self.direction_selector.setCurrentIndex(index)
+            (self.threshold_upper if shift else self.threshold_value).setValue(value)
+        finally:
+            self._setting_values = False
+
+        self._percentiles[bound] = reference
+        self._set_mode("value")
+
+    def _on_value_edited(self, bound):
+        # Typing a number replaces the percentile of that bound.
+        if not self._setting_values:
+            self._percentiles[bound] = None
+        self._update_threshold_controls()
+
+    def _clear_percentiles(self):
+        self._percentiles = {"lower": None, "upper": None}
+        self._update_threshold_controls()
+
+    def _update_percentile_label(self):
+        interval = self.direction_selector.currentData() == "between"
+        lower, upper = self._percentiles["lower"], self._percentiles["upper"]
+
+        parts = []
+        if lower is not None:
+            parts.append(("Lower bound: " if interval else "Threshold: ") + lower.describe())
+        if interval and upper is not None:
+            parts.append("Upper bound: " + upper.describe())
+
+        self.percentile_label.setText("; ".join(parts))
+        self.percentile_label.setVisible(bool(parts))
+        self.percentile_clear.setVisible(bool(parts))
+
+    def _schedule_fit(self):
+        """Fit the height to the content once the layout has settled
+        (sections, interval rows and suggestion tables come and go)."""
+        if not self._fit_pending:
+            self._fit_pending = True
+            QTimer.singleShot(0, self._fit_height)
+
+    def _fit_height(self):
+        self._fit_pending = False
+
+        if self._closed or not self.isVisible():
+            return
+
+        self.layout().activate()
+        geometry = self.geometry()
+        available = self.screen().availableGeometry()
+
+        height = min(self.sizeHint().height(), available.height())
+        width = max(geometry.width(), self.minimumSizeHint().width())
+        width = min(width, available.width())
+        top = min(geometry.top(), available.bottom() - height + 1)
+        left = min(geometry.left(), available.right() - width + 1)
+
+        self.setGeometry(
+            max(available.left(), left), max(available.top(), top), width, height
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_fit()
+
+    def event(self, event):
+        # Any content change (sections, rows, suggestion tables, statistic
+        # parameters) requests a new layout.
+        if event.type() == QEvent.Type.LayoutRequest:
+            self._schedule_fit()
+        return super().event(event)
 
     def done(self, result):
         self._closed = True
@@ -510,10 +824,33 @@ class CurationFilterConditionPopup(QDialog):
             self._cancel_suggestions()
             self._clear_suggestions()
 
+        definition = (
+            None if query is None else self.engine.registry.get(query.statistic_key)
+        )
+        distance = query is not None and is_distance_query(definition, query)
+        if self.model_section.isHidden() == distance:
+            self.model_section.setVisible(distance)
+            self._schedule_fit()
+        if distance:
+            self._update_model_section()
+        elif self._mode == "model":
+            self._set_mode("value")
+            return
+
         error = ""
 
         try:
-            self._threshold_spec().validate()
+            spec = self._threshold_spec()
+            spec.validate()
+
+            if not distance and any(
+                isinstance(reference, ModelDistanceReference)
+                for reference in (spec.reference, spec.upper_reference)
+            ):
+                raise ValueError(
+                    "Model distance thresholds need a distance statistic "
+                    "without sum reductions."
+                )
         except ValueError as exc:
             error = str(exc)
 
@@ -540,12 +877,35 @@ class CurationFilterConditionPopup(QDialog):
             self.direction_selector.findData(condition.threshold.direction)
         )
 
-        self.threshold_value.setValue(condition.threshold.value)
-        self.threshold_upper.setValue(
-            condition.threshold.upper_value
-            if condition.threshold.upper_value is not None
-            else max(1.0, condition.threshold.value)
-        )
+        self._setting_values = True
+        try:
+            self.threshold_value.setValue(condition.threshold.value)
+            self.threshold_upper.setValue(
+                condition.threshold.upper_value
+                if condition.threshold.upper_value is not None
+                else max(1.0, condition.threshold.value)
+            )
+        finally:
+            self._setting_values = False
+
+        threshold = condition.threshold
+        references = {"lower": threshold.reference, "upper": threshold.upper_reference}
+
+        self._percentiles = {
+            bound: reference if isinstance(reference, PercentileReference) else None
+            for bound, reference in references.items()
+        }
+
+        model = False
+        for bound, reference in references.items():
+            if isinstance(reference, ModelDistanceReference):
+                model = True
+                coefficients = dict(reference.coefficients)
+                for name, spin in self.model_rows[bound][2].items():
+                    spin.setValue(coefficients.get(name, 0.0))
+
+        self._on_query_changed(self.query_selector.effective_query())
+        self._set_mode("model" if model else "value")
 
         self._update_threshold_controls()
 
@@ -591,14 +951,31 @@ class CurationFilterConditionPopup(QDialog):
     def _threshold_spec(self):
         direction = self.direction_selector.currentData()
 
+        interval = direction == "between"
+
+        if self._mode == "model":
+            references = {
+                bound: self._model_reference(bound) for bound in ("lower", "upper")
+            }
+            # Unresolvable without a fitted model; resolved on evaluation.
+            values = {
+                bound: self._resolve_model(bound) or 0.0 for bound in ("lower", "upper")
+            }
+        else:
+            references = self._percentiles
+            values = {
+                "lower": self.threshold_value.value(),
+                "upper": self.threshold_upper.value(),
+            }
+
         return ThresholdSpec(
             axis=(None if self.condition is None else self.condition.threshold.axis),
-            value=self.threshold_value.value(),
+            value=values["lower"],
             direction=direction,
             active=True,
-            upper_value=(
-                self.threshold_upper.value() if direction == "between" else None
-            ),
+            upper_value=values["upper"] if interval else None,
+            reference=references["lower"],
+            upper_reference=references["upper"] if interval else None,
         )
 
     def _update_threshold_controls(self, *_):
@@ -610,6 +987,10 @@ class CurationFilterConditionPopup(QDialog):
         self.threshold_value.setToolTip(
             "Inclusive lower bound" if interval else "Threshold value"
         )
+        self._update_percentile_label()
+        if not self.model_section.isHidden():
+            self._update_model_section()
+        self._schedule_fit()
 
         self._on_query_changed(self.query_selector.effective_query())
 
@@ -1192,13 +1573,14 @@ class Display(QWidget):
             stat_def,
         )
 
-        threshold = condition.threshold
+        threshold, notes = self._display_threshold(condition.threshold)
         text = threshold.expression(query_title, precision=4)
 
         lines = [
             query_title,
             "",
             f"Threshold: {threshold.expression(precision=6)}",
+            *notes,
         ]
 
         if not threshold.active:
@@ -1224,6 +1606,32 @@ class Display(QWidget):
                 lines.append(f"  {parameter.label}: {value_text}")
 
         return text, "\n".join(lines)
+
+    def _display_threshold(self, threshold):
+        """A copy of ``threshold`` with model recipes resolved for the
+        current model, and notes on its recipes."""
+        threshold = replace(threshold)
+        notes = []
+
+        for reference, attribute in (
+            (threshold.reference, "value"),
+            (
+                threshold.upper_reference if threshold.direction == "between" else None,
+                "upper_value",
+            ),
+        ):
+            if isinstance(reference, ModelDistanceReference):
+                try:
+                    setattr(threshold, attribute, reference.resolve(self.data))
+                except ThresholdReferenceError as exc:
+                    notes.append(str(exc))
+            elif isinstance(reference, PercentileReference):
+                notes.append(
+                    f"{reference.describe()}: value from the last sample, "
+                    "resampled on evaluation."
+                )
+
+        return threshold, notes
 
     def set_retained_results(self, count, note=""):
         self.result_label.setText(
@@ -1964,6 +2372,15 @@ class Controller(BasePlot.ControlsController):
         self.current_result = RetainedResults(result, self.data)
         self._results_note = ""
 
+        # Show the values the threshold recipes resolved to.
+        for condition_id, (value, upper_value) in result.resolved_thresholds.items():
+            condition = self._find_condition(condition_id)
+            if condition is not None:
+                condition.threshold.value = value
+                condition.threshold.upper_value = upper_value
+        if result.resolved_thresholds:
+            self.menu.refresh_condition_availability()
+
         self._evidence_source = (
             "group",
             self.current_result.root_id,
@@ -2358,7 +2775,25 @@ class Controller(BasePlot.ControlsController):
             self._clear_results()
             return
 
+        # Model recipes now resolve to other values than evaluated.
+        if (
+            isinstance(event, DataChange)
+            and event.has(ChangeKind.MODEL_PARAMETERS)
+            and self.current_result is not None
+            and self._uses_model_references(self.root_filter)
+        ):
+            self._results_note = "Model changed since evaluation."
+
         self._update_filter_validity()
+
+    def _uses_model_references(self, node):
+        if is_filter_group(node):
+            return any(self._uses_model_references(child) for child in node.children)
+
+        return any(
+            isinstance(reference, ModelDistanceReference)
+            for reference in (node.threshold.reference, node.threshold.upper_reference)
+        )
 
     def _update_filter_validity(self, *, preserve_status=False):
         invalid_groups = empty_filter_group_ids(self.root_filter)

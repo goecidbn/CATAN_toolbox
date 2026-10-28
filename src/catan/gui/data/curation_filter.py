@@ -14,6 +14,11 @@ from catan.gui.data.statistics import (
 )
 from catan.gui.data.statistics.engine import StatisticEngine
 from catan.gui.panels.helper.Threshold import ThresholdSpec
+from catan.gui.data.threshold_references import (
+    ThresholdReferenceError,
+    reference_from_dict,
+    resolve_reference,
+)
 from catan.gui.data.curation_actions import ManipulationSpec
 
 FilterOperator = Literal["and", "or"]
@@ -319,6 +324,10 @@ class CurationFilterResult:
 
     bound_inspections: dict = field(default_factory=dict)
 
+    # Threshold recipes resolved for this evaluation:
+    # {condition id: (value, upper_value)}.
+    resolved_thresholds: dict = field(default_factory=dict)
+
     def evidence_for_neuron(
         self,
         neuron_id: int,
@@ -446,7 +455,9 @@ class CurationFilterEvaluator:
                 np.flatnonzero(np.isin(statuses, root.review_statuses))
             )
 
-        with progress_scope(0, 3, "Preparing curator domains"):
+        with progress_scope(0, 2, "Resolving thresholds"):
+            resolved = self.resolve_thresholds(root)
+        with progress_scope(2, 3, "Preparing curator domains"):
             self._prepare_count_domains(root)
         with progress_scope(3, 97):
             root_result = self._evaluate_group(root, condition_results, group_results)
@@ -462,7 +473,58 @@ class CurationFilterEvaluator:
             group_results=group_results,
             root_result=root_result,
             bound_inspections=self._bound_inspections,
+            resolved_thresholds=resolved,
         )
+
+    def resolve_thresholds(self, root):
+        """Resolve the threshold recipes (threshold_references) of all
+        conditions in ``root``: their values are set in place.
+
+        Returns {condition id: (value, upper_value)} of the conditions
+        with recipes.
+        """
+        resolved = {}
+
+        def visit(node):
+            if is_filter_group(node):
+                for child in node.children:
+                    visit(child)
+                return
+
+            threshold = node.threshold
+
+            if threshold.reference is None and (
+                threshold.direction != "between" or threshold.upper_reference is None
+            ):
+                return
+
+            try:
+                if threshold.reference is not None:
+                    threshold.value = resolve_reference(
+                        threshold.reference, self.engine, node.query
+                    )
+                if threshold.direction == "between" and threshold.upper_reference is not None:
+                    threshold.upper_value = resolve_reference(
+                        threshold.upper_reference, self.engine, node.query
+                    )
+            except ThresholdReferenceError as exc:
+                raise CurationFilterError(
+                    str(exc), node_id=node.id, node_type="condition"
+                ) from exc
+
+            if not np.isfinite(threshold.value) or (
+                threshold.direction == "between" and not np.isfinite(threshold.upper_value)
+            ):
+                raise CurationFilterError(
+                    "The threshold recipe gave no finite value.",
+                    node_id=node.id,
+                    node_type="condition",
+                )
+
+            resolved[node.id] = (threshold.value, threshold.upper_value)
+
+        visit(root)
+        return resolved
 
     @reports_progress(None)
     def _evaluate_condition(
@@ -2420,12 +2482,21 @@ def curation_filter_node_to_dict(
         threshold.validate()
 
         threshold_data = {
-            "value": float(threshold.value),
             "direction": threshold.direction,
             "active": bool(threshold.active),
         }
+
+        # A recipe replaces the value: it is resolved on evaluation.
+        if threshold.reference is None:
+            threshold_data["value"] = float(threshold.value)
+        else:
+            threshold_data["reference"] = threshold.reference.to_dict()
+
         if threshold.direction == "between":
-            threshold_data["upper_value"] = float(threshold.upper_value)
+            if threshold.upper_reference is None:
+                threshold_data["upper_value"] = float(threshold.upper_value)
+            else:
+                threshold_data["upper_reference"] = threshold.upper_reference.to_dict()
 
         # Curator thresholds are currently axis-independent,
         # but retain this if ThresholdSpec has an axis field.
@@ -2483,7 +2554,7 @@ def curation_filter_node_from_dict(data: dict):
         threshold_data = data["threshold"]
 
         threshold_kwargs = {
-            "value": float(threshold_data["value"]),
+            "value": float(threshold_data.get("value", 0.0)),
             "direction": threshold_data["direction"],
             "active": bool(
                 threshold_data.get(
@@ -2491,9 +2562,16 @@ def curation_filter_node_from_dict(data: dict):
                     True,
                 )
             ),
+            "reference": reference_from_dict(threshold_data.get("reference")),
+            "upper_reference": reference_from_dict(
+                threshold_data.get("upper_reference")
+            ),
         }
         if threshold_data.get("upper_value") is not None:
             threshold_kwargs["upper_value"] = float(threshold_data["upper_value"])
+        elif threshold_kwargs["upper_reference"] is not None:
+            # Resolved on evaluation.
+            threshold_kwargs["upper_value"] = threshold_kwargs["value"]
 
         if threshold_data.get("axis") is not None:
             threshold_kwargs["axis"] = threshold_data["axis"]

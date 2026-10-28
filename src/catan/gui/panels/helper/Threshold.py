@@ -8,6 +8,10 @@ from PySide6.QtWidgets import QToolTip
 from vispy.scene import visuals
 
 from catan.gui.interaction import click_events
+from catan.gui.data.threshold_references import (
+    ModelDistanceReference,
+    PercentileReference,
+)
 from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 
 ThresholdAxis = Literal["x", "y"]
@@ -37,6 +41,11 @@ class ThresholdSpec:
 
     # In interval mode, value is the lower bound.
     upper_value: float | None = None
+
+    # Recipes of value / upper_value (threshold_references); None: fixed.
+    # The values then hold the last resolved results.
+    reference: PercentileReference | ModelDistanceReference | None = None
+    upper_reference: PercentileReference | ModelDistanceReference | None = None
 
     def validate(self):
         if self.direction not in ("greater", "less", "between"):
@@ -70,10 +79,14 @@ class ThresholdSpec:
     def expression(self, label="value", precision=4):
         self.validate()
 
-        lower = f"{self.value:.{precision}g}"
+        def bound(value, reference):
+            text = f"{value:.{precision}g}"
+            return text if reference is None else f"{reference.describe()} ({text})"
+
+        lower = bound(self.value, self.reference)
 
         if self.direction == "between":
-            upper = f"{self.upper_value:.{precision}g}"
+            upper = bound(self.upper_value, self.upper_reference)
             return f"{lower} ≤ {label} ≤ {upper}"
 
         symbol = "≥" if self.direction == "greater" else "≤"

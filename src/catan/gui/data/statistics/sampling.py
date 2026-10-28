@@ -38,6 +38,8 @@ from .queries import PairFilter, ReductionSpec
 from .table import PickTable
 
 SUGGESTION_PERCENTILES = (5, 25, 50, 75, 95)
+# Values per suggestion sample (threshold editor and percentile thresholds).
+SUGGESTION_SAMPLES = 4000
 
 # Session pairs evaluated between two budget checks.
 SESSION_PAIR_CHUNK = 16

@@ -367,6 +367,16 @@ CALCULATED_STATISTICS.update(
 )
 
 
+# Values are centroid distances in px (model distance thresholds).
+for key in (
+    "distances",
+    "centroid_shift",
+    "cross_session_distances",
+    "footprint_union_distance",
+    "union_distances",
+):
+    CALCULATED_STATISTICS[key].value_kind = "distance"
+
 definition = CALCULATED_STATISTICS["footprint_union_distance"]
 definition.component_axes = (("neuron_i", "session"),)
 definition.curation_kind = "reassignment"
