@@ -684,3 +684,16 @@ class CurationFilterPresetStore:
             self.settings.sync()
 
         return new_key
+
+
+def shared_preset_store(state) -> CurationFilterPresetStore:
+    """The application's preset store (one per AppState: the curator panel
+    and preset checks share its working filter)."""
+    store = getattr(state, "curation_filter_store", None)
+
+    if store is None:
+        store = state.curation_filter_store = CurationFilterPresetStore(
+            settings=state.settings,
+        )
+
+    return store

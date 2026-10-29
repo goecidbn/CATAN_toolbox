@@ -58,7 +58,7 @@ from catan.gui.GUI_elements.fragments.curation_actions_widget import (
     CuratorActions,
 )
 from catan.gui.data.curation_filter_presets import (
-    CurationFilterPresetStore,
+    shared_preset_store,
     PRESET_CATEGORIES,
     PRESET_CATEGORY_DESCRIPTIONS,
     UNCATEGORIZED_LABEL,
@@ -1960,11 +1960,7 @@ class Controller(BasePlot.ControlsController):
     def __init__(self, display_section, config=None):
         super().__init__(display_section, config)
 
-        if not hasattr(self.state, "curation_filter_store"):
-            self.state.curation_filter_store = CurationFilterPresetStore(
-                settings=self.state.settings,
-            )
-        self.filter_store = self.state.curation_filter_store
+        self.filter_store = shared_preset_store(self.state)
 
         self.root_filter = self.filter_store.working_filter
 

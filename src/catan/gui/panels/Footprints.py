@@ -1525,6 +1525,8 @@ class Display(BasePlot.BaseCanvas):
         menu.addAction(act_focus)
 
         self.add_neuron_highlight_menu(menu, this_component.neuron_id)
+        self.add_preset_check_menu(menu, this_component)
+        self.add_compare_menu(menu, this_component)
 
         menu.addSeparator()
 
@@ -1594,6 +1596,110 @@ class Display(BasePlot.BaseCanvas):
 
         menu.exec(QCursor.pos())
         menu.deleteLater()
+
+    def add_preset_check_menu(self, menu: QMenu, component: NeuronComponent):
+        """Submenu: check the footprint's neuron against a curator preset."""
+        from catan.gui.data.curation_filter_presets import (
+            PRESET_CATEGORIES,
+            UNCATEGORIZED_LABEL,
+            shared_preset_store,
+        )
+        from catan.gui.GUI_elements.fragments.preset_check_dialog import (
+            WORKING_FILTER_KEY,
+        )
+
+        store = shared_preset_store(self.state)
+        submenu = QMenu("Check against preset", menu)
+        submenu.setToolTipsVisible(True)
+        submenu.setToolTip(
+            "Does this neuron match the preset? Shows its values against "
+            "every threshold of the preset."
+        )
+
+        working = "Curator's current filter"
+        if store.working_dirty:
+            working += " (unsaved changes)"
+        submenu.addAction(working).triggered.connect(
+            lambda checked=False: self.open_preset_check(component, WORKING_FILTER_KEY)
+        )
+
+        category = object()
+        for preset in store.presets():
+            if preset.category != category:
+                category = preset.category
+                submenu.addSection(PRESET_CATEGORIES.get(category, UNCATEGORIZED_LABEL))
+            submenu.addAction(preset.name).triggered.connect(
+                lambda checked=False, key=preset.key: self.open_preset_check(component, key)
+            )
+
+        menu.addMenu(submenu)
+
+    def add_compare_menu(self, menu: QMenu, component: NeuronComponent):
+        """Pair statistics of selected footprints: two selected → compare
+        them; three or more → choose the partner of the clicked one."""
+        selected = list(dict.fromkeys(self.state.selected_components or ()))
+
+        def label(c):
+            if c.session_id is None:
+                return f"neuron {c.neuron_id}"
+            return f"N{c.neuron_id} S{c.session_id}"
+
+        def this_for(partner):
+            # A neuron partner compares neurons (unions).
+            if partner.session_id is None:
+                return NeuronComponent(component.neuron_id, None)
+            return component
+
+        if len(selected) == 2:
+            first, second = selected
+            if component in selected:
+                first, second = component, next(c for c in selected if c != component)
+            action = menu.addAction(f"Compare footprints ({label(first)} ↔ {label(second)})")
+            action.triggered.connect(
+                lambda checked=False: self.open_pair_statistics(first, second)
+            )
+            return
+
+        partners = [c for c in selected if c != component]
+        if len(selected) < 3 or not partners:
+            action = menu.addAction("Compare footprints")
+            action.setEnabled(False)
+            action.setToolTip("Select two footprints to compare them.")
+            return
+
+        submenu = QMenu(f"Compare {label(component)} with", menu)
+        for partner in partners:
+            submenu.addAction(label(partner)).triggered.connect(
+                lambda checked=False, b=partner: self.open_pair_statistics(this_for(b), b)
+            )
+        menu.addMenu(submenu)
+
+    def open_pair_statistics(self, first: NeuronComponent, second: NeuronComponent):
+        from catan.gui.GUI_elements.fragments.pair_statistics_dialog import (
+            PairStatisticsDialog,
+        )
+
+        dialog = PairStatisticsDialog(
+            self.state, self.data, first, second, parent=self.native.window()
+        )
+        dialog.setWindowFlag(Qt.WindowType.Tool, True)
+        dialog.show()
+
+    def open_preset_check(self, component: NeuronComponent, preset_key: str):
+        from catan.gui.GUI_elements.fragments.preset_check_dialog import (
+            PresetCheckDialog,
+        )
+
+        dialog = PresetCheckDialog(
+            self.state,
+            self.data,
+            component.neuron_id,
+            component,
+            preset_key,
+            parent=self.native.window(),
+        )
+        dialog.setWindowFlag(Qt.WindowType.Tool, True)
+        dialog.show()
 
     def build_neuron_tag_menu(self, neuron_id: int, menu: QMenu) -> QMenu:
         submenu = QMenu("Tag neuron ...", menu)
