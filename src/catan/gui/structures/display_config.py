@@ -1,7 +1,22 @@
 from PySide6.QtCore import QObject, Signal, QSettings
 import json
-from catan.gui.data.statistics.queries import StatisticQuery
+from catan.gui.data.statistics.queries import ReductionSpec, StatisticQuery
 from catan.gui.data.statistics.engine import StatisticEngine
+
+
+
+def default_queries(entity_mode, row_mode):
+    """Columns before the user chose any: number of sessions a neuron is
+    present in (occurrence summed over sessions), for single footprints and
+    neurons. These columns also fill the footprint hover tooltips."""
+    if row_mode != "single":
+        return []
+    return [
+        StatisticQuery(
+            statistic_key="occurence",
+            reductions=(("session", ReductionSpec("sum")),),
+        )
+    ]
 
 
 class StatisticDisplayConfig(QObject):
@@ -116,7 +131,11 @@ class StatisticDisplayConfig(QObject):
 
                 mode = (entity_mode, row_mode)
 
-                raw = self.settings.value(self._settings_key(mode), "")
+                raw = self.settings.value(self._settings_key(mode), None)
+
+                if raw is None:
+                    self._queries_by_mode[mode] = default_queries(*mode)
+                    continue
 
                 if not raw:
                     self._queries_by_mode[mode] = []

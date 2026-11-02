@@ -29,6 +29,7 @@ from catan.gui.background_tasks.runtime import current_task_context, reports_pro
 
 from .dimensions import canonical_dim
 from .session_relations import (
+    included_detections,
     NEURON_RELATIONS,
     DetectionReference,
     is_order_relation,
@@ -236,7 +237,8 @@ def _masked_bindings(data, state, ids):
 
     bound_data = copy(data)
     bound_data._current_assignments = name
-    bound_data._assignments = {name: bound_assignments}
+    # Other loaded sets stay available (e.g. assignment differences).
+    bound_data._assignments = {**data._assignments, name: bound_assignments}
     bound_data.sessions = list(data.sessions)
     bound_data.state = bound_state
 
@@ -476,7 +478,7 @@ def _sample_pairs(engine, query, definition, endpoints, *, max_samples, budget, 
     )
     ordered = is_order_relation(relation) and None not in (si_axis, sj_axis)
     detection = (
-        DetectionReference(state.assignments)
+        DetectionReference(included_detections(data.sessions, state.assignments))
         if ordered and relation in NEURON_RELATIONS
         else None
     )

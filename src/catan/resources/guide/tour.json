@@ -1,0 +1,1028 @@
+{
+  "version": 6,
+  "demo": {
+    "default_path": "demo/catan_demo_ID29",
+    "recipe": "catan_demo_recipe.json",
+    "alternative_assignments": "catan_demo_ID29_alternative.assignments.hdf5"
+  },
+  "help": {
+    "session_alignment": "alignment",
+    "model_results": "model",
+    "tracked_overview": "results#overview:overview_colour",
+    "footprints": "footprints",
+    "traces": "results#activity:activity",
+    "statistics": "statistics",
+    "selection_display": "results#selection_table:selection_tooltips",
+    "match_curator": "curation"
+  },
+  "quick": {
+    "id": "quick",
+    "title": "Quick tour",
+    "summary": "What is where, and what each panel is for.",
+    "description": "A short look around: the main menu, the panels and what each of them is for. Every stop links to the detailed guide.",
+    "minutes": 6,
+    "steps": [
+      {
+        "title": "Quick tour",
+        "text": "A short look around CATAN: where your data is loaded and processed, which panels there are and what you do with them — about six minutes. Every stop has a <b>Learn more</b> button that opens the detailed guide for it; it brings you back here afterwards.<br><br>Panels show more with data. Without data loaded, <b>Load the demo in the background</b> loads the small demo dataset, fits the match model and tracks the neurons while you read on (a minute or two). If your own data is loaded, the tour uses it and changes nothing.",
+        "do_it": "quick_setup",
+        "do_it_label": "Load the demo in the background"
+      },
+      {
+        "title": "Main menu",
+        "text": "The left side holds your data and its processing, from top to bottom: loading and saving, the sessions, the match model and the tracked neurons (assignments); at the bottom the background tasks and memory use.",
+        "anchor": "main_menu",
+        "more": "welcome"
+      },
+      {
+        "title": "Loading and saving",
+        "text": "Choose the <b>root folder</b> where your sessions live, then add data with <b>+</b>: a CATAN project, session files, a loading recipe or a path table — or a file pattern (glob). The floppy button (<b>Ctrl+S</b>) saves the project.",
+        "anchor": "load.add_row",
+        "more": "project"
+      },
+      {
+        "title": "Sessions",
+        "text": "One row per session, in recording order (S0, S1, …). The checkbox leaves a session out of tracking, calculations and displays; the dot shows its status; the cog opens its loading configuration; right-click for more (background, alignment, removing).",
+        "anchor": "sessions.list",
+        "more": "project#session_list:process_session"
+      },
+      {
+        "title": "The match model",
+        "text": "The match model decides how likely two footprints of different sessions belong to the same neuron, from their distance and shape similarity. <b>▶</b> calculates what it needs and fits it; <b>+</b> creates a new model next to the loaded ones.",
+        "anchor": "menu.model_row",
+        "more": "model"
+      },
+      {
+        "title": "Tracking neurons",
+        "text": "The assignments are the tracked neurons: which footprint of each session belongs to which neuron. <b>▶</b> registers the sessions one after another with the model; the parameters below set how strict it is, and the counts show your review progress.",
+        "anchor": "menu.assignments_row",
+        "more": "registration"
+      },
+      {
+        "title": "Panels",
+        "text": "The right side is a grid of panels. The button at a panel's top left chooses its view: <b>Plots</b> (Overview, Neuron footprints, Neuron activity, Statistics), <b>Selection table</b>, <b>Curation</b> (Session alignment, Match model, Neuron tracking). <b>+ →</b> / <b>+ ↓</b> split a panel, <b>×</b> closes it.<br><br>Panels are <b>linked</b>: what you select, focus or hover in one is shown in all others. Neuron activity (calcium traces) is not part of this tour: the demo has no traces.",
+        "anchor": "panel.mode_selector",
+        "more": "welcome#panels:split"
+      },
+      {
+        "title": "Session alignment",
+        "text": "All sessions are mapped onto one common field of view. Here you check how well each session fits — overlaid images, the correlation raster of all session pairs — and correct a shift by dragging when needed.",
+        "anchor": "panel.alignment",
+        "panel": "session_alignment",
+        "interactive": "none",
+        "on_enter": "open_panel",
+        "more": "alignment"
+      },
+      {
+        "title": "Help for each panel",
+        "text": "The <b>?</b> in a panel's header opens the part of the guide about that panel, whenever you are unsure what a view does.",
+        "anchor": "panel.help_button",
+        "interactive": "none"
+      },
+      {
+        "title": "Match model panel",
+        "text": "The model's evidence and fit: distances and similarities of footprint pairs, the two populations (same and different neurons) and the resulting match probability. Hover the plots for values.",
+        "anchor": "panel.model",
+        "panel": "model_results",
+        "interactive": "none",
+        "on_enter": "open_panel",
+        "more": "model"
+      },
+      {
+        "title": "Overview",
+        "text": "All tracked neurons in the field of view. Click a neuron to focus it, Ctrl + click to select several, hover for its values; the colour can show any statistic.",
+        "anchor": "panel.overview",
+        "panel": "tracked_overview",
+        "interactive": "none",
+        "on_enter": "open_panel",
+        "more": "results#overview:overview_colour"
+      },
+      {
+        "title": "Neuron navigation",
+        "text": "Below the panels: the <b>focused neuron</b> — the one the footprint views show in detail. Type a number or step through the neurons (or through your selection) with the arrows.",
+        "anchor": "navigation_bar",
+        "more": "results#navigation:radius"
+      },
+      {
+        "title": "Neuron footprints",
+        "text": "The focused neuron's footprint in every session, with its neighbours. This is where you review a neuron: tag it reviewed or uncertain, and right-click a footprint to move, merge, compare or check it.",
+        "anchor": "panel.footprints",
+        "panel": "footprints",
+        "interactive": "none",
+        "on_enter": "open_panel",
+        "more": "footprints"
+      },
+      {
+        "title": "Statistics",
+        "text": "Any statistic of your data as a histogram, scatter plot or session series. Select values in the plot to select those neurons in all other panels.",
+        "anchor": "panel.statistics",
+        "panel": "statistics",
+        "interactive": "none",
+        "on_enter": "open_panel",
+        "more": "statistics"
+      },
+      {
+        "title": "Selection table",
+        "text": "The selected neurons with values of your choice. Its columns are also what the hover tooltips of the footprints show.",
+        "anchor": "panel.selection_table",
+        "panel": "selection_display",
+        "interactive": "none",
+        "on_enter": "open_panel",
+        "more": "results#selection_table:selection_tooltips"
+      },
+      {
+        "title": "Neuron tracking",
+        "text": "Curation: filters (presets) find suspicious or reliable neurons — e.g. split or merge candidates, swapped footprints, well-tracked neurons — and act on the matches or let you step through them.",
+        "anchor": "panel.curation",
+        "panel": "match_curator",
+        "interactive": "none",
+        "on_enter": "open_panel",
+        "more": "curation"
+      },
+      {
+        "title": "Tasks and saving",
+        "text": "Loading, alignment, fitting and tracking run in the background; they are listed here and can be cancelled. Save the project with <b>Ctrl+S</b>: sessions, alignment, model and assignments with all your changes.",
+        "anchor": "tasks",
+        "more": "saving"
+      },
+      {
+        "title": "That's the overview",
+        "text": "The <b>detailed guide</b> goes through all of this step by step, on the demo data. Open it now, or later with the <b>?</b> button next to the root folder — and the <b>?</b> of any panel opens its part.",
+        "more": "outline"
+      }
+    ]
+  },
+  "chapters": [
+    {
+      "id": "welcome",
+      "title": "Welcome and layout",
+      "summary": "What CATAN does and where things are.",
+      "steps": [
+        {
+          "title": "Welcome to CATAN",
+          "text": "CATAN tracks neurons across imaging sessions: it aligns the sessions, registers each neuron's footprints across them, and helps you check and curate the result.<br><br>This tour shows where things are and walks you through a small demo dataset. You do each step yourself; where it helps, <i>Do it for me</i> does it for you.<br><br>Close the tour at any time and reopen any chapter with the <b>?</b> button."
+        },
+        {
+          "title": "Main menu",
+          "anchor": "main_menu",
+          "text": "The left side holds your data and its processing, from top to bottom:<ul><li><b>Loading</b>: the root folder, adding data, saving the project</li><li><b>Sessions</b>: the session list with each session's data and status</li><li><b>Model and assignments</b>: the match model and the tracked neurons</li><li>at the bottom: background tasks and memory use</li></ul>"
+        },
+        {
+          "id": "panels",
+          "title": "Panels",
+          "anchor": "display_area",
+          "text": "The right side is a grid of panels. Each panel shows one view of your data — plots, tables or curation tools — and you arrange them as you like. The layout is kept for your next session."
+        },
+        {
+          "title": "Choosing what a panel shows",
+          "anchor": "panel.mode_selector",
+          "text": "This button chooses the panel's view:<ul><li><b>Plots</b>: Overview, Neuron footprints, Neuron activity, Statistics</li><li><b>Selection table</b>: values of the selected neurons</li><li><b>Curation</b>: Session alignment, Match model, Neuron tracking</li></ul>Several panels side by side are <b>linked</b>: what you select, focus or hover in one is shown in all. Later chapters open the views they need."
+        },
+        {
+          "id": "split",
+          "title": "Splitting and closing panels",
+          "anchor": "panel.split_buttons",
+          "text": "<b>+ →</b> splits a panel side by side, <b>+ ↓</b> one above the other, <b>×</b> closes it. Drag the borders between panels to resize them."
+        },
+        {
+          "title": "Background tasks",
+          "anchor": "tasks",
+          "text": "Loading, alignment, model fitting and registration run in the background, so CATAN stays responsive. Running and queued tasks are listed here; you can cancel them."
+        },
+        {
+          "title": "Reopening the guide",
+          "anchor": "guide.button",
+          "text": "This <b>?</b> button reopens the guide: pick any chapter, switch the startup offer on or off, or choose the demo data folder.<br><br>Next: loading the demo data."
+        }
+      ],
+      "description": "Where things are: the main menu, panels and their views, background tasks.",
+      "minutes": 2
+    },
+    {
+      "id": "project",
+      "title": "Project and data",
+      "summary": "Load sessions, configure their data, save a project.",
+      "steps": [
+        {
+          "title": "The demo data",
+          "skip_if": [],
+          "wait_for": "demo_available",
+          "do_it": "choose_demo_folder",
+          "do_it_label": "Choose demo folder…",
+          "text": "The demo dataset holds 4 sessions of one mouse (20240719–20240722): each session folder has CaImAn results (footprints and quality values; the activity traces are left out to keep it small) and, in <i>mc/</i>, a correlation image used as background.<br><br>Demo folder: <i>{demo_path}</i>"
+        },
+        {
+          "title": "Root folder",
+          "anchor": "load.root_folder",
+          "wait_for": "root_is_demo",
+          "skip_if": [
+            "root_is_demo"
+          ],
+          "do_it": "set_demo_root",
+          "text": "The root folder is where your sessions live. Session paths and file searches start here, and the project is saved in its <i>catan</i> subfolder.<br><br>Click <b>…</b> and select the demo folder:<br><i>{demo_path}</i>",
+          "on_enter": "offer_demo_root_start",
+          "on_leave": "clear_demo_root_start"
+        },
+        {
+          "title": "Adding sessions",
+          "anchor": "load.add_row",
+          "wait_for": "demo_sessions_registered",
+          "skip_if": [
+            "demo_sessions_registered"
+          ],
+          "do_it": "load_demo_recipe",
+          "text": "<b>+</b> adds data. With <b>from file</b> you pick a CATAN project, a session file, a loading recipe (.json) or a path table (.csv); with <b>.* (glob)</b> you enter a pattern (e.g. <i>*/results_CaImAn_*.hdf5</i>) and CATAN finds all matching files below the root folder, assuming these are session files.<br><br>For the demo: click <b>+</b> (from file) and open <b>{demo_recipe}</b> in the demo folder. A loading recipe lists sessions together with their configuration. A dialog lists the 4 sessions — keep them selected and confirm. The guide then moves on to the loading progress.",
+          "advance_when": "demo_sessions_registered",
+          "on_enter": "offer_demo_add_start",
+          "on_leave": "clear_demo_add_start"
+        },
+        {
+          "title": "Loading",
+          "anchor": "tasks",
+          "wait_for": "loading_finished",
+          "text": "CATAN now loads each session's footprints, background and quality values and aligns the sessions to each other. Progress is shown here; the guide waits while the tasks run.<br><br>When all tasks are done (a few seconds for the demo), click <b>Next</b>."
+        },
+        {
+          "id": "session_list",
+          "title": "The session list",
+          "anchor": "sessions.list",
+          "text": "One row per session, in recording order:<ul><li><b>S0, S1, …</b>: the session's position, used throughout CATAN, next to its name (e.g. {first_session})</li><li>the checkbox includes or excludes the session: an excluded session is left out of tracking, calculations and displays (its data stays loaded)</li><li>the name can be edited; drag rows to reorder them</li><li>the dot shows the session's status — click it for details</li></ul>Right-click a row for more: change the background, adjust the alignment, remove the session."
+        },
+        {
+          "title": "A session's configuration",
+          "anchor": "sessions.first_row.config",
+          "do_it": "open_session_config",
+          "do_it_label": "Open it for me",
+          "text": "The gear button opens the session's <b>configuration</b>: which file and dataset each kind of data comes from.<ul><li><b>Spatial data</b>: footprints and the background — in the demo the background is <i>mc/ID29_&lt;date&gt;_Cn.tiff</i></li><li><b>Quality data</b>: CNN, SNR, r-values from the source (optional)</li><li><b>Trace data</b>: activity — switched off in the demo</li></ul>CATAN checks in the background whether the file fits the configuration and colours each field: <b style='color:#6A9A74'>green</b> found, <b style='color:#A88A52'>yellow</b> not found but optional, <b style='color:#A8676B'>red</b> required but not found (grey: not checked yet). Loading stops while a required field is missing.<br><br>After editing a field, <b>Apply changes</b> loads what changed. For your own data, CATAN suggests a configuration from the file format; a recipe saves it for all sessions."
+        },
+        {
+          "id": "process_session",
+          "title": "Processing a session",
+          "anchor": "sessions.first_row.process",
+          "text": "This button (re)loads a session's data; its arrow switches single data groups (traces, quality, footprints) on or off. You rarely need it — loading runs automatically when sessions are added."
+        },
+        {
+          "title": "Saving the project",
+          "anchor": "load.save_button",
+          "wait_for": "project_saved",
+          "skip_if": [
+            "project_saved"
+          ],
+          "do_it": "save_project",
+          "text": "Save the project: CATAN asks for a name and writes <i>name.catan.hdf5</i> (with the sessions and, later, the model and tracked neurons) into<br><i>{project_folder}</i>.<br><br>Next time, open it with <b>+</b> (from file) or File ▸ Open project."
+        },
+        {
+          "title": "Data loaded",
+          "text": "You can now load sessions, check their configuration and save a project.<br><br>Next: checking the <b>session alignment</b> — the basis for everything that follows."
+        }
+      ],
+      "description": "Create a project from the demo folder: root folder, adding and configuring sessions, saving.",
+      "minutes": 5
+    },
+    {
+      "id": "alignment",
+      "title": "Session alignment",
+      "summary": "Check and correct how the sessions are aligned.",
+      "description": "Compare sessions, the correlation raster and mean shifts, compare a background with its footprints, correct and apply alignments.",
+      "minutes": 9,
+      "requires": [
+        "sessions_loaded"
+      ],
+      "setup": "setup_chapter",
+      "steps": [
+        {
+          "title": "The alignment panel",
+          "text": "All sessions are mapped onto one common field of view; this panel checks how well each session fits in.<br><br>It opens on the current session, <b>{first_session}</b>. The first session defines the common frame, so it has nothing earlier to be compared with: you see it against its own current geometry, and both images coincide.<br><br>To compare two sessions, click a cell off the diagonal of the <b>correlation raster</b> (the small grid in the panel), or let me show S1.",
+          "anchor": "panel.alignment",
+          "panel": "session_alignment",
+          "wait_for": "later_session_shown",
+          "do_it": "select_later_session",
+          "do_it_label": "Show S1 for me"
+        },
+        {
+          "title": "Comparing two sessions",
+          "text": "Now the session (<b>magenta</b>) lies on its reference (<b>green</b>): where both agree, the image turns grey/white; structures that don't coincide appear as magenta and green fringes.<br><br>The label at the bottom left names both, e.g. <i>■ 20240720 (S1) ↔ ■ 20240719 (S0)</i>. Zoom and pan the image to look closer.",
+          "anchor": "panel.alignment",
+          "panel": "session_alignment"
+        },
+        {
+          "title": "The correlation raster",
+          "text": "Each cell compares two sessions: the brighter, the better their backgrounds match after alignment. Dark cells point to a problem.<ul><li><b>Click a cell</b> to compare that pair.</li><li><b>Click the diagonal</b> to see one session alone.</li></ul>",
+          "anchor": "alignment.correlation_inset",
+          "panel": "session_alignment"
+        },
+        {
+          "title": "Correcting a shift",
+          "anchor": "alignment.shift_controls",
+          "panel": "session_alignment",
+          "text": "If a session is off its reference, correct it:<ul><li><b>Shift + drag</b> on the image moves the session (Esc cancels the drag).</li><li>The shift controls set it numerically; ↻ allows a rotation.</li><li>The magic wands estimate the shift / rotation automatically.</li></ul>Changes stay a draft (<i>unapplied</i> in the label) until you apply them."
+        },
+        {
+          "title": "Fine corrections",
+          "text": "<ul><li><b>Refine flow</b> computes a smooth, non-rigid correction (optical flow) against the reference, starting from the current shift and rotation; its mean displacement is zero, so your shift is kept. Useful when parts of the field of view are deformed.</li><li><b>Footprint correction</b> estimates a small rigid correction (shift, slight rotation) from the footprints: it matches this session's cell centres to those of earlier sessions. Toggle it on and off to compare; its arrow menu refines all sessions at once.</li></ul>Both are previews until you apply.",
+          "anchor": "alignment.shift_controls",
+          "panel": "session_alignment"
+        },
+        {
+          "title": "Mean shifts",
+          "anchor": "alignment.shift_inset",
+          "panel": "session_alignment",
+          "wait_for": "shift_inset_shown",
+          "do_it": "show_shift_inset",
+          "do_it_label": "Show them for me",
+          "on_leave": "show_correlation_inset",
+          "text": "The inset can also show the <b>mean shifts</b> (display settings ▸ Inset; or let me switch it): each arrow is a session's mean displacement into the common frame (dx →, dy ↑, in pixels).<ul><li><b>Hover</b> an arrow: after a moment the panel previews that session on its reference; the line below names it and its shift.</li><li><b>Click</b> an arrow: that session becomes the edited one, and thin lines from its tip show where it would lie if aligned against each single reference session — hover them to preview, click one to use that reference.</li><li><b>Drag</b> the tip of the edited session's arrow to set its shift.</li><li>Click empty space (or the arrow again) to release it.</li></ul>Leaving this step switches the inset back to the correlation raster."
+        },
+        {
+          "title": "Display settings",
+          "text": "The gear opens the display settings (or let me): the view (overlay, flow, correlation surface), the reference session and, for <b>this session</b> and the <b>reference</b> separately, whether the background or the projected <b>footprints</b> are shown. Open them (or let me) and try them out.",
+          "anchor": "alignment.settings",
+          "panel": "session_alignment",
+          "do_it": "open_alignment_settings",
+          "do_it_label": "Open them for me",
+          "wait_for": "alignment_settings_open"
+        },
+        {
+          "title": "Background or footprints",
+          "anchor": "alignment.settings",
+          "panel": "session_alignment",
+          "on_leave": "close_alignment_settings",
+          "text": "Backgrounds are usually the better basis for the alignment. A background that sits a few pixels off its own footprints is moved onto them when loading. Only when a session's background does not resemble its footprints at all, CATAN marks the session with ⚠ in the session list and aligns it by its <b>footprint projection</b> (the sum of its footprints) instead. The background is still loaded.<br><br><b>This session</b> chooses what the edited session is aligned by — applied together with the alignment; <b>Reference</b> only changes what is shown for the reference."
+        },
+        {
+          "title": "Applying",
+          "anchor": "alignment.apply_reset",
+          "panel": "session_alignment",
+          "text": "<b>Apply</b> commits the draft. Sessions aligned against this one then become <i>outdated</i>: they keep their alignment but are realigned on request.<br><br>The <b>reset</b> button (↻, at the top right next to the gear) discards all unapplied changes of the draft and resets both views."
+        },
+        {
+          "title": "Outdated and failed alignments",
+          "text": "This button realigns all outdated sessions. If an automatic alignment fails or needs confirmation, CATAN asks you to review it here: accept the proposal, correct it, or keep the current alignment.",
+          "anchor": "alignment.update_stale",
+          "panel": "session_alignment"
+        },
+        {
+          "title": "One session alone",
+          "text": "Click the diagonal cell of the session shown (or let me do it): the panel shows this session's background alone, in grey — the starting point for checking it against its own footprints.",
+          "anchor": "alignment.correlation_inset",
+          "panel": "session_alignment",
+          "wait_for": "alignment_self_view",
+          "do_it": "alignment_self_view"
+        },
+        {
+          "title": "Background vs. footprints",
+          "anchor": "alignment.self_view_bar",
+          "panel": "session_alignment",
+          "wait_for": "alignment_compare_on",
+          "do_it": "alignment_compare",
+          "text": "A special case, rarely needed: does a session's background fit its <b>own</b> footprints? Tick <b>Compare with footprints</b> (or let me): the session's footprints (green) are drawn on its background (magenta). They should mostly sit on the bright cell bodies — if not, the background does not fit these footprints (wrong file, orientation or motion correction).<br><br>Correct an offset with the same tools as a session shift (see <i>Correcting a shift</i>) — here they move the <b>background</b> onto the footprints, which stay. Applying aligns the session anew from its corrected background. CATAN already does this when loading if the background sits only a few pixels off its footprints."
+        },
+        {
+          "title": "Back to a comparison",
+          "anchor": "alignment.correlation_inset",
+          "panel": "session_alignment",
+          "wait_for": "alignment_pair_view",
+          "do_it": "alignment_pair_view",
+          "do_it_label": "Compare for me",
+          "text": "To compare two sessions again, click a cell <b>off the diagonal</b> of the correlation raster (row: the later session, column: the earlier one), or let me compare with the reference. Changing the reference, the view or the session also leaves the single-session view."
+        },
+        {
+          "title": "Changing a background",
+          "text": "Right-click a session in the session list → <b>Change background</b>: keep the configured one, <b>Select background…</b> — pick the dataset and its <b>source</b>: the session's own file or any other file (e.g. a separately saved mean or correlation image) — or <b>Construct from footprints</b>. If its automatic alignment fails, <b>Load with current alignment</b> still loads it, and you correct it here afterwards.",
+          "anchor": "sessions.list"
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "title": "Match model",
+      "summary": "Fit and judge the model that decides which footprints match.",
+      "description": "Fitting the match model, reading its evidence and plots, and what its distance and correlation parameters mean.",
+      "minutes": 7,
+      "requires": [
+        "sessions_loaded"
+      ],
+      "setup": "setup_chapter",
+      "steps": [
+        {
+          "title": "The match model",
+          "text": "To decide whether two footprints of different sessions belong to the same cell, CATAN compares their <b>distance</b> and <b>shape similarity</b> (correlation) with a statistical model of two populations: pairs of the same cell, and pairs of neighbouring different cells.<br><br>If this panel is still empty: nothing has been calculated yet — neither the evidence (distances and correlations of footprint pairs) nor the model. The plots are explained once they show data.",
+          "anchor": "panel.model",
+          "panel": "model_results"
+        },
+        {
+          "id": "fit",
+          "title": "Fit the model",
+          "text": "The <b>▶</b> button of the model row does both: it calculates the missing evidence and then fits the model, in the background. Click it (or let me) — this also takes care of the panel's note about missing evidence records.<br><br>The selector shows <b>Model: Project</b>: the model held in memory and saved with the project. Further models can be loaded next to it, or created with the <b>+</b> button next to it (new, empty, or a copy of the current one), so building a model does not overwrite a loaded one; the selected one is used.<br><br>Fitting and registering are the most costly steps of CATAN: with many sessions and neurons they can take several minutes. They run in the background — the <b>task overview</b> in the main menu shows their progress (and can cancel them).",
+          "anchor": "menu.model_row",
+          "wait_for": "model_fitted",
+          "do_it": "fit_model",
+          "do_it_label": "Fit it for me"
+        },
+        {
+          "title": "The evidence",
+          "text": "The plot at the bottom right holds the evidence: footprint pairs of consecutive sessions, by shape <b>correlation</b> (horizontal) and centroid <b>distance</b> (vertical).<ul><li>Opacity: how many pairs fall into a bin.</li><li>Colour: the fraction of <i>nearest-neighbour</i> pairs there (green: mostly nearest neighbours, red: mostly not).</li></ul>Nearest neighbour is evidence, not a ground-truth label: close, similar pairs are mostly the same cell.",
+          "anchor": "model.joint",
+          "panel": "model_results"
+        },
+        {
+          "title": "The distance model",
+          "text": "Left: the distances as a histogram (counts grow to the left; nearest neighbours green, others red, all grey) with the fitted curves (same cell green, different cells red, sum black). Its parameters (hover one for its explanation):<ul><li><b>π<sub>same</sub></b>: prior fraction of pairs that are the same cell (weights both curves).</li><li><b>h</b>: exclusion radius — different cells cannot come closer than their physical extent; <b>σ<sub>h</sub></b>: its spread, from the variation of cell sizes.</li><li><b>σ<sub>det</sub></b>: detection noise, the scatter of one footprint's centre.</li><li><b>σ<sub>move</sub></b>: movement between consecutive sessions; <b>ν<sub>move</sub></b>: how heavy its tail is (large: Gaussian).</li></ul>",
+          "anchor": "model.distance_parameters",
+          "panel": "model_results"
+        },
+        {
+          "title": "The correlation model",
+          "text": "Top: the correlations as a histogram with the fitted curves (green same cell, red different cells). Both populations are <b>Gamma distributions</b> of 1 − correlation:<ul><li><b>μ<sub>same</sub></b>, <b>k<sub>same</sub></b>: the mean correlation of the same cell and its shape (the larger k, the narrower).</li><li><b>β<sub>same</sub></b>: how fast that mean correlation drops with the distance — a footprint detected further from the neuron's centre also differs more in its completeness and shape.</li><li><b>μ<sub>diff</sub></b>, <b>k<sub>diff</sub></b>: mean correlation and shape for different cells.</li></ul>Hover a parameter for its explanation.",
+          "anchor": "model.correlation_parameters",
+          "panel": "model_results"
+        },
+        {
+          "title": "The match probability",
+          "text": "Back at the bottom right: the black contours are the model's probability that a pair is the same cell, <b>p(same)</b>, at 5 %, 50 % and 95 %; they should follow the edge between the green and red evidence.<br><br>The selectors at the top switch the view between <b>2D</b> and <b>3D</b> and the height between <b>Counts</b> (the evidence) and <b>p(same)</b> (the model). In 3D, drag to rotate. Hover the plot (2D or 3D) to read the distance, correlation, p(same) and number of pairs there.",
+          "anchor": "model.joint",
+          "panel": "model_results"
+        },
+        {
+          "title": "Model options",
+          "text": "The gear opens the model options (or let me):<ul><li><b>Fit model</b>: fit again, e.g. after realigning sessions.</li><li><b>Session difference</b>: which evidence the plots show (0: within a session, 1: consecutive sessions, …) — display only.</li><li><b>Calculate missing evidence</b> appears when evidence is missing or outdated, e.g. after an alignment changed.</li></ul>",
+          "anchor": "model.options",
+          "panel": "model_results",
+          "do_it": "open_model_options",
+          "do_it_label": "Open them for me",
+          "on_leave": "close_model_options"
+        },
+        {
+          "title": "Editing parameters",
+          "text": "Edit a parameter to preview its effect: the faded curves show the applied model. <b>Apply to model</b> updates the model with them (registration then uses them); the arrow next to the reset button reverts the preview.<br><br>A plausible fit: the same-cell curve explains the narrow peak of close nearest neighbours, and h is about a cell diameter.",
+          "anchor": "model.parameters",
+          "panel": "model_results"
+        },
+        {
+          "title": "Where the model is used",
+          "text": "With the model, each footprint gets a <b>probability to match each neuron</b>: registration assigns footprints by it, and curation presets derive thresholds from the parameters (e.g. 2·(σ<sub>det</sub> + σ<sub>move</sub>) as the allowed step between sessions) — so they adapt to your data."
+        }
+      ]
+    },
+    {
+      "id": "registration",
+      "title": "Registering neurons",
+      "summary": "Track neurons across sessions.",
+      "description": "Registration parameters and running the registration.",
+      "minutes": 2,
+      "requires": [
+        "sessions_loaded",
+        "model_fitted"
+      ],
+      "setup": "setup_chapter",
+      "steps": [
+        {
+          "title": "Registration parameters",
+          "text": "<ul><li><b>Match p</b>: minimum match probability to add a footprint to an existing neuron.</li><li><b>Drop p</b>: a footprint that lost its match to another one is dropped instead of becoming a new neuron if its probability reaches this.</li><li><b>Union a</b>: how strongly a new footprint updates the neuron's combined (union) footprint.</li></ul>Hover them for details. The defaults are a good start.",
+          "anchor": "menu.registration_parameters"
+        },
+        {
+          "title": "Register the neurons",
+          "text": "Run the registration with this row's process button (or let me do it). CATAN goes through the sessions in order and assigns each footprint to a neuron or starts a new one.<br><br>Like fitting, this can take several minutes for large data sets; the task overview shows its progress.",
+          "anchor": "menu.assignments_row",
+          "wait_for": "neurons_registered",
+          "do_it": "register_neurons",
+          "do_it_label": "Register for me"
+        },
+        {
+          "title": "The result",
+          "text": "Each neuron now has at most one footprint per session, each with its match probability. The counts show how many neurons are reviewed, uncertain or still pending — curation works on these.<br><br>Next: looking at the tracked neurons.",
+          "anchor": "menu.review_counts"
+        }
+      ]
+    },
+    {
+      "id": "results",
+      "title": "Looking at the results",
+      "summary": "Linked views of the tracked neurons.",
+      "description": "Linked views: overview and footprints side by side, focusing and selecting neurons, the selection table (which also sets the hover tooltips).",
+      "minutes": 9,
+      "requires": [
+        "neurons_registered"
+      ],
+      "setup": "setup_chapter",
+      "panels": [
+        "tracked_overview",
+        "footprints"
+      ],
+      "steps": [
+        {
+          "title": "Two linked views",
+          "anchor": "display_area",
+          "panel": "tracked_overview",
+          "text": "From here on, the guide works with several panels side by side: the <b>Overview</b> (all neurons of the field of view) and <b>Neuron footprints</b> (one neuron in every session). They are linked: what you select, focus or hover in one is shown in the other — and in every other open panel."
+        },
+        {
+          "id": "navigation",
+          "title": "The neuron navigation bar",
+          "text": "Now that neurons are tracked, this bar becomes useful: it holds the <b>focused neuron</b> — the one the footprint views show in detail.",
+          "anchor": "navigation_bar"
+        },
+        {
+          "title": "Stepping through neurons",
+          "text": "Type a neuron ID, use the arrows or the slider to focus a neuron (or let me focus the next one) — and watch both panels follow. The keyboard does the same: <b>←</b> / <b>→</b> step to the previous / next neuron (whenever no text field has the cursor).<br><br>The <b>Review</b> selector next to them sets which review states the arrows step through, e.g. only neurons not yet reviewed.",
+          "anchor": "navigation.stepper",
+          "wait_for": "neuron_focused",
+          "do_it": "focus_next_neuron",
+          "do_it_label": "Focus one for me"
+        },
+        {
+          "id": "radius",
+          "title": "Neighbourhood radius",
+          "text": "Neurons within this radius of the focused one count as its neighbours: the footprint views show them too, so you see what a footprint could be confused with.",
+          "anchor": "navigation.radius"
+        },
+        {
+          "id": "overview",
+          "title": "The overview",
+          "anchor": "panel.overview",
+          "panel": "tracked_overview",
+          "text": "All tracked neurons, drawn as their combined (union) footprints.<ul><li><b>Click</b> a neuron to select and focus it: the footprints panel shows it.</li><li><b>Hover</b> a neuron for a tooltip: its ID and session, and the values of the statistics you choose for it — by default its <i>occurrence</i> (in how many sessions it was found). Which values the tooltip shows is set in the selection table, later in this chapter.</li><li><b>Colours</b>: hovered blue, selected green, focused bright green.</li></ul>"
+        },
+        {
+          "title": "Selecting several neurons",
+          "anchor": "panel.overview",
+          "panel": "tracked_overview",
+          "wait_for": "several_selected",
+          "do_it": "select_some_neurons",
+          "do_it_label": "Select some for me",
+          "text": "<b>Ctrl + click</b> adds a neuron to the selection or removes it; a plain click selects only that one again. <b>Shift + drag</b> selects all neurons inside a rectangle (<b>Shift + Ctrl + drag</b> adds them). Select a few neurons (or let me).<br><br>With several neurons selected, the navigation bar (framed below) shows <i>Selected n / N neurons</i> and its arrows step through the selection only.",
+          "also_open": [
+            "navigation_bar"
+          ]
+        },
+        {
+          "title": "Overview options",
+          "anchor": "overview.options",
+          "panel": "tracked_overview",
+          "do_it": "open_overview_options",
+          "do_it_label": "Open them for me",
+          "on_leave": "close_overview_options",
+          "text": "The gear holds the display options (or let me open them):<ul><li><b>Review status</b>: which neurons are drawn.</li><li><b>Background</b>: the current session's, a fixed session's or one loaded from a file, and its colormap.</li><li><b>Border</b>: the red overlay marks pixels not imaged in all sessions.</li><li><b>Show current session only</b>: that session's detected footprints instead of the neurons' unions.</li><li><b>Threshold</b>: the outline level — a footprint is drawn where its pixels exceed this fraction of its own peak (0.1: everything above 10 % of the brightest pixel; higher values draw only the cores).</li></ul>"
+        },
+        {
+          "id": "overview_colour",
+          "title": "Colouring by a statistic",
+          "anchor": "overview.statistic",
+          "panel": "tracked_overview",
+          "text": "Below the plot, choose a <b>statistic</b> to colour the neurons by (e.g. their occurrence or match probability), with its colormap. How to choose and combine statistics is shown in the Statistics chapter."
+        },
+        {
+          "id": "footprints",
+          "title": "Neuron footprints",
+          "anchor": "panel.footprints",
+          "panel": "footprints",
+          "wait_for": "neuron_focused",
+          "do_it": "focus_next_neuron",
+          "do_it_label": "Focus a neuron for me",
+          "text": "This panel shows the focused neuron's footprint in every session, stacked session by sess  ion, together with its neighbours within the radius. Highlighted footprints are always shown, however far away."
+        },
+        {
+          "id": "footprint_options",
+          "title": "Footprint options",
+          "anchor": "footprints.options",
+          "panel": "footprints",
+          "wait_for": "footprint_options_open",
+          "do_it": "open_footprint_options",
+          "do_it_label": "Open them for me",
+          "on_leave": "close_footprint_options",
+          "text": "The gear of this panel decides what is drawn, in three groups (or let me open it):<ul><li><b>Neurons</b> — <b>Show</b>: <i>Nearby</i> neurons within the radius, or the <i>Selected</i> ones; <b>Review status</b>: which neurons; <b>Show excluded</b> (off by default): also excluded neurons and footprints.</li><li><b>Sessions</b> — <b>Show</b>: <i>All</i> sessions, or only those <i>With focused</i> neuron; <b>One session only</b>: footprints of the session chosen with the session slider next to the panel, optionally <i>also for the focused neuron</i> and with gaps <i>filled with inferred</i> footprints (cyan: a neuron's union at its expected position where it was not detected).</li><li><b>View</b> — <b>Threshold</b>, <b>Z stretch</b>: drawn pixels and session spacing; <b>Coordinate grid</b>: floor grid, hover coordinates and direction marker; <b>Rotate on focus</b>: turn the view once around each newly focused neuron (duration of a turn next to it; dragging the view stops it).</li></ul>"
+        },
+        {
+          "id": "activity",
+          "title": "Neuron activity",
+          "anchor": "panel.mode_selector",
+          "text": "Plots ▸ Neuron activity shows the calcium traces of the focused neuron in each session. The demo data has no traces (they are large), so it is left out here."
+        },
+        {
+          "id": "selection_table",
+          "title": "The selection table",
+          "anchor": "panel.selection_table",
+          "panel": "selection_display",
+          "panels": [
+            "tracked_overview",
+            "footprints",
+            "selection_display"
+          ],
+          "wait_for": "several_selected",
+          "do_it": "select_some_neurons",
+          "do_it_label": "Select some for me",
+          "text": "The <b>Selection table</b> (now on the right) lists the selected neurons — select a few in the overview (Ctrl + click, or let me). Hovering a row shows it in the plots; a click highlights a footprint, a double click focuses the neuron."
+        },
+        {
+          "title": "Entity and rows",
+          "anchor": "selection.mode",
+          "panel": "selection_display",
+          "panels": [
+            "tracked_overview",
+            "footprints",
+            "selection_display"
+          ],
+          "text": "<b>Entity</b> chooses what a row is: a <i>footprint</i> (one neuron in one session) or a <i>neuron</i>. <b>Rows</b>: <i>Single</i> rows describe one entity, <i>Pairs</i> two (e.g. the distance between two footprints)."
+        },
+        {
+          "id": "selection_tooltips",
+          "title": "Columns are your hover tooltips",
+          "anchor": "selection.header",
+          "panel": "selection_display",
+          "panels": [
+            "tracked_overview",
+            "footprints",
+            "selection_display"
+          ],
+          "text": "<b>+</b> in the header adds a statistic as a column. Important: the columns of <b>Single</b> rows are also what the <b>tooltip shows when you hover</b>: footprint columns for footprints, neuron columns for neurons in the overview. Pair columns do not appear in tooltips.<br><br>Choosing statistics (reductions, session and neuron relations) is explained in the Statistics chapter."
+        }
+      ]
+    },
+    {
+      "id": "footprints",
+      "title": "Working with footprints",
+      "summary": "Inspect, tag and change single neurons.",
+      "description": "Review status, highlighting footprints, the right-click menu: reassigning, merging, tagging, checking against presets and comparing footprints.",
+      "minutes": 6,
+      "requires": [
+        "neurons_registered"
+      ],
+      "setup": "setup_chapter",
+      "panels": [
+        "tracked_overview",
+        "footprints"
+      ],
+      "steps": [
+        {
+          "title": "The review status",
+          "anchor": "footprints.review_tag",
+          "panel": "footprints",
+          "wait_for": "neuron_focused",
+          "do_it": "focus_next_neuron",
+          "do_it_label": "Focus a neuron for me",
+          "text": "Every neuron is <i>pending</i>, <i>reviewed</i> or <i>uncertain</i>. The tag at the top of the footprints panel shows the focused neuron's status (grey pending, green reviewed, orange uncertain) and which assignments are shown. Click the tag (▾) to change the status — or press <b>R</b> (reviewed), <b>U</b> (uncertain) or <b>P</b> (pending); <b>Shift + R / U / P</b> sets it for all selected neurons."
+        },
+        {
+          "title": "Highlighting footprints",
+          "anchor": "panel.footprints",
+          "panel": "footprints",
+          "wait_for": "footprint_highlighted",
+          "do_it": "highlight_footprint",
+          "do_it_label": "Highlight one for me",
+          "text": "<b>Click</b> a footprint to highlight it (orange) — in every panel; <b>Ctrl + click</b> adds or removes one (up to three). <b>Hover</b> a footprint for its values (the selection table's footprint columns)."
+        },
+        {
+          "title": "The right-click menu",
+          "anchor": "panel.footprints",
+          "panel": "footprints",
+          "text": "Right-click a footprint for everything you can do with it, in four groups:<ul><li><b>Inspect</b>: Set focus, Highlight all footprints of neuron N, Compare footprints, Check against preset.</li><li><b>Assignment</b>: <b>Reassign this footprint</b> to the focused neuron, a nearby or a new one (with how well it fits); <b>Move footprints of neuron N</b>: all, this and previous, this and following, or the highlighted ones, into the selected neuron, a nearby or a new one. Options that do not apply are greyed out; hover them for the reason.</li><li><b>Shape</b>: split this footprint, merge it with other footprints of the session, or replace it with the union shape.</li><li><b>Inclusion</b>: exclude / include the footprint or the neuron, remove.</li></ul>"
+        },
+        {
+          "title": "The status line",
+          "anchor": "menu.review_counts",
+          "wait_for": "neuron_reviewed",
+          "do_it": "mark_focused_reviewed",
+          "do_it_label": "Mark it for me",
+          "text": "The status line in the main menu keeps count of your work on the active assignments:<ul><li><b>Reviewed · Uncertain · Pending</b>: neurons per review status (included neurons only).</li><li><b>Splits · Merges · Reassignments</b>: the manipulations recorded so far (also those loaded with the assignments), and the number of <b>excluded footprints</b>.</li></ul>Mark the focused neuron as reviewed (<b>R</b>, the tag, or let me) and watch <i>Reviewed</i> go up and <i>Pending</i> down."
+        },
+        {
+          "title": "Comparing footprints",
+          "anchor": "panel.footprints",
+          "panel": "footprints",
+          "text": "How similar are two footprints, or a footprint and a neuron? Select both (<b>Ctrl + click</b> in the footprints panel or the overview), then right-click one of them ▸ <b>Compare footprints</b>. A window lists the pair statistics — distance, overlap, similarity, match probability — in both directions (some are directional, e.g. <i>i inside j</i>). With three or more selected, <b>Compare … with ▸</b> chooses the partner."
+        }
+      ]
+    },
+    {
+      "id": "statistics",
+      "title": "Statistics",
+      "summary": "Plot any statistic and select neurons from it.",
+      "description": "Histograms, scatter plots and session series; choosing a statistic with its reductions and session / neuron relations; selecting from plots.",
+      "minutes": 8,
+      "requires": [
+        "neurons_registered"
+      ],
+      "setup": "setup_chapter",
+      "panels": [
+        "statistics",
+        "tracked_overview"
+      ],
+      "steps": [
+        {
+          "title": "The statistics panel",
+          "anchor": "statistics.selectors",
+          "panel": "statistics",
+          "text": "Plots ▸ Statistics plots any statistic of your data. Which plot you get depends on the selectors that are set:<ul><li>only <b>x</b> (below): a <b>histogram</b></li><li>only <b>y</b> (left): a <b>session series</b> — values per session</li><li>both: a <b>scatter</b> plot</li></ul>The overview next to it shows what you select."
+        },
+        {
+          "title": "Choosing a statistic",
+          "anchor": "statistics.x_selector",
+          "panel": "statistics",
+          "wait_for": "histogram_shown",
+          "do_it": "show_histogram",
+          "do_it_label": "Choose it for me",
+          "text": "Click the x selector: statistics come as <b>Single statistics</b> (one value per footprint or neuron, e.g. <i>Footprint size</i>) and <b>Pair statistics</b> (between two footprints or neurons, e.g. distances, similarities), grouped into footprint, neuron and footprint-to-neuron statistics. Hover an entry for its description. Choose <i>Footprint size</i> (or let me)."
+        },
+        {
+          "title": "Reductions",
+          "anchor": "statistics.reductions",
+          "panel": "statistics",
+          "text": "A statistic has dimensions — e.g. <i>Footprint size</i>: neuron × session. <b>Reductions</b> decide what one value is: per dimension <i>keep</i> it, take a <i>single</i> index, or reduce it (<i>mean, median, min, max, sum, std</i>). Keeping both gives one value per footprint; the median over sessions one per neuron."
+        },
+        {
+          "title": "Neuron and session relations",
+          "anchor": "statistics.pair_filters",
+          "panel": "statistics",
+          "text": "A pair statistic compares two things, e.g. two footprints. Two buttons decide <b>which pairs</b> are included:<ul><li><b>neuron:</b> <i>same</i> — both belong to one neuron (e.g. its footprints in different sessions); <i>different</i> — two different neurons (e.g. a neuron and its neighbours).</li><li><b>session:</b> <i>same</i> or <i>different</i> session, or one step in time: <i>with previous</i> (session s − 1), or along the neuron's own detections — its previous / next one, its first / last one, all earlier / all later ones.</li></ul>Example: <i>Cross-session distances</i> with <i>neuron: same</i> and <i>session: with previous instance</i> — how far each footprint lies from the neuron's previous detection."
+        },
+        {
+          "title": "Selecting in a histogram",
+          "anchor": "panel.statistics",
+          "panel": "statistics",
+          "text": "<ul><li><b>Click a bin</b> to select what its values belong to (Ctrl + click adds).</li><li>The <b>threshold line</b>: hover it for help; click to activate it or flip its direction, drag to move it — everything beyond is selected.</li></ul>Selections are made of neurons and footprints, not values: with one value per footprint (e.g. footprint size kept over sessions), <b>a single footprint</b> in the selected range selects it — and the overview then shows its whole neuron as selected. To select neurons that are unusual overall, reduce over the sessions first (e.g. their median).<br><br>The selection appears in every panel, and the navigation bar steps through it."
+        },
+        {
+          "title": "Scatter plots",
+          "anchor": "statistics.y_selector",
+          "panel": "statistics",
+          "wait_for": "scatter_shown",
+          "do_it": "show_scatter",
+          "do_it_label": "Plot it for me",
+          "text": "With a y statistic as well, each footprint or neuron becomes a point (or let me plot <i>Footprint elongation</i> against the size). Click a point to select it; with two thresholds, their intersection selects a corner; <b>Shift</b> picks points underneath a threshold line.<br><br>Both statistics need <b>fitting dimensions</b> — e.g. both one value per footprint, or both one per neuron. If they don't fit, nothing is plotted and a notice says why: adjust the reductions (e.g. the median over sessions for both)."
+        },
+        {
+          "title": "Session series",
+          "anchor": "statistics.selectors",
+          "panel": "statistics",
+          "wait_for": "series_shown",
+          "do_it": "show_series",
+          "do_it_label": "Show it for me",
+          "text": "Without an x statistic, y is plotted per <b>session</b>: its centre and spread over all neurons, and the selected neurons as their own line — e.g. how a neuron's size develops (or let me show it). A second y selector adds another series."
+        },
+        {
+          "title": "Statistics options",
+          "anchor": "statistics.options",
+          "panel": "statistics",
+          "do_it": "open_statistics_options",
+          "do_it_label": "Open them for me",
+          "on_leave": "close_statistics_options",
+          "text": "The gear (or let me): <b>Review status</b> of the neurons included, the number of histogram bins and <i>Aggregate equal values</i> for integer scatter plots. Comparing assignment sets has a chapter of its own."
+        }
+      ]
+    },
+    {
+      "id": "curation",
+      "title": "Curating",
+      "summary": "Find and fix tracking errors with presets.",
+      "description": "Reading a filter (AND / OR, by …, counts, applied to, thresholds), running presets, their matches, sources and targets and actions — with three presets — and building your own.",
+      "minutes": 12,
+      "requires": [
+        "neurons_registered"
+      ],
+      "setup": "setup_chapter",
+      "steps": [
+        {
+          "title": "Neuron tracking",
+          "text": "Curation ▸ Neuron tracking finds neurons or footprints that match a <b>filter</b>: conditions on statistics, combined in groups. Ready-made filters are called <b>presets</b>.<br><br>The footprints and the overview next to it show each match.",
+          "anchor": "panel.curation",
+          "panel": "match_curator"
+        },
+        {
+          "title": "Choose a preset",
+          "text": "Choose <b>High-confidence tracked neurons</b> (or let me): neurons tracked in at least 3 sessions whose footprints are all typical — candidates to mark as reviewed.",
+          "anchor": "curation.preset_selector",
+          "panel": "match_curator",
+          "wait_for": "preset_loaded",
+          "do_it": "load_preset",
+          "do_it_label": "Choose it for me"
+        },
+        {
+          "id": "filter",
+          "title": "Reading a filter",
+          "anchor": "curation.filter_tree",
+          "panel": "match_curator",
+          "text": "A filter reads like a sentence, top to bottom. Each box is a <b>group</b>; its first line says how its parts combine:<ul><li><b>AND</b> — all its conditions and subgroups must hold;</li><li><b>OR</b> — at least one of them.</li></ul>Indented boxes are subgroups, so groups nest like brackets. <b>ⓘ</b> shows the comment explaining a group (it also explains the presets)."
+        },
+        {
+          "title": "What one match is: “by …”",
+          "anchor": "curation.group_header",
+          "panel": "match_curator",
+          "on_enter": "reveal_anchor",
+          "text": "Next to AND / OR, <b>by …</b> says what a match is:<ul><li><b>by neuron</b> — a neuron passes or not (e.g. its occurrence);</li><li><b>by footprint</b> — each footprint is checked (its size, its match probability, …);</li><li><b>by pair relationship</b> — pairs of a <i>source</i> and a <i>target</i> (e.g. a footprint and another neuron): the basis of every move, merge or split.</li></ul>This preset is <i>AND by neuron</i>: tracked in more than 3 sessions, AND its footprint subgroup below."
+        },
+        {
+          "title": "Counting matches",
+          "anchor": "curation.count",
+          "panel": "match_curator",
+          "on_enter": "reveal_anchor",
+          "text": "A subgroup can <b>count</b> its matches. Here, the <i>OR by footprint</i> subgroup describes an <b>atypical footprint</b> (far from its union, unusual shape or size, low match probability, …), and <b>Count per neuron: exactly 0</b> requires that a neuron has <i>none</i> of them.<br><br><i>at least 1</i> would instead find neurons with an atypical footprint, <i>at most 1</i> tolerate one. In pair groups you also choose what is counted around a target or a source (distinct neurons or footprints)."
+        },
+        {
+          "title": "Conditions and thresholds",
+          "anchor": "curation.condition",
+          "panel": "match_curator",
+          "do_it": "open_condition",
+          "do_it_label": "Open one for me",
+          "on_enter": "reveal_anchor",
+          "text": "Each line in a group is a <b>condition</b>: a statistic and a threshold. Click one to open its editor (or let me):<ul><li><b>Statistic</b> — chosen as in the statistics panel, with reductions and neuron / session relations.</li><li><b>Match when</b> ≥, ≤ or between.</li><li>Where the bound comes from: <b>a fixed number</b>; <b>a percentile</b> of the values sampled from your data (resampled on every evaluation, so it adapts to each animal); or <b>from the fitted model</b> — e.g. 2·σ<sub>det</sub> + 2·σ<sub>move</sub>, following every refit.</li></ul><b>Optional</b> skips a condition whose statistic is missing. The editor closes when you click outside it (Cancel keeps the condition unchanged)."
+        },
+        {
+          "title": "Review status filter",
+          "text": "Which neurons to consider: e.g. skip neurons you already reviewed.",
+          "anchor": "curation.review_filter",
+          "panel": "match_curator"
+        },
+        {
+          "title": "Evaluate",
+          "text": "<b>Evaluate</b> runs the filter (or let me).",
+          "anchor": "curation.evaluate",
+          "panel": "match_curator",
+          "wait_for": "preset_evaluated",
+          "do_it": "evaluate_preset",
+          "do_it_label": "Evaluate for me"
+        },
+        {
+          "title": "The matches",
+          "anchor": "curation.select_button",
+          "panel": "match_curator",
+          "wait_for": "matches_selected",
+          "do_it": "select_matches",
+          "do_it_label": "Select them for me",
+          "text": "<b>Select matching neurons</b> selects them all (or let me); the navigation bar now steps through the matches only. The focused match is highlighted in the footprints and the overview. This preset has no sources or targets, so its footprints are simply shown as <b>targets</b> (orange).<br><br>Why does a neuron match, or not? Right-click it in the footprints ▸ <b>Check against preset</b>."
+        },
+        {
+          "title": "Acting on matches",
+          "text": "A preset can carry an <b>action</b> — this one: <i>mark reviewed</i>.<ul><li><b>Apply current</b> — only the focused match.</li><li><b>Apply all selected</b> — all selected matches at once.</li></ul>Presets whose matches deserve a look each (merges, splits) go one by one: <b>Apply &amp; next</b> applies and moves on, <b>Skip</b> leaves the match as it is; Enter confirms.",
+          "anchor": "curation.actions",
+          "panel": "match_curator"
+        },
+        {
+          "id": "merge",
+          "title": "Second example: merging neurons",
+          "anchor": "curation.preset_selector",
+          "panel": "match_curator",
+          "wait_for": "merge_preset_loaded",
+          "do_it": "load_merge_preset",
+          "do_it_label": "Choose it for me",
+          "text": "Choose <b>Merge neuron candidates</b> (or let me). It works <i>by pair relationship</i>: each match is a pair of neurons whose unions are close (&lt; 5 px) and similar (≥ 0.9) and that never appear in the same session — one cell tracked as two. Its action merges the <b>source</b> neuron into the <b>target</b>."
+        },
+        {
+          "title": "Sources and targets",
+          "anchor": "panel.footprints",
+          "panel": "match_curator",
+          "wait_for": "matches_selected",
+          "do_it": "evaluate_and_select",
+          "do_it_label": "Evaluate and select for me",
+          "text": "Evaluate and select the matches (or let me). In each match, the <b>source</b> (violet) is what would be moved — here the neuron merged away — and the <b>target</b> (orange) where it goes.<br><br>Adjust them by hand: <b>Ctrl + click</b> cycles a footprint through source → target → not highlighted. Edited highlights become a candidate in the curator, ready to apply — or move them yourself with right-click ▸ <b>Move footprints of neuron N ▸ Highlighted footprints</b>."
+        },
+        {
+          "id": "split",
+          "title": "Third example: splitting a footprint",
+          "anchor": "curation.preset_selector",
+          "panel": "match_curator",
+          "wait_for": "split_preset_loaded",
+          "do_it": "load_split_preset",
+          "do_it_label": "Choose it for me",
+          "text": "Choose <b>footprint manipulation: split candidates</b> (or let me): one footprint (the <b>target</b>) that covers two cells seen separately in other sessions (the <b>sources</b>). Its count reads <i>per target footprint: exactly 2 distinct source neurons</i>; its action splits the target into the two sources' shapes."
+        },
+        {
+          "title": "“applied to”",
+          "anchor": "curation.applied_to",
+          "panel": "match_curator",
+          "on_enter": "reveal_anchor",
+          "text": "In pair groups, a subgroup says which side it tests — <b>applied to</b>:<ul><li><b>source</b> / <b>target</b> — each source (target) of the parent's pairs must pass, e.g. here: every source is a good detection (CNN) seen alike in another session;</li><li><b>between sources</b> / <b>between targets</b> — the sources sharing a target are compared with each other, e.g. here: the two sources barely overlap and lie apart — two different cells;</li><li><b>parent matches</b> — an ordinary nested group.</li></ul>"
+        },
+        {
+          "title": "A good order",
+          "text": "Work through the presets roughly in this order:<ol><li><b>Cleanup</b>: edge artifacts, low-quality one-offs, duplicates, size outliers.</li><li><b>Structure</b>: misassigned footprints, orphans, stray footprints, swap risk, two footprint groups.</li><li><b>Merges</b>: fragmented tracks, merge candidates.</li><li><b>High confidence / nearly clean</b>: mark the good ones as reviewed.</li><li><b>Uncertain matches</b> last.</li></ol>"
+        },
+        {
+          "id": "own",
+          "title": "Your own presets",
+          "anchor": "curation.preset_menu",
+          "panel": "match_curator",
+          "text": "The presets are starting points — build your own: <b>+ condition</b> and <b>+ group</b> add parts, <b>⠿</b> drags them, <b>ⓘ</b> holds your comment, a click on a condition edits it. The <b>⋮</b> menu next to the preset <b>saves</b> it (Save as… keeps the original), sets it as default or files it into a category. Thresholds from percentiles or the model carry over to other animals."
+        }
+      ],
+      "panels": [
+        "match_curator",
+        "footprints",
+        "tracked_overview"
+      ]
+    },
+    {
+      "id": "comparing",
+      "title": "Comparing assignments",
+      "summary": "Load a second assignment set and find where the two differ.",
+      "description": "Loading a second assignment set, the active set, footprints of two sets side by side, assignment differences and comparing a statistic between sets.",
+      "minutes": 6,
+      "requires": [
+        "neurons_registered"
+      ],
+      "setup": "setup_chapter",
+      "panels": [
+        "footprints",
+        "tracked_overview"
+      ],
+      "steps": [
+        {
+          "id": "load_second",
+          "title": "A second assignment set",
+          "anchor": "load.add_row",
+          "wait_for": "second_assignments_loaded",
+          "skip_if": [
+            "second_assignments_loaded"
+          ],
+          "do_it": "load_alternative_assignments",
+          "do_it_label": "Load it for me",
+          "on_enter": "offer_demo_add_start",
+          "on_leave": "clear_demo_add_start",
+          "text": "Several assignment sets can be loaded side by side — e.g. two registrations, two curation states or another tool's result. Click <b>+</b> (from file), open <b>{demo_alternative}</b> in the demo folder and keep a name for it (or let me).<br><br>This set was made from the same registration with deliberate errors: 15 tracks cut in two and 10 footprints swapped between neighbours."
+        },
+        {
+          "title": "The active set",
+          "anchor": "menu.assignments_selector",
+          "text": "The assignments selector lists all loaded sets; the one just loaded is now <b>active</b>. The active set is what the panels show, statistics and curation work on, and what you edit.<br><br>Neuron IDs differ between sets. When you switch, the focus, the selection and the navigation bar move to the <b>matching</b> neuron of the new set: the one sharing most footprints (without shared footprints, the nearest union)."
+        },
+        {
+          "title": "Two sets side by side",
+          "anchor": "footprints.assignments_selector",
+          "panel": "footprints",
+          "wait_for": "footprints_other_set_shown",
+          "do_it": "show_other_set",
+          "do_it_label": "Set it up for me",
+          "text": "Open a second <b>Neuron footprints</b> panel (split with <b>+ →</b>) and choose the other set in its selector at the bottom (or let me). It shows the <b>matching</b> neuron of that set for the focused one — so differences stand out: a cut track shows only part of the footprints, a swapped footprint sits with the neighbour.<br><br>Step through neurons with ← / →; both panels follow. Right-click a footprint of the other set to focus its counterpart or make that set active."
+        },
+        {
+          "title": "Finding differences",
+          "anchor": "statistics.x_selector",
+          "panel": "statistics",
+          "wait_for": "difference_histogram_shown",
+          "do_it": "show_assignment_differences",
+          "do_it_label": "Show it for me",
+          "text": "Which neurons differ at all? The neuron statistic <b>Assignment differences</b> counts the sessions in which a neuron's footprints differ from its match in another set (<i>vs</i>: which set; <i>d<sub>max</sub></i>: the distance for neurons sharing no footprint). Plot it (or let me) and select the bins above 0: the navigation bar then steps through exactly the differing neurons.",
+          "panels": [
+            "statistics",
+            "tracked_overview"
+          ]
+        },
+        {
+          "title": "A statistic in both sets",
+          "anchor": "statistics.comparison",
+          "panel": "statistics",
+          "wait_for": "sets_compared",
+          "do_it": "compare_occurrence",
+          "do_it_label": "Compare for me",
+          "text": "The statistics options (gear) ▸ <b>Assignments</b> overlay one histogram per set — e.g. the <i>Occurrence</i>: the cut tracks of the second set shift neurons to fewer sessions (or let me show it). In scatter plots, <b>Compare assignments</b> takes x from one set and y from another, e.g. a neuron's occurrence in both.",
+          "panels": [
+            "statistics",
+            "tracked_overview"
+          ]
+        },
+        {
+          "title": "Working with several sets",
+          "text": "Curate the active set; the others stay untouched until you activate them. A project saves all its sets (chapter Saving), and the selector's <b>+</b> creates new ones — empty, or a copy of the current one to try something out."
+        }
+      ]
+    },
+    {
+      "id": "saving",
+      "title": "Saving and exporting",
+      "summary": "Keep your work and export results.",
+      "description": "What a project stores, saving the model and assignments, exporting seeds for redetection and figures.",
+      "minutes": 3,
+      "requires": [
+        "sessions_loaded"
+      ],
+      "setup": "setup_chapter",
+      "steps": [
+        {
+          "title": "Saving the project",
+          "text": "Save regularly (<b>Ctrl+S</b>). A project is saved as several files in <i>{project_folder}</i>:<ul><li><b><i>name</i>.catan.hdf5</b>: the main file — one assignment set (with all manipulations and review statuses) and references to all the other files;</li><li><b><i>name</i>.sessions.hdf5</b>: the sessions with their alignment;</li><li><b><i>name</i>.model.hdf5</b>: the match model (one file per further model);</li><li><b><i>name.set</i>.assignments.hdf5</b>: further assignment sets.</li></ul>Opening the <b>.catan.hdf5</b> main file loads all of them. Each file can also be loaded on its own — e.g. only a model, an assignment set or the sessions, with <b>+</b> (from file) or the rows' arrow menus.",
+          "anchor": "load.save_button"
+        },
+        {
+          "title": "Model and assignments",
+          "text": "The arrow menus of the model and assignments rows save or load them separately — e.g. to reuse a fitted model for another mouse.",
+          "anchor": "menu.model_row"
+        },
+        {
+          "title": "Seeds for redetection",
+          "text": "The tracked neurons can be exported as <b>seeds</b> for a seeded redetection (e.g. CaImAn started from these footprints, to recover neurons missed in a session): the arrow of the save button → <b>Export redetection seeds for all sessions…</b> (one file per session, saved beside its source file under a prefix you choose), or a session row's menu for one session.<ul><li><b>Present included footprints only</b>, or <b>all included neurons</b> — then sessions where a neuron was not detected get its union footprint at the expected position.</li><li>If neurons are not reviewed yet (<i>pending</i> or <i>uncertain</i>), CATAN warns and asks which to export: <i>reviewed only</i>, <i>reviewed + uncertain</i>, or <i>all</i> (the last one only with pending neurons).</li></ul>Afterwards, the redetected sessions can be loaded and registered again.",
+          "anchor": "load.save_button"
+        },
+        {
+          "title": "Exporting figures",
+          "text": "Each plot's save button exports it as an image; size, resolution and transparency are set in its menu.",
+          "anchor": "plot.export_button",
+          "panel": "tracked_overview"
+        },
+        {
+          "title": "That's it",
+          "text": "You have seen the whole workflow: load, align, model, register, inspect, work with footprints and statistics, and curate. Reopen any chapter with the <b>?</b> button."
+        }
+      ]
+    }
+  ]
+}

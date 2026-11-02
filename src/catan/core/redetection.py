@@ -182,6 +182,23 @@ def infer_aligned_footprint(
     if column.shape != (int(np.prod(dims)), 1):
         raise ValueError("Union footprint does not match the session dimensions.")
 
+    return place_footprint(column, dims, position)
+
+
+def detected_position(session, fp_id):
+    """(y, x) centroid of component ``fp_id``'s detected shape (before a
+    replace_footprint), as place_footprint expects it."""
+    detected = session.replaced_footprints.get(int(fp_id))
+    if detected is None:
+        detected = session.footprints[:, int(fp_id)]
+    return centroid(detected, tuple(session.dims))
+
+
+def place_footprint(column, dims, position):
+    """``column`` (sparse, C-order) translated so its centroid lies at
+    ``position`` (y, x), bilinearly interpolated; None if nothing remains
+    inside the image."""
+    column = sparse.csc_matrix(column)
     displacement = position - centroid(column, dims)
 
     # Translate nonzero pixels using bilinear interpolation.

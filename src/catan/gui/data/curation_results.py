@@ -4,6 +4,14 @@ from catan.core.structures import NeuronComponent as Component
 from catan.gui.data.curation_actions import EndpointRef
 
 
+def _footprint_count(session):
+    return int(getattr(session, "n_neurons", 0) or 0)
+
+
+def _session_key(session):
+    return (getattr(session, "path", None), _footprint_count(session))
+
+
 class RetainedResults:
     def __init__(self, result, data):
         self.snapshot = result
@@ -39,6 +47,7 @@ class RetainedResults:
     def _remember_data(self, data):
         self.assignments = data.assignments
         self.sessions = tuple(data.sessions)
+        self.session_keys = tuple(_session_key(session) for session in self.sessions)
         self.ids = data.assignments.ids.copy()
 
     @property
@@ -242,10 +251,21 @@ class RetainedResults:
     def data_changed(self, data):
         # External changes: follow physical footprints.
         # Neuron endpoints require unchanged membership.
+        # Replaced assignments or session copies (edits elsewhere) keep the
+        # footprint indices as long as every session is the same recording
+        # with no fewer footprints (synthetic ones are appended).
         same_data = (
-            data.assignments is self.assignments
+            data.assignments is not None
+            and data.assignments.ids.shape[1] == self.ids.shape[1]
             and len(data.sessions) == len(self.sessions)
-            and all(a is b for a, b in zip(data.sessions, self.sessions))
+            and all(
+                a is b
+                or (
+                    getattr(a, "path", None) == key[0]
+                    and _footprint_count(a) >= key[1]
+                )
+                for a, b, key in zip(data.sessions, self.sessions, self.session_keys)
+            )
         )
 
         owners = {}

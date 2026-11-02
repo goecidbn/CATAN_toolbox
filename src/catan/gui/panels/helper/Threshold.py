@@ -52,6 +52,15 @@ class ThresholdSpec:
     # evaluation. None: unitless.
     unit: str | None = None
 
+    # Strict bounds (> / <) for "greater" / "less"; intervals are inclusive.
+    strict: bool = False
+
+    def symbol(self):
+        if self.direction == "greater":
+            return ">" if self.strict else "≥"
+
+        return "<" if self.strict else "≤"
+
     def validate(self):
         if self.direction not in ("greater", "less", "between"):
             raise ValueError(f"Unknown threshold direction: {self.direction}")
@@ -74,10 +83,10 @@ class ThresholdSpec:
         values = np.asarray(values)
 
         if self.direction == "greater":
-            return values >= self.value
+            return values > self.value if self.strict else values >= self.value
 
         if self.direction == "less":
-            return values <= self.value
+            return values < self.value if self.strict else values <= self.value
 
         return (values >= self.value) & (values <= self.upper_value)
 
@@ -94,8 +103,7 @@ class ThresholdSpec:
             upper = bound(self.upper_value, self.upper_reference)
             return f"{lower} ≤ {label} ≤ {upper}"
 
-        symbol = "≥" if self.direction == "greater" else "≤"
-        return f"{label} {symbol} {lower}"
+        return f"{label} {self.symbol()} {lower}"
 
 
 class ThresholdOverlay:
@@ -380,7 +388,7 @@ class ThresholdOverlay:
         value = f"{self.spec.value:.{self.tooltip_precision}g}"
         unit = f" {self.unit}" if self.unit else ""
 
-        direction_symbol = "≥" if self.spec.direction == "greater" else "≤"
+        direction_symbol = self.spec.symbol()
 
         return (
             f"<b>{self.label}</b> {direction_symbol} {value}{unit}<br>"

@@ -1,0 +1,297 @@
+{
+  "schema_version": 2,
+  "name": "footprint manipulation: merge candidates",
+  "category": "footprints",
+  "root": {
+    "type": "group",
+    "id": "5ee3e5a7e1a344a78fa927977520ea8c",
+    "operator": "and",
+    "match_level": "relationship",
+    "children": [
+      {
+        "type": "condition",
+        "id": "f83a031dbfff4ec2abe3b374e51e6206",
+        "query": {
+          "statistic_key": "footprint_overlap",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
+            {
+              "target": "session",
+              "relation": "different",
+              "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {
+            "normalize_by": "j",
+            "support_threshold": 0.1
+          }
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 0.7
+        }
+      },
+      {
+        "type": "condition",
+        "id": "9fee639cb6274ffab8b674bd2a255c4b",
+        "query": {
+          "statistic_key": "footprint_overlap",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
+            {
+              "target": "session",
+              "relation": "different",
+              "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {
+            "normalize_by": "i",
+            "support_threshold": 0.1
+          }
+        },
+        "threshold": {
+          "direction": "between",
+          "active": true,
+          "value": 0.1,
+          "upper_value": 0.7
+        }
+      },
+      {
+        "type": "group",
+        "id": "f638f60ccd274266b2de836f8d59efdb",
+        "operator": "and",
+        "match_level": "footprint",
+        "children": [
+          {
+            "type": "condition",
+            "id": "1a93e872caa344028ffd007f686ef1c6",
+            "query": {
+              "statistic_key": "session:CNN",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {}
+            },
+            "threshold": {
+              "direction": "greater",
+              "active": true,
+              "value": 0.9
+            },
+            "optional": true
+          },
+          {
+            "type": "group",
+            "id": "b0134381a1cd4640b21d0413dbc417d4",
+            "operator": "and",
+            "match_level": "relationship",
+            "children": [
+              {
+                "type": "condition",
+                "id": "4c2c95efe43c4189ba10661890f8b092",
+                "query": {
+                  "statistic_key": "footprint_similarity",
+                  "reductions": {
+                    "neuron_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "neuron_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [
+                    {
+                      "target": "neuron",
+                      "relation": "same",
+                      "collapse_same": true
+                    },
+                    {
+                      "target": "session",
+                      "relation": "different",
+                      "collapse_same": true
+                    }
+                  ],
+                  "context": "generic",
+                  "parameters": {
+                    "gamma": 0.1
+                  }
+                },
+                "threshold": {
+                  "direction": "greater",
+                  "active": true,
+                  "value": 0.95
+                }
+              }
+            ],
+            "count": {
+              "target": "footprint",
+              "comparison": "ge",
+              "value": 1,
+              "unit": "footprint",
+              "anchor": "target",
+              "separate_partner_sessions": false
+            },
+            "comment": "Seen again: a footprint of the same neuron in another session is very similar (≥ 0.95).",
+            "apply_to": "same",
+            "summary": null,
+            "manipulation": null,
+            "review_statuses": null
+          }
+        ],
+        "count": null,
+        "comment": "The reference (source) is a reliable single cell: repeatedly detected, cell-like (CNN ≥ 0.9 where loaded).",
+        "apply_to": "source",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      },
+      {
+        "type": "group",
+        "id": "c8b755a56cfe459aa206a15ee8b69f43",
+        "operator": "and",
+        "match_level": "relationship",
+        "children": [
+          {
+            "type": "condition",
+            "id": "85853147abf64acabb2fdccd71d8ee37",
+            "query": {
+              "statistic_key": "footprint_overlap",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "normalize_by": "IoU",
+                "support_threshold": 0.1
+              }
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 0.2
+            }
+          }
+        ],
+        "count": null,
+        "comment": "The two fragments do not overlap each other (intersection over union ≤ 0.2).",
+        "apply_to": "between_targets",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": {
+      "target": "footprint",
+      "comparison": "eq",
+      "value": 2,
+      "unit": "footprint",
+      "anchor": "source",
+      "separate_partner_sessions": true
+    },
+    "comment": "Mirror of split candidates: a reference footprint (source) of a reliable cell contains two footprints of another session from different neurons (targets). Each target lies ≥ 70 % inside the reference and covers 10–70 % of it. Only proposed when the other sessions see the region more often as one joint footprint than as two separate ones. The two targets are merged.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": {
+      "kind": "merge",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
+    "review_statuses": null
+  }
+}

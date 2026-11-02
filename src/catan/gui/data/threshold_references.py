@@ -22,6 +22,15 @@ MODEL_DISTANCE_TERMS = {
     "sigma_h": "σ_h",
 }
 
+# The same names as rich text (subscripts), for labels and tooltips; the
+# plain names above are used in plain-text condition descriptions.
+MODEL_DISTANCE_TERM_HTML = {
+    "h": "h",
+    "sigma_det": "σ<sub>det</sub>",
+    "sigma_move": "σ<sub>move</sub>",
+    "sigma_h": "σ<sub>h</sub>",
+}
+
 # Reductions that leave values in the statistic's unit (no "sum").
 UNIT_PRESERVING_REDUCTIONS = ("keep", "single", "mean", "median", "max", "min", "std")
 

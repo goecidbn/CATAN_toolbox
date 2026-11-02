@@ -313,6 +313,78 @@ def footprint_union_requested_pairs(state, query, requested_pairs, values_of):
 
 
 # ----------------------------------------------------------------------
+# Partner's own match
+# ----------------------------------------------------------------------
+
+
+def partner_session_match_values(data, state, ni, nj, sid, *, gamma=0.1):
+    """For rows (footprint of ni in session sid, neuron nj): how well nj's
+    own footprint in sid matches nj's union (footprint → union similarity);
+    0 if nj has no included footprint there. NaN where ni has none."""
+    ni, nj, sid = (np.asarray(v, dtype=np.int64).reshape(-1) for v in (ni, nj, sid))
+    ids = np.asarray(state.assignments)
+    values = np.zeros(len(ni), dtype=np.float64)
+
+    if not len(ni):
+        return values
+
+    present = ids[nj, sid] >= 0
+    if np.any(present):
+        keys = np.unique(np.column_stack((nj[present], sid[present])), axis=0)
+        own = union_similarity_values(
+            data, state, keys[:, 0], keys[:, 0], keys[:, 1],
+            neighborhood_thr=np.inf, gamma=gamma,
+        )
+        # Excluded footprints count as absent.
+        own = np.where(np.isfinite(own), own, 0.0)
+        lookup = {(int(j), int(s)): v for (j, s), v in zip(keys, own)}
+        rows = np.flatnonzero(present)
+        values[rows] = [lookup[(int(nj[r]), int(sid[r]))] for r in rows]
+
+    values[ids[ni, sid] < 0] = np.nan
+    return values
+
+
+@reports_progress("Calculating partner matches")
+def calculate_partner_session_match(
+    data,
+    state,
+    indexers=None,
+    filters=(),
+    neighborhood_thr=10,
+    gamma=0.1,
+):
+    """Footprint/union pairs closer than ``neighborhood_thr`` px, scored by
+    the union neuron's own match in the footprint's session."""
+    return footprint_union_pairs(
+        data,
+        state,
+        indexers,
+        filters,
+        lambda ni, nj, sid: partner_session_match_values(data, state, ni, nj, sid, gamma=gamma),
+        neighborhood_thr=neighborhood_thr,
+    )
+
+
+@reports_progress("Calculating requested partner matches")
+def partner_session_match_requested_pairs(
+    data,
+    state,
+    query,
+    *,
+    requested_pairs,
+    neighborhood_thr=10,
+    gamma=0.1,
+):
+    return footprint_union_requested_pairs(
+        state,
+        query,
+        requested_pairs,
+        lambda ni, nj, sid: partner_session_match_values(data, state, ni, nj, sid, gamma=gamma),
+    )
+
+
+# ----------------------------------------------------------------------
 # Union vs union
 # ----------------------------------------------------------------------
 

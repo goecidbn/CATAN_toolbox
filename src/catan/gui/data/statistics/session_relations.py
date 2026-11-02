@@ -45,6 +45,23 @@ def is_order_relation(relation):
     return relation in ORDER_RELATIONS
 
 
+def included_detections(sessions, ids):
+    """``ids`` with excluded footprints set to -1: they are no detections."""
+    ids = np.array(ids, dtype=np.int64, copy=True)
+
+    for sid, session in enumerate(sessions[: ids.shape[1]]):
+        included = None if session is None else getattr(session, "included", None)
+
+        if included is None:
+            continue
+
+        rows = np.flatnonzero(ids[:, sid] >= 0)
+        excluded = ~np.asarray(included, dtype=bool)[ids[rows, sid]]
+        ids[rows[excluded], sid] = -1
+
+    return ids
+
+
 class DetectionReference:
     """Per-neuron reference sessions from assignment IDs (neurons × sessions)."""
 

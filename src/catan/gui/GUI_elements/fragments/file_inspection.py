@@ -45,6 +45,20 @@ class FileInspection(QWidget):
     # does not start a separate reader for every row at once.
     _pool = None
     _navigation_pool = None
+    # Running workers of all instances (cancelled when CATAN closes).
+    _running = set()
+
+    @classmethod
+    def pools(cls):
+        return [pool for pool in (cls._pool, cls._navigation_pool) if pool is not None]
+
+    @classmethod
+    def cancel_all(cls):
+        """Cancel running inspections and drop queued ones (shutdown)."""
+        for pool in cls.pools():
+            pool.clear()
+        for worker in list(cls._running):
+            worker.cancel()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -190,6 +204,10 @@ class FileInspection(QWidget):
         worker.signals.message.connect(self._on_message, connection)
         worker.signals.error.connect(self._on_error, connection)
         worker.signals.finished.connect(self._on_finished, connection)
+        FileInspection._running.add(worker)
+        worker.signals.finished.connect(
+            lambda *_, worker=worker: FileInspection._running.discard(worker)
+        )
 
         navigation_operations = {
             "browse_directory",

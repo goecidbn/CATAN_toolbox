@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QSizePolicy, QToolTip, QApplication
 from PySide6.QtGui import QCursor
 
 import importlib
+from catan.gui.utils.session_labels import session_label
 from catan.core.changes import DataChange
 from catan.gui.panels import StatisticsData, styles
 from catan.gui.structures.state import NeuronComponent, AppState
@@ -545,9 +546,7 @@ class BaseCanvas(scene.SceneCanvas):
 
             component = component[0]
 
-        session = self.data.sessions[component.session_id]
-
-        session_name = session.name
+        session_name = session_label(self.data, component.session_id)
 
         fp_id = self.state.get_footprint_from_component(component)
         if fp_id is not None and fp_id >= 0:

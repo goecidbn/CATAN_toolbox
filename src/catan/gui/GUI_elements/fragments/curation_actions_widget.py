@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from catan.gui.data.curation_actions import (
     BATCH_ACTIONS,
+    SHAPE_ACTIONS,
     ManipulationBatch,
     ManipulationSpec,
     ManipulationPlan,
@@ -40,6 +41,7 @@ HIGHLIGHT_NEEDS = {
     "merge": "2 target footprints (to merge) and 1 source footprint (reference)",
     "reassign": "1 source footprint and target footprints of 1 other neuron",
     "neuron_merge": "footprints of 1 source neuron and 1 target neuron",
+    "replace_with_union": "target footprints (to replace) and no sources",
 }
 
 CONFLICT_HELP = {
@@ -86,6 +88,7 @@ DEFAULT_CONFLICT_CHOICES = (
 from catan.tracking.structures import ReviewStatus
 from catan.core.structures import NeuronComponent
 from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
+from catan.gui.GUI_elements.utils.enter_key import EnterKeyButton
 
 
 class CuratorActions(QGroupBox):
@@ -95,6 +98,10 @@ class CuratorActions(QGroupBox):
         self.controller = controller
         self.data = controller.data
         self.state = controller.state
+
+        # Takes the keyboard focus from the Apply buttons before they hide
+        # (see _buttons).
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
         self.result_version = None
         self.run_id = 0
@@ -126,6 +133,7 @@ class CuratorActions(QGroupBox):
             ("Mark uncertain", "mark_uncertain"),
             ("Exclude neurons", "exclude_neuron"),
             ("Exclude footprints", "exclude_footprint"),
+            ("Replace with union shape", "replace_with_union"),
         ):
             self.kind.addItem(label, value)
 
@@ -228,6 +236,9 @@ class CuratorActions(QGroupBox):
         self.current.clicked.connect(lambda: self._start(False))
         self.all.clicked.connect(lambda: self._start(True))
         self.next.clicked.connect(lambda: self._apply(self.run_id))
+        # Enter = Apply & next while reviewing candidates.
+        self._enter_key = EnterKeyButton(self.next)
+        self.next.setToolTip("Enter")
         self.skip.clicked.connect(self._skip)
         self.stop.clicked.connect(self._on_stop)
 
@@ -410,7 +421,18 @@ class CuratorActions(QGroupBox):
                 (-1 if component.session_id is None else component.session_id),
             )
 
-        if kind == "split":
+        if kind in SHAPE_ACTIONS:
+            # One candidate per matched footprint not replaced already.
+            ids = self.data.assignments.ids
+            replaced = self.data.replaced_shape_footprints()
+            requests = [
+                ((), (target,))
+                for target in result.target_components()
+                if target.session_id is not None
+                and (target.session_id, int(ids[target.id])) not in replaced
+            ]
+
+        elif kind == "split":
             requests = [
                 (
                     tuple(sorted(sources, key=sort)),
@@ -616,8 +638,8 @@ class CuratorActions(QGroupBox):
             #     + ("" if component.session_id is None else f",{component.session_id}")
             #     + ")"
             # )
-            return f"n{component.neuron_id}" + (
-                "" if component.session_id is None else f"/s{component.session_id}"
+            return f"N{component.neuron_id}" + (
+                "" if component.session_id is None else f" S{component.session_id}"
             )
 
         source = ", ".join(map(label, sources))
@@ -628,6 +650,7 @@ class CuratorActions(QGroupBox):
             "merge": f"{target} using {source}",
             "neuron_merge": f"{source} into {target}",
             "reassign": f"{source} → {target}",
+            "replace_with_union": f"{target} → union shape",
         }[kind]
 
     def _show(self, plan, *, focus=False):
@@ -666,6 +689,12 @@ class CuratorActions(QGroupBox):
         for widget in (self.conflict_label, self.conflict, self.conflict_help):
             widget.setVisible(help_text is not None)
         self.conflict_help.setText(help_text or "")
+
+        # A focused button that is hidden or disabled below passes the focus
+        # to the next widget in the Tab order (e.g. the navigation bar's ID
+        # field, which then takes the arrow keys): keep it here instead.
+        if QApplication.focusWidget() in (self.current, self.all):
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
 
         if running:
             self.controller.menu.evaluate_button.setEnabled(False)
@@ -763,7 +792,7 @@ class CuratorActions(QGroupBox):
 
         if any(component.session_id is None for component in components):
             raise ValueError(
-                "This preset matches whole neurons. Use 'Exclude neurons', "
+                "This preset matches whole neurons. Use a neuron action, "
                 "or evaluate footprints (by footprint or with footprint "
                 "endpoints)."
             )
@@ -887,6 +916,10 @@ class CuratorActions(QGroupBox):
             self._run_batch(plans)
             return
 
+        if all_selected and not self.review and self.kind.currentData() in SHAPE_ACTIONS:
+            self._run_shape_batch(plans)
+            return
+
         self._advance(self.run_id)
 
     def _advance(self, token):
@@ -958,7 +991,62 @@ class CuratorActions(QGroupBox):
             self._continue(token)
             return
 
+        if plan.kind in SHAPE_ACTIONS:
+            try:
+                self._replace_shapes(targets)
+            except Exception as exc:
+                self.reports.append(("failed", f"{type(exc).__name__}: {exc}"))
+                self._finish("Stopped after unexpected error")
+                QMessageBox.warning(self.window(), "Manipulation failed", str(exc))
+                return
+            self._continue(token)
+            return
+
         self._prepare_in_background(token, plan, sources, targets)
+
+    def _replace_shapes(self, targets):
+        """Replace the targets' shapes with their neuron's union (directly:
+        footprint IDs and activity stay, so no isolated preparation)."""
+        skipped = []
+        self.committing = True
+        try:
+            replaced = self.data.replace_footprints_with_union(
+                list(targets), skipped=skipped
+            )
+        finally:
+            self.committing = False
+
+        result = self.controller.current_result
+        if result is not None:
+            result.data_changed(self.data)
+        self.controller._refresh_results()
+
+        self.reports.extend(("applied", "replace_with_union") for _ in replaced)
+        for _, reason in skipped:
+            self._report_skipped(ValueError(reason))
+
+        if replaced:
+            self.controller._highlight_endpoints(set(), set(replaced))
+
+    def _run_shape_batch(self, plans):
+        """Replace all plans' shapes at once (one union rebuild)."""
+        targets = []
+        for plan in plans:
+            try:
+                targets.extend(plan.resolve(self.data)[1])
+            except ValueError as exc:
+                self.reports.append(("skipped", str(exc)))
+
+        try:
+            if targets:
+                self._replace_shapes(targets)
+        except Exception as exc:
+            self.reports.append(("failed", f"{type(exc).__name__}: {exc}"))
+            self._finish("Stopped after unexpected error")
+            QMessageBox.warning(self.window(), "Manipulation failed", str(exc))
+            return
+
+        self._finish("Finished")
 
     def _prepare_in_background(self, token, plan, sources, targets, **resolution):
         """Prepare the manipulation in a worker; commit on the GUI thread.

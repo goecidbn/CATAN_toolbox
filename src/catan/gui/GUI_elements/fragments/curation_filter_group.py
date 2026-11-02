@@ -30,6 +30,23 @@ from .curation_filter_chip import (
 )
 
 
+def _sentence_label(text):
+    """Plain sentence part between the selectors of a group."""
+    label = QLabel(text)
+    label.setObjectName("curationSentenceLabel")
+    label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+    return label
+
+
+def _shrinkable(combo, characters):
+    """The combo box may shrink to ``characters`` (eliding its text)."""
+    combo.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+    )
+    combo.setMinimumContentsLength(characters)
+    combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+
 class CurationFilterGroupWidget(QFrame):
 
     condition_edit_requested = Signal(str)
@@ -171,9 +188,18 @@ class CurationFilterGroupWidget(QFrame):
         self.header_widget = QFrame()
         self.header_widget.setObjectName("curationFilterGroupHeader")
 
-        header_layout = QHBoxLayout(self.header_widget)
+        # The selectors read as a sentence over two lines (the second only
+        # for subgroups): "[AND] by [pair relationship]  ⓘ ×" /
+        # "applied to [between targets], pairs: [largest compatible set]".
+        outer_layout = QHBoxLayout(self.header_widget)
+        outer_layout.setContentsMargins(0, 0, 6, 0)
+        outer_layout.setSpacing(6)
 
-        header_layout.setContentsMargins(0, 0, 6, 0)
+        lines_layout = QVBoxLayout()
+        lines_layout.setContentsMargins(0, 3, 0, 3)
+        lines_layout.setSpacing(3)
+
+        header_layout = QHBoxLayout()
         header_layout.setSpacing(6)
 
         if not self.is_root:
@@ -185,7 +211,10 @@ class CurationFilterGroupWidget(QFrame):
             self.drag_handle.setText("⠿")
             self.drag_handle.setFixedWidth(30)
 
-            header_layout.addWidget(self.drag_handle)
+            outer_layout.addWidget(self.drag_handle)
+
+        outer_layout.addLayout(lines_layout, 1)
+        lines_layout.addLayout(header_layout)
 
         self.operator_selector = QComboBox()
         self.operator_selector.addItem(
@@ -199,15 +228,15 @@ class CurationFilterGroupWidget(QFrame):
 
         self.match_level_selector = QComboBox()
         self.match_level_selector.addItem(
-            "by neuron",
+            "neuron",
             "neuron",
         )
         self.match_level_selector.addItem(
-            "by footprint",
+            "footprint",
             "footprint",
         )
         self.match_level_selector.addItem(
-            "by pair relationship",
+            "pair relationship",
             "relationship",
         )
 
@@ -231,22 +260,24 @@ class CurationFilterGroupWidget(QFrame):
         self.match_level_selector.setObjectName("curationGroupSelector")
 
         header_layout.addWidget(self.operator_selector)
+        header_layout.addWidget(_sentence_label("by"))
         header_layout.addWidget(self.match_level_selector)
 
         if not self.is_root:
+            binding_layout = QHBoxLayout()
+            binding_layout.setSpacing(6)
+            lines_layout.addLayout(binding_layout)
+
             self.binding_selector = QComboBox()
-            self.binding_selector.addItem("Apply to: parent matches", "same")
-            self.binding_selector.addItem("Apply to: source", "source")
-            self.binding_selector.addItem("Apply to: target", "target")
+            self.binding_selector.addItem("parent matches", "same")
+            self.binding_selector.addItem("source", "source")
+            self.binding_selector.addItem("target", "target")
+            self.binding_selector.addItem("between sources", "between_sources")
+            self.binding_selector.addItem("between targets", "between_targets")
             self.binding_selector.addItem(
-                "Apply to: between sources", "between_sources"
+                "between sources and targets", "between_sources_targets"
             )
-            self.binding_selector.addItem(
-                "Apply to: between targets", "between_targets"
-            )
-            self.binding_selector.addItem(
-                "Apply to: between sources and targets", "between_sources_targets"
-            )
+            _shrinkable(self.binding_selector, 12)
 
             self.binding_selector.setCurrentIndex(
                 self.binding_selector.findData(self.group.apply_to)
@@ -273,12 +304,14 @@ class CurationFilterGroupWidget(QFrame):
                 "is evaluated on all such pairs of a target neuron, combined, "
                 "and thresholded once; target neurons failing it are dropped."
             )
-            header_layout.addWidget(self.binding_selector)
+            binding_layout.addWidget(_sentence_label("applied to"))
+            binding_layout.addWidget(self.binding_selector, 1)
 
             self.summary_selector = QComboBox()
-            self.summary_selector.addItem("Pairs: largest compatible set", None)
+            self.summary_selector.addItem("largest compatible set", None)
             for summary in ("median", "mean", "min", "max"):
-                self.summary_selector.addItem(f"Pairs: {summary}", summary)
+                self.summary_selector.addItem(summary, summary)
+            _shrinkable(self.summary_selector, 8)
             self.summary_selector.setToolTip(
                 "How the between-partner pairs of a target neuron are combined "
                 "before the condition thresholds apply."
@@ -286,7 +319,10 @@ class CurationFilterGroupWidget(QFrame):
             self.summary_selector.setCurrentIndex(
                 max(0, self.summary_selector.findData(self.group.summary))
             )
-            header_layout.addWidget(self.summary_selector)
+            self.summary_label = _sentence_label("pairs:")
+            binding_layout.addWidget(self.summary_label)
+            binding_layout.addWidget(self.summary_selector, 1)
+            binding_layout.addStretch()
             self._update_summary_selector(self.group.apply_to)
 
             self.binding_selector.currentIndexChanged.connect(
@@ -350,6 +386,7 @@ class CurationFilterGroupWidget(QFrame):
             "between_sources_targets",
         )
         self.summary_selector.setVisible(between)
+        self.summary_label.setVisible(between)
 
         model = self.summary_selector.model()
         model.item(0).setEnabled(binding != "between_sources_targets")
@@ -369,18 +406,23 @@ class CurationFilterGroupWidget(QFrame):
         self.binding_changed.emit(self.group.id, binding)
 
     def _build_count_controls(self):
-        layout = QHBoxLayout()
-
-        self.count_enabled = QCheckBox("Count matches")
+        # A sentence over up to three lines:
+        # "☐ Count per [target] [footprint]" /
+        # "[exactly] [2] distinct [source footprints]" /
+        # "☐ separately for each partner session" (pair relationships only).
+        self.count_enabled = QCheckBox("Count")
         self.count_enabled.setChecked(self.group.count is not None)
+        self.count_enabled.setToolTip(
+            "Require a number of matches per neuron or footprint."
+        )
 
         spec = self.group.count or CountSpec(
             unit=("neuron" if self.group.match_level == "relationship" else "footprint")
         )
 
         self.count_anchor = QComboBox()
-        self.count_anchor.addItem("per target", "target")
-        self.count_anchor.addItem("per source", "source")
+        self.count_anchor.addItem("target", "target")
+        self.count_anchor.addItem("source", "source")
         self.count_anchor.setCurrentIndex(self.count_anchor.findData(spec.anchor))
         self.count_anchor.setToolTip(
             "Count opposite endpoints around each source or target. "
@@ -388,8 +430,8 @@ class CurationFilterGroupWidget(QFrame):
         )
 
         self.count_target = QComboBox()
-        self.count_target.addItem("per neuron", "neuron")
-        self.count_target.addItem("per target footprint", "footprint")
+        self.count_target.addItem("neuron", "neuron")
+        self.count_target.addItem("footprint", "footprint")
         self.count_target.setCurrentIndex(self.count_target.findData(spec.target))
         self.count_target.setToolTip(
             "Choose whether the count anchor is one neuron or one footprint."
@@ -409,33 +451,43 @@ class CurationFilterGroupWidget(QFrame):
         self.count_value.setKeyboardTracking(False)
         self.count_value.setMaximumWidth(50)
 
-        layout.addWidget(self.count_enabled)
-        layout.addWidget(self.count_anchor)
-        layout.addWidget(self.count_target)
-        layout.addWidget(self.count_comparison)
-        layout.addWidget(self.count_value)
-        layout.addStretch()
+        self.count_per_label = _sentence_label("per")
 
-        self.layout.addLayout(layout)
+        anchor_layout = QHBoxLayout()
+        anchor_layout.addWidget(self.count_enabled)
+        anchor_layout.addWidget(self.count_per_label)
+        anchor_layout.addWidget(self.count_anchor)
+        anchor_layout.addWidget(self.count_target)
+        anchor_layout.addStretch()
+        self.layout.addLayout(anchor_layout)
 
-        self.count_unit_row = QWidget()
-        unit_layout = QHBoxLayout(self.count_unit_row)
-        unit_layout.setContentsMargins(0, 0, 0, 0)
+        self.count_matches_label = _sentence_label("matches")
 
         self.count_unit = QComboBox()
         self.count_unit.addItem("source neurons", "neuron")
         self.count_unit.addItem("source footprints", "footprint")
         self.count_unit.setCurrentIndex(self.count_unit.findData(spec.unit))
-        self.count_unit.setToolTip(
-            "Source neurons: repeated observations of one tracked neuron "
-            "count once.\n"
-            "Source footprints: each session-specific footprint counts separately."
+        _shrinkable(self.count_unit, 10)
+
+        # Pair relationships only: what is counted around the anchor.
+        self.count_unit_row = QWidget()
+        unit_layout = QHBoxLayout(self.count_unit_row)
+        unit_layout.setContentsMargins(0, 0, 0, 0)
+        unit_layout.addWidget(_sentence_label("distinct"))
+        unit_layout.addWidget(self.count_unit, 1)
+
+        value_layout = QHBoxLayout()
+        value_layout.setContentsMargins(22, 0, 0, 0)
+        value_layout.addWidget(self.count_comparison)
+        value_layout.addWidget(self.count_value)
+        value_layout.addWidget(self.count_matches_label)
+        value_layout.addWidget(self.count_unit_row, 1)
+        value_layout.addStretch()
+        self.layout.addLayout(value_layout)
+
+        self.count_partner_sessions = QCheckBox(
+            "separately for each partner session"
         )
-
-        unit_layout.addWidget(QLabel("Count distinct"))
-        unit_layout.addWidget(self.count_unit)
-
-        self.count_partner_sessions = QCheckBox("Separate partner sessions")
         self.count_partner_sessions.setChecked(spec.separate_partner_sessions)
         self.count_partner_sessions.setToolTip(
             "Count separately for each partner session. "
@@ -443,11 +495,11 @@ class CurationFilterGroupWidget(QFrame):
             "from different sessions."
         )
 
-        unit_layout.addWidget(self.count_partner_sessions)
-
-        unit_layout.addStretch()
-
-        self.layout.addWidget(self.count_unit_row)
+        sessions_layout = QHBoxLayout()
+        sessions_layout.setContentsMargins(22, 0, 0, 0)
+        sessions_layout.addWidget(self.count_partner_sessions)
+        sessions_layout.addStretch()
+        self.layout.addLayout(sessions_layout)
 
         self._set_count_controls_enabled()
 
@@ -473,13 +525,14 @@ class CurationFilterGroupWidget(QFrame):
 
         self.count_unit_row.setVisible(pair_mode)
         self.count_unit.setEnabled(enabled and pair_mode)
+        self.count_matches_label.setVisible(not pair_mode)
+        self.count_matches_label.setEnabled(enabled)
+        self.count_per_label.setEnabled(enabled)
 
         self.count_anchor.setVisible(pair_mode)
         self.count_anchor.setEnabled(enabled and pair_mode)
+        self.count_partner_sessions.setVisible(pair_mode)
         self.count_partner_sessions.setEnabled(enabled and pair_mode)
-
-        self.count_target.setItemText(0, "neuron" if pair_mode else "per neuron")
-        self.count_target.setItemText(1, "footprint" if pair_mode else "per footprint")
 
         partner = "target" if self.count_anchor.currentData() == "source" else "source"
 
@@ -732,7 +785,8 @@ class CurationFilterGroupWidget(QFrame):
                 if chip is None:
                     continue
 
-                invalid = child.query.statistic_key not in registry
+                # Optional conditions without their statistic are skipped.
+                invalid = child.query.statistic_key not in registry and not child.optional
                 if invalid:
                     invalid_ids.add(child.id)
 

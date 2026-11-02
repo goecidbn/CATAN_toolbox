@@ -11,6 +11,7 @@ from vispy.scene.visuals import Rectangle, Text, Markers
 from typing import Optional, Tuple, Callable
 from types import SimpleNamespace
 
+from catan.gui.utils.session_labels import session_label
 from catan.gui.interaction import click_events
 
 from PySide6.QtCore import Qt, QEvent, Signal, QObject
@@ -23,8 +24,10 @@ from PySide6.QtWidgets import (
     QToolButton,
     QMenu,
     QCheckBox,
+    QColorDialog,
 )
 from PySide6.QtGui import (
+    QColor,
     QCursor,
 )
 
@@ -54,9 +57,15 @@ from catan.gui.panels import BasePlot
 from catan.gui.panels.helper import Threshold, ReviewStatusFilter
 from catan.gui.data.assignment_colors import (
     assignment_color,
+    assignment_colors,
     assignment_label,
     assignment_shade,
+    color_signals,
+    has_custom_color,
+    set_assignment_color,
 )
+
+LEGEND_TEXT_COLOR = "#38404a"
 from catan.gui.data.statistics.plotdata_comparison import (
     ASSIGNMENTS_REF,
     ComparisonHistogram,
@@ -66,6 +75,7 @@ from catan.gui.data.statistics.plotdata_comparison import (
 from catan.gui.background_tasks.runtime import TaskCancelled
 import catan.gui.data.curation_filter as curation_filter
 from catan.gui.panels.helper.Threshold import ThresholdSpec
+from catan.gui.GUI_elements.utils.menu_creation import add_menu_section
 from catan.gui.GUI_elements.fragments.ResetViewButton import ResetViewButton
 from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 
@@ -74,15 +84,67 @@ STATUS_CARD_IDLE_HEIGHT = 30
 STATUS_CARD_BUSY_HEIGHT = 50
 STATUS_PROGRESS_HEIGHT = 6
 
-SERIES_PRIMARY_COLOR = (0.0, 0.0, 0.0, 1.0)
-SERIES_SECONDARY_COLOR = (0.0, 0.35, 0.65, 1.0)
+# Session series: one hue per series (first blue, second orange), all
+# data in its mid step with a translucent band, the selected neurons in a
+# darker step of the same hue (thicker line, ringed markers). Validated
+# light-surface steps (dataviz reference palette; dark orange stepped in
+# OKLCH to the same lightness drop): blue #5598e7 / #184f95, orange
+# #eb6834 / #a24017 — all pairs >= 15.7 CVD ΔE. Axis text uses the dark step
+# (contrast >= 4.5:1).
+SERIES_PRIMARY_COLOR = (0.333, 0.596, 0.906, 1.0)  # blue
+SERIES_SECONDARY_COLOR = (0.922, 0.408, 0.204, 1.0)  # orange
 # Series of the selected neurons only.
-SERIES_PRIMARY_SELECTED_COLOR = (0.9, 0.4, 0.0, 1.0)
-SERIES_SECONDARY_SELECTED_COLOR = (0.8, 0.1, 0.55, 1.0)
-SERIES_BAND_ALPHA = 0.18
+SERIES_PRIMARY_SELECTED_COLOR = (0.094, 0.31, 0.584, 1.0)
+SERIES_SECONDARY_SELECTED_COLOR = (0.635, 0.251, 0.09, 1.0)
+# The second series is drawn in an overlaid view (above the first): its
+# lighter, more saturated orange band gets less alpha so the blue band and
+# line below stay visible.
+SERIES_BAND_ALPHA = 0.22
+SERIES_SECONDARY_BAND_ALPHA = 0.13
+SERIES_SELECTED_BAND_ALPHA = 0.10
 
 SeriesPoint = tuple[str, int]
 VisualIndex = int | SeriesPoint
+
+
+def _use_integer_ticks(axis_visual, step_getter):
+    """Integer-centred histograms: major ticks only at integers (multiples
+    of the bin step, at most as many as vispy would place), so they sit on
+    bin centres. ``step_getter()`` returns the step or None (vispy's ticks)."""
+    ticker = axis_visual.ticker
+    default = ticker._get_tick_frac_labels
+
+    def tick_frac_labels():
+        major_frac, minor_frac, labels = default()
+        step = step_getter()
+        domain = axis_visual.domain
+        low, high = sorted(float(value) for value in domain)
+        if step is None or high <= low:
+            return major_frac, minor_frac, labels
+
+        # Every bin labelled while labels are >= 32 px apart, else multiples.
+        length = float(np.linalg.norm(np.subtract(*np.asarray(axis_visual.pos)[:2])))
+        px_per_unit = length / (high - low) if length > 0 else 0.0
+        target = max(2, len(labels))
+        spacing = step
+        for factor in (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000):
+            spacing = step * factor
+            if (
+                spacing * px_per_unit >= 32
+                if px_per_unit > 0
+                else (high - low) / spacing <= target
+            ):
+                break
+        major = np.arange(np.ceil(low / spacing), np.floor(high / spacing) + 1) * spacing
+        # Minor ticks at the bin centres between the labelled ones.
+        minor = np.arange(np.ceil(low / step), np.floor(high / step) + 1) * step
+        minor = minor[~np.isin(minor, major)] if spacing > step else np.asarray([])
+        scale = float(domain[1]) - float(domain[0])
+        major_frac = (major - float(domain[0])) / scale
+        minor_frac = (minor - float(domain[0])) / scale
+        return major_frac, minor_frac, [f"{int(value)}" for value in major]
+
+    ticker._get_tick_frac_labels = tick_frac_labels
 
 
 @dataclass
@@ -100,6 +162,9 @@ class DisplaySignals(QObject):
 
     bin_hovered = Signal(object)
     bin_clicked = Signal(object, object)
+
+    # Index of the clicked assignments legend entry.
+    legend_clicked = Signal(int)
 
 
 class Display(BasePlot.BaseCanvas):
@@ -194,8 +259,10 @@ class Display(BasePlot.BaseCanvas):
             anchor_x="right",
             anchor_y="center",
             font_size=10,
-            color="#38404a",
+            color=LEGEND_TEXT_COLOR,
         )
+        # Assignments of the legend's swatch rows (for colour changes).
+        self.assignment_legend_names = ()
         self.assignment_legend_swatches = Markers(parent=self.view)
         self.assignment_legend_swatches.visible = False
         self.assignment_legend_swatch_colors = np.empty(
@@ -292,6 +359,7 @@ class Display(BasePlot.BaseCanvas):
         self.axes["x"] = create_axis("bottom")
         self.grid.add_widget(self.axes["x"], row=2, col=1)
         self.axes["x"].link_view(self.view)
+        _use_integer_ticks(self.axes["x"].axis, lambda: self._integer_bin_step())
 
         self.axes["y"] = create_axis("left")
         self.grid.add_widget(self.axes["y"], row=1, col=0)
@@ -702,14 +770,38 @@ class Display(BasePlot.BaseCanvas):
         xmin, xmax = bin_edges[[0, -1]]
         ymax = max(1.0, float(np.nanmax(bin_counts)))
 
-        self._set_camera_ranges(
-            {"x": (min(0.0, xmin) * 1.1, xmax * 1.1), "y": (0.0, ymax * 1.1)}
-        )
+        if self._integer_bin_step() is not None:
+            # Integer-centred bins already carry half a bin of margin.
+            margin = 0.02 * (xmax - xmin)
+            x_range = (xmin - margin, xmax + margin)
+        else:
+            x_range = (min(0.0, xmin) * 1.1, xmax * 1.1)
+
+        self._set_camera_ranges({"x": x_range, "y": (0.0, ymax * 1.1)})
 
         # self.axes["x"]._view_changed()
 
         self._init_threshold_overlays(kind="histogram")
         self.update()
+
+    def _integer_bin_step(self):
+        """Integers per bin of an integer-centred histogram, else None."""
+        if self.plot_type != "histogram" or not isinstance(
+            self.plot_data, plotdata_histogram.PlotData
+        ):
+            return None
+        return getattr(self.plot_data, "integer_step", None)
+
+    def _snap_threshold_value(self, threshold, value):
+        """With integer-centred bins the x threshold snaps to bin edges
+        (half-integers), so it never splits a bin: "≥ 2.5" selects 3, 4, …"""
+        step = self._integer_bin_step()
+        if step is None or threshold.spec.axis != "x":
+            return value
+        edges = np.asarray(self.plot_data.bin_edges, dtype=float)
+        if isinstance(self.plot_data, ComparisonHistogram):
+            edges = np.asarray(self.plot_data.shared_edges, dtype=float)
+        return float(edges[np.argmin(np.abs(edges - value))])
 
     def _histogram_bar_bounds(self):
         plot_data = self.plot_data
@@ -769,8 +861,8 @@ class Display(BasePlot.BaseCanvas):
         is_dual = second is not None
 
         for key, color in (
-            ("y", SERIES_PRIMARY_COLOR),
-            ("y_2nd", SERIES_SECONDARY_COLOR),
+            ("y", SERIES_PRIMARY_SELECTED_COLOR),
+            ("y_2nd", SERIES_SECONDARY_SELECTED_COLOR),
         ):
             axis = self.axes[key].axis
             axis.text_color = color
@@ -788,7 +880,7 @@ class Display(BasePlot.BaseCanvas):
             self.axes["y_2nd"].visible = False
 
         self.axes["y"].visible = True
-        self.axes["y"].axis.axis_label = first.table.stat.name
+        self.axes["y"].axis.axis_label = first.table.stat.display_title
 
         first_visual = series_with_confidence.SeriesVisual(
             parent=self.plot_root,
@@ -811,12 +903,12 @@ class Display(BasePlot.BaseCanvas):
 
         # ---------- optional right series ----------
         if is_dual:
-            self.axes["y_2nd"].axis.axis_label = second.table.stat.name
+            self.axes["y_2nd"].axis.axis_label = second.table.stat.display_title
 
             second_visual = series_with_confidence.SeriesVisual(
                 parent=self.plot_root_right,
                 line_color=SERIES_SECONDARY_COLOR,
-                band_color=(*SERIES_SECONDARY_COLOR[:3], SERIES_BAND_ALPHA),
+                band_color=(*SERIES_SECONDARY_COLOR[:3], SERIES_SECONDARY_BAND_ALPHA),
                 marker_size=7,
                 order=0,
             )
@@ -870,8 +962,10 @@ class Display(BasePlot.BaseCanvas):
             selected_visual = series_with_confidence.SeriesVisual(
                 parent=parent,
                 line_color=color,
-                band_color=(*color[:3], SERIES_BAND_ALPHA),
-                marker_size=7,
+                band_color=(*color[:3], SERIES_SELECTED_BAND_ALPHA),
+                marker_size=9,
+                line_width=3.0,
+                marker_edge_color=(1.0, 1.0, 1.0, 1.0),
                 order=30,
             )
             selected_visual.clear()
@@ -1025,9 +1119,11 @@ class Display(BasePlot.BaseCanvas):
         else:
             x_name = y_name = self.data.current_assignments
 
+        x_color, y_color = assignment_colors([x_name, y_name])
+
         return {
-            "face_color": assignment_shade(assignment_color(x_name), style),
-            "edge_color": assignment_shade(assignment_color(y_name), style),
+            "face_color": assignment_shade(x_color, style),
+            "edge_color": assignment_shade(y_color, style),
             "edge_width": 1.0,
         }
 
@@ -1044,6 +1140,13 @@ class Display(BasePlot.BaseCanvas):
             on_changed=self._on_threshold_changed,
         )
         self.thresholds["x"].reset_to_view_center(emit=False)
+        if kind == "histogram":
+            self.thresholds["x"].set_value(
+                self._snap_threshold_value(
+                    self.thresholds["x"], self.thresholds["x"].spec.value
+                ),
+                emit=False,
+            )
         self.thresholds["x"].set_visible(True)
         self.thresholds["x"].set_tooltip_parameter(self.plot_data.title["x"])
 
@@ -1166,7 +1269,9 @@ class Display(BasePlot.BaseCanvas):
                 threshold.dragging = True
                 threshold.set_active_visual_state(True, emit=False)
                 threshold.set_value(
-                    value + xy[axis] - origin[axis],
+                    self._snap_threshold_value(
+                        threshold, value + xy[axis] - origin[axis]
+                    ),
                     emit=False,
                 )
 
@@ -1292,6 +1397,9 @@ class Display(BasePlot.BaseCanvas):
 
     def on_mouse_release(self, event):
 
+        if self.legend_entry_at(event.pos) is not None:
+            return
+
         if (
             event.button != 1
             or event.pos is None
@@ -1311,7 +1419,35 @@ class Display(BasePlot.BaseCanvas):
         elif isinstance(self.plot_data, plotdata_scatter.PlotData):
             self.signals.marker_clicked.emit(idx, event.modifiers)
 
+    def legend_entry_at(self, canvas_pos):
+        """Index of the assignments legend row (with a swatch) at
+        ``canvas_pos``, or None."""
+        legend = self.assignment_legend
+        names = self.assignment_legend_names
+
+        if not legend.visible or not names or canvas_pos is None:
+            return None
+
+        x, y = legend.get_transform(map_from="canvas", map_to="visual").map(
+            canvas_pos
+        )[:2]
+        right = max(24, self.view.size[0] - 12)
+
+        for index, label in enumerate(list(legend.text)[: len(names)]):
+            centre = 18 + 18 * index
+            # Text right-aligned at right - 16, swatch at right - 4.
+            left = right - 24 - 7.5 * len(label)
+            if abs(y - centre) <= 9 and left <= x <= right + 6:
+                return index
+
+        return None
+
     def on_mouse_press(self, event):
+
+        if event.button == 1 and self.legend_entry_at(event.pos) is not None:
+            self.signals.legend_clicked.emit(self.legend_entry_at(event.pos))
+            event.handled = True
+            return
 
         if (
             event.button != 1
@@ -1955,15 +2091,7 @@ class Display(BasePlot.BaseCanvas):
         session_id: int,
     ) -> str:
 
-        session_id = int(session_id)
-
-        if 0 <= session_id < len(self.data.sessions):
-            session = self.data.sessions[session_id]
-
-            if session is not None and session.name:
-                return session.name
-
-        return f"Session {session_id}"
+        return session_label(self.data, int(session_id))
 
     def update_selection(self):
         pass
@@ -2219,6 +2347,8 @@ class Controller(BasePlot.CanvasController):
         self.connect_signal(
             self.canvas.signals.bin_clicked, self._on_visual_clicked, controls=True
         )
+        self.canvas.signals.legend_clicked.connect(self._on_legend_clicked)
+        color_signals.changed.connect(self._on_assignment_colors_changed)
 
         self.connect_signal(
             self.data.statistic_engine.values_changed,
@@ -2255,7 +2385,8 @@ class Controller(BasePlot.CanvasController):
             "Integer statistics: one point per value pair, sized by the "
             "number of entries. Clicking a point selects all of them."
         )
-        aggregate_scatter.setChecked(bool(self.config.get("aggregate_scatter", False)))
+        # On by default: equal integer values are sized by their number.
+        aggregate_scatter.setChecked(bool(self.config.get("aggregate_scatter", True)))
         aggregate_scatter.toggled.connect(self._set_scatter_aggregation)
         aggregate_scatter.setVisible(False)
 
@@ -2280,6 +2411,9 @@ class Controller(BasePlot.CanvasController):
             C.REVIEW_STATUS,
         ):
             self._sync_review_selector_to_selection()
+
+        if event.has(C.ASSIGNMENT_SET):
+            self._sync_comparison_controls()
 
         if self._uses_assignment_comparison():
             self.recalculate_statistics(force=True)
@@ -2737,7 +2871,13 @@ class Controller(BasePlot.CanvasController):
             return
 
         names = tuple(self.config.get("histogram_assignments", ()))
-        button.setVisible(self.plot_type == "histogram")
+        # A choice only with several loaded assignment sets (or some chosen).
+        several = (
+            sum(item is not None for item in self.data._assignments.values()) > 1
+            or bool(names)
+        )
+        form = self.controls["panel"].form
+        form.setRowVisible(button, self.plot_type == "histogram" and several)
 
         if names:
             button.setText(f"Assignments ({len(names)})")
@@ -2749,7 +2889,7 @@ class Controller(BasePlot.CanvasController):
         checkbox = self.controls.get("compare_scatter")
 
         if checkbox is not None:
-            checkbox.setVisible(self.plot_type == "scatter")
+            checkbox.setVisible(self.plot_type == "scatter" and several)
 
         aggregate = self.controls.get("aggregate_scatter")
 
@@ -2784,22 +2924,21 @@ class Controller(BasePlot.CanvasController):
                     f"{plot_data.unmatched_count} X neurons unmatched"
                 ),
             ]
-            colors = np.asarray(
-                [
-                    assignment_color(plot_data.names[0]),
-                    assignment_color(plot_data.names[1]),
-                    (0.22, 0.25, 0.29, 1.0),
-                ]
+            colors = np.vstack(
+                [assignment_colors(plot_data.names), [(0.22, 0.25, 0.29, 1.0)]]
             )
 
         else:
             legend.visible = False
             self.canvas.assignment_legend_swatches.visible = False
+            self.canvas.assignment_legend_names = ()
             return
 
         legend.text = labels
-        legend.color = colors
+        # Coloured swatches, dark text.
+        legend.color = LEGEND_TEXT_COLOR
         legend.visible = True
+        self.canvas.assignment_legend_names = tuple(plot_data.names)
 
         # Scatter has an additional summary line, without a swatch.
         swatch_count = len(plot_data.names)
@@ -2810,6 +2949,37 @@ class Controller(BasePlot.CanvasController):
         )
         self.canvas.assignment_legend_swatches.visible = True
         self.canvas.position_assignment_legend()
+
+    def _on_legend_clicked(self, index):
+        names = self.canvas.assignment_legend_names
+        if not 0 <= index < len(names):
+            return
+
+        name = names[index]
+        menu = QMenu(self.canvas.native)
+        add_menu_section(menu, assignment_label(name), title=True)
+        change = menu.addAction("Change colour…")
+        automatic = menu.addAction("Automatic colour")
+        automatic.setEnabled(has_custom_color(name))
+
+        chosen = menu.exec(QCursor.pos())
+        menu.deleteLater()
+
+        if chosen is automatic:
+            set_assignment_color(name, None)
+        elif chosen is change:
+            current = assignment_colors(names)[index]
+            color = QColorDialog.getColor(
+                QColor.fromRgbF(*(float(v) for v in current)),
+                self.canvas.native,
+                f"Colour of {assignment_label(name)}",
+            )
+            if color.isValid():
+                set_assignment_color(name, color.getRgbF())
+
+    def _on_assignment_colors_changed(self):
+        if isinstance(self.current_plot_data, (ComparisonHistogram, ComparisonScatter)):
+            self.update_canvas()
 
     def _result_context_matches(self, result):
         expected_names = self._assignment_names_for_slot(result.slot)
@@ -2932,12 +3102,24 @@ class Controller(BasePlot.CanvasController):
         self.update_canvas()
         self._update_statistics_status()
 
+    def _histogram_bounds(self, table):
+        """Possible value range of the table's statistic (or None)."""
+        stat = getattr(table, "stat", None)
+        if stat is None:
+            return None
+        definition = self.data.statistic_engine.registry.get(stat.name)
+        return plotdata_histogram.possible_value_range(
+            definition, stat, len(self.data.active_session_ids())
+        )
+
     def _build_plot_data(
         self,
         tables: dict[str, PickTable],
     ):
 
         if self.plot_type == "histogram":
+            # Integer-valued statistics get integer-centred bins over their
+            # possible range; the bin count is then the maximum.
             nbins = int(self.controls["bin_selector"].value())
             histogram_tables = tables["x"]
 
@@ -2946,11 +3128,15 @@ class Controller(BasePlot.CanvasController):
                     histogram_tables,
                     bins=nbins,
                     data=self.data,
+                    bounds=self._histogram_bounds(
+                        next(iter(histogram_tables.values()), None)
+                    ),
                 )
 
             return plotdata_histogram.build_plot_data(
                 histogram_tables,
                 bins=nbins,
+                bounds=self._histogram_bounds(histogram_tables),
             )
 
         if self.plot_type == "session_series":
@@ -2976,7 +3162,7 @@ class Controller(BasePlot.CanvasController):
             plot_data = plotdata_scatter.build_plot_data(
                 x_table=tables["x"],
                 y_table=tables["y"],
-                aggregate=bool(self.config.get("aggregate_scatter", False)),
+                aggregate=bool(self.config.get("aggregate_scatter", True)),
             )
 
             # Offered for integer values only.

@@ -19,6 +19,7 @@ from catan.core.changes import (
     SESSION_STRUCTURE_CHANGES,
 )
 from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
+from catan.gui.utils.session_labels import session_label
 from catan.gui.GUI_elements.fragments.manual_alignment_dialog import (
     ManualAlignmentEditor,
     select_alignment_draft,
@@ -153,8 +154,7 @@ class Display(QWidget):
                 "Realign in session order (manual alignments keep their "
                 "transform; stops at a session needing review):\n"
                 + "\n".join(
-                    f"S{session_id} {self.data.sessions[session_id].name}"
-                    for session_id in stale
+                    session_label(self.data, session_id) for session_id in stale
                 )
                 + "\n\nArrow: realign all sessions."
             )
@@ -212,15 +212,15 @@ class Display(QWidget):
             if entry is None:
                 continue
             dx, dy, angle = entry["parameters"]
-            name = self.data.sessions[sid].name
+            name = session_label(self.data, sid)
             if entry["accepted"]:
                 accepted += 1
                 lines.append(
-                    f"S{sid} {name}: dx {dx:+.2f}, dy {dy:+.2f} px, "
+                    f"{name}: dx {dx:+.2f}, dy {dy:+.2f} px, "
                     f"rotation {angle:+.2f}° ({entry.get('matches')} cells)"
                 )
             else:
-                lines.append(f"S{sid} {name}: not refined — {entry.get('reason')}")
+                lines.append(f"{name}: not refined — {entry.get('reason')}")
 
         largest = max(
             (np.hypot(*entry["parameters"][:2]) for entry in results.values() if entry and entry["accepted"]),
@@ -281,8 +281,8 @@ class Display(QWidget):
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("Realign all sessions")
         box.setText(
-            f"Realign sessions 1–{len(sessions) - 1} automatically, in session "
-            "order? Session 0 is the reference."
+            f"Realign S1–S{len(sessions) - 1} automatically, in session "
+            f"order? {session_label(self.data, 0)} is the reference."
         )
         box.setInformativeText(
             "Model evidence and assignments of all sessions become outdated. "
@@ -369,6 +369,10 @@ class Display(QWidget):
                 self.placeholder.show()
                 self.toolbar.hide()
                 self._hide_editor()
+            return
+
+        if self.state.draft_discard_question_open:
+            # Follow the session once the open question is answered.
             return
 
         draft = select_alignment_draft(self.data, sid, self)
@@ -502,6 +506,7 @@ class Display(QWidget):
             remap=draft.make_remap(),
             background_spec=None,
             expected_version=draft.expected_version,
+            **draft.commit_options(),
         )
 
     def dispose(self):

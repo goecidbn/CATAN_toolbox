@@ -7,6 +7,12 @@ from catan.gui.structures.state import NeuronComponent
 
 
 class RequestHandler:
+    """Manual split/merge. ``origin``: the target footprints that are
+    replaced (split: the whole; merge: the two pieces), ``destination``:
+    the source footprints from other sessions used for that (split: one or
+    two pieces; merge: the whole). Shown to the user as targets/sources.
+    A split with one source turns the rest of the target into a new neuron.
+    """
 
     type: Literal["split", "merge"]
     stage: Literal["origin", "destination"]
@@ -41,12 +47,25 @@ class RequestHandler:
             return len(self.origin) == self.n_components_origin
 
         if self.stage == "destination":
-            return (
-                len(self.origin) == self.n_components_origin
-                and len(self.destination) == self.n_components_destination
+            return len(self.origin) == self.n_components_origin and (
+                self.min_components_destination
+                <= len(self.destination)
+                <= self.n_components_destination
             )
 
         return False
+
+    @property
+    def min_components_destination(self) -> int:
+        # Split: one source is enough (the rest becomes a new neuron).
+        return 1 if self.type == "split" else self.n_components_destination
+
+    @property
+    def roles(self) -> dict:
+        """Highlight roles: targets orange, sources violet."""
+        roles = {component: "target" for component in self.origin}
+        roles.update({component: "source" for component in self.destination})
+        return roles
 
     @property
     def n_components_origin(self) -> int:
@@ -88,20 +107,20 @@ class RequestHandler:
         if self.stage == "origin":
 
             if len(self.origin) >= self.n_components_origin:
-                return "All origin components are already selected."
+                return "All targets are already selected."
 
             if self.origin:
 
                 origin_session = self.origin[0].session_id
 
                 if component.session_id != origin_session:
-                    return "All origin components must belong " "to the same session."
+                    return "All targets must belong to the same session."
 
                 if any(
                     existing.neuron_id == component.neuron_id
                     for existing in self.origin
                 ):
-                    return "Origin components must be " "different neurons."
+                    return "Targets must be different neurons."
 
             return None
 
@@ -112,18 +131,21 @@ class RequestHandler:
         if self.stage == "destination":
 
             if len(self.destination) >= self.n_components_destination:
-                return "All destination components are already selected."
+                return "All sources are already selected."
 
             if not self.origin:
-                return "The request has no origin component."
+                return "The request has no target."
 
             origin_session = self.origin[0].session_id
 
             if component.session_id == origin_session:
-                return (
-                    "Destination components must come from "
-                    "a different session than the origin."
-                )
+                return "Sources must come from a different session than the target."
+
+            if self.type == "split" and any(
+                existing.neuron_id == component.neuron_id
+                for existing in self.destination
+            ):
+                return "The two sources must belong to different neurons."
 
             return None
 
@@ -169,7 +191,7 @@ class RequestHandler:
             raise ValueError(
                 "Cannot continue: "
                 f"{len(self.origin)}/{self.n_components_origin} "
-                "origin components selected."
+                "targets selected."
             )
 
         self.stage = "destination"
@@ -181,27 +203,48 @@ class RequestHandler:
             return len(self.origin) == self.n_components_origin
 
         if self.stage == "destination":
-            return len(self.destination) == self.n_components_destination
+            return (
+                self.min_components_destination
+                <= len(self.destination)
+                <= self.n_components_destination
+            )
 
         return False
 
     def origin_status_text(self):
-        selected = ", ".join(f"({c.session_id}, {c.neuron_id})" for c in self.origin)
+        selected = ", ".join(f"N{c.neuron_id} S{c.session_id}" for c in self.origin)
+        what = (
+            "Target (footprint to split)"
+            if self.type == "split"
+            else "Targets (footprints to merge)"
+        )
 
-        return f"Origin: " f"{len(self.origin)}/{self.n_components_origin}" + (
+        return f"{what}: {len(self.origin)}/{self.n_components_origin}" + (
             f" — {selected}" if selected else ""
         )
 
     def destination_status_text(self):
         selected = ", ".join(
-            f"({c.session_id}, {c.neuron_id})" for c in self.destination
+            f"N{c.neuron_id} S{c.session_id}" for c in self.destination
         )
 
-        return (
-            f"Destination: "
-            f"{len(self.destination)}/"
-            f"{self.n_components_destination}" + (f" — {selected}" if selected else "")
-        )
+        if self.type == "split":
+            text = (
+                f"Sources (pieces in other sessions): {len(self.destination)}/"
+                f"{self.n_components_destination}"
+            )
+        else:
+            text = (
+                f"Source (whole footprint in another session): "
+                f"{len(self.destination)}/{self.n_components_destination}"
+            )
+
+        text += f" — {selected}" if selected else ""
+
+        if self.type == "split" and len(self.destination) == 1:
+            text += "\nWith one source, the rest of the target becomes a new neuron."
+
+        return text
 
 
 # Part of the source neuron moved by a neuron merge, relative to the
@@ -349,6 +392,21 @@ class NeuronMergeRequest:
                 for neuron_id in (self.source_id, self.target_id)
             ]
         return list(self.origin)
+
+    @property
+    def roles(self):
+        """Highlight roles: moved footprints as sources, the destination's
+        as targets (conflict view: both footprints of each shared session)."""
+        if self.highlight_mode == "conflicts" and self.conflicts:
+            roles = {NeuronComponent(self.source_id, s): "source" for s in self.conflicts}
+            roles.update(
+                {NeuronComponent(self.target_id, s): "target" for s in self.conflicts}
+            )
+            return roles
+
+        roles = {component: "source" for component in self.origin}
+        roles.update({component: "target" for component in self.destination})
+        return roles
 
     @property
     def is_complete(self):

@@ -1,17 +1,20 @@
 """Validated, isolated preparation of Curator manipulations."""
 
+from collections import Counter
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import numpy as np
 
+from catan.gui.utils.session_labels import session_tag
 from catan.core.structures import NeuronComponent
 from catan.core.changes import (
     ChangeKind as C,
     ASSIGNMENT_CONTENT_CHANGES,
 )
 from catan.tracking.structures import ReviewStatus
+from catan.tracking.structures import manipulation_records as records
 
 # Actions applied to all selected results at once, without per-candidate
 # preparation: review status changes and exclusion.
@@ -21,6 +24,10 @@ BATCH_ACTIONS = (
     "exclude_neuron",
     "exclude_footprint",
 )
+
+# Per-candidate actions applied directly (no isolated preparation; IDs do
+# not change): footprint shapes replaced by their neuron's union.
+SHAPE_ACTIONS = ("replace_with_union",)
 
 
 # What to do when a destination slot is already occupied (see
@@ -51,6 +58,7 @@ class ManipulationSpec:
             "neuron_merge",
             "reassign",
             *BATCH_ACTIONS,
+            *SHAPE_ACTIONS,
         ):
             raise ValueError(f"Unknown manipulation: {self.kind}")
 
@@ -293,7 +301,7 @@ class OccupiedDestination(ValueError):
         super().__init__(
             header
             + "\n".join(
-                f"Neuron {n}, session {sid}: footprint {fp}"
+                f"Neuron {n}, {session_tag(sid)}: footprint {fp}"
                 for n, sid, fp in self.slots
             )
         )
@@ -402,9 +410,17 @@ def _validate(data, kind, sources, targets):
 
     actual = (len(sources), len(targets))
 
+    if kind == "split" and len(sources) == 1:
+        # One source: the rest of the target becomes a new neuron.
+        expected[kind] = (1, 1)
+
     if kind == "move_footprints":
         # Several footprints into one (or a new) neuron.
         expected[kind] = (max(1, len(sources)), min(1, len(targets)))
+
+    if kind == "replace_with_union":
+        # Target footprints only; the union comes from the other footprints.
+        expected[kind] = (0, max(1, len(targets)))
 
     if kind not in expected or actual != expected[kind]:
         raise ValueError(
@@ -441,6 +457,11 @@ def _validate(data, kind, sources, targets):
                 "Align the endpoint sessions before " "manipulating footprints."
             )
 
+    if kind == "replace_with_union":
+        if any(c.session_id is None for c in targets):
+            raise ValueError("Replacing shapes requires footprint targets.")
+        return None
+
     if kind in ("split", "merge"):
         request = RequestHandler(kind)
 
@@ -458,7 +479,7 @@ def _validate(data, kind, sources, targets):
         if not request.is_complete:
             raise ValueError("Incomplete footprint manipulation.")
 
-        if kind == "split" and len({c.neuron_id for c in sources}) != 2:
+        if kind == "split" and len({c.neuron_id for c in sources}) != len(sources):
             raise ValueError(
                 "Split references must belong to " "two different neurons."
             )
@@ -625,6 +646,9 @@ def prepare(data, plan, *, detach_occupied=False, exclude_occupied=False):
 
     version = data.state.data_version
     original = data.assignments
+    # Footprint-keyed before-state of the record (undo).
+    snapshot = records.FootprintSnapshot.capture(original, data.sessions)
+    first_record = original.next_manipulation_id
 
     candidate, worker = _new_candidate(data)
 
@@ -652,17 +676,8 @@ def prepare(data, plan, *, detach_occupied=False, exclude_occupied=False):
     replacements = {}
 
     if plan.kind in ("split", "merge"):
-        worker._process_component_request_inplace(request)
-
-        session_id = targets[0].session_id
-
-        result_ids = (
-            [component.neuron_id for component in sources]
-            if plan.kind == "split"
-            else [targets[0].neuron_id]
-        )
-
-        results = tuple(NeuronComponent(neuron, session_id) for neuron in result_ids)
+        # Split: the pieces, then (one source) the remainder; merge: the whole.
+        results = tuple(worker._process_component_request_inplace(request))
 
         replacements = {component: results for component in targets}
 
@@ -760,6 +775,13 @@ def prepare(data, plan, *, detach_occupied=False, exclude_occupied=False):
             affected_neurons=registered,
         )
 
+    records.attach_diff(
+        candidate,
+        first_record,
+        records.footprint_diff(snapshot, candidate, worker.sessions),
+        manipulation_type=plan.kind,
+    )
+
     row_map, component_map, after = _finalize(data, worker, affected)
 
     return PreparedManipulation(
@@ -823,6 +845,8 @@ class ManipulationBatch:
 
         self.candidate, self.worker = _new_candidate(data)
         self.worker._deferred_union_neurons = {}
+        # Records of this batch are tagged with it (undone together).
+        self.first_record = self.worker.assignments.next_manipulation_id
 
         self.changed = {}
         self.affected = set()
@@ -919,6 +943,10 @@ class ManipulationBatch:
             self._session(session_id)
 
         affected = {c.neuron_id for c in sources + targets}
+        snapshot = records.FootprintSnapshot.capture(
+            self.worker.assignments, self.worker.sessions
+        )
+        first_record = self.worker.assignments.next_manipulation_id
 
         try:
             if slots and occupied == "exclude":
@@ -929,7 +957,7 @@ class ManipulationBatch:
             request = _validate(self.worker, kind, sources, targets)
 
             if kind in ("split", "merge"):
-                self.worker._process_component_request_inplace(request)
+                results = tuple(self.worker._process_component_request_inplace(request))
 
             else:
                 if kind == "neuron_merge":
@@ -951,20 +979,21 @@ class ManipulationBatch:
                     },
                 )
 
+            records.attach_diff(
+                self.worker.assignments,
+                first_record,
+                records.footprint_diff(
+                    snapshot, self.worker.assignments, self.worker.sessions
+                ),
+                manipulation_type=kind,
+            )
+
         except Exception as exc:
             raise BatchAborted(
                 f"{type(exc).__name__} while applying a manipulation: {exc}"
             ) from exc
 
         if kind in ("split", "merge"):
-            result_ids = (
-                [component.neuron_id for component in sources]
-                if kind == "split"
-                else [targets[0].neuron_id]
-            )
-            results = tuple(
-                NeuronComponent(neuron, session_id) for neuron in result_ids
-            )
             self.replacements.update({component: results for component in targets})
 
         self.affected.update(affected)
@@ -1039,6 +1068,7 @@ class ManipulationBatch:
             raise ValueError("No manipulation was applied.")
 
         self.worker.flush_deferred_union()
+        records.tag_batch(self.worker.assignments.manipulations, self.first_record)
 
         if self.kind == "neuron_merge" and self.removed:
             # Merging removes exactly the merged source rows.
@@ -1134,8 +1164,15 @@ def commit(data, prepared):
     if focused is not None:
         # Add results before focusing. Otherwise State's focus setter
         # can replace the entire selection with the focused component.
-        selected = set(data.state.selected_components or ()) | set(results) | {focused}
-        data.state.update_selected_components(list(selected), [])
+        # Results join as whole neurons: footprint entries would keep the
+        # moved footprints drawn in the "selected" style.
+        selected = list(data.state.selected_components or ())
+        present = {int(component.neuron_id) for component in selected}
+        for component in (*results, focused):
+            if int(component.neuron_id) not in present:
+                present.add(int(component.neuron_id))
+                selected.append(NeuronComponent(int(component.neuron_id), None))
+        data.state.update_selected_components(selected, [])
         data.state.focused_component = focused
 
     data.notify_change(
@@ -1144,4 +1181,261 @@ def commit(data, prepared):
         *([C.FOOTPRINT_GEOMETRY] if prepared.changed_sessions else []),
     )
 
+    return prepared
+
+
+# --------------------------------------------------------------------
+# Undo of footprint-keyed (format 2) manipulation records
+# --------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UndoPlan:
+    """Records undone together (newest first); committed like a plan."""
+
+    record_ids: tuple
+    assignments: object = field(compare=False, repr=False)
+    sessions: tuple = field(compare=False, repr=False)
+    kind: str = "undo"
+
+    @classmethod
+    def capture(cls, data, record_ids):
+        return cls(
+            record_ids=tuple(sorted(record_ids, reverse=True)),
+            assignments=data.assignments,
+            sessions=tuple(data.sessions),
+        )
+
+    def resolve(self, data):
+        if (
+            data.assignments is not self.assignments
+            or len(data.sessions) != len(self.sessions)
+            or any(a is not b for a, b in zip(data.sessions, self.sessions))
+        ):
+            raise ValueError("Assignments or sessions changed. Open the list again.")
+        return (), ()
+
+
+def undo_chain(data, record_ids):
+    """(record IDs to undo together, newest first): ``record_ids`` (one ID
+    or several, e.g. a curator batch) and the later records depending on
+    them."""
+    manipulations = data.assignments.manipulations
+    if isinstance(record_ids, (int, np.integer)):
+        record_ids = (record_ids,)
+    chain = set()
+    for record_id in record_ids:
+        record = manipulations.get(record_id)
+        if record is None or not records.undoable(record):
+            raise ValueError(f"Manipulation {record_id} cannot be undone.")
+        if record_id in chain:
+            continue
+        chain |= {record_id, *records.dependents(manipulations, record_id)}
+    if not chain:
+        raise ValueError("No manipulation selected.")
+    return tuple(sorted(chain, reverse=True))
+
+
+def _owner(ids, footprint):
+    session_id, footprint_id = footprint
+    rows = np.flatnonzero(ids[:, session_id] == footprint_id)
+    return int(rows[0]) if rows.size else None
+
+
+def _undo_record(worker, record, session_copy, notes):
+    """Undo one record in the candidate (rows not compacted). Returns
+    (touched rows, {row: review status}, redirect of emptied rows)."""
+    candidate = worker.assignments
+    ids = candidate.ids
+    moved = records.moved(record)
+    created = records.created(record)
+    before = [tuple(map(tuple, g)) for g in record.get("before", [])]
+    review = list(record.get("review_before", []))
+    anchors = records.anchors(record)
+
+    # Where each before-group's staying footprints are now.
+    anchor_rows = []
+    for anchor in anchors:
+        rows = [r for r in (_owner(ids, fp) for fp in anchor) if r is not None]
+        anchor_rows.append(Counter(rows).most_common(1)[0][0] if rows else None)
+
+    touched = set()
+    redirect = {}
+
+    def new_row():
+        candidate.pad_empty(n_neurons=1, n_sessions=0)
+        worker.state.assignments = candidate.ids
+        return len(candidate.ids) - 1
+
+    # Take the moved and created footprints out of their neurons.
+    for footprint in moved | created:
+        row = _owner(candidate.ids, footprint)
+        if row is not None:
+            candidate.ids[row, footprint[0]] = -1
+            touched.add(row)
+
+    # Created footprints: excluded singletons (every footprint stays
+    # assigned; their columns remain so later footprint IDs are kept).
+    for session_id, footprint_id in sorted(created):
+        if footprint_id >= len(worker.sessions[session_id].included):
+            continue
+        row = new_row()
+        candidate.ids[row, session_id] = footprint_id
+        session_copy(session_id).included[footprint_id] = False
+        touched.add(row)
+
+    moves = []
+    statuses = {}
+    for group, anchor_row, status in zip(before, anchor_rows, review or [None] * len(before)):
+        back = [fp for fp in group if fp in moved and fp not in created]
+        if not back:
+            if anchor_row is not None and status is not None:
+                statuses[anchor_row] = status
+            continue
+        row = anchor_row if anchor_row is not None else new_row()
+        for session_id, footprint_id in back:
+            target = row
+            if candidate.ids[target, session_id] >= 0:
+                # Filled since by something not undone here.
+                notes.append(
+                    f"S{session_id} footprint {footprint_id}: its neuron has another "
+                    "footprint in that session now; it became a neuron of its own."
+                )
+                target = new_row()
+            candidate.ids[target, session_id] = footprint_id
+            moves.append((None, target, session_id))
+            touched.add(target)
+        if status is not None:
+            statuses[row] = status
+
+    for session_id, footprint_id in record.get("excluded", []):
+        if (session_id, footprint_id) not in created:
+            session_copy(session_id).included[footprint_id] = True
+    for session_id, footprint_id in record.get("included", []):
+        session_copy(session_id).included[footprint_id] = False
+
+    # Replaced shapes: the detected shape back.
+    if record["type"] == "replace_shape":
+        for ref in record.get("results", []):
+            session_id, footprint_id = int(ref["session_id"]), int(ref["footprint_id"])
+            session_copy(session_id).restore_replaced_footprint(footprint_id)
+            row = _owner(candidate.ids, (session_id, footprint_id))
+            if row is not None:
+                touched.add(row)
+                moves.append((row, row, session_id))
+
+    worker.state.assignments = candidate.ids
+    if moves:
+        worker.update_moved_footprint_stats(moves)
+
+    # Emptied rows follow the neuron their first footprint went back to.
+    for row in touched:
+        if not np.any(candidate.ids[row] >= 0):
+            for group, anchor_row in zip(before, anchor_rows):
+                placed = [_owner(candidate.ids, fp) for fp in group]
+                placed = [r for r in placed if r is not None]
+                if placed:
+                    redirect.setdefault(row, placed[0])
+                    break
+
+    return touched, statuses, redirect
+
+
+def _remove_empty_rows(worker, redirect):
+    """Compact rows without footprints; returns the row map (removed rows
+    follow ``redirect``)."""
+    candidate = worker.assignments
+    union = candidate.union
+    keep = np.flatnonzero(np.any(candidate.ids >= 0, axis=1))
+    row_map = {int(old): new for new, old in enumerate(keep)}
+
+    for row, target in redirect.items():
+        while target is not None and target not in row_map and target in redirect:
+            target = redirect[target]
+        if row not in row_map and target in row_map:
+            row_map[row] = row_map[target]
+
+    candidate.manipulation_id = {
+        row_map[old]: value
+        for old, value in candidate.manipulation_id.items()
+        if old in row_map and old in set(keep.tolist())
+    }
+    candidate.ids = candidate.ids[keep]
+    candidate.review_status = candidate.review_status[keep]
+    candidate.stats = {key: values[keep] for key, values in candidate.stats.items()}
+    union.footprints = union.footprints[:, keep].tocsc()
+    union.centroids = union.centroids[keep]
+    union.included = union.included[keep]
+    union.synthetic = union.synthetic[keep]
+    union.n_neurons = len(keep)
+
+    worker.state.assignments = candidate.ids
+    worker.state.row_map = row_map
+    return row_map
+
+
+def prepare_undo(data, record_ids):
+    """Isolated undo of ``record_ids`` (a chain from undo_chain(), newest
+    first), committed with commit(). ``notes`` on the result: footprints
+    that could not go back to their neuron."""
+    plan = UndoPlan.capture(data, record_ids)
+    version = data.state.data_version
+    original = data.assignments
+    candidate, worker = _new_candidate(data)
+    changed = {}
+
+    def session_copy(session_id):
+        if session_id not in changed:
+            changed[session_id] = clone_session(data.sessions[session_id])
+            worker.sessions[session_id] = changed[session_id]
+        return changed[session_id]
+
+    affected, statuses, redirect, notes = set(), {}, {}, []
+    for record_id in plan.record_ids:
+        record = candidate.manipulations[record_id]
+        if not records.is_new(record) or records.is_undone(record):
+            raise ValueError(f"Manipulation {record_id} cannot be undone.")
+        touched, status, moved_rows = _undo_record(worker, record, session_copy, notes)
+        affected |= touched
+        statuses.update(status)
+        redirect.update(moved_rows)
+        for part in [record_id, *records.parts(candidate.manipulations, record_id)]:
+            candidate.manipulations[part]["undone"] = True
+
+    worker.rebuild_union_neurons(sorted(affected))
+    row_map = _remove_empty_rows(worker, redirect)
+    row_map, component_map, after = _finalize(data, worker, affected)
+
+    # Inclusion of the changed neurons follows their footprints (_finalize
+    # may carry an emptied excluded row's flag over to its redirect).
+    ids = worker.assignments.ids
+    for new in after:
+        flags = [
+            bool(worker.sessions[s].included[int(f)])
+            for s, f in enumerate(ids[new])
+            if f >= 0
+        ]
+        worker.assignments.union.included[new] = any(flags)
+
+    # The restored neurons get their review status from before.
+    for row, status in statuses.items():
+        new = row_map.get(row)
+        if new is not None and new < len(candidate.review_status):
+            candidate.review_status[new] = status
+
+    prepared = PreparedManipulation(
+        plan=plan,
+        version=version,
+        candidate=worker.assignments,
+        candidate_data=worker,
+        changed_sessions=changed,
+        row_map=row_map,
+        component_map=component_map,
+        affected_before=tuple(
+            NeuronComponent(n, None) for n in sorted(affected) if n < len(original.ids)
+        ),
+        affected_after=tuple(NeuronComponent(n, None) for n in sorted(after)),
+        replacements={},
+    )
+    prepared.notes = notes
     return prepared

@@ -451,9 +451,15 @@ class AggregatedScatter(PlotData):
                 / self._pick_scale
             )
 
-    def marker_sizes(self, base=5.0, maximum=40.0):
-        """Marker diameters: area grows with the number of points."""
-        return np.minimum(base * np.sqrt(self.counts), maximum).astype(np.float32)
+    def marker_sizes(self, base=5.0, maximum=30.0):
+        """Marker diameters: ``base`` for one point, ``maximum`` for the
+        largest group, in between the area grows with the number of points
+        (relative to the largest group, so large counts stay distinct)."""
+        counts = np.asarray(self.counts, dtype=np.float64)
+        if counts.size == 0 or counts.max() <= 1:
+            return np.full(counts.shape, base, dtype=np.float32)
+        fraction = np.sqrt((counts - 1) / (counts.max() - 1))
+        return (base + (maximum - base) * fraction).astype(np.float32)
 
     def _points_of_markers(self, marker_indices):
         markers = np.atleast_1d(np.asarray(marker_indices, dtype=int))

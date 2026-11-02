@@ -1,0 +1,183 @@
+{
+  "schema_version": 2,
+  "name": "Seeds: deviating footprints",
+  "category": "footprints",
+  "root": {
+    "type": "group",
+    "id": "728e8a6118b64a5a9898b11f40ae11fc",
+    "operator": "and",
+    "match_level": "footprint",
+    "children": [
+      {
+        "type": "group",
+        "id": "5f6bd4714f3f4cac9c1c68f200d7b773",
+        "operator": "or",
+        "match_level": "footprint",
+        "children": [
+          {
+            "type": "condition",
+            "id": "d4763e5dee434174a6112cece200445b",
+            "query": {
+              "statistic_key": "relative_footprint_size",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "thr": 0.1
+              }
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 0.5
+            }
+          },
+          {
+            "type": "condition",
+            "id": "852de2d7776d4a348843d8eaae41fa39",
+            "query": {
+              "statistic_key": "relative_footprint_size",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "thr": 0.1
+              }
+            },
+            "threshold": {
+              "direction": "greater",
+              "active": true,
+              "value": 2.0
+            }
+          },
+          {
+            "type": "condition",
+            "id": "ce87ef22807943f4bfcd3da20b722d38",
+            "query": {
+              "statistic_key": "footprint_union_overlap",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "same",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {
+                "normalize_by": "j",
+                "support_threshold": 0.2
+              }
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 0.3
+            }
+          },
+          {
+            "type": "condition",
+            "id": "e7189bd21c8f4cb88a29eac713a58c22",
+            "query": {
+              "statistic_key": "footprint_union_overlap",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "same",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {
+                "normalize_by": "i",
+                "support_threshold": 0.2
+              }
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 0.3
+            }
+          }
+        ],
+        "count": null,
+        "comment": "Only strong deviations (the union replacement is a strong intervention; normal variability between sessions is kept): less than half or more than twice the neuron's median footprint size; covering less than 30 % of the own union (partial); or less than 30 % inside the own union (spills over, e.g. a merged neighbour). ID20: about the 1 % tails of each measure.",
+        "apply_to": "same",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": null,
+    "comment": "Footprints that deviate from the other footprints of their neuron, to clean up before seeded redetection. 'Replace with union shape' gives each the union shape of the neuron's other footprints at its own position and keeps its activity; exclude footprints that belong to another cell instead. The union needs at least one other footprint of the neuron.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": {
+      "kind": "replace_with_union",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
+    "review_statuses": null
+  }
+}

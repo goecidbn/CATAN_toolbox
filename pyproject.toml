@@ -115,6 +115,7 @@ include = ["catan*"]
 catan = [
     "resources/load_configs/*.json",
     "resources/curation_filters/*.json",
+    "resources/guide/*.json",
 ]
 
 [tool.setuptools_scm]

@@ -6,6 +6,7 @@ from threading import RLock
 import numpy as np
 from scipy import sparse
 
+from catan.gui.utils.session_labels import session_label
 from catan.gui.background_tasks.runtime import (
     current_task_context,
     progress_scope,
@@ -139,7 +140,7 @@ def _calculate(
             with progress_step(
                 j,
                 len(sessions),
-                message=f"Event rates: session {sid}",
+                message=f"Event rates: {session_label(data, sid)}",
             ):
                 session = data.sessions[sid]
                 fp_ids = ids[neurons, sid]

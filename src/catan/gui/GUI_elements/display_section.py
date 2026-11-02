@@ -30,47 +30,52 @@ from catan.gui.panels import (
     ModelResults,
 )
 
+# "menu": parent menu of the entry; an entry with a single option is an
+# action of its parent menu (top level without one), others a submenu.
 display_modes = {
     "overview": {
         "title": "Overview",
+        "menu": "Plots",
         "options": {
             # Session footprints are an option of this panel
             # ("Show current session only").
-            "tracked_overview": "Footprint overview",
-            "selection_display": "Selection display",
+            "tracked_overview": "Overview",
         },
     },
     "footprints": {
         "title": "Neuron footprints",
+        "menu": "Plots",
         "options": {
             "footprints": "Neuron footprints",
             # "multi_footprint": "Neuron footprints (multi)",
         },
     },
     "traces": {
-        "title": "Neuron traces",
+        "title": "Neuron activity",
+        "menu": "Plots",
         "options": {
             "traces": "Neuron activity",
         },
     },
     "population": {
-        "title": "Population statistics",
+        "title": "Statistics",
+        "menu": "Plots",
         "options": {
             "statistics": "Statistics",
-            "raster": "Raster plot",
+        },
+    },
+    "selection": {
+        "title": "Selection table",
+        "options": {
+            "selection_display": "Selection table",
         },
     },
     "controls": {
         "title": "Curation",
         "options": {
-            "match_curator": "Statistics Filter",
             "session_alignment": "Session alignment",
-        },
-    },
-    "model": {
-        "title": "Tracking model",
-        "options": {
-            "model_results": "Model results",
+            "model_results": "Match model",
+            "match_curator": "Neuron tracking",
         },
     },
 }
@@ -258,10 +263,23 @@ class DisplaySection(QFrame):
         # Root menu
         menu = QMenu(self.display_mode_selector)
 
+        parents = {}
+
         for mode, opts in display_modes.items():
-            submenu = QMenu(opts["title"], menu)
+            parent_title = opts.get("menu")
+
+            parent = menu
+            if parent_title is not None:
+                if parent_title not in parents:
+                    parents[parent_title] = menu.addMenu(parent_title)
+                parent = parents[parent_title]
+
+            if len(opts["options"]) == 1:
+                add_options(parent, mode, opts["options"])
+                continue
+
+            submenu = parent.addMenu(opts["title"])
             add_options(submenu, mode, opts["options"])
-            menu.addMenu(submenu)
 
         self.display_mode_selector.setMenu(menu)
 
@@ -311,6 +329,7 @@ class DisplaySection(QFrame):
         self.display_mode_selector.setText(title)
         controller_cls = DISPLAY_CONTROLLERS[mode].Controller
         if controller_cls is None:
+            self._update_help_button()
             return
 
         self.active_controller = controller_cls(
@@ -321,6 +340,17 @@ class DisplaySection(QFrame):
         self.display_cls = DISPLAY_CONTROLLERS[mode].Display
 
         self.active_controller.activate()
+        self._update_help_button()
+
+    def _update_help_button(self):
+        from catan.gui.guide.tour import help_modes
+
+        self.btn_help.setVisible(self.display_mode in help_modes())
+
+    def _open_guide_help(self):
+        guide = getattr(self.window(), "guide", None)
+        if guide is not None:
+            guide.start_help(self.display_mode, section=self)
 
     def _clear_option_panels(self):
         for layout in self.opts:
@@ -329,6 +359,17 @@ class DisplaySection(QFrame):
     def build_split_options(self) -> QHBoxLayout:
 
         buttons_layout = QHBoxLayout()
+
+        # The starter guide's part about this panel (shown for panels that
+        # have one, see _update_help_button).
+        btn_help = QToolButton()
+        btn_help.setText("?")
+        btn_help.setMaximumWidth(24)
+        btn_help.setToolTip("Guide: what this panel shows and how to use it")
+        btn_help.clicked.connect(self._open_guide_help)
+        btn_help.hide()
+        buttons_layout.addWidget(btn_help)
+        self.btn_help = btn_help
 
         ## add splitting options
         btn_split_h = QToolButton()

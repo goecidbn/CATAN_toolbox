@@ -706,7 +706,8 @@ class StatisticEngine(QObject):
 
         bound_data = copy(self.data)
         bound_data._current_assignments = assignment_name
-        bound_data._assignments = {assignment_name: bound_assignments}
+        # Other loaded sets stay available (e.g. assignment differences).
+        bound_data._assignments = {**self.data._assignments, assignment_name: bound_assignments}
         # Sessions with this set's synthetic components and inclusion.
         bound_data.sessions = (
             self.data.staged_sessions_for(assignments)
@@ -982,7 +983,12 @@ class StatisticEngine(QObject):
             and definition.relationship_axes is not None
             and all(
                 spec.method in ("keep", "single")
-                for spec in query.reduction_dict().values()
+                or (
+                    dim in definition.requested_reduced_axes
+                    and definition.pairs_getter is not None
+                    and spec.error_method == "none"
+                )
+                for dim, spec in query.reduction_dict().items()
             )
         )
 

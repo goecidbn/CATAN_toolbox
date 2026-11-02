@@ -1,9 +1,11 @@
 import importlib
 from copy import deepcopy
+from html import escape
 from dataclasses import replace
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent
 from PySide6.QtWidgets import (
+    QCheckBox,
     QApplication,
     QGridLayout,
     QWidget,
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
 )
 
+from catan.gui.utils.session_labels import session_label
 from catan.gui.data.curation_filter import (
     CurationFilterCondition,
     CurationFilterGroup,
@@ -43,7 +46,7 @@ from catan.core.changes import ChangeKind, DataChange
 from catan.gui.panels import StatisticsData
 from catan.gui.panels.helper.Threshold import ThresholdSpec
 from catan.gui.data.threshold_references import (
-    MODEL_DISTANCE_TERMS,
+    MODEL_DISTANCE_TERM_HTML,
     ModelDistanceReference,
     PercentileReference,
     ThresholdReferenceError,
@@ -267,8 +270,11 @@ class CurationFilterConditionPopup(QDialog):
         direction_row.addWidget(QLabel("Match when:"))
 
         self.direction_selector = QComboBox()
+        # Data: direction, "_strict" suffix for strict bounds.
         self.direction_selector.addItem("≥", "greater")
+        self.direction_selector.addItem(">", "greater_strict")
         self.direction_selector.addItem("≤", "less")
+        self.direction_selector.addItem("<", "less_strict")
         self.direction_selector.addItem("Between", "between")
 
         self.direction_selector.setCurrentIndex(0)
@@ -368,6 +374,14 @@ class CurationFilterConditionPopup(QDialog):
         # ---------------------------------------------
 
         button_layout = QHBoxLayout()
+
+        self.optional_checkbox = QCheckBox("Optional")
+        self.optional_checkbox.setToolTip(
+            "Skip this condition when its statistic is unavailable (e.g. "
+            "imported values that some data sets lack): the filter is then "
+            "evaluated as if the condition were absent."
+        )
+        button_layout.addWidget(self.optional_checkbox)
         button_layout.addStretch()
 
         self.cancel_button = QPushButton("Cancel")
@@ -648,7 +662,7 @@ class CurationFilterConditionPopup(QDialog):
 
             spins = {}
 
-            for index, (name, label) in enumerate(MODEL_DISTANCE_TERMS.items()):
+            for index, (name, label) in enumerate(MODEL_DISTANCE_TERM_HTML.items()):
                 if index:
                     row.addWidget(QLabel("+"))
 
@@ -665,6 +679,7 @@ class CurationFilterConditionPopup(QDialog):
                 spins[name] = spin
 
                 term = QLabel(f"·{label}")
+                term.setTextFormat(Qt.TextFormat.RichText)
                 term.setProperty("term", name)
                 self.model_term_labels.append(term)
 
@@ -704,11 +719,11 @@ class CurationFilterConditionPopup(QDialog):
             name = term.property("term")
             description = PARAMETERS[name][1]
             term.setToolTip(
-                f"{MODEL_DISTANCE_TERMS[name]} = "
+                f"<qt>{MODEL_DISTANCE_TERM_HTML[name]} = "
                 f"{units.to_display(float(model.parameters[name]), 'distance'):.3g} "
-                f"{unit}\n{description}"
+                f"{unit}<br>{escape(description)}</qt>"
                 if fitted
-                else f"{description}\nNo fitted two-noise model."
+                else f"<qt>{escape(description)}<br>No fitted two-noise model.</qt>"
             )
 
         for bound, (widget, bound_label, _, preview) in self.model_rows.items():
@@ -869,14 +884,19 @@ class CurationFilterConditionPopup(QDialog):
     ):
 
         self.condition = condition
+        self.optional_checkbox.setChecked(condition.optional)
 
         self.query_selector.set_query(
             condition.query,
             emit=False,
         )
 
+        threshold = condition.threshold
+        strict = threshold.strict and threshold.direction != "between"
         self.direction_selector.setCurrentIndex(
-            self.direction_selector.findData(condition.threshold.direction)
+            self.direction_selector.findData(
+                threshold.direction + ("_strict" if strict else "")
+            )
         )
 
         # Values in the display unit (the condition's may differ).
@@ -943,6 +963,7 @@ class CurationFilterConditionPopup(QDialog):
             condition = CurationFilterCondition(
                 query=query,
                 threshold=threshold,
+                optional=self.optional_checkbox.isChecked(),
             )
 
         else:
@@ -952,6 +973,7 @@ class CurationFilterConditionPopup(QDialog):
                 query=query,
                 threshold=threshold,
                 id=self.condition.id,
+                optional=self.optional_checkbox.isChecked(),
             )
 
         self.conditionAccepted.emit(condition)
@@ -960,6 +982,8 @@ class CurationFilterConditionPopup(QDialog):
 
     def _threshold_spec(self):
         direction = self.direction_selector.currentData()
+        strict = direction.endswith("_strict")
+        direction = direction.removesuffix("_strict")
 
         interval = direction == "between"
 
@@ -988,6 +1012,7 @@ class CurationFilterConditionPopup(QDialog):
             axis=(None if self.condition is None else self.condition.threshold.axis),
             value=values["lower"],
             direction=direction,
+            strict=strict,
             active=True,
             upper_value=values["upper"] if interval else None,
             reference=references["lower"],
@@ -1227,6 +1252,13 @@ class Display(QWidget):
 
         self.evidence_label = QLabel("Highlighted evidence: —")
         self.evidence_label.setObjectName("curationEvidenceLabel")
+        # Wraps instead of setting the panel's minimum width.
+        self.evidence_label.setWordWrap(True)
+        self.evidence_label.setMinimumWidth(0)
+        self.evidence_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
 
         layout.addWidget(self.evidence_label)
 
@@ -1397,19 +1429,6 @@ class Display(QWidget):
             Filter chips
             ===================================================== */
 
-            QToolButton#curationConditionButton {
-                color: #edf0f4;
-                background-color: #3a414a;
-                border: 1px solid #606a76;
-                border-radius: 5px;
-                padding: 2px 6px;
-            }
-
-            QToolButton#curationConditionButton:hover {
-                background-color: #48515c;
-                border-color: #75808d;
-            }
-
             QToolButton#curationConditionRemoveButton {
                 color: #dfe3e8;
                 background-color: #3a414a;
@@ -1578,10 +1597,17 @@ class Display(QWidget):
 
         if stat_def is None:
             text = condition.threshold.expression(key, precision=4)
+            if condition.optional:
+                return f"⊘ {text}  (optional, skipped)", (
+                    f"Statistic unavailable: {key}\n\n"
+                    "This optional condition is skipped: the filter is "
+                    "evaluated as if it were absent. It applies again when "
+                    "data providing the statistic is loaded."
+                )
             tooltip = (
                 f"Statistic unavailable: {key}\n\n"
                 "Load data providing this statistic, or edit the condition "
-                "to choose another statistic.\n"
+                "to choose another statistic (or make it optional).\n"
                 "This condition remains stored in the preset."
             )
             return text, tooltip
@@ -1590,6 +1616,17 @@ class Display(QWidget):
             condition.query,
             stat_def,
         )
+
+        # Changed parameters, compact: two conditions on one statistic with
+        # different parameters (e.g. overlap directions) stay distinguishable.
+        try:
+            changed = stat_def.parameters_short(
+                dict(condition.query.parameters), changed_only=True
+            )
+        except ValueError:
+            changed = ""
+        if changed:
+            query_title += f" [{changed}]"
 
         threshold, notes = self._display_threshold(
             condition.threshold, stat_def.value_kind
@@ -1606,7 +1643,17 @@ class Display(QWidget):
         if not threshold.active:
             lines.append("Threshold disabled")
 
+        if condition.optional:
+            text += "  (optional)"
+            lines.append("Optional: skipped when the statistic is unavailable.")
+
         parameters = dict(condition.query.parameters)
+
+        try:
+            # Parameters of older presets in their current form.
+            parameters = stat_def.resolve_parameters(parameters)
+        except ValueError:
+            pass
 
         if stat_def.parameters:
             lines.extend(["", "Parameters:"])
@@ -1623,7 +1670,9 @@ class Display(QWidget):
                 else:
                     value_text = str(value)
 
-                lines.append(f"  {parameter.label}: {value_text}")
+                lines.append(
+                    f"  {parameter.label} ({parameter.short_label}): {value_text}"
+                )
 
         return text, "\n".join(lines)
 
@@ -1786,7 +1835,7 @@ class Display(QWidget):
                     + (
                         ""
                         if target.session_id is None
-                        else f", session {target.session_id}"
+                        else f", {session_label(self.data, target.session_id)}"
                     ),
                     target,
                 )
@@ -2454,12 +2503,16 @@ class Controller(BasePlot.ControlsController):
                 '<span style="color:#C9A6FF">sources</span> highlighted'
             )
 
+        # Single-role views keep their role, so Ctrl-clicks cycle roles
+        # (none -> source -> target -> none) here as well.
         elif mode == "target":
             components = target_components
+            roles = {component: "target" for component in target_components}
             showing = "target highlighted"
 
         else:
             components = source_components
+            roles = {component: "source" for component in source_components}
             showing = "sources highlighted"
 
         self.state.update_highlighted_components(
@@ -2533,6 +2586,14 @@ class Controller(BasePlot.ControlsController):
         if condition is None:
             return
 
+        key = condition.query.statistic_key
+        if key not in self.data.statistic_engine.registry:
+            self.menu.status_label.setText(
+                f"Statistic {key} is unavailable: load data providing it to "
+                "edit this condition, or remove it."
+            )
+            return
+
         popup = CurationFilterConditionPopup(
             engine=self.data.statistic_engine,
             condition=condition,
@@ -2584,6 +2645,28 @@ class Controller(BasePlot.ControlsController):
 
         self._evidence_neuron = neuron
         self._update_evidence_highlight()
+
+    def _partner_targets(self, targets, sources, source_type, source_id):
+        """Counts per source (e.g. merge candidates): the other targets of
+        these sources in the targets' sessions, which belong to other
+        neurons and would otherwise stay unhighlighted."""
+        root = self.root_filter
+        count = None if root is None else root.count
+        if (
+            source_type != "group"
+            or source_id != self.current_result.root_id
+            or count is None
+            or count.anchor != "source"
+            or not sources
+        ):
+            return set()
+
+        sessions = {target.session_id for target in targets}
+        return {
+            target
+            for target, target_sources in self.current_result.root_targets().items()
+            if target.session_id in sessions and target_sources & set(sources)
+        }
 
     def _display_components(self, endpoints):
         """Expand neuron endpoints for display only."""
@@ -2666,9 +2749,10 @@ class Controller(BasePlot.ControlsController):
                 described = f"Target n{target.neuron_id}" + (
                     ""
                     if target.session_id is None
-                    else f", session {target.session_id}"
+                    else f", {session_label(self.data, target.session_id)}"
                 )
 
+            targets = targets | self._partner_targets(targets, sources, source_type, source_id)
             source_neurons = {c.neuron_id for c in sources}
 
             showing = self._highlight_endpoints(sources, targets)

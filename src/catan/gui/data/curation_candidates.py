@@ -36,6 +36,7 @@ class Step:
     value: str
     passed: bool | None  # None: not evaluated / unknown
     detail: str = ""
+    skipped: bool = False  # optional condition without its statistic
 
 
 @dataclass
@@ -178,6 +179,14 @@ def _condition_label(engine, condition):
 
 def _condition_step(engine, condition_check, components):
     condition = condition_check.condition
+    if condition_check.skipped:
+        return Step(
+            _condition_label(engine, condition),
+            "skipped (statistic unavailable)",
+            None,
+            condition_check.note,
+            skipped=True,
+        )
     value = _value(engine, condition_check, components)
     return Step(
         _condition_label(engine, condition),
@@ -218,7 +227,9 @@ def _finish(candidate):
     failure = candidate.first_failure()
     if candidate.passed is None and candidate.steps:
         candidate.passed = (
-            None if failure is None and any(s.passed is None for s in candidate.steps)
+            None
+            if failure is None
+            and any(s.passed is None and not s.skipped for s in candidate.steps)
             else failure is None
         )
 
@@ -233,7 +244,7 @@ def _finish(candidate):
     lines = []
     failed = False
     for step in candidate.steps:
-        mark = {True: "✓", False: "✗", None: "–"}[step.passed]
+        mark = "⊘" if step.skipped else {True: "✓", False: "✗", None: "–"}[step.passed]
         prefix = "   (downstream) " if failed else "   "
         lines.append(f"{prefix}{mark} {step.label}: {step.value}")
         failed = failed or step.passed is False
@@ -267,6 +278,13 @@ def _neuron_footprints(engine, neuron_id):
 
 def _group_step(result, group_check, matched):
     group = group_check.group
+    if group.id in result.skipped_nodes:
+        return Step(
+            _describe_group(group),
+            "skipped (only unavailable optional conditions)",
+            None,
+            skipped=True,
+        )
     group_result = result.group_results.get(group.id)
     passed = None if group_result is None else matched(group_result)
     value = group_check.count or {True: "matches", False: "no match", None: "–"}[passed]
@@ -280,6 +298,9 @@ def _neuron_candidate(engine, result, check, neuron_id):
     for child in root_check.children:
         if isinstance(child, ConditionCheck):
             verdict = root_check.condition_verdicts.get(child.condition.id)
+            if child.skipped:
+                steps.append(_condition_step(engine, child, ()))
+                continue
             if child.n_rows == 1:
                 value = format_value(float(child.values[0]))
             elif child.n_rows:
@@ -288,9 +309,8 @@ def _neuron_candidate(engine, result, check, neuron_id):
                 value = "no values"
             steps.append(Step(_condition_label(engine, child.condition), value, verdict, child.note))
         else:
-            steps.append(
-                Step(_describe_group(child.group), child.count or "", child.passed, child.note)
-            )
+            value = child.count or {True: "matches", False: "no match", None: "–"}[child.passed]
+            steps.append(Step(_describe_group(child.group), value, child.passed, child.note))
 
     return _finish(
         Candidate(
@@ -494,6 +514,12 @@ def _relationship_candidates(engine, evaluator, result, check, neuron_id):
             if qualifying and not matched:
                 target_candidate.summary += " (no pair passes all groups)"
 
+        vote = _vote_step(engine, result, root, target, compatible)
+        if vote is not None:
+            target_candidate.steps.append(vote)
+            if target_candidate.passed is False and qualifying:
+                target_candidate.summary += f" ({vote.value})"
+
         explanation = [
             f"{len(passing_pairs)} source footprint(s) pass the pair conditions, "
             f"{len(qualifying)} also the source checks"
@@ -544,6 +570,61 @@ def _relationship_candidates(engine, evaluator, result, check, neuron_id):
             targets.append(partner_node)
 
     return targets
+
+
+def _vote_step(engine, result, root, target, compatible):
+    """Split / merge: how the other sessions see the region (see
+    manipulation_votes). The curator's chosen pair if any, else the best
+    compatible pair of a split target."""
+    kind = None if root.manipulation is None else root.manipulation.kind
+    if kind not in ("split", "merge") or target.session_id is None:
+        return None
+
+    label = f"Other sessions ({'separate' if kind == 'split' else 'joint'} > "
+    label += f"{'joint' if kind == 'split' else 'separate'})"
+
+    chosen = getattr(result, "manipulation_votes", {}) or {}
+    for whole, (pair, votes) in chosen.items():
+        # Split: the target is the whole; merge: one of the pieces.
+        if (whole == target) if kind == "split" else (target in pair):
+            parts = " + ".join(footprint_label(c) for c in pair)
+            return Step(
+                label,
+                f"{votes.describe()} for {parts}",
+                votes.supports(kind),
+                detail=votes.votes,
+            )
+
+    if kind != "split":
+        return None
+
+    from catan.gui.data.manipulation_votes import SessionVoter
+
+    sources = [c.components[0] for c in compatible if c.components]
+    if len(sources) < 2:
+        return None
+
+    voter = SessionVoter(engine.data.sessions, engine.state.assignments)
+    best = None
+    for a, b in combinations(sources, 2):
+        if a.neuron_id == b.neuron_id:
+            continue
+        votes = voter.votes(target, (a, b))
+        rank = (votes.margin(kind), votes.separate + votes.joint)
+        if best is None or rank > best[0]:
+            best = (rank, (a, b), votes)
+
+    if best is None:
+        return Step(label, "no source pair from two different neurons", False)
+
+    _, pair, votes = best
+    parts = " + ".join(footprint_label(c) for c in pair)
+    return Step(
+        label,
+        f"{votes.describe()} for {parts}",
+        votes.supports(kind),
+        detail=votes.votes,
+    )
 
 
 # Partner pairs evaluated per summary condition.

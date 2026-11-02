@@ -38,7 +38,7 @@ def snapshot_inclusion(sessions):
         mask = inclusion_mask(
             session.included,
             session.n_neurons,
-            f"Session {index}",
+            f"S{index}",
         )
 
         record = {
@@ -85,7 +85,7 @@ def inclusion_to_restore(document, sessions):
         count = record.get("n_footprints")
         if count != session.n_neurons:
             raise ValueError(
-                f"Session {index} ({session.name}): saved inclusion "
+                f"{session.name} (S{index}): saved inclusion "
                 f"expects {count} footprints, but the session has "
                 f"{session.n_neurons}.\n"
                 f"Saved source: {record.get('source_path', 'unknown')}\n"
@@ -99,7 +99,7 @@ def inclusion_to_restore(document, sessions):
                     np.ones(session.n_neurons, dtype=bool),
                 ),
                 session.n_neurons,
-                f"Session {index}",
+                f"S{index}",
             )
         )
 

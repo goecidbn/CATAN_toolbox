@@ -2,7 +2,7 @@ import numpy as np
 from copy import deepcopy
 
 from catan.core.structures.remap import Remapping
-from catan.core import footprint_alignment
+from catan.core import footprint_alignment, footprint_frame
 
 
 class AlignmentDraft:
@@ -41,6 +41,121 @@ class AlignmentDraft:
         # set_footprint_correction.
         self._footprint = None
 
+        # The background relative to the footprints (core.footprint_frame):
+        # the image the session is aligned by and the background correction
+        # (dx, dy, angle in the original frame, like ``values``; a flow field
+        # is kept for the rigid values it was estimated at).
+        self.initial_alignment_source = (
+            "background" if self.external else self.session.alignment_source
+        )
+        self.alignment_source = self.initial_alignment_source
+        correction = None if self.external else self.session.background_correction
+        self.initial_correction = (
+            np.zeros(3)
+            if correction is None
+            else np.array([*correction["shift"], correction.get("rotation", 0.0)], dtype=float)
+        )
+        self.correction = self.initial_correction.copy()
+        flow = None if correction is None else correction.get("flow")
+        self._initial_correction_flow = (
+            None if flow is None else (tuple(self.initial_correction), flow)
+        )
+        self._correction_flow = self._initial_correction_flow
+        self._corrected_cache = None
+
+    @property
+    def can_edit_correction(self):
+        """Background correction / alignment source apply: a session whose
+        background was loaded (not constructed from its footprints)."""
+        return (
+            not self.external
+            and self.session.background_origin != "footprints"
+            and getattr(self.session, "footprints", None) is not None
+            and self.session.footprints.shape[1] > 0
+        )
+
+    @property
+    def correction_flow(self):
+        """The correction's flow field if estimated at the current rigid
+        correction values, else None."""
+        flow = self._correction_flow
+        if flow is None or flow[0] != tuple(map(float, self.correction)):
+            return None
+        return flow[1]
+
+    def accept_correction_flow(self, flow):
+        self._correction_flow = (tuple(map(float, self.correction)), flow)
+
+    def clear_correction_flow(self):
+        self._correction_flow = None
+
+    def correction_dict(self):
+        """The edited correction (footprint_frame format), None for none."""
+        dx, dy, angle = map(float, self.correction)
+        flow = self.correction_flow
+        if dx == 0.0 and dy == 0.0 and angle == 0.0 and flow is None:
+            return None
+        return {"shift": (dx, dy), "rotation": angle, "flow": flow, "source": "manual"}
+
+    @property
+    def correction_changed(self):
+        return not np.array_equal(self.correction, self.initial_correction) or (
+            self.correction_flow is not (
+                None
+                if self._initial_correction_flow is None
+                or self._initial_correction_flow[0] != tuple(map(float, self.correction))
+                else self._initial_correction_flow[1]
+            )
+        )
+
+    def reset_correction(self):
+        self.correction = self.initial_correction.copy()
+        self._correction_flow = self._initial_correction_flow
+
+    @property
+    def corrected_template(self):
+        """The template moved by the edited correction (footprints' frame)."""
+        correction = self.correction_dict()
+        if footprint_frame.is_identity(correction):
+            return self.template
+        key = (
+            id(self.template),
+            self.background_transposed,
+            footprint_frame.correction_key(correction),
+        )
+        if self._corrected_cache is None or self._corrected_cache[0] != key:
+            self._corrected_cache = (
+                key,
+                footprint_frame.apply_correction(self.template, correction),
+            )
+        return self._corrected_cache[1]
+
+    @property
+    def alignment_source_changed(self):
+        return self.alignment_source != self.initial_alignment_source
+
+    def commit_options(self):
+        """Background keywords of Data.queue_commit_session_realignment."""
+        if self.correction_changed:
+            correction = self.correction_dict()
+            # No correction: an explicit zero (kept, not estimated again).
+            correction = correction or {"shift": (0.0, 0.0), "rotation": 0.0}
+        else:
+            correction = None
+        return {
+            "background_correction": correction,
+            "alignment_source": (
+                self.alignment_source if self.alignment_source_changed else None
+            ),
+            # A moved background needs a new alignment; the user's own
+            # geometry (changed values or refined flow) is kept instead.
+            "realign": bool(
+                self.correction_changed
+                and not self.geometry_changed
+                and not self.has_refined_flow
+            ),
+        }
+
     @property
     def template(self):
         if self.background_transposed:
@@ -74,7 +189,12 @@ class AlignmentDraft:
 
     @property
     def dirty(self):
-        return self.geometry_changed or self.has_refined_flow
+        return (
+            self.geometry_changed
+            or self.has_refined_flow
+            or self.correction_changed
+            or self.alignment_source_changed
+        )
 
     def accept_refined_flow(self, remap):
         if remap.flow is None:
@@ -284,3 +404,15 @@ class AlignmentDraft:
             return self.source_remap.flow_message
 
         return "No flow correction applied."
+
+
+def footprint_projection(session):
+    """Sum projection of the session's included footprints in the aligned
+    (common) frame; None without footprints (footprint_frame)."""
+    return footprint_frame.aligned_projection(session)
+
+
+def unaligned_footprint_projection(session):
+    """footprint_projection in the session's original frame (that of
+    background_template and its correction)."""
+    return footprint_frame.unaligned_projection(session)

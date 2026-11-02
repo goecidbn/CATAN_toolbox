@@ -2,12 +2,16 @@ from copy import copy
 from html import escape
 from textwrap import fill
 import numpy as np
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QEvent, QTimer, Qt
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QFormLayout, QComboBox,
     QDoubleSpinBox, QPushButton, QLabel, QScrollArea, QGridLayout, QToolButton, QMenu,
-    QMessageBox,
+    QMessageBox, QToolTip,
 )
+from catan.gui.GUI_elements.utils.tooltips import show_tooltip
+from catan.gui.GUI_elements.utils.vispy_axes import link_axis
+from catan.gui.utils.session_labels import session_label
 from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 from vispy import scene, color
 from vispy.geometry import Rect
@@ -26,6 +30,50 @@ from catan.gui.data.units import DisplayUnits
 PARAMETER_UNIT_POWERS = {
     "h": 1, "sigma_h": 1, "sigma_det": 1, "sigma_move": 1, "sigma_eff": 1,
     "u_same_slope": -2,
+}
+
+# Two-noise parameters in the panel (internal keys and model files keep
+# the model's parameterisation; the Gamma means are on u = 1 - correlation
+# and are shown and edited as mean correlations, 1 - mean of u).
+MEAN_CORRELATION_KEYS = ("u_same_mean", "u_diff_mean")
+
+TWO_NOISE_LABELS = {
+    "p_same": "π<sub>same</sub>",
+    "h": "h",
+    "sigma_h": "σ<sub>h</sub>",
+    "sigma_det": "σ<sub>det</sub>",
+    "sigma_move": "σ<sub>move</sub>",
+    "nu_move": "ν<sub>move</sub>",
+    "u_same_mean": "μ<sub>same</sub>",
+    "u_same_shape": "k<sub>same</sub>",
+    "u_same_slope": "β<sub>same</sub>",
+    "u_diff_mean": "μ<sub>diff</sub>",
+    "u_diff_shape": "k<sub>diff</sub>",
+}
+
+# Editor help ({unit}: the display length unit).
+TWO_NOISE_HELP = {
+    "p_same": "π<sub>same</sub> – prior: fraction of footprint pairs between consecutive sessions that belong to the same neuron. It weights the same-neuron against the different-neuron distributions (it is not the p(same) map over distance and correlation).",
+    "h": "h – exclusion radius ({unit}): neurons cannot overlap beyond their physical extent, so different neurons keep about h apart (a hard core; closer pairs come from neurons above and below each other in the imaged slab).",
+    "sigma_h": "σ<sub>h</sub> – spread of the exclusion radius ({unit}), from the varying sizes of neurons.",
+    "sigma_det": "σ<sub>det</sub> – detection noise ({unit}): per-axis uncertainty of a footprint's centre within one detection; fitted from the difference between optimal shifts and centroid displacements.",
+    "sigma_move": "σ<sub>move</sub> – movement of a neuron between consecutive sessions ({unit}, per-axis scale of the displacement on top of the detection noise).",
+    "nu_move": "ν<sub>move</sub> – tail of the movement distribution (Student-t degrees of freedom): small values allow occasional large jumps, large values approach a Gaussian.",
+    "u_same_mean": "μ<sub>same</sub> – mean footprint correlation of the same neuron at zero displacement (Gamma distribution of 1 − correlation).",
+    "u_same_shape": "k<sub>same</sub> – Gamma shape of the same neuron's correlation distribution: larger values concentrate the correlations around the mean.",
+    "u_same_slope": "β<sub>same</sub> (1/{unit}²) – decrease of the same neuron's mean correlation with the displacement d: mean = 1 − (1 − μ<sub>same</sub>)(1 + β<sub>same</sub>·d²). Footprints detected further from the neuron's position also differ more in detection completeness and shape (partial or misplaced detections). Measured on 845ad (nearest-neighbour pairs): 1 − correlation 0.036 at 0–1 px, 0.109 at 3–5 px.",
+    "u_diff_mean": "μ<sub>diff</sub> – mean footprint correlation of different (neighbouring) neurons (Gamma distribution of 1 − correlation).",
+    "u_diff_shape": "k<sub>diff</sub> – Gamma shape of the correlation distribution of different neurons: larger values concentrate the correlations around the mean.",
+}
+
+# Editor grid positions (row, column pair): distance model above, the
+# correlation model below (same | different).
+TWO_NOISE_POSITIONS = {
+    "p_same": (0, 0), "h": (0, 1), "sigma_h": (1, 0), "sigma_det": (1, 1),
+    "sigma_move": (2, 0), "nu_move": (2, 1),
+    "u_same_mean": (3, 0), "u_diff_mean": (3, 1),
+    "u_same_shape": (4, 0), "u_diff_shape": (4, 1),
+    "u_same_slope": (5, 0),
 }
 
 PARAMETERS = (
@@ -70,6 +118,20 @@ class CorrelationTicker(Ticker):
             step = next(v for v in (1, 2, 5, 10) if v*scale >= raw)*scale
         ticks = np.arange(np.ceil((low-1e-10)/step), np.floor((high+1e-10)/step)+1)*step
         return (ticks-start)/(end-start), np.empty(0), [f"{v:g}" for v in ticks]
+
+
+class NotifyingTurntableCamera(scene.TurntableCamera):
+    """Turntable camera that reports every view change (rotation, zoom,
+    resize), so overlay labels can follow the projection."""
+
+    def __init__(self, *args, on_change=None, **kwargs):
+        self._on_change = on_change
+        super().__init__(*args, **kwargs)
+
+    def view_changed(self):
+        super().view_changed()
+        if self._on_change is not None:
+            self._on_change()
 
 
 class BoundedCamera(scene.PanZoomCamera):
@@ -139,7 +201,7 @@ class Display(QWidget):
         self.height_mode = QComboBox()
         self.height_mode.addItems(["Counts", "p(same)"])
         self.fit_button = QPushButton("Fit model")
-        self.fit_button.setToolTip(tooltip("Fit the selected model to the available evidence (background task). Models loaded from a file cannot be refitted."))
+        self.fit_button.setToolTip(tooltip("Fit the selected model to the available evidence (background task)."))
         form.addRow(self.fit_button)
         self.gaps = QComboBox()
         self.gaps.addItem("1", 1)
@@ -156,7 +218,7 @@ class Display(QWidget):
         launch = QVBoxLayout(self.launcher)
         row = QHBoxLayout()
         self.options_button = ToggleOption(options, icon_name="gear",
-            tooltip="Model options", popup=True, popup_size=(330, 220), parent=self.launcher)
+            tooltip="Model options", popup=True, popup_size=(360, 420), parent=self.launcher)
         row.addWidget(self.options_button)
         self.reset_button = ResetViewButton(self.launcher, (0, 28), self.reset_view)
         self.reset_button.setFixedWidth(44)
@@ -189,9 +251,11 @@ class Display(QWidget):
         self.build_parameter_editors("two_noise")
         self.apply = QPushButton("Apply to model")
         parameter_form.addWidget(self.apply, 4, 0, 1, 5)
+        # Word-wrapped over the editors' width; no maximum width (with one
+        # the layout sized it for fewer lines than it wrapped into: cropped).
         self.status = QLabel()
         self.status.setWordWrap(True)
-        self.status.setMaximumWidth(270)
+        self.status.setContentsMargins(0, 4, 0, 0)
         parameter_form.addWidget(self.status, 5, 0, 1, 5)
         launch.addWidget(parameter_box)
         launch.addStretch()
@@ -211,6 +275,18 @@ class Display(QWidget):
         self._reference_surface = None
         self._surface_visual = None
         self._surface_labels = []
+        # 3D axis texts: (scene anchor, Text in view pixels), placed by
+        # projecting the anchors (texts inside the 3D scene shrink with the
+        # perspective and were unreadable).
+        self._surface_texts = []
+        # Per 3D axis: scene start / end, tick (fraction, Text) and title.
+        self._surface_axes = []
+        self._surface_z = None
+        self._surface_columns = None
+        self._surface_probability = False
+        # Hover isolines on the 3D surface: constant distance, constant
+        # correlation, p(same) level (Line visuals, created on first hover).
+        self._hover_lines = None
 
     def build_parameter_editors(self, kind):
         """Editors of the model kind's parameters (replaces earlier ones)."""
@@ -230,14 +306,17 @@ class Display(QWidget):
         self.editors = {}
         if kind == "two_noise":
             specs = []
-            for index, (key, (short, description, low, high, _)) in enumerate(two_noise_model.PARAMETERS.items()):
-                specs.append((key, short, description, low, high, max((high - low) / 100, .001), (index // 2, 3 * (index % 2))))
+            for key, (_, _, low, high, _) in two_noise_model.PARAMETERS.items():
+                row, pair = TWO_NOISE_POSITIONS[key]
+                specs.append((key, TWO_NOISE_LABELS[key], TWO_NOISE_HELP[key], low, high,
+                              max((high - low) / 100, .001), (row, 3 * pair)))
         else:
             positions = {"p_same": (0, 0), "h": (0, 3), "sigma_eff": (1, 0),
                          "c_same_mean": (2, 0), "c_diff_mean": (2, 3),
                          "c_same_sd": (3, 0), "c_diff_sd": (3, 3)}
             specs = [(key, *PARAMETER_LABELS[key], low, high, step, positions[key]) for key, _, low, high, step in PARAMETERS]
         self._editor_specs = {}
+        self._editor_captions = {}
         for key, short, description, low, high, step, (r, c) in specs:
             editor = QDoubleSpinBox()
             editor.setDecimals(4 if kind == "two_noise" else 3)
@@ -253,6 +332,8 @@ class Display(QWidget):
             editor.setStyleSheet("QDoubleSpinBox { padding: 2px 5px; }")
             label = short.replace("π_same", "π<sub>same</sub>").replace("σ_D", "σ<sub>D</sub>").replace("μ_c", "μ<sub>c</sub>").replace("σ_c", "σ<sub>c</sub>")
             label = label.replace(" (same)", "").replace(" (diff)", "")
+            unit = self.units.label("distance")
+            description = description.replace("{unit}", unit)
             caption = QWidget()
             caption_layout = QHBoxLayout(caption)
             caption_layout.setContentsMargins(0, 0, 0, 0)
@@ -263,11 +344,13 @@ class Display(QWidget):
                 swatch.setStyleSheet("background: " + ("#159447" if "same" in key else "#c52c32") + "; border: none;")
                 swatch.setToolTip(tooltip(description))
                 caption_layout.addWidget(swatch)
-                label = label.replace(" same", "").replace(" diff", "")
+                if kind != "two_noise":
+                    label = label.replace(" same", "").replace(" diff", "")
             text = QLabel(label)
             text.setToolTip(tooltip(description))
             caption_layout.addWidget(text)
             caption.setToolTip(tooltip(description))
+            self._editor_captions[key] = caption
             grid.addWidget(caption, r, c, alignment=Qt.AlignmentFlag.AlignRight)
             grid.addWidget(editor, r, c+1)
         self.editor_layout.addWidget(box)
@@ -278,18 +361,39 @@ class Display(QWidget):
         power = PARAMETER_UNIT_POWERS.get(key)
         return 1.0 if power is None else self.units.factor("distance") ** power
 
+    def _shows_mean_correlation(self, key):
+        return self.editor_kind == "two_noise" and key in MEAN_CORRELATION_KEYS
+
+    def to_display(self, key, value):
+        """Model parameter -> editor value (display unit; Gamma means on
+        1 - correlation as mean correlations)."""
+        if self._shows_mean_correlation(key):
+            return 1.0 - value
+        return value * self.parameter_factor(key)
+
+    def from_display(self, key, shown):
+        """Editor value -> model parameter (inverse of to_display)."""
+        if self._shows_mean_correlation(key):
+            return 1.0 - shown
+        return shown / self.parameter_factor(key)
+
     def _apply_editor_units(self):
         unit = self.units.label("distance")
         for key, editor in self.editors.items():
             low, high, step, description = self._editor_specs[key]
-            factor = self.parameter_factor(key)
+            ends = sorted((self.to_display(key, low), self.to_display(key, high)))
             blocked = editor.blockSignals(True)
-            editor.setRange(low * factor, high * factor)
-            editor.setSingleStep(step * factor)
+            editor.setRange(*ends)
+            editor.setSingleStep(step * (1.0 if self._shows_mean_correlation(key) else self.parameter_factor(key)))
             editor.blockSignals(blocked)
-            editor.setToolTip(tooltip(
-                description.replace("(px)", f"({unit})").replace("1/px²", f"1/{unit}²")
-            ))
+            if self.editor_kind == "two_noise":
+                description = TWO_NOISE_HELP[key].replace("{unit}", unit)
+            text = tooltip(description.replace("(px)", f"({unit})").replace("1/px²", f"1/{unit}²"))
+            editor.setToolTip(text)
+            caption = self._editor_captions.get(key)
+            if caption is not None:
+                for widget in (caption, *caption.findChildren(QLabel)):
+                    widget.setToolTip(text)
 
     def set_units(self, units):
         """Show distances in ``units`` (editor values are set by the
@@ -348,7 +452,8 @@ class Display(QWidget):
         self.cards.append(card)
         self.canvases.append(canvas)
         grid = canvas.central_widget.add_grid(spacing=0, margin=0)
-        view = grid.add_view(row=0, col=0 if three_d else 1, camera="turntable" if three_d else BoundedCamera())
+        camera = NotifyingTurntableCamera(on_change=self._place_surface_texts) if three_d else BoundedCamera()
+        view = grid.add_view(row=0, col=0 if three_d else 1, camera=camera)
         grid.border_color = None
         view.border_color = None
         if not three_d:
@@ -368,7 +473,9 @@ class Display(QWidget):
                 if label == "Distance":
                     axis.axis.axis_label = f"Distance ({self.units.label('distance')})"
                     self._distance_axes.append(axis)
-                axis.link_view(view)
+                # Refreshes the ticks after layout changes too (the joint
+                # camera rarely moves: plain link_view kept stale ticks).
+                link_axis(axis, view)
         button = QToolButton(canvas.native)
         button.setText("ⓘ")
         button.setToolTip(tooltip(help_text))
@@ -420,6 +527,9 @@ class Display(QWidget):
         self.left.camera.link(self.joint.camera, axis="y")
         self.surface_view.camera.set_range(x=(-.2, 1), y=(-.2, 1), z=(0, 1), margin=0)
         self._surface_default = self.surface_view.camera.get_state()
+        self.canvases[2].events.mouse_move.connect(self._hover_joint)
+        self.canvases[3].events.mouse_move.connect(self._hover_surface)
+        self.canvases[3].native.installEventFilter(self)
         self._built = True
 
     @staticmethod
@@ -609,10 +719,19 @@ class Display(QWidget):
         values = values[:, selected]
         maximum = 1. if probability else max(1., float(np.nanmax(values)))
         z = np.nan_to_num(values.T/maximum)
+        self._surface_z = z
+        self._surface_columns = selected
+        self._surface_probability = probability
+        self._hide_hover_lines()
         colors = self.cmap.map(z.ravel()) if probability else self._rgba[:, selected].transpose(1, 0, 2).reshape(-1, 4).copy()
         colors[:, 3] = 1
         if self._surface_visual is None:
             self._surface_visual = scene.visuals.SurfacePlot(shading=None, parent=self.surface_view.scene)
+            # Pushed back in depth a little: hover isolines lying on it stay
+            # in front of it (and hidden behind nearer parts).
+            self._surface_visual.set_gl_state(
+                depth_test=True, polygon_offset_fill=True, polygon_offset=(1.0, 1.0)
+            )
         self._surface_visual.set_data(x=np.linspace(0, 1, z.shape[0]), y=np.linspace(0, 1, z.shape[1]), z=z)
         self._surface_visual.set_data(colors=colors)
         reference = self._reference if probability and self._reference is not self._model else None
@@ -639,15 +758,274 @@ class Display(QWidget):
         for visual in self._surface_labels:
             visual.parent = None
         self._surface_labels.clear()
+        self._surface_texts.clear()
+        self._surface_axes.clear()
         distance_label = f"Distance ({self.units.label('distance')})"
         for axis, limits, label in ((0, (.5, 1.), "Correlation"), (1, (d[0], d[-1]), distance_label), (2, (0, maximum), "p(same)" if probability else "Counts")):
             end = np.zeros(3); end[axis] = 1
             self._surface_labels.append(scene.visuals.Line(np.array([np.zeros(3), end]), color="#555555", parent=self.surface_view.scene))
-            for fraction in (0., .5, 1.):
-                pos = np.zeros(3); pos[axis] = fraction; pos[(axis+1)%3] = -.09
-                self._surface_labels.append(scene.visuals.Text(f"{limits[0]+fraction*(limits[1]-limits[0]):.3g}", pos=pos, color="black", font_size=13, parent=self.surface_view.scene))
-            pos = np.zeros(3); pos[axis] = .5; pos[(axis+1)%3] = -.24
-            self._surface_labels.append(scene.visuals.Text(label, pos=pos, color="black", font_size=15, parent=self.surface_view.scene))
+            ticks = [(fraction, self._add_surface_text(f"{limits[0]+fraction*(limits[1]-limits[0]):.3g}", 8))
+                     for fraction in (0., .5, 1.)]
+            self._surface_axes.append({"start": np.zeros(3), "end": end, "ticks": ticks,
+                                       "title": self._add_surface_text(label, 9, bold=True)})
+        self._place_surface_texts()
+
+    def _add_surface_text(self, text, size, bold=False):
+        # Font sizes as the 2D axes (tick 8, label 9 pt), in view pixels.
+        visual = scene.visuals.Text(text, color="black", font_size=size, bold=bold, parent=self.surface_view)
+        visual.set_gl_state(depth_test=False, blend=True, blend_func=('src_alpha', 'one_minus_src_alpha'))
+        visual.order = 100
+        self._surface_labels.append(visual)
+        self._surface_texts.append(visual)
+        return visual
+
+    def _project_surface(self, points):
+        """Scene points (n, 3) -> view pixels (n, 2) and depth (n,)."""
+        transform = self.surface_view.scene.node_transform(self.surface_view)
+        mapped = transform.map(np.asarray(points, dtype=float))
+        mapped = mapped / mapped[:, 3:4]
+        return mapped[:, :2], mapped[:, 2]
+
+    def _text_box(self, visual):
+        """Half width / height (px) of a text's box (estimated from the font)."""
+        dpi = getattr(self.canvases[3], "dpi", None) or 96
+        size = visual.font_size * dpi / 72
+        width = 0.38 if visual.bold else 0.34
+        return width * size * max(1, len(visual.text)), 0.6 * size
+
+    def _text_extent(self, visual, normal):
+        """Half extent (px) of a text's box along the unit ``normal``."""
+        half_w, half_h = self._text_box(visual)
+        return abs(normal[0]) * half_w + abs(normal[1]) * half_h
+
+    def _place_surface_texts(self):
+        """Ticks and titles beside their projected axis, pushed outwards
+        (away from the projected box centre) by their own extent, titles
+        beyond the ticks; a label that would still overlap one placed
+        before (the three axes meet at the origin) moves further out."""
+        if not self._surface_axes:
+            return
+        (center,), _ = self._project_surface(np.array([[.5, .5, .5]]))
+        gap = 6.0
+        wanted = []  # (visual, position, outward normal); titles last
+        titles = []
+        for axis in self._surface_axes:
+            (p0, p1), _ = self._project_surface(np.array([axis["start"], axis["end"]]))
+            direction = p1 - p0
+            length = float(np.hypot(*direction))
+            direction = direction / length if length > 1 else np.array([1.0, 0.0])
+            normal = np.array([-direction[1], direction[0]])
+            middle = (p0 + p1) / 2
+            if np.dot(normal, middle - center) < 0:
+                normal = -normal
+            reach = 0.0
+            for fraction, visual in axis["ticks"]:
+                extent = self._text_extent(visual, normal)
+                wanted.append((visual, p0 + fraction * (p1 - p0) + normal * (gap + extent), normal))
+                reach = max(reach, 2 * extent)
+            title = axis["title"]
+            titles.append((title, middle + normal * (2 * gap + reach + self._text_extent(title, normal)), normal))
+        placed = []
+        for visual, position, normal in wanted + titles:
+            half = np.array(self._text_box(visual))
+            for _ in range(40):
+                if not any(np.all(np.abs(position - other) < half + other_half + 3)
+                           for other, other_half in placed):
+                    break
+                position = position + normal * 4
+            placed.append((position, half))
+            visual.pos = position
+
+    # ------------------------------------------------------------------ hover
+    def _hover_text(self, row, column):
+        """Tooltip for the joint bin (distance row, correlation column)."""
+        model, counts = self._model, self._counts
+        d = self._bounds(model, "distance"); c = self._bounds(model, "correlation")
+        if not (0 <= row < len(d) - 1 and 0 <= column < len(c) - 1):
+            return None
+        unit = self.units.label("distance")
+        lines = [f"Distance {(d[row] + d[row + 1]) / 2:.2f} {unit}",
+                 f"Correlation {(c[column] + c[column + 1]) / 2:.3f}"]
+        joint = model.p_same.get("joint") if self._split else None
+        if joint is not None and np.isfinite(joint[row, column]):
+            lines.append(f"p(same) {joint[row, column]:.3f}")
+        total = int(counts[row, column, 0])
+        lines.append(f"Pairs {total:,}" + (f" (NN {int(counts[row, column, 1]):,})" if self._split else ""))
+        return "<br>".join(lines)
+
+    def _show_hover(self, text, canvas):
+        if text is None:
+            QToolTip.hideText()
+        else:
+            show_tooltip(QCursor.pos(), text, canvas.native)
+
+    def _hover_joint(self, event):
+        if self._model is None or self._counts is None:
+            return
+        view = self.joint
+        local = self.canvases[2].scene.node_transform(view).map(event.pos)[:2]
+        if not (0 <= local[0] <= view.size[0] and 0 <= local[1] <= view.size[1]):
+            return self._show_hover(None, self.canvases[2])
+        x, y = self.canvases[2].scene.node_transform(view.scene).map(event.pos)[:2]
+        d = self._bounds(self._model, "distance"); c = self._bounds(self._model, "correlation")
+        row = int(np.searchsorted(d, y, side="right")) - 1
+        column = int(np.searchsorted(c, x, side="right")) - 1
+        self._show_hover(self._hover_text(row, column), self.canvases[2])
+
+    def surface_pick(self, pos):
+        """Grid indices (distance row, correlation column) of the surface
+        point under the canvas position ``pos``, or None: the first crossing
+        of the view ray with the surface."""
+        hit = self._surface_hit(pos)
+        if hit is None:
+            return None
+        nx, ny = self._surface_z.shape
+        column = int(round(hit[0] * (nx - 1)))
+        row = int(round(hit[1] * (ny - 1)))
+        return row, int(self._surface_columns[column])
+
+    def _surface_hit(self, pos):
+        """Scene point (x, y, height) of the surface under ``pos``, or None."""
+        z = self._surface_z
+        if z is None or self._surface_columns is None:
+            return None
+        transform = self.canvases[3].scene.node_transform(self.surface_view.scene)
+        # Depth -1 is the near plane; the far plane lies very far away, so
+        # take the direction from a nearer depth and clip the ray to the
+        # surface's bounding box (slab method).
+        ends = transform.map(np.array([[pos[0], pos[1], -1, 1], [pos[0], pos[1], 0.5, 1]], dtype=float))
+        near, farther = ends[:, :3] / ends[:, 3:4]
+        direction = farther - near
+        low = np.array([0.0, 0.0, float(z.min()) - 1e-3])
+        high = np.array([1.0, 1.0, float(z.max()) + 1e-3])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t0, t1 = (low - near) / direction, (high - near) / direction
+        enter = np.nanmax(np.minimum(t0, t1))
+        leave = np.nanmin(np.maximum(t0, t1))
+        if not np.isfinite(enter) or not np.isfinite(leave) or leave <= max(enter, 0):
+            return None
+        t = np.linspace(max(enter, 0), leave, 2000)[:, None]
+        ray = np.clip(near + t * direction, low, high)
+        nx, ny = z.shape
+        fx, fy = ray[:, 0] * (nx - 1), ray[:, 1] * (ny - 1)
+        ix, iy = np.minimum(fx.astype(int), nx - 2), np.minimum(fy.astype(int), ny - 2)
+        ax, ay = fx - ix, fy - iy
+        height = ((1 - ax) * (1 - ay) * z[ix, iy] + ax * (1 - ay) * z[ix + 1, iy]
+                  + (1 - ax) * ay * z[ix, iy + 1] + ax * ay * z[ix + 1, iy + 1])
+        side = np.sign(ray[:, 2] - height)
+        crossing = np.flatnonzero(side != side[0])
+        if not crossing.size:
+            return None
+        return ray[crossing[0]]
+
+    def _hover_surface(self, event):
+        if self._model is None or self._counts is None:
+            return
+        if event.is_dragging:
+            self._hide_hover_lines()
+            return
+        hit = self._surface_hit(event.pos)
+        self._update_hover_lines(hit)
+        if hit is None:
+            return self._show_hover(None, self.canvases[3])
+        nx, ny = self._surface_z.shape
+        column = int(round(hit[0] * (nx - 1)))
+        row = int(round(hit[1] * (ny - 1)))
+        self._show_hover(self._hover_text(row, int(self._surface_columns[column])), self.canvases[3])
+
+    # Lifted slightly above the surface so it does not hide them.
+    HOVER_LIFT = 0.012
+    HOVER_COLORS = {"distance": "#1f5fd6", "correlation": "#b02fc8", "level": "#111111"}
+
+    def _hover_line_visuals(self):
+        """Per isoline a solid, depth-tested line (hidden where the surface
+        is in front) and a faint one drawn on top (its hidden parts)."""
+        if self._hover_lines is None:
+            self._hover_lines = {}
+            for key, col in self.HOVER_COLORS.items():
+                pair = []
+                for depth, alpha, order in ((True, 1.0, 21), (False, 0.35, 20)):
+                    line = scene.visuals.Line(np.zeros((2, 3)), color=(*color.Color(col).rgb, alpha),
+                                              width=2.5, method="gl", parent=self.surface_view.scene)
+                    line.set_gl_state(depth_test=depth, blend=True,
+                                      blend_func=('src_alpha', 'one_minus_src_alpha'))
+                    line.order = order
+                    line.visible = False
+                    pair.append(line)
+                self._hover_lines[key] = pair
+        return self._hover_lines
+
+    def _hide_hover_lines(self):
+        if self._hover_lines:
+            for pair in self._hover_lines.values():
+                for line in pair:
+                    line.visible = False
+
+    def surface_isolines(self, hit):
+        """Scene polylines through the surface point ``hit``: {"distance":
+        (n, 3) along correlation at its distance, "correlation": (m, 3) along
+        distance, "level": (points, index pairs) of the p(same) level set —
+        p(same) heights only (counts per bin have no meaningful level set)}."""
+        z = self._surface_z
+        nx, ny = z.shape
+        fx, fy = float(hit[0]) * (nx - 1), float(hit[1]) * (ny - 1)
+        ix, iy = min(int(fx), nx - 2), min(int(fy), ny - 2)
+        ax, ay = fx - ix, fy - iy
+        xs, ys = np.linspace(0, 1, nx), np.linspace(0, 1, ny)
+        lift = self.HOVER_LIFT
+        along_x = (1 - ay) * z[:, iy] + ay * z[:, iy + 1]
+        along_y = (1 - ax) * z[ix, :] + ax * z[ix + 1, :]
+        lines = {
+            "distance": np.column_stack((xs, np.full(nx, hit[1]), along_x + lift)),
+            "correlation": np.column_stack((np.full(ny, hit[0]), ys, along_y + lift)),
+            "level": None,
+        }
+        if self._surface_probability:
+            from skimage.measure import find_contours
+
+            # Height at the hovered point (bilinear).
+            level = float((1 - ax) * along_x[ix] + ax * along_x[ix + 1])
+            points, pairs = [], []
+            for contour in find_contours(z, level):
+                if len(contour) < 2:
+                    continue
+                start = sum(len(c) for c in points)
+                points.append(np.column_stack((contour[:, 0] / (nx - 1), contour[:, 1] / (ny - 1),
+                                               np.full(len(contour), level + lift))))
+                index = np.arange(start, start + len(contour) - 1)
+                pairs.append(np.column_stack((index, index + 1)))
+            if points:
+                lines["level"] = (np.concatenate(points), np.concatenate(pairs))
+        return lines
+
+    def _update_hover_lines(self, hit):
+        if hit is None or self._surface_z is None:
+            self._hide_hover_lines()
+            return
+        visuals = self._hover_line_visuals()
+        lines = self.surface_isolines(hit)
+        for key in ("distance", "correlation", "level"):
+            data = lines[key]
+            if key == "level" and data is not None:
+                pos, connect = data
+            else:
+                pos, connect = data, "strip"
+            for line in visuals[key]:
+                if data is None:
+                    line.visible = False
+                    continue
+                line.set_data(pos=pos.astype(np.float32), connect=connect)
+                line.visible = True
+
+    def eventFilter(self, watched, event):
+        if (
+            event.type() == QEvent.Type.Leave
+            and len(self.canvases) > 3
+            and watched is self.canvases[3].native
+        ):
+            self._hide_hover_lines()
+            QToolTip.hideText()
+        return super().eventFilter(watched, event)
 
 
 class Controller(BasePlot.BaseDisplayController):
@@ -688,7 +1066,7 @@ class Controller(BasePlot.BaseDisplayController):
         w = self.display_widget
         model = self.data.model
         kind = "two_noise" if model is None else model.kind
-        w.fit_button.setEnabled(model is not None and not model.loaded)
+        w.fit_button.setEnabled(model is not None)
         if w.editor_kind != kind:
             w.build_parameter_editors(kind)
             self._connect_editors()
@@ -696,7 +1074,7 @@ class Controller(BasePlot.BaseDisplayController):
 
     def _fit(self, *_):
         # Never fit to part of the evidence: calculate what is missing first.
-        if self.data.model is not None and not self.data.model.loaded and self._fit_evidence_missing():
+        if self.data.model is not None and self._fit_evidence_missing():
             self.display_widget.status.setText("Calculating missing evidence before fitting…")
             self._calculate_evidence(then=self._fit)
             return
@@ -722,7 +1100,7 @@ class Controller(BasePlot.BaseDisplayController):
         self._edited_keys = set()
         for key, editor in w.editors.items():
             editor.blockSignals(True)
-            editor.setValue(0 if self._source is None else self._source.parameters.get(key, 0) * w.parameter_factor(key))
+            editor.setValue(0 if self._source is None else w.to_display(key, self._source.parameters.get(key, 0)))
             editor.setEnabled(self._source is not None and bool(self._source.parameters))
             editor.blockSignals(False)
         w.status.setText("No fitted model available." if self._source is None or not self._source.parameters
@@ -742,14 +1120,14 @@ class Controller(BasePlot.BaseDisplayController):
         w = self.display_widget
         if w.units == self.data.units:
             return
-        edited = {k: w.editors[k].value() / w.parameter_factor(k) for k in self._edited_keys}
+        edited = {k: w.from_display(k, w.editors[k].value()) for k in self._edited_keys}
         w.set_units(self.data.units)
         for key, editor in w.editors.items():
             value = edited.get(key)
             if value is None:
                 value = 0 if self._source is None else self._source.parameters.get(key, 0)
             blocked = editor.blockSignals(True)
-            editor.setValue(value * w.parameter_factor(key))
+            editor.setValue(w.to_display(key, value))
             editor.blockSignals(blocked)
         self._evidence_key = None
         self._redraw()
@@ -771,7 +1149,7 @@ class Controller(BasePlot.BaseDisplayController):
         # Preserve full precision for fields the user has not edited.
         parameters = dict(source.parameters)
         w = self.display_widget
-        parameters.update({k: w.editors[k].value() / w.parameter_factor(k) for k in self._edited_keys})
+        parameters.update({k: w.from_display(k, w.editors[k].value()) for k in self._edited_keys})
         # Capture the model settings before starting the worker.
         snapshot = copy(source)
         snapshot.params = dict(source.params)
@@ -919,8 +1297,8 @@ class Controller(BasePlot.BaseDisplayController):
             try:
                 results = []
                 for index, (kind, key, i, j) in enumerate(requests):
-                    label = (sessions[j].name if kind in ("same", "same2")
-                             else f"{sessions[i].name} → {sessions[j].name}")
+                    label = (session_label(sessions, j) if kind in ("same", "same2")
+                             else f"{session_label(sessions, i)} → {session_label(sessions, j)}")
                     with progress_step(index, len(requests),
                                        message=f"Evidence {index + 1}/{len(requests)}: {label}"):
                         if kind == "same2":
@@ -993,7 +1371,7 @@ class Controller(BasePlot.BaseDisplayController):
         # update every outdated alignment, not only the requested sessions.
         outdated = [sid for sid in range(len(self.data.sessions))
                     if self.data.alignment_is_stale(sid) and self.data.session_is_active(sid)]
-        names = [self.data.sessions[sid].name for sid in outdated]
+        names = [session_label(self.data, sid) for sid in outdated]
         listed = ", ".join(names[:6]) + (f" and {len(names) - 6} more" if len(names) > 6 else "")
         box = QMessageBox(self.display_widget)
         box.setIcon(QMessageBox.Icon.Question)

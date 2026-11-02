@@ -230,7 +230,7 @@ class ControlPanel(QWidget):
     def _schedule_relayout(self):
         if not self._relayout_pending:
             self._relayout_pending = True
-            QTimer.singleShot(0, self._relayout)
+            QTimer.singleShot(0, self, self._relayout)  # dropped once deleted
 
     def _relayout(self):
         self._relayout_pending = False

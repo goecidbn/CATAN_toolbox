@@ -85,6 +85,9 @@ class AppState(QObject):
 
         self._hovered_components: Optional[NeuronComponent] = None
         self._selected_components: Optional[List[NeuronComponent]] = None
+        # The selection is a set to step through (preset results, statistic
+        # picks, Ctrl-click collections), not a single clicked component.
+        self._selection_is_set = False
         self._focused_component: Optional[NeuronComponent] = None
         self._highlighted_components: Optional[List[NeuronComponent]] = None
         self.highlight_roles = {}
@@ -112,6 +115,12 @@ class AppState(QObject):
         self._adjacency_radius = 15.0
 
         self.alignment_draft = None
+        # Places the starter guide can point at (gui/guide/anchors.py).
+        from catan.gui.guide.anchors import AnchorRegistry
+
+        self.guide_anchors = AnchorRegistry()
+        # A "Replace alignment draft?" question is open (asked only once).
+        self.draft_discard_question_open = False
         # (session_id, reference_id) chosen in the session-correlation inset.
         self.alignment_pending_reference = None
         self.alignment_panels = WeakSet()
@@ -355,11 +364,20 @@ class AppState(QObject):
 
         return self._selected_components
 
+    @property
+    def selection_is_set(self) -> bool:
+        return self._selection_is_set and bool(self._selected_components)
+
     def update_selected_components(
         self,
         components: Optional[NeuronComponent | List[NeuronComponent]],
         modifiers=(),
     ):
+        # A list is a set even with a single entry; a single component is a click.
+        given_set = components is not None and not isinstance(
+            components, NeuronComponent
+        )
+
         if isinstance(components, NeuronComponent):
             # print(f"Casting input component to list: {components}")
             components = [components]
@@ -402,6 +420,14 @@ class AppState(QObject):
         if not self._allow_focus_change(next_focus):
             return
 
+        if selected_components is None:
+            is_set = False
+        elif "Control" in modifiers:
+            is_set = self._selection_is_set or len(selected_components) > 1
+        else:
+            is_set = given_set or len(selected_components) > 1
+
+        self._selection_is_set = is_set
         self._selected_components = (
             sorted(selected_components, key=lambda c: c.neuron_id)
             if selected_components is not None

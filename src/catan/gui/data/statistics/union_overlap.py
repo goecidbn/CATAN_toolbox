@@ -2,17 +2,20 @@
 
 Footprint of neuron_i in one session vs. the union footprint of neuron_j
 (one comparison per neuron instead of one per stored footprint). Same
-measure as footprint_overlap: supports above ``support_threshold`` of each
-footprint's peak (binary, or peak-normalized intensities when weighted),
-intersection = summed pixelwise minimum, normalized by the smaller
-footprint (containment), the source / target (directional) or the union.
+measure as footprint_overlap: binary supports above ``support_threshold``
+of each footprint's peak, shared pixels normalized by the union (IoU), the
+smaller footprint, the footprint (i) or the union footprint (j).
 """
 
 import numpy as np
 
 from catan.gui.background_tasks.runtime import current_task_context, reports_progress
 
-from .overlap_statistics import _prepare_session_supports
+from .overlap_statistics import (
+    _prepare_session_supports,
+    check_normalization,
+    overlap_denominator,
+)
 from .union_similarity import footprint_union_pairs, footprint_union_requested_pairs
 
 
@@ -23,15 +26,13 @@ def footprint_union_overlap_values(
     nj,
     sid,
     *,
-    weighted=False,
-    containment=True,
-    directional=False,
-    normalize_by_target=False,
+    normalize_by="smaller",
     support_threshold=0.1,
 ):
     """Overlap of footprint (ni, sid) with union nj; NaN if unavailable."""
     if not 0 <= support_threshold < 1:
         raise ValueError("Support threshold must be in [0, 1).")
+    check_normalization(normalize_by)
 
     ni, nj, sid = (np.asarray(v, dtype=np.int64) for v in (ni, nj, sid))
     values = np.full(len(ni), np.nan, dtype=np.float32)
@@ -49,7 +50,6 @@ def footprint_union_overlap_values(
         0,
         targets,
         np.arange(len(ids))[:, None],
-        weighted=weighted,
         support_threshold=support_threshold,
     )
     fj_all = np.searchsorted(targets, nj)
@@ -73,7 +73,6 @@ def footprint_union_overlap_values(
             session_id,
             sources,
             ids,
-            weighted=weighted,
             support_threshold=support_threshold,
         )
 
@@ -83,15 +82,10 @@ def footprint_union_overlap_values(
         fi = np.searchsorted(sources, ni[rows])
         fj = fj_all[rows]
 
-        # Corresponding columns only; binary and weighted supports use min().
+        # Corresponding columns only; min() of binary supports counts
+        # shared pixels.
         intersection = np.asarray(a[:, fi].minimum(b[:, fj]).sum(axis=0)).ravel()
-
-        if directional:
-            denominator = mb[fj] if normalize_by_target else ma[fi]
-        elif containment:
-            denominator = np.minimum(ma[fi], mb[fj])
-        else:
-            denominator = ma[fi] + mb[fj] - intersection
+        denominator = overlap_denominator(normalize_by, intersection, ma[fi], mb[fj])
 
         valid = (ma[fi] > 0) & (mb[fj] > 0) & (denominator > 0)
 

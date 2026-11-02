@@ -4,13 +4,13 @@
   "category": "review",
   "root": {
     "type": "group",
-    "id": "741d3e09c1de439e8d639c1b0384073d",
+    "id": "7ca864445e2a4846a41aaa1a6df09183",
     "operator": "and",
     "match_level": "neuron",
     "children": [
       {
         "type": "condition",
-        "id": "df081131535c4e5f995a536743f38fac",
+        "id": "ce9e9be5345d46468c5c9aae2c5e6006",
         "query": {
           "statistic_key": "occurence",
           "reductions": {
@@ -31,106 +31,485 @@
           "parameters": {}
         },
         "threshold": {
-          "value": 3.0,
           "direction": "greater",
-          "active": true
-        }
-      },
-      {
-        "type": "condition",
-        "id": "a5ef6457436b4567aeb42934ed45c3aa",
-        "query": {
-          "statistic_key": "footprint_union_distance",
-          "reductions": {
-            "neuron_i": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            },
-            "neuron_j": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            },
-            "session": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            }
-          },
-          "reduction_order": [],
-          "filters": [
-            {
-              "target": "neuron",
-              "relation": "same",
-              "collapse_same": true
-            }
-          ],
-          "context": "generic",
-          "parameters": {}
-        },
-        "threshold": {
-          "value": 3.0,
-          "direction": "less",
-          "active": true
-        }
-      },
-      {
-        "type": "condition",
-        "id": "40ff6a43a1334f9ca3c28442feeb4437",
-        "query": {
-          "statistic_key": "footprint_union_similarity",
-          "reductions": {
-            "neuron_i": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            },
-            "neuron_j": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            },
-            "session": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            }
-          },
-          "reduction_order": [],
-          "filters": [
-            {
-              "target": "neuron",
-              "relation": "same",
-              "collapse_same": true
-            }
-          ],
-          "context": "generic",
-          "parameters": {
-            "gamma": 0.1
-          }
-        },
-        "threshold": {
-          "value": 0.85,
-          "direction": "greater",
-          "active": true
+          "active": true,
+          "value": 3.0
         }
       },
       {
         "type": "group",
-        "id": "277c6538dc5946d3a5a3c046f32ed6b8",
+        "id": "fc1c384c991041dcb0b386228082f238",
+        "operator": "or",
+        "match_level": "footprint",
+        "children": [
+          {
+            "type": "group",
+            "id": "b46bc06b4d764b59921699f8e833f2b4",
+            "operator": "and",
+            "match_level": "footprint",
+            "children": [
+              {
+                "type": "condition",
+                "id": "8c9b7463877a46378d11f4595268e842",
+                "query": {
+                  "statistic_key": "footprint_union_distance",
+                  "reductions": {
+                    "neuron_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "neuron_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [
+                    {
+                      "target": "neuron",
+                      "relation": "same",
+                      "collapse_same": true
+                    }
+                  ],
+                  "context": "generic",
+                  "parameters": {}
+                },
+                "threshold": {
+                  "direction": "greater",
+                  "active": true,
+                  "reference": {
+                    "kind": "percentile",
+                    "sample": "Condition values",
+                    "level": 90.0
+                  },
+                  "unit": "px"
+                }
+              },
+              {
+                "type": "group",
+                "id": "7e2fbd445a5549bfad2c9d98f0ceeb4c",
+                "operator": "or",
+                "match_level": "footprint",
+                "children": [
+                  {
+                    "type": "condition",
+                    "id": "188cd1cb87ab49529898ffab24d09aae",
+                    "query": {
+                      "statistic_key": "centroid_shift",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session_i": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session_j": {
+                          "method": "max",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [
+                        {
+                          "target": "session",
+                          "relation": "previous instance",
+                          "collapse_same": true
+                        }
+                      ],
+                      "context": "generic",
+                      "parameters": {}
+                    },
+                    "threshold": {
+                      "direction": "greater",
+                      "active": true,
+                      "reference": {
+                        "kind": "model_distance",
+                        "coefficients": {
+                          "sigma_det": 2.0,
+                          "sigma_move": 2.0
+                        }
+                      },
+                      "unit": "px"
+                    }
+                  },
+                  {
+                    "type": "condition",
+                    "id": "929ca983b2db4209af6f124aa12c6384",
+                    "query": {
+                      "statistic_key": "centroid_shift",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session_i": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session_j": {
+                          "method": "max",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [
+                        {
+                          "target": "session",
+                          "relation": "next instance",
+                          "collapse_same": true
+                        }
+                      ],
+                      "context": "generic",
+                      "parameters": {}
+                    },
+                    "threshold": {
+                      "direction": "greater",
+                      "active": true,
+                      "reference": {
+                        "kind": "model_distance",
+                        "coefficients": {
+                          "sigma_det": 2.0,
+                          "sigma_move": 2.0
+                        }
+                      },
+                      "unit": "px"
+                    }
+                  }
+                ],
+                "count": null,
+                "comment": "",
+                "apply_to": "same",
+                "summary": null,
+                "manipulation": null,
+                "review_statuses": null
+              }
+            ],
+            "count": null,
+            "comment": "Far from its own union (≥ p90), and not by drift: the step to the previous or next detection exceeds 2·(σ_det + σ_move) of the fitted model. A neuron drifting slowly but steadily in one direction ends far from its union in small steps only.",
+            "apply_to": "same",
+            "summary": null,
+            "manipulation": null,
+            "review_statuses": null
+          },
+          {
+            "type": "condition",
+            "id": "44a9d087661945b4890c48d1e5239c89",
+            "query": {
+              "statistic_key": "footprint_union_similarity",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "same",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {
+                "gamma": 0.1
+              }
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "reference": {
+                "kind": "percentile",
+                "sample": "Condition values",
+                "level": 5.0
+              }
+            }
+          },
+          {
+            "type": "condition",
+            "id": "030071e081ed496aba390f1dca893469",
+            "query": {
+              "statistic_key": "footprint_eccentricity",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "measure": "axis ratio",
+                "thr": 0.2
+              }
+            },
+            "threshold": {
+              "direction": "greater",
+              "active": true,
+              "value": 2.0
+            }
+          },
+          {
+            "type": "condition",
+            "id": "89829c5d74cd48f3a1e7729ec65e2774",
+            "query": {
+              "statistic_key": "relative_footprint_size",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "thr": 0.01
+              }
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 0.5
+            }
+          },
+          {
+            "type": "condition",
+            "id": "ac65d75244604965a994202784e15689",
+            "query": {
+              "statistic_key": "relative_footprint_size",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {
+                "thr": 0.01
+              }
+            },
+            "threshold": {
+              "direction": "greater",
+              "active": true,
+              "value": 2.0
+            }
+          },
+          {
+            "type": "condition",
+            "id": "9da5d97d0854412392b8ee4acd5122ae",
+            "query": {
+              "statistic_key": "match_probability",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "same",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {}
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 0.5
+            }
+          },
+          {
+            "type": "condition",
+            "id": "9ed2bb5b642040cba9b92c9d92d67ea9",
+            "query": {
+              "statistic_key": "session:CNN",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {}
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "reference": {
+                "kind": "percentile",
+                "sample": "Condition values",
+                "level": 5.0
+              }
+            },
+            "optional": true
+          },
+          {
+            "type": "condition",
+            "id": "dd10a867e84f40f781f0dab50cfbb884",
+            "query": {
+              "statistic_key": "session:SNR",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {}
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "reference": {
+                "kind": "percentile",
+                "sample": "Condition values",
+                "level": 5.0
+              }
+            },
+            "optional": true
+          },
+          {
+            "type": "condition",
+            "id": "8657227891374788a5f44a8dfc4c8bf8",
+            "query": {
+              "statistic_key": "session:r-values",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {}
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "reference": {
+                "kind": "percentile",
+                "sample": "Condition values",
+                "level": 5.0
+              }
+            },
+            "optional": true
+          }
+        ],
+        "count": {
+          "target": "neuron",
+          "comparison": "eq",
+          "value": 0,
+          "unit": "footprint",
+          "anchor": "target",
+          "separate_partner_sessions": false
+        },
+        "comment": "Every footprint is typical for the neuron: none is far from or dissimilar to its union (≥ p90 distance unless by slow drift, ≤ p5 similarity), matched by the model with probability < 0.5, elongated (axis ratio ≥ 2), much smaller or larger than its others, or — where loaded — low in imported quality (≤ p5).",
+        "apply_to": "same",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      },
+      {
+        "type": "group",
+        "id": "8c5107659ca24ff5855265e485fc5218",
         "operator": "and",
         "match_level": "relationship",
         "children": [
           {
             "type": "group",
-            "id": "62aae933d6ba4443973168e281f55d9c",
+            "id": "7f3d1692e67a4ed192591d2c23931bbd",
             "operator": "or",
             "match_level": "relationship",
             "children": [
               {
                 "type": "condition",
-                "id": "d53c37553d80483d9c682f4a65e7ccd6",
+                "id": "0a4edc4b84e147258232658d72c32486",
                 "query": {
                   "statistic_key": "footprint_union_distance",
                   "reductions": {
@@ -162,14 +541,15 @@
                   "parameters": {}
                 },
                 "threshold": {
-                  "value": 3.0,
                   "direction": "less",
-                  "active": true
+                  "active": true,
+                  "value": 3.0,
+                  "unit": "px"
                 }
               },
               {
                 "type": "condition",
-                "id": "483904c4edb142b4be9a523a791d11e4",
+                "id": "4d596bff734f4cf387fdfb3d0beaaed2",
                 "query": {
                   "statistic_key": "footprint_union_overlap",
                   "reductions": {
@@ -199,17 +579,14 @@
                   ],
                   "context": "generic",
                   "parameters": {
-                    "containment": true,
-                    "directional": false,
-                    "normalize_by_target": false,
-                    "support_threshold": 0.1,
-                    "weighted": false
+                    "normalize_by": "smaller",
+                    "support_threshold": 0.1
                   }
                 },
                 "threshold": {
-                  "value": 0.7,
                   "direction": "greater",
-                  "active": true
+                  "active": true,
+                  "value": 0.7
                 }
               }
             ],
@@ -222,7 +599,7 @@
           },
           {
             "type": "condition",
-            "id": "5c881a4ba72a4b99b17197b55b71e709",
+            "id": "e21b6e835e6449a9bd5fc9b7a6cdf820",
             "query": {
               "statistic_key": "footprint_union_similarity",
               "reductions": {
@@ -256,9 +633,9 @@
               }
             },
             "threshold": {
-              "value": 0.8,
               "direction": "greater",
-              "active": true
+              "active": true,
+              "value": 0.8
             }
           }
         ],
@@ -270,7 +647,7 @@
           "anchor": "target",
           "separate_partner_sessions": false
         },
-        "comment": "No nearby confusing footprint",
+        "comment": "No nearby confusing footprint of another neuron (close or overlapping, and similar).",
         "apply_to": "same",
         "summary": null,
         "manipulation": null,
@@ -278,7 +655,7 @@
       }
     ],
     "count": null,
-    "comment": "",
+    "comment": "Neurons tracked in ≥ 3 sessions whose footprints are all typical and that no other neuron's footprint could be confused with. Mark them as reviewed.",
     "apply_to": "same",
     "summary": null,
     "manipulation": {

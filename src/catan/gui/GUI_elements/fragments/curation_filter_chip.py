@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QFrame,
     QHBoxLayout,
+    QLabel,
     QToolButton,
     QSizePolicy,
     QMenu,
@@ -13,6 +14,58 @@ from PySide6.QtWidgets import (
 )
 
 CURATION_NODE_MIME = "application/x-catan-curation-filter-node"
+
+
+class CurationFilterChipText(QLabel):
+    """Clickable condition text that wraps instead of being clipped."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
+        self._pressed = False
+
+    def sizeHint(self):
+        # The whole text in one line when there is room (QLabel's word-wrap
+        # hint wraps long texts early); wraps only when the chip shrinks.
+        size = super().sizeHint()
+        one_line = self.heightForWidth(100_000)
+        width = self.fontMetrics().horizontalAdvance(self.text())
+        while self.heightForWidth(width) > one_line and width < 4000:
+            width += 4
+        size.setWidth(width)
+        size.setHeight(one_line)
+        return size
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Not every enclosing layout asks for height-for-width (nested
+        # groups): reserve the wrapped height as minimum.
+        height = self.heightForWidth(self.width())
+        if height > 0 and height != self.minimumHeight():
+            self.setMinimumHeight(height)
+
+    def mousePressEvent(self, event):
+        self._pressed = event.button() == Qt.MouseButton.LeftButton
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        clicked = (
+            self._pressed
+            and event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        )
+        self._pressed = False
+        super().mouseReleaseEvent(event)
+        if clicked:
+            self.clicked.emit()
 
 
 class CurationFilterDragHandle(QToolButton):
@@ -96,7 +149,7 @@ class CurationFilterChip(QFrame):
         self.drag_handle.setFixedWidth(20)
         layout.addWidget(self.drag_handle)
 
-        self.condition_button = QToolButton()
+        self.condition_button = CurationFilterChipText()
         self.condition_button.setObjectName("curationConditionButton")
         self.condition_button.setText(text)
 
@@ -107,7 +160,14 @@ class CurationFilterChip(QFrame):
         self.remove_button.setFixedWidth(20)
         self.remove_button.setToolTip("Remove condition")
 
-        layout.addWidget(self.condition_button)
+        # Handle and remove button span the (possibly wrapped) chip height.
+        for button in (self.drag_handle, self.remove_button):
+            button.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Preferred,
+            )
+
+        layout.addWidget(self.condition_button, 1)
         layout.addWidget(self.remove_button)
 
         self.condition_button.clicked.connect(
@@ -121,9 +181,10 @@ class CurationFilterChip(QFrame):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._open_context_menu)
 
+        # Shrinks with the filter area; the text then wraps.
         self.setSizePolicy(
             QSizePolicy.Policy.Maximum,
-            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
         )
 
         self.set_text(
@@ -167,9 +228,14 @@ class CurationFilterChip(QFrame):
                 padding-right: 4px;
             }
 
-            QFrame#curationConditionChip
-            QToolButton#curationConditionButton {
-                text-align: left;
+            QFrame#curationConditionChip QLabel#curationConditionButton {
+                color: #e8eaed;
+                background: transparent;
+                padding: 3px 6px;
+            }
+
+            QFrame#curationConditionChip QLabel#curationConditionButton:hover {
+                background-color: #3c424b;
             }
 
             QFrame#curationConditionChip

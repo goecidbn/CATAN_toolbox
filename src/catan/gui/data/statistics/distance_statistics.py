@@ -13,6 +13,7 @@ from .queries import ReductionSpec
 from .blockwise import evaluate_blockwise
 from .sparse_pairs import SparsePairCollector, only_kept_axes, selection_upper_bound
 from .session_relations import (
+    included_detections,
     NEURON_RELATIONS,
     DetectionReference,
     is_order_relation,
@@ -256,11 +257,12 @@ def distance_query(
     positions = None if mode == "union" else geometry(data, state)[0]
     union = union_positions(data, n) if mode in ("union", "to_union") else None
 
+    detected = included_detections(data.sessions, state.assignments)
     dims, aliases, references, coord, allowed = pair_plan(
-        names, n, s, query, ids=state.assignments
+        names, n, s, query, ids=detected
     )
     detection = (
-        DetectionReference(state.assignments)
+        DetectionReference(detected)
         if any(f.relation in NEURON_RELATIONS for f in query.filters)
         else None
     )
@@ -395,7 +397,7 @@ def distance_query(
             query,
             select_values,
             exclude_self=exclude_self,
-            ids=state.assignments,
+            ids=detected,
         )
 
         if result is not None:

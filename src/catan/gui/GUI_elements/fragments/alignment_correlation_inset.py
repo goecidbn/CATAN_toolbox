@@ -97,7 +97,8 @@ def session_background_inputs(sessions):
 
 
 class AlignmentCorrelationInset(QWidget):
-    """Clickable raster; chosen(row, column) on click."""
+    """Clickable raster; chosen(row, column) on click (row == column: the
+    session alone)."""
 
     chosen = Signal(int, int)
 
@@ -341,6 +342,8 @@ class AlignmentCorrelationInset(QWidget):
             text += "\nAligned against: " + ", ".join(f"S{i}" for i in references)
         if row != column:
             text += "\nClick: align the later session against the earlier one."
+        else:
+            text += "\nClick: show this session alone (and compare with its footprints)."
 
         show_tooltip(event.globalPosition().toPoint() + QPoint(12, 12), text, self)
 
@@ -348,8 +351,7 @@ class AlignmentCorrelationInset(QWidget):
         cell = self._cell_at(event.position().toPoint())
         if cell is not None and event.button() == Qt.MouseButton.LeftButton:
             row, column = cell
-            if row != column:
-                self.chosen.emit(row, column)
+            self.chosen.emit(row, column)
         event.accept()
 
     def leaveEvent(self, event):

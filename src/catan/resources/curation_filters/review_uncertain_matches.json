@@ -1,0 +1,110 @@
+{
+  "schema_version": 2,
+  "name": "Review: uncertain matches",
+  "category": "review",
+  "root": {
+    "type": "group",
+    "id": "0e87a85e0c054a2fa7b62b902e2e9fee",
+    "operator": "and",
+    "match_level": "neuron",
+    "children": [
+      {
+        "type": "condition",
+        "id": "cf91ec1a3d594b4c8013749d8d5b321f",
+        "query": {
+          "statistic_key": "occurence",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "sum",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic",
+          "parameters": {}
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 2.0
+        }
+      },
+      {
+        "type": "group",
+        "id": "3a4cfcb3a5fe437183a3827f21d8631e",
+        "operator": "and",
+        "match_level": "footprint",
+        "children": [
+          {
+            "type": "condition",
+            "id": "32d2d5d2c0564ed4a9f9b2330adc2f7f",
+            "query": {
+              "statistic_key": "match_probability",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "same",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {}
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 0.5
+            }
+          }
+        ],
+        "count": {
+          "target": "neuron",
+          "comparison": "ge",
+          "value": 1,
+          "unit": "footprint",
+          "anchor": "target",
+          "separate_partner_sessions": false
+        },
+        "comment": "The model matched the footprint to its neuron with probability < 0.5 (its own decision boundary). Manually assigned or moved footprints have no value and are not listed.",
+        "apply_to": "same",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": null,
+    "comment": "Neurons (≥ 2 sessions) with at least one footprint the model was undecided about. Review the highlighted footprints: accept, exclude or reassign.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": null,
+    "review_statuses": [
+      0,
+      2
+    ]
+  }
+}

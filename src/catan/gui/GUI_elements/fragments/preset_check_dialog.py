@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from catan.gui.utils.session_labels import session_label
 from catan.gui.data.curation_filter_presets import (
     PRESET_CATEGORIES,
     UNCATEGORIZED_LABEL,
@@ -305,7 +306,7 @@ class PresetCheckDialog(QDialog):
                 s_symbol, s_color = VERDICTS[check.component_passed]
                 text += (
                     f"<br><span style='color:{s_color}'>{s_symbol} Its footprint in "
-                    f"session {check.component.session_id} "
+                    f"{session_label(self.data, check.component.session_id)} "
                     f"{'is' if check.component_passed else 'is not'} among the "
                     "matching footprints.</span>"
                 )
@@ -340,6 +341,8 @@ class PresetCheckDialog(QDialog):
         for step in candidate.steps:
             step_item = QTreeWidgetItem([step.label, step.value, ""])
             _set_verdict(step_item, 2, step.passed)
+            if step.skipped:
+                step_item.setText(2, "⊘")
             if downstream:
                 step_item.setForeground(0, dim)
                 step_item.setForeground(1, dim)
@@ -408,7 +411,9 @@ class PresetCheckDialog(QDialog):
         except ValueError:
             text = title
 
-        if check.error:
+        if check.skipped:
+            summary = "skipped (statistic unavailable)"
+        elif check.error:
             summary = "error"
         elif check.n_rows:
             summary = f"{check.n_passing} of {check.n_rows} pass"

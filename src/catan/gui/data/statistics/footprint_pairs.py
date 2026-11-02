@@ -5,6 +5,7 @@ from scipy.spatial import cKDTree
 
 from collections import OrderedDict
 
+from catan.gui.utils.session_labels import session_tag
 from catan.core.image_correlation import (
     compact_positive_footprint,
     compact_positive_footprints,
@@ -19,6 +20,7 @@ from catan.gui.background_tasks.runtime import (
 
 from .dimensions import Dimension
 from .session_relations import (
+    included_detections,
     NEURON_RELATIONS,
     DetectionReference,
     is_order_relation,
@@ -79,7 +81,9 @@ def calculate_footprint_pairs(
         raise ValueError("Unsupported pair relation")
 
     detection = (
-        DetectionReference(state.assignments) if sr in NEURON_RELATIONS else None
+        DetectionReference(included_detections(data.sessions, state.assignments))
+        if sr in NEURON_RELATIONS
+        else None
     )
     compact_n = nr == "same" and collapse.get("neuron", True)
     compact_s = sr in ("same", "with previous") and collapse.get("session", True)
@@ -235,7 +239,7 @@ def calculate_footprint_pairs(
             len(pairs),
             start=0,
             stop=95,
-            message=f"Similarity: sessions {si + 1} / {sj + 1}",
+            message=f"Similarity: {session_tag(si)} / {session_tag(sj)}",
         ):
 
             session_key = (min(si, sj), max(si, sj))
@@ -603,7 +607,7 @@ def footprint_similarity_requested_pairs(
 
     dims, aliases, references, _, _ = pair_plan(names, n, s, query)
     detection = (
-        DetectionReference(state.assignments)
+        DetectionReference(included_detections(data.sessions, state.assignments))
         if any(f.relation in NEURON_RELATIONS for f in query.filters)
         else None
     )

@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 
+from catan.core import footprint_frame
 from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 from catan.core.changes import (
     ChangeKind as C,
@@ -48,6 +49,8 @@ from catan.core.changes import (
 )
 from catan.core.structures import sessiondata_type
 from catan.core.structures.load_config import FieldSpec
+from catan.core.structures.remap import Remapping
+from catan.gui.structures.alignment_draft import AlignmentDraft
 from catan.core.structures.inclusion import has_exclusions
 from catan.core.io import resolve_source_path
 from catan.core.io.isolated_read import read_operation
@@ -84,6 +87,8 @@ from .fragments.manual_alignment_dialog import (
 from .fragments.file_inspection import FileInspection
 from catan.gui.GUI_elements.utils.elided_label import ElidedLabel
 from catan.gui.GUI_elements.utils.paths import display_path
+from catan.gui.utils.session_labels import session_label, session_tag
+from catan.gui.utils.fs_guard import responsive_folder, warn_unresponsive
 
 
 class SessionRowWidget(QFrame):
@@ -97,6 +102,7 @@ class SessionRowWidget(QFrame):
 
     loadRequested = Signal(int)  # session_id
     backgroundRequested = Signal(int)
+    applyConfigRequested = Signal(int)
     manualAlignmentRequested = Signal(int)
     saveIncludedRequested = Signal(int)
     exportSeedsRequested = Signal(int)
@@ -144,6 +150,12 @@ class SessionRowWidget(QFrame):
 
         self.active_checkbox = QCheckBox()
         self.active_checkbox.stateChanged.connect(self._on_active_changed)
+
+        # Position in the session list (not editable; follows reordering).
+        self.index_label = QLabel()
+        self.index_label.setObjectName("SessionIndexLabel")
+        self.index_label.setMinimumWidth(24)
+        self.index_label.setToolTip("Session index (position in this list)")
 
         self.name_edit = QLineEdit()
         self.name_edit.setObjectName("SessionNameEdit")
@@ -249,6 +261,7 @@ class SessionRowWidget(QFrame):
 
         layout.addLayout(order_layout)
         layout.addWidget(self.active_checkbox)
+        layout.addWidget(self.index_label)
         layout.addWidget(self.name_edit)
         layout.addWidget(self.offset_label)
         layout.addWidget(self.status_button)
@@ -260,6 +273,10 @@ class SessionRowWidget(QFrame):
         # Built on first expansion: constructing the field options for every
         # row made adding sessions slow (~80 ms per row).
         self.config_constructor = FieldConfigConstructor(self, self.session, lazy=True)
+        self.config_constructor.enable_apply(
+            lambda: self.data.session_config_changes(self.data.sessions[self.index]),
+            lambda: self.applyConfigRequested.emit(self.index),
+        )
 
         layout.addWidget(self.config_constructor.toggle_config_options)
         stacked_layout.addLayout(layout)
@@ -287,9 +304,14 @@ class SessionRowWidget(QFrame):
         if event.has(C.DATA_AVAILABILITY) and self.config_constructor._content_built:
             self.config_constructor.config_field_options.rebuild()
 
+        if event.has(C.DATA_AVAILABILITY, C.BACKGROUND_IMAGE, C.FOOTPRINT_GEOMETRY):
+            self.config_constructor.update_apply()
+
     def refresh(self, current=False):
-        name = getattr(self.session, "name", f"Session{self.index:02d}")
+        name = getattr(self.session, "name", "")
         path = getattr(self.session, "path", "")
+
+        self.index_label.setText(session_tag(self.index))
         active = getattr(self.session, "active", True)
         offset = getattr(self.session, "time_offset", 0)
 
@@ -326,6 +348,7 @@ class SessionRowWidget(QFrame):
         )
 
         for widget in (
+            self.index_label,
             self.name_edit,
             self.offset_label,
             self.status_button,
@@ -372,11 +395,43 @@ class SessionRowWidget(QFrame):
 
         tooltip = label
 
+        warning = self._footprint_frame_warning()
+        if warning:
+            tooltip += "\n\n⚠ " + warning
+
         if self.session.status["spatial_loaded"] and self.session.remap is not None:
             tooltip += "\n\n" + self._alignment_report_text(detailed=False)
 
         if self.status_button.toolTip() != tooltip:
             self.status_button.setToolTip(tooltip)
+
+        # A mismatch between background and footprints is marked, not asked.
+        text = "⚠" if warning else "●"
+        if self.status_button.text() != text:
+            self.status_button.setText(text)
+
+    def _footprint_frame_warning(self):
+        """Why this session's background does not match its footprints and
+        what is aligned instead, or ""."""
+        session = self.session
+        coherence = getattr(session, "background_coherence", None) or {}
+        if not session.status["spatial_loaded"] or coherence.get("coherent") is not False:
+            return ""
+        text = f"The background does not match the footprints: {coherence['reason']}."
+        if session.alignment_source == "footprints":
+            text += (
+                " The session is aligned by its footprints. Check it in the "
+                "alignment editor (click the session on the diagonal of the "
+                "correlation inset, Compare with footprints); 'This session' "
+                "switches back to the background."
+            )
+        else:
+            text += (
+                " The session is aligned by its background; correct the "
+                "background in the alignment editor (click the session on the "
+                "diagonal of the correlation inset, Compare with footprints)."
+            )
+        return text
 
     def _show_status_details(self):
 
@@ -384,14 +439,17 @@ class SessionRowWidget(QFrame):
 
         dialog = QMessageBox(self)
 
-        dialog.setWindowTitle(f"Session: {self.session.name}")
+        dialog.setWindowTitle(f"Session: {session_label(self.session)}")
 
         if key == "alignment_error":
             dialog.setIcon(QMessageBox.Icon.Warning)
         else:
             dialog.setIcon(QMessageBox.Icon.Information)
 
-        dialog.setText(label)
+        warning = self._footprint_frame_warning()
+        dialog.setText(label + ("\n\n⚠ " + warning if warning else ""))
+        if warning:
+            dialog.setIcon(QMessageBox.Icon.Warning)
 
         # ------------------------------------------
         # Alignment information
@@ -612,6 +670,16 @@ class SessionRowWidget(QFrame):
 
         lines = []
 
+        session = self.session
+        if session.background_origin != "footprints":
+            lines.append(f"Aligned by: {session.alignment_source}")
+        correction = session.background_correction
+        if not footprint_frame.is_identity(correction):
+            lines.append(
+                "Background moved onto its footprints: "
+                + footprint_frame.describe_correction(correction)
+            )
+
         if report.success:
             lines.append("Alignment successful")
         elif getattr(remap, "confirmation", None):
@@ -662,7 +730,7 @@ class SessionRowWidget(QFrame):
             lines.append("-------------------")
 
             names = {
-                str(session.path): f"S{index} {session.name}"
+                str(session.path): session_label(self.data, index)
                 for index, session in enumerate(self.data.sessions)
             }
             for path, entry in report.remap_data.items():
@@ -1075,6 +1143,7 @@ class LoadSessionRowWidget(QFrame):
             icon_size=30,
         )
         load_button.clicked.connect(self.on_register_session)
+        self.load_button = load_button
 
         layout.addWidget(load_button, alignment=Qt.AlignmentFlag.AlignVCenter)
 
@@ -1501,7 +1570,7 @@ class LoadSessionRowWidget(QFrame):
             key="background",
             spec=self._background_spec(session),
             title="Select background",
-            context=f"Session {session.name}",
+            context=f"Session {session_label(session)}",
             parent=self,
         )
 
@@ -1775,7 +1844,7 @@ class LoadSessionRowWidget(QFrame):
         self._start_loading_inspection(
             "required",
             required,
-            f"Checking required fields — {session.name}",
+            f"Checking required fields — {session_label(session)}",
         )
 
     def _begin_background_check(self):
@@ -1806,7 +1875,7 @@ class LoadSessionRowWidget(QFrame):
         self._start_loading_inspection(
             "background",
             {"spatial": {"background": spec}},
-            f"Checking background source — {session.name}",
+            f"Checking background source — {session_label(session)}",
         )
 
     def _start_loading_inspection(self, stage, fields, title):
@@ -1935,7 +2004,7 @@ class LoadSessionRowWidget(QFrame):
             check["signature"] = self._loading_config_signature(session)
 
             self.loading_status_title.setText(
-                f"Checking image dimensions — {session.name}"
+                f"Checking image dimensions — {session_label(session)}"
             )
 
             self.loading_inspection.start(
@@ -2185,12 +2254,12 @@ class LoadSessionRowWidget(QFrame):
         confirmation = getattr(session.remap, "confirmation", None)
 
         text = (
-            f"Automatic alignment of {session.name!r} needs confirmation.\n\n"
+            f"Automatic alignment of {session_label(session)} needs confirmation.\n\n"
             f"{confirmation}\n\n"
             "Check the proposal, then use it, adjust it or remove the session. "
             "Until then, no neurons are registered."
             if confirmation
-            else f"Automatic alignment failed for {session.name!r}.\n\n"
+            else f"Automatic alignment failed for {session_label(session)}.\n\n"
             "The session has been kept loaded, but no neurons were registered."
         )
 
@@ -2220,11 +2289,18 @@ class LoadSessionRowWidget(QFrame):
         if opt.lower() != "from file":
             raise ValueError(f"Unknown option selected: {opt}")
 
-        folder = self.data.project_folder()
+        # Checked with a time limit: a dead network mount must not freeze
+        # the GUI thread (fs_guard).
+        init_path, unresponsive = responsive_folder(
+            self.data.project_folder(), self.data.root
+        )
+        warn_unresponsive(self.state, unresponsive)
+        # The starter guide points it at the demo folder (its recipe).
+        init_path = getattr(self, "dialog_start", None) or init_path
         path = choose_path(
             self,
             pick_dir=False,
-            init_path=str(folder if folder.is_dir() else self.data.root),
+            init_path=init_path,
             display_text=(
                 "Select a CATAN project (.catan.hdf5), session file, "
                 "loading recipe (.json) or path table (.csv)"
@@ -2731,7 +2807,7 @@ class LoadSessionRowWidget(QFrame):
             self,
             pick_dir=False,
             init_path=str(source.parent),
-            display_text=f"Save footprint 'included' tags — {session.name}",
+            display_text=f"Save footprint 'included' tags — {session_label(session)}",
             only_existing=False,
             default_suffix="hdf5",
             default_filename=filename,
@@ -2813,6 +2889,11 @@ class LoadSessionRowWidget(QFrame):
             return
 
         include_missing = choice == choices[1]
+
+        review_statuses = self._ask_seed_review_statuses()
+        if review_statuses is False:
+            return
+
         jobs = []
 
         if batch:
@@ -2854,7 +2935,7 @@ class LoadSessionRowWidget(QFrame):
                 self,
                 pick_dir=False,
                 init_path=str(source.parent),
-                display_text=(f"Export redetection seeds — {session.name}"),
+                display_text=(f"Export redetection seeds — {session_label(session)}"),
                 only_existing=False,
                 default_suffix="hdf5",
                 default_filename=f"seeds_{source.stem}.hdf5",
@@ -2883,7 +2964,63 @@ class LoadSessionRowWidget(QFrame):
         self.data.queue_export_redetection(
             jobs,
             include_missing=include_missing,
+            review_statuses=review_statuses,
         )
+
+    def _ask_seed_review_statuses(self):
+        """Review states of the neurons to export as seeds: None (all, no
+        neuron is pending or uncertain), a set of ReviewStatus, or False
+        (cancelled). Asked when included neurons are pending or uncertain."""
+        from catan.tracking.structures import ReviewStatus
+
+        assignments = self.data.assignments
+        if assignments is None or assignments.union is None:
+            return None
+
+        ids = np.asarray(assignments.ids)
+        status = np.asarray(assignments.review_status)
+        neurons = np.asarray(assignments.union.included, dtype=bool) & np.any(ids >= 0, axis=1)
+        counts = {s: int(np.count_nonzero(neurons & (status == s))) for s in ReviewStatus}
+        reviewed = counts[ReviewStatus.REVIEWED]
+        uncertain = counts[ReviewStatus.UNCERTAIN]
+        pending = counts[ReviewStatus.PENDING]
+        if not (pending or uncertain):
+            return None
+        open_count = pending + uncertain
+
+        box = QMessageBox(self.window())
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Export redetection seeds")
+        box.setText(
+            f"{open_count} included neuron{'s are' if open_count != 1 else ' is'} "
+            "not reviewed yet (pending or uncertain)."
+        )
+        box.setInformativeText(
+            f"Reviewed: {reviewed} · Uncertain: {uncertain} · Pending: {pending}\n\n"
+            "Which neurons should be exported as seeds? Neurons left out are "
+            "not exported (the assignments do not change). Footprints without "
+            "a neuron are exported as before."
+        )
+        options = (
+            (f"Reviewed only ({reviewed})", {ReviewStatus.REVIEWED}),
+            (
+                f"Reviewed + uncertain ({reviewed + uncertain})",
+                {ReviewStatus.REVIEWED, ReviewStatus.UNCERTAIN},
+            ),
+        )
+        if pending:
+            options += (
+                (f"All, incl. pending ({reviewed + uncertain + pending})", set(ReviewStatus)),
+            )
+        buttons = {}
+        for label, statuses in options:
+            button = box.addButton(label, QMessageBox.ButtonRole.AcceptRole)
+            buttons[button] = statuses
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(next(iter(buttons)))
+        fit_message_box_buttons(box)
+        box.exec()
+        return buttons.get(box.clickedButton(), False)
 
     def save_all_included(self):
         tasks = self.state.tasks
@@ -3229,6 +3366,7 @@ class SessionOverview(QWidget):
         # The row emits its current index (rows are reused after reordering).
         row.loadRequested.connect(self.load_requested.emit)
         row.backgroundRequested.connect(self.change_session_background)
+        row.applyConfigRequested.connect(self.apply_session_config)
         row.manualAlignmentRequested.connect(self.adjust_session_alignment)
         row.saveIncludedRequested.connect(
             lambda session_id: self.load_row.save_included(
@@ -3439,7 +3577,7 @@ class SessionOverview(QWidget):
                 key="background",
                 spec=self.load_row._background_spec(session),
                 title="Select background and load spatial data",
-                context=f"Session: {session.name}",
+                context=f"Session: {session_label(session)}",
                 parent=self,
             )
             if selection is None:
@@ -3482,18 +3620,24 @@ class SessionOverview(QWidget):
             key="background",
             spec=spec,
             title="Select replacement background",
-            context=(f"Session: {session.name}"),
+            context=(f"Session: {session_label(session)}"),
             parent=self,
         )
 
         if selection is None:
             return
 
+        self._propose_background(session_id, selection, expected_version=expected_version)
+
+    def _propose_background(self, session_id, selection, *, expected_version):
+        """Align ``selection`` (a background field) to the other sessions
+        and show the preview (_show_background_proposal)."""
+        session = self.data.sessions[session_id]
         source_path = resolve_source_path(session.path, selection.source_path)
 
         self.state.tasks.start(
             "loading",
-            ("Testing background for " f"{session.name}"),
+            ("Testing background for " f"{session_label(session)}"),
             lambda: (
                 self.data.propose_background_remapping(
                     session_id,
@@ -3507,6 +3651,51 @@ class SessionOverview(QWidget):
                 session_id, selection, result, expected_version=expected_version
             ),
         )
+
+    def apply_session_config(self, session_id: int):
+        """Load what the session's configuration changed: enabled groups
+        not loaded yet, changed traces / quality fields (reloaded) and a
+        changed background (aligned and previewed like Change background)."""
+        session = self.data.sessions[session_id]
+        changes = self.data.session_config_changes(session)
+
+        if changes["unsupported"]:
+            self.state.issue(
+                "warning",
+                "Changed spatial fields not loaded",
+                f"{session_label(session)}: the spatial data is loaded; changed fields "
+                f"({', '.join(changes['unsupported'])}) cannot replace it. "
+                "Only a changed background is loaded. Remove and re-add the "
+                "session to load other spatial fields.",
+            )
+
+        groups = changes["missing"] + changes["reload"]
+        if groups:
+            for group in changes["reload"]:
+                self.data.toggle_session_data(session_id, group, to_present=False)
+
+            if "spatial" in changes["missing"]:
+                # The configured background, not one built from footprints.
+                session._load_background_mode = "configured"
+
+            self.data.queue_load_data(
+                session_id,
+                fields_to_load=session.source_config.get_fields_to_load(groups),
+                finished=self.refresh_rows,
+            )
+
+        if changes["background"]:
+            spec = session.source_config.groups["spatial"].fields["background"]
+            self._propose_background(
+                session_id,
+                FieldSelection(
+                    path=spec.path,
+                    source_path=spec.source_path,
+                    source=spec.source,
+                    attribute=spec.attribute,
+                ),
+                expected_version=self.state.data_version,
+            )
 
     def _queue_alignment_failure(self, session, message, proposal):
         self._alignment_failures = [
@@ -3631,7 +3820,7 @@ class SessionOverview(QWidget):
         session = self.data.sessions[session_id]
         self.state.tasks.start(
             "loading",
-            f"Loading {which} data for {session.name}",
+            f"Loading {which} data for {session_label(session)}",
             lambda: self.data.toggle_session_data(session_id, which),
             finished=self.refresh_rows,
         )
@@ -3653,8 +3842,7 @@ class SessionOverview(QWidget):
         )
 
     def remove_session(self, session_id: int):
-        session = self.data.sessions[session_id]
-        name = getattr(session, "name", f"Session {session_id}")
+        name = session_label(self.data, session_id)
 
         result = QMessageBox.question(
             self,
@@ -3757,25 +3945,70 @@ class SessionOverview(QWidget):
             else QMessageBox.Icon.Warning
         )
 
-        dialog.setText(f"Alignment preview for " f"{session.name}")
+        dialog.setText(f"Alignment preview for " f"{session_label(session)}")
+
+        confirmation = getattr(candidate_remap, "confirmation", None)
+        keep_current = current_report is not None and current_report.success
+
+        # Without an accepted proposal, the background can still be loaded
+        # and the alignment corrected manually afterwards.
+        options = []
+        if confirmation:
+            options.append(
+                "Confirm proposal: use the proposed alignment although it "
+                f"deviates ({confirmation})."
+            )
+        load_text = (
+            "Load with current alignment: replace the background, keep the "
+            "current shift and rotation."
+            if keep_current
+            else "Load unaligned: replace the background without shift or rotation."
+        )
+        options.append(load_text + " Correct it afterwards in Session alignment.")
 
         dialog.setInformativeText(
             "Current alignment\n"
             "-----------------\n" + self._alignment_summary(current_report) + "\n\n"
             "Proposed alignment\n"
             "------------------\n" + self._alignment_summary(proposed_report) + "\n\n"
-            "No changes have been applied yet."
+            + ("" if proposed_report.success else "\n".join(options) + "\n\n")
+            + "No changes have been applied yet."
         )
 
         dialog.setStandardButtons(QMessageBox.StandardButton.Close)
 
-        apply_button = dialog.addButton(QMessageBox.StandardButton.Apply)
-        apply_button.setEnabled(proposed_report.success)
+        apply_button = dialog.addButton(
+            "Confirm proposal" if confirmation else "Apply",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        apply_button.setEnabled(bool(proposed_report.success or confirmation))
+
+        load_button = None
+        if not proposed_report.success:
+            load_button = dialog.addButton(
+                "Load with current alignment" if keep_current else "Load unaligned",
+                QMessageBox.ButtonRole.ApplyRole,
+            )
 
         fit_message_box_buttons(dialog)
         dialog.exec()
 
-        if dialog.clickedButton() is not apply_button:
+        clicked = dialog.clickedButton()
+
+        if clicked is apply_button and apply_button.isEnabled():
+            remap = candidate_remap
+            if not proposed_report.success:
+                # As the review's "Use": a confirmed (manual) alignment.
+                remap = AlignmentDraft(
+                    self.data, session_id, proposal=candidate_remap
+                ).make_remap()
+        elif load_button is not None and clicked is load_button:
+            if keep_current:
+                remap = deepcopy(session.remap)
+            else:
+                remap = Remapping.identity(session.dims)
+                remap.method = "manual"
+        else:
             return
 
         source_path = resolve_source_path(
@@ -3794,7 +4027,7 @@ class SessionOverview(QWidget):
         self.data.queue_commit_session_realignment(
             session_id,
             background_template=candidate_template,
-            remap=candidate_remap,
+            remap=remap,
             background_spec=background_spec,
             expected_version=expected_version,
         )

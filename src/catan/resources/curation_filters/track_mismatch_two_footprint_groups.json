@@ -81,11 +81,8 @@
               "filters": [],
               "context": "generic",
               "parameters": {
-                "containment": true,
-                "directional": false,
-                "normalize_by_target": false,
-                "support_threshold": 0.1,
-                "weighted": false
+                "normalize_by": "smaller",
+                "support_threshold": 0.1
               }
             },
             "threshold": {
@@ -139,11 +136,8 @@
               "filters": [],
               "context": "generic",
               "parameters": {
-                "containment": true,
-                "directional": false,
-                "normalize_by_target": false,
-                "support_threshold": 0.1,
-                "weighted": false
+                "normalize_by": "smaller",
+                "support_threshold": 0.1
               }
             },
             "threshold": {
@@ -197,7 +191,7 @@
               "filters": [],
               "context": "generic",
               "parameters": {
-                "containment": true
+                "normalize_by": "smaller"
               }
             },
             "threshold": {

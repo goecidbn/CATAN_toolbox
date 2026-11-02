@@ -17,6 +17,7 @@ from catan.core.structures.load_config import LoadConfig, FieldSpec
 from catan.core.structures.inclusion import inclusion_mask
 from catan.core.data import center_of_mass
 from catan.core.io.isolated_read import read_fields
+from catan.core import footprint_frame
 
 from catan.core.spatial_geometry import (
     check_shapes,
@@ -58,6 +59,9 @@ class SessionData:
     background: Optional[np.ndarray] = None  #
     background_origin: Optional[str] = None  #
     background_template: Optional[np.ndarray] = None
+    # Background vs. own footprints at loading (footprint_frame.
+    # background_coherence); None without a loaded background.
+    background_coherence: Optional[dict] = None
     included: np.ndarray = np.array([], dtype=bool)
     synthetic: np.ndarray = np.array([], dtype=bool)  #
     # traces
@@ -513,6 +517,7 @@ class SessionData:
             dtype=np.float32,
         ).reshape(dims)
 
+        coherence = None
         if loaded_background is None:
             origin = "footprints"
             template = footprints_proj
@@ -534,17 +539,21 @@ class SessionData:
                 )
                 template = orientation.fix_transpose(template)
 
+            coherence = self._correct_background(template, footprints_proj)
+
         # Validate geometry before modifying the session.
         self.dims = dims
         self.footprints = footprints
         self.background_origin = origin
+        self.background_coherence = coherence
 
         # Never alter this copy through cross-session alignment.
         self.background_template = np.asarray(
             template,
             dtype=np.float32,
         ).copy()
-        self.background = self.background_template.copy()
+        self._corrected_template_cache = None
+        self.background = np.asarray(self.corrected_template(), dtype=np.float32).copy()
 
         self.status["spatial_loaded"] = True
 
@@ -552,10 +561,21 @@ class SessionData:
             self.align_to_reference(
                 alignment_references,
                 use_optical_flow=True,
+                alignment_template=(
+                    footprints_proj
+                    if self.alignment_source == "footprints"
+                    else None
+                ),
             )
         else:
             self.remap = Remapping.identity(self.dims)
             self.postprocess_spatial_data()
+
+        # The original-frame footprint projection (see footprint_template).
+        self._footprint_template_cache = (
+            (id(self.footprints), id(self.remap)),
+            footprints_proj,
+        )
 
         if loaded_included is not None:
             self.included = loaded_included
@@ -712,6 +732,9 @@ class SessionData:
         self.background = None
         self.background_origin = None
         self.background_template = None
+        self.background_coherence = None
+        self._footprint_template_cache = None
+        self._corrected_template_cache = None
         self.remap = None
         self.status["aligned"] = False
         self.included = np.array([], dtype=bool)
@@ -721,12 +744,64 @@ class SessionData:
     ### ================== ALTERATION METHODS =================== ###
     ### ========================================================= ###
 
+    # Detected shapes of components whose shape an assignment set replaced
+    # (replace_footprint); never mutated, only reassigned (sessions are
+    # shallow-copied).
+    replaced_footprints = {}
+
+    def replace_footprint(self, fp_id: int, footprint) -> None:
+        """Give component ``fp_id`` a new shape; its ID and traces stay.
+        remove_synthetic_components() restores the detected shape."""
+        footprint = sparse.csc_matrix(footprint, dtype=self.footprints.dtype)
+        expected_shape = (self.footprints.shape[0], 1)
+        if footprint.shape != expected_shape:
+            raise ValueError(
+                f"Replacement footprint has shape {footprint.shape}, "
+                f"expected {expected_shape}."
+            )
+
+        current = sparse.csc_matrix(self.footprints)
+        originals = dict(self.replaced_footprints)
+        originals.setdefault(int(fp_id), current[:, fp_id].copy())
+        self.replaced_footprints = originals
+
+        self._set_footprint_column(int(fp_id), footprint)
+
+    def _set_footprint_column(self, fp_id, footprint):
+        current = sparse.csc_matrix(self.footprints)
+        self.footprints = sparse.hstack(
+            [current[:, :fp_id], footprint, current[:, fp_id + 1 :]], format="csc"
+        )
+        centroids = np.array(self.centroids, dtype=float, copy=True)
+        centroids[fp_id] = center_of_mass(footprint, *self.dims)
+        self.centroids = centroids
+
+    def restore_replaced_footprint(self, fp_id: int) -> bool:
+        """Detected shape back for one replaced component (undo)."""
+        originals = dict(self.replaced_footprints)
+        original = originals.pop(int(fp_id), None)
+        if original is None:
+            return False
+        self.replaced_footprints = originals
+        self._set_footprint_column(int(fp_id), original)
+        return True
+
+    def restore_replaced_footprints(self):
+        """Detected shapes back for all replaced components."""
+        originals = self.replaced_footprints
+        self.replaced_footprints = {}
+        for fp_id, footprint in sorted(originals.items()):
+            if fp_id < self.footprints.shape[1]:
+                self._set_footprint_column(fp_id, footprint)
+
     def remove_synthetic_components(self):
         """Drop all synthetic components (appended after the detected
-        ones, see append_synthetic_component): the session as detected,
-        before the manipulations of an assignment set."""
+        ones, see append_synthetic_component) and replaced shapes: the
+        session as detected, before the manipulations of an assignment set."""
         if not self.status.get("spatial_loaded", False) or self.synthetic is None:
             return
+        if self.replaced_footprints:
+            self.restore_replaced_footprints()
         synthetic = np.asarray(self.synthetic, dtype=bool)
         if not synthetic.any():
             return
@@ -827,6 +902,92 @@ class SessionData:
     ### ==================== ALIGNMENT METHODS ================== ###
     ### ========================================================= ###
 
+    # ------------------------------------------------------------------
+    # Footprints relative to the background (core.footprint_frame)
+    # ------------------------------------------------------------------
+
+    @property
+    def background_correction(self):
+        """The correction bringing the background into the footprints'
+        frame (footprint_frame.correction_of), or None."""
+        return footprint_frame.correction_of(self.params)
+
+    def _correct_background(self, template, footprint_projection):
+        """Estimate (or keep a manual) background correction for the loaded
+        ``template``; returns the corrected background's coherence."""
+        coherence = footprint_frame.correct_background(
+            self.params, template, footprint_projection
+        )
+        if coherence.get("coherent") is False:
+            logging.getLogger(__name__).warning(
+                "Session %s: %s.", self.name, coherence["reason"]
+            )
+        elif coherence.get("uncorrected_offset") is not None:
+            logging.getLogger(__name__).info(
+                "Session %s: background moved onto its footprints (%s).",
+                self.name,
+                footprint_frame.describe_correction(self.background_correction),
+            )
+        return coherence
+
+    def corrected_template(self):
+        """The background template in the footprints' frame (its correction
+        applied); the background template itself without correction."""
+        template = self.background_template
+        correction = self.background_correction
+        if template is None or footprint_frame.is_identity(correction):
+            return template
+        key = (id(template), footprint_frame.correction_key(correction))
+        cached = getattr(self, "_corrected_template_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        image = footprint_frame.apply_correction(template, correction)
+        self._corrected_template_cache = (key, image)
+        return image
+
+    @property
+    def alignment_source(self):
+        """"background" or "footprints": the image this session is aligned
+        by. Set explicitly in params["alignment_source"]; otherwise the
+        footprints when the background does not resemble them."""
+        explicit = self.params.get("alignment_source")
+        if explicit in footprint_frame.ALIGNMENT_SOURCES:
+            return explicit
+        coherence = self.background_coherence or {}
+        # Only a background that does not resemble its footprints at all;
+        # one offset from them is corrected (background_correction).
+        return (
+            "footprints"
+            if coherence.get("coherent") is False and not footprint_frame.matched(coherence)
+            else "background"
+        )
+
+    def footprint_template(self):
+        """Projection of the footprints in the original frame of the
+        background template; None without footprints."""
+        footprints = getattr(self, "footprints", None)
+        if footprints is None or footprints.shape[1] == 0:
+            return None
+        key = (id(footprints), id(self.remap))
+        cached = getattr(self, "_footprint_template_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        image = footprint_frame.unaligned_projection(self)
+        self._footprint_template_cache = (key, image)
+        return image
+
+    def alignment_template(self):
+        """The original-frame image this session is aligned by: its
+        (corrected) background template, or its footprint projection
+        (alignment_source)."""
+        if self.alignment_source == "footprints" and self.background_origin != "footprints":
+            image = self.footprint_template()
+            if image is not None and self.background_template is not None and (
+                image.shape == self.background_template.shape
+            ):
+                return image
+        return self.corrected_template()
+
     def prepare_background_template(
         self,
         background: np.ndarray,
@@ -892,7 +1053,7 @@ class SessionData:
         """
 
         template = (
-            self.background_template
+            self.alignment_template()
             if background_template is None
             else background_template
         )
@@ -996,7 +1157,9 @@ class SessionData:
         }
         return remap
 
-    def align_to_reference(self, alignment_references, use_optical_flow=True):
+    def align_to_reference(
+        self, alignment_references, use_optical_flow=True, *, alignment_template=None
+    ):
 
         if (
             not self.status["spatial_loaded"]
@@ -1007,6 +1170,7 @@ class SessionData:
 
         self.remap = self.propose_remapping(
             alignment_references,
+            background_template=alignment_template,
             use_optical_flow=use_optical_flow,
         )
 
@@ -1025,7 +1189,7 @@ class SessionData:
         )
 
         self.background = self.remap.apply_remap(
-            self.background_template,
+            self.corrected_template(),
             use_optical_flow=(use_optical_flow),
         )
 

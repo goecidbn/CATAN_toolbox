@@ -1,0 +1,338 @@
+{
+  "schema_version": 2,
+  "name": "Structure: swap risk",
+  "category": "assignments",
+  "root": {
+    "type": "group",
+    "id": "f17cec20a38448ffbf6e4bd1259e1644",
+    "operator": "and",
+    "match_level": "relationship",
+    "children": [
+      {
+        "type": "group",
+        "id": "6581052ab6ee451680c67e8bb6d78bc9",
+        "operator": "or",
+        "match_level": "relationship",
+        "children": [
+          {
+            "type": "group",
+            "id": "6952ef58439649058b0d7483c5adaf05",
+            "operator": "and",
+            "match_level": "relationship",
+            "children": [
+              {
+                "type": "condition",
+                "id": "5087df6ba2cf48b5acc66889525fedea",
+                "query": {
+                  "statistic_key": "cross_session_distances",
+                  "reductions": {
+                    "neuron_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "neuron_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session_j": {
+                      "method": "max",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [
+                    {
+                      "target": "neuron",
+                      "relation": "different",
+                      "collapse_same": true
+                    },
+                    {
+                      "target": "session",
+                      "relation": "previous instance",
+                      "collapse_same": true
+                    }
+                  ],
+                  "context": "generic",
+                  "parameters": {}
+                },
+                "threshold": {
+                  "direction": "less",
+                  "active": true,
+                  "reference": {
+                    "kind": "model_distance",
+                    "coefficients": {
+                      "sigma_det": 2.0,
+                      "sigma_move": 2.0
+                    }
+                  },
+                  "unit": "px"
+                }
+              },
+              {
+                "type": "group",
+                "id": "621ddce20f554d6b81797b6cf18e124a",
+                "operator": "and",
+                "match_level": "footprint",
+                "children": [
+                  {
+                    "type": "condition",
+                    "id": "a7e129f6e4a246a98122da9b04efdcfe",
+                    "query": {
+                      "statistic_key": "centroid_shift",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session_i": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session_j": {
+                          "method": "max",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [
+                        {
+                          "target": "session",
+                          "relation": "previous instance",
+                          "collapse_same": true
+                        }
+                      ],
+                      "context": "generic",
+                      "parameters": {}
+                    },
+                    "threshold": {
+                      "direction": "greater",
+                      "active": true,
+                      "reference": {
+                        "kind": "model_distance",
+                        "coefficients": {
+                          "sigma_det": 2.0,
+                          "sigma_move": 2.0
+                        }
+                      },
+                      "unit": "px"
+                    }
+                  }
+                ],
+                "count": null,
+                "comment": "",
+                "apply_to": "source",
+                "summary": null,
+                "manipulation": null,
+                "review_statuses": null
+              }
+            ],
+            "count": null,
+            "comment": "Towards the previous instance: the footprint is closer than 2·(σ_det + σ_move) to B's footprint there, and farther from its own neuron's.",
+            "apply_to": "same",
+            "summary": null,
+            "manipulation": null,
+            "review_statuses": null
+          },
+          {
+            "type": "group",
+            "id": "ad1a1e3a38ad4f3487c059b7524e0f0a",
+            "operator": "and",
+            "match_level": "relationship",
+            "children": [
+              {
+                "type": "condition",
+                "id": "4d94cf8e085a4b10b0b9efc80ac1c367",
+                "query": {
+                  "statistic_key": "cross_session_distances",
+                  "reductions": {
+                    "neuron_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "neuron_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session_j": {
+                      "method": "max",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [
+                    {
+                      "target": "neuron",
+                      "relation": "different",
+                      "collapse_same": true
+                    },
+                    {
+                      "target": "session",
+                      "relation": "next instance",
+                      "collapse_same": true
+                    }
+                  ],
+                  "context": "generic",
+                  "parameters": {}
+                },
+                "threshold": {
+                  "direction": "less",
+                  "active": true,
+                  "reference": {
+                    "kind": "model_distance",
+                    "coefficients": {
+                      "sigma_det": 2.0,
+                      "sigma_move": 2.0
+                    }
+                  },
+                  "unit": "px"
+                }
+              },
+              {
+                "type": "group",
+                "id": "82b6c31e5dc244449875b9f8424fa1e9",
+                "operator": "and",
+                "match_level": "footprint",
+                "children": [
+                  {
+                    "type": "condition",
+                    "id": "75961bf3cdfb48e89bf0ab27461978b6",
+                    "query": {
+                      "statistic_key": "centroid_shift",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session_i": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session_j": {
+                          "method": "max",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [
+                        {
+                          "target": "session",
+                          "relation": "next instance",
+                          "collapse_same": true
+                        }
+                      ],
+                      "context": "generic",
+                      "parameters": {}
+                    },
+                    "threshold": {
+                      "direction": "greater",
+                      "active": true,
+                      "reference": {
+                        "kind": "model_distance",
+                        "coefficients": {
+                          "sigma_det": 2.0,
+                          "sigma_move": 2.0
+                        }
+                      },
+                      "unit": "px"
+                    }
+                  }
+                ],
+                "count": null,
+                "comment": "",
+                "apply_to": "source",
+                "summary": null,
+                "manipulation": null,
+                "review_statuses": null
+              }
+            ],
+            "count": null,
+            "comment": "Towards the next instance: the footprint is closer than 2·(σ_det + σ_move) to B's footprint there, and farther from its own neuron's.",
+            "apply_to": "same",
+            "summary": null,
+            "manipulation": null,
+            "review_statuses": null
+          }
+        ],
+        "count": null,
+        "comment": "",
+        "apply_to": "same",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      },
+      {
+        "type": "condition",
+        "id": "2fe34dbf2a324f3ea28b055cb72dd6b2",
+        "query": {
+          "statistic_key": "partner_session_match",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
+            {
+              "target": "neuron",
+              "relation": "different",
+              "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {
+            "gamma": 0.1
+          }
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 0.0,
+          "strict": true
+        }
+      }
+    ],
+    "count": null,
+    "comment": "A footprint (source) that continues another neuron's track (target) better than its own: closer than 2·(σ_det + σ_move) of the fitted model to that neuron's previous or next detection, but farther from its own neuron's. The other neuron has a footprint in this session too, so the two may be swapped (without one: misassigned / orphans). Union distances do not matter — drift and fluctuations can bring two tracks close in single sessions. Review both neurons; exchange the footprints by reassigning (the occupied slot is asked for).",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": null,
+    "review_statuses": [
+      0,
+      2
+    ]
+  }
+}

@@ -457,14 +457,14 @@ class Tracking:
         session = self.sessions[session_id]
 
         if not session.status["spatial_loaded"] or session.footprints is None:
-            raise ValueError(f"Session {session_id}: spatial data must be loaded.")
+            raise ValueError(f"S{session_id}: spatial data must be loaded.")
 
         if not session.status["aligned"]:
-            raise ValueError(f"Session {session_id}: alignment has not succeeded.")
+            raise ValueError(f"S{session_id}: alignment has not succeeded.")
 
         if self.alignment_is_stale(session_id):
             raise ValueError(
-                f"Session {session_id}: alignment is outdated; "
+                f"S{session_id}: alignment is outdated; "
                 "realign this session before further processing."
             )
 
@@ -763,8 +763,8 @@ class Tracking:
             matrix = np.eye(3) if remap is None else remap.matrix
 
             entry = {
-                "name": f"S{sid} {session.name}",
-                "template": session.background_template.copy(),
+                "name": f"{session.name} (S{sid})",
+                "template": session.alignment_template().copy(),
                 "matrix": np.asarray(matrix, dtype=float).copy(),
                 "flow_candidate": sid >= flow_start,
                 # This session's own accepted alignment quality.
@@ -783,11 +783,11 @@ class Tracking:
 
             if entry["flow_candidate"]:
                 if remap is None:
-                    aligned = session.background_template.copy()
+                    aligned = session.alignment_template().copy()
                     valid = np.ones(session.dims, dtype=bool)
                 else:
                     aligned = remap.apply_remap(
-                        session.background_template,
+                        session.alignment_template(),
                         use_optical_flow=True,
                     )
                     valid = remap.valid_mask(use_optical_flow=True)
@@ -860,8 +860,8 @@ class Tracking:
         for sid, session in reversed(ranked):
             remap = session.remap
             entry = {
-                "name": f"S{sid} {session.name}",
-                "template": session.background_template.copy(),
+                "name": f"{session.name} (S{sid})",
+                "template": session.alignment_template().copy(),
                 "matrix": np.asarray(
                     np.eye(3) if remap is None else remap.matrix, dtype=float
                 ).copy(),
@@ -874,11 +874,11 @@ class Tracking:
 
             if entry["flow_candidate"]:
                 if remap is None:
-                    aligned = session.background_template.copy()
+                    aligned = session.alignment_template().copy()
                     valid = np.ones(session.dims, dtype=bool)
                 else:
                     aligned = remap.apply_remap(
-                        session.background_template, use_optical_flow=True
+                        session.alignment_template(), use_optical_flow=True
                     )
                     valid = remap.valid_mask(use_optical_flow=True)
 
@@ -1332,11 +1332,6 @@ class Tracking:
         if self.model is None:
             raise ValueError("No current model available.")
 
-        if self.model.loaded:
-            raise ValueError(
-                "The current model was loaded from file and cannot be updated."
-            )
-
         accepted = {
             "pending": {"missing", "stale"},
             "missing": {"missing"},
@@ -1556,7 +1551,7 @@ class Tracking:
                 "Model fitting requires sessions on one common image grid."
             )
 
-        if grids and not self.model.loaded:
+        if grids:
             self.model.params["window_dims"] = tuple(
                 float(value) for value in grids.pop()
             )
@@ -1889,6 +1884,14 @@ class Tracking:
                 neuron_id_map = {
                     old: rows[new] for old, new in neuron_id_map.items() if new in rows
                 }
+
+        # Records whose footprints were registered again cannot be undone:
+        # their before / after groups no longer describe the assignments.
+        from catan.tracking.structures import manipulation_records
+
+        manipulation_records.retire_from_session(
+            candidate.manipulations, plan["from_session_id"]
+        )
 
         # Recover manipulation associations through stable footprint refs.
         # Later history entries supersede earlier entries for a neuron.
@@ -2944,7 +2947,7 @@ class Tracking:
                     )
 
                     problems.append(
-                        f"Session {session_index}: {name}\n"
+                        f"{name} (S{session_index})\n"
                         f"Available footprints: {count}; "
                         f"valid IDs: {valid_range}.\n"
                         f"Highest referenced footprint ID: {maximum}.\n"
@@ -3593,5 +3596,8 @@ class Tracking:
             for session in self.sessions
             if session.path is not None
         ]
+        # Nothing loaded yet (e.g. "+ from file" before a root is set).
+        if not candidate_paths:
+            return Path.home() / "tracking"
         common_path = os.path.commonpath([str(path) for path in candidate_paths])
         return Path(common_path) / "tracking"

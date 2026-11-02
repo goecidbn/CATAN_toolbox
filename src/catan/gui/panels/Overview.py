@@ -89,6 +89,8 @@ class Display(BasePlot.BaseCanvas):
 
     main_visual = Markers
     main_visual_name = "marker"
+    # Shift + drag: canvas position where the selection rectangle started.
+    _rectangle_start = None
 
     overlays = ["selected", "focused", "highlighted", "hovered"]
 
@@ -1292,8 +1294,11 @@ class Display(BasePlot.BaseCanvas):
         self.plotting["overlays"][style][0].visible = True
         self.update()
 
-    def find_closest_component(self, mouse_pos) -> Optional[NeuronComponent]:
-        # print("neurons:", self.data.neurons)
+    def _pickable_union_centroids(self):
+        """Union centroids (x, y) and a mask of the neurons that can be
+        hovered or picked: shown by the review filter (focused kept),
+        included, and present in the current session with "Show current
+        session only". None without a union."""
         if (
             self.state.current_session_id is None
             or "background" not in self.plotting
@@ -1303,17 +1308,7 @@ class Display(BasePlot.BaseCanvas):
         ):
             return None
 
-        mouse_pos = click_events.canvas_to_visual(
-            self.plotting["background"], mouse_pos
-        )
-
-        # union_centroids = np.nanmean(self.data.neurons.centroids, axis=1)
         union_centroids = self.data.assignments.union.centroids
-
-        # find closest footprint
-        distances = (union_centroids[:, 0] - mouse_pos[0]) ** 2 + (
-            union_centroids[:, 1] - mouse_pos[1]
-        ) ** 2
 
         ## filter results for display based on review status
         neuron_ids = np.arange(len(union_centroids), dtype=int)
@@ -1323,25 +1318,41 @@ class Display(BasePlot.BaseCanvas):
             else self.state.focused_component.neuron_id
         )
 
-        review_mask = ReviewStatusFilter.neuron_mask(
+        mask = ReviewStatusFilter.neuron_mask(
             neuron_ids,
             self.data.assignments.review_status,
             (self.controls["panel"].review_filter.visible_statuses),
             focused_neuron_id=focused_neuron_id,
             keep_focused=True,
         )
-        distances[~review_mask] = np.inf
 
         # Excluded neurons are not displayed, so they cannot be hovered.
         union = self.data.assignments.union
         if union.included is not None:
-            distances[~np.asarray(union.included, dtype=bool)] = np.inf
+            mask &= np.asarray(union.included, dtype=bool)
 
         if self.session_only:
-            mask = self.state.assignments[:, self.state.current_session_id] >= 0
-            distances[~mask] = np.inf
+            mask &= self.state.assignments[:, self.state.current_session_id] >= 0
 
-        distances[~np.isfinite(distances)] = np.inf
+        mask &= np.all(np.isfinite(union_centroids[:, :2]), axis=1)
+        return union_centroids, mask
+
+    def find_closest_component(self, mouse_pos) -> Optional[NeuronComponent]:
+        pickable = self._pickable_union_centroids()
+        if pickable is None:
+            return None
+        union_centroids, mask = pickable
+
+        mouse_pos = click_events.canvas_to_visual(
+            self.plotting["background"], mouse_pos
+        )
+
+        # find closest footprint
+        distances = (union_centroids[:, 0] - mouse_pos[0]) ** 2 + (
+            union_centroids[:, 1] - mouse_pos[1]
+        ) ** 2
+        distances[~mask] = np.inf
+
         if not np.any(np.isfinite(distances)):
             return None
 
@@ -1351,7 +1362,100 @@ class Display(BasePlot.BaseCanvas):
 
         return NeuronComponent(neuron_id, self.state.current_session_id)
 
+    # ----- Shift + drag: select the neurons inside a rectangle -----
+
+    def _rectangle_corners(self, start, end):
+        corners = click_events.canvas_to_visual(
+            self.plotting["background"], np.array([start, end], dtype=np.float32)
+        )
+        low = corners.min(axis=0)
+        high = corners.max(axis=0)
+        return low, high
+
+    def _show_selection_rectangle(self, start, end):
+        low, high = self._rectangle_corners(start, end)
+        outline = np.array(
+            [
+                [low[0], low[1]],
+                [high[0], low[1]],
+                [high[0], high[1]],
+                [low[0], high[1]],
+                [low[0], low[1]],
+            ],
+            dtype=np.float32,
+        )
+        line = self.plotting.get("selection_rectangle")
+        if line is None:
+            line = visuals.Line(
+                outline,
+                color=(0.55, 0.85, 0.55, 0.95),
+                width=1.5,
+                method="gl",
+                parent=self.plot_root,
+            )
+            line.order = 50
+            line.set_gl_state(depth_test=False, blend=True)
+            line.interactive = False
+            self.plotting["selection_rectangle"] = line
+        else:
+            line.set_data(pos=outline)
+            line.visible = True
+        self.update()
+
+    def _hide_selection_rectangle(self):
+        line = self.plotting.get("selection_rectangle")
+        if line is not None:
+            line.visible = False
+            self.update()
+
+    def _components_in_rectangle(self, start, end):
+        pickable = self._pickable_union_centroids()
+        if pickable is None:
+            return []
+        union_centroids, mask = pickable
+        low, high = self._rectangle_corners(start, end)
+        inside = (
+            mask
+            & (union_centroids[:, 0] >= low[0])
+            & (union_centroids[:, 0] <= high[0])
+            & (union_centroids[:, 1] >= low[1])
+            & (union_centroids[:, 1] <= high[1])
+        )
+        session_id = self.state.current_session_id
+        return [
+            NeuronComponent(int(neuron_id), session_id)
+            for neuron_id in np.flatnonzero(inside)
+        ]
+
+    def _select_rectangle(self, start, end, add):
+        components = self._components_in_rectangle(start, end)
+        if add:
+            # Shift + Ctrl: add to the current selection (never remove).
+            current = list(self.state.selected_components or [])
+            known = {(c.neuron_id, c.session_id) for c in current}
+            components = current + [
+                c for c in components if (c.neuron_id, c.session_id) not in known
+            ]
+        self.state.update_selected_components(components if components else None)
+
+    def on_mouse_press(self, event):
+        super().on_mouse_press(event)
+        self._rectangle_start = (
+            event.pos
+            if event.button == 1
+            and "Shift" in event.modifiers
+            and event.pos is not None
+            and self._colorbar_hit_target(event.pos) is None
+            else None
+        )
+
     def on_mouse_move(self, event):
+
+        if self._rectangle_start is not None and event.is_dragging:
+            QToolTip.hideText()
+            self._show_selection_rectangle(self._rectangle_start, event.pos)
+            event.handled = True
+            return
 
         target = self._colorbar_hit_target(event.pos)
 
@@ -1367,6 +1471,17 @@ class Display(BasePlot.BaseCanvas):
         super().on_mouse_move(event)
 
     def on_mouse_release(self, event):
+
+        start = self._rectangle_start
+        self._rectangle_start = None
+        if start is not None:
+            self._hide_selection_rectangle()
+            if event.pos is not None and self.is_drag(event.pos):
+                self._select_rectangle(
+                    start, event.pos, add="Control" in event.modifiers
+                )
+                event.handled = True
+                return
 
         if event.button == 1:
 
@@ -2023,8 +2138,9 @@ class OverviewControlPanel(ControlPanel.ControlPanel):
 
         self.background_session = QSpinBox()
         self.background_session.setMinimum(0)
+        self.background_session.setPrefix("S")
         self.background_session.setValue(int(background_session))
-        self.background_session.setToolTip("Session ID; numbering starts at 0.")
+        self.background_session.setToolTip("Session (S index as in the session list).")
 
         self.background_load = QPushButton("Load…")
         self.background_file_label = QLabel()

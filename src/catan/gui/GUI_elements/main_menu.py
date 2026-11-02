@@ -26,7 +26,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from PySide6.QtCore import QSettings, QThreadPool, Qt, Signal, QSignalBlocker, QSize
+from PySide6.QtCore import (
+    QSettings, QThreadPool, Qt, Signal, QSignalBlocker, QSize, QTimer,
+)
 from PySide6.QtGui import QAction
 from shiboken6 import isValid
 from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
@@ -51,6 +53,8 @@ from .fragments import (
 )
 from . import session_overview
 from catan.gui.GUI_elements.utils.paths import display_path
+from catan.gui.utils.fs_guard import responsive_folder, warn_unresponsive
+from catan.gui.utils import fs_guard
 from catan.gui.GUI_elements.utils.elided_label import ElidedLabel
 import qtawesome as qta
 
@@ -58,6 +62,8 @@ import qtawesome as qta
 # loaded models / assignment sets.
 source_actions = {
     "model": [
+        "Create new",
+        "Create named copy…",
         "Load ...",
         "Remove current…",
     ],
@@ -147,7 +153,8 @@ class MainMenu(QFrame):
             self.state.tasks,
         )
         layout.addWidget(self.task_overview)
-        layout.addWidget(ResourceMonitor(parent=self))
+        self.resource_monitor = ResourceMonitor(parent=self)
+        layout.addWidget(self.resource_monitor)
 
         self.session_list.load_requested.connect(self.process_data_from_session)
 
@@ -289,7 +296,25 @@ class MainMenu(QFrame):
         )
         self.review_counts_label.setStyleSheet("font-size: 11px; padding: 2px 0;")
 
-        form.addRow("", self.review_counts_label)
+        # The second line (manipulations) has the list of manipulations.
+        self.manipulations_button = QToolButton()
+        self.manipulations_button.setText("Manipulations…")
+        self.manipulations_button.setToolTip(
+            "List the manipulations of the active assignments: see what each "
+            "changed and undo it"
+        )
+        self.manipulations_button.setStyleSheet("font-size: 11px;")
+        self.manipulations_button.clicked.connect(self.open_manipulations)
+        counts_row = QWidget()
+        counts_layout = QHBoxLayout(counts_row)
+        counts_layout.setContentsMargins(0, 0, 0, 0)
+        counts_layout.setSpacing(4)
+        counts_layout.addWidget(self.review_counts_label, 1)
+        counts_layout.addWidget(
+            self.manipulations_button, 0, Qt.AlignmentFlag.AlignBottom
+        )
+
+        form.addRow("", counts_row)
         self._update_review_counts()
 
         # Configuration content belongs to its popup, not this form.
@@ -390,6 +415,39 @@ class MainMenu(QFrame):
         layout.addWidget(QLabel("Root folder:"))
         layout.addWidget(self.edit_root_path)
         layout.addWidget(self.button_root_path)
+        self.root_selector = widget
+
+        # Fresh start (e.g. another animal): removes sessions, models and
+        # assignment sets after offering to save, as when closing.
+        self.button_clean_all = make_icon_button(
+            "broom",
+            color="orange",
+            tooltip=(
+                "Clean all: remove all sessions, models and assignment sets "
+                "from this window (asks to save changes first; files stay)"
+            ),
+            size=28,
+            icon_size=18,
+        )
+        self.button_clean_all.setObjectName("cleanAllButton")
+        self.button_clean_all.clicked.connect(lambda: self.window().clean_workspace())
+        layout.addWidget(self.button_clean_all)
+
+        # Starter guide: chapters and its settings (menu built on demand,
+        # the guide is created after the main menu).
+        self.guide_button = make_icon_button(
+            "circle-question",
+            tooltip="Starter guide: an interactive tour of CATAN",
+            size=28,
+            icon_size=18,
+        )
+        self.guide_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        guide_menu = QMenu(self.guide_button)
+        guide_menu.aboutToShow.connect(
+            lambda: self.window().guide.build_menu(guide_menu)
+        )
+        self.guide_button.setMenu(guide_menu)
+        layout.addWidget(self.guide_button)
 
         def on_root_path_changed():
             self.data.root = self.edit_root_path.text().strip()
@@ -400,7 +458,8 @@ class MainMenu(QFrame):
                 choose_path(
                     self,
                     pick_dir=True,
-                    init_path=self.data.root,
+                    # The starter guide may suggest its demo folder.
+                    init_path=getattr(self, "root_dialog_start", None) or self.data.root,
                     edit_line=self.edit_root_path,
                     display_text="Select root folder",
                     only_existing=True,
@@ -409,6 +468,16 @@ class MainMenu(QFrame):
             )
         )
         self.edit_root_path.editingFinished.connect(on_root_path_changed)
+
+        # The field is narrow (and disabled once sessions are loaded): the
+        # full path on hover.
+        def show_root_tooltip(text):
+            tip = text or "No root folder set"
+            self.edit_root_path.setToolTip(tip)
+            self.button_root_path.setToolTip(f"Choose the root folder\n{tip}")
+
+        self.edit_root_path.textChanged.connect(show_root_tooltip)
+        show_root_tooltip(self.edit_root_path.text())
         return widget
 
     def _add_process_menu(self, button, key):
@@ -478,7 +547,7 @@ class MainMenu(QFrame):
 
             if key == "model":
                 model = self.data.model
-                available = model is not None and not model.loaded and n_sessions > 0
+                available = model is not None and n_sessions > 0
             else:
                 assignments = self.data.assignments
                 needs_loading = (
@@ -555,7 +624,9 @@ class MainMenu(QFrame):
         # selector.currentTextChanged.connect(
         #     lambda text: self._on_load_option_changed(key, text)
         # )
-        def describe(text):
+        def describe(*_):
+            name = selector.currentData()
+            text = "none" if name is None else assignment_label(name)
             selector.setToolTip(
                 f"Active model: {text}. Used for evidence, fitting and registration."
                 if key == "model"
@@ -564,7 +635,7 @@ class MainMenu(QFrame):
             )
 
         selector.currentTextChanged.connect(describe)
-        describe(selector.currentText())
+        describe()
 
         layout.addWidget(selector, 1)
 
@@ -596,13 +667,23 @@ class MainMenu(QFrame):
         # model also via its process button's arrow menu.
         save.setVisible(False)
 
-        if key == "assignments":
+        if key in ("model", "assignments"):
             create = QToolButton(self)
             create.setAutoRaise(True)
             create.setFixedSize(36, 26)
             create.setIconSize(QSize(16, 16))
             create.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-            set_button_icon(create, "square-plus", tooltip="Create assignments")
+            set_button_icon(
+                create,
+                "square-plus",
+                tooltip=(
+                    "Create a model (new, empty or a copy of the current one), "
+                    "e.g. to build one from the loaded sessions without changing "
+                    "a loaded model"
+                    if key == "model"
+                    else "Create assignments"
+                ),
+            )
             create_menu = QMenu(create)
             create_menu.addAction(
                 "New, empty…", lambda: self._on_load_option_changed(key, "Create new")
@@ -696,6 +777,9 @@ class MainMenu(QFrame):
 
         if assignments is not None:
             for record in assignments.manipulations.values():
+                # Undone ones and parts of another one do not count.
+                if record.get("undone") or record.get("part_of") is not None:
+                    continue
                 category = category_for_type.get(record["type"])
 
                 if category is not None:
@@ -731,6 +815,24 @@ class MainMenu(QFrame):
             "replaced by splitting or merging."
         )
 
+    def open_manipulations(self):
+        """The (single) manipulations window of the active assignments."""
+        from catan.gui.GUI_elements.fragments.manipulations_dialog import (
+            ManipulationsDialog,
+        )
+
+        dialog = getattr(self, "_manipulations_dialog", None)
+        if dialog is not None and isValid(dialog) and dialog.isVisible():
+            dialog.raise_()
+            dialog.activateWindow()
+            return dialog
+
+        dialog = ManipulationsDialog(self.state, self.data, parent=self.window())
+        dialog.setWindowFlag(Qt.WindowType.Tool, True)
+        dialog.show()
+        self._manipulations_dialog = dialog
+        return dialog
+
     def import_source_file(self, key, path):
         """Import assignments or a model from ``path`` (named as with the
         sections' Load …)."""
@@ -752,20 +854,117 @@ class MainMenu(QFrame):
             on_loaded=lambda: self._on_source_registered(key),
         )
 
-    def save_project(self, *, save_as=False):
+    def save_project(self, *, save_as=False, finished=None):
         """Save the project (Data.queue_save_project). The first save, and
-        Save as, ask for the project name. Returns the path, or None."""
+        Save as, ask for the project name; changed models and assignment
+        sets loaded from a file are saved only where the user chooses.
+        Returns the path, or None (cancelled). ``finished`` runs after the
+        save."""
         path = None if save_as else self.data.project_path()
         if path is None:
             path = self._ask_project_path()
             if path is None:
                 return None
+        model_targets = self._ask_changed_set_targets("model")
+        if model_targets is None:
+            return None
+        assignment_targets = self._ask_changed_set_targets("assignments")
+        if assignment_targets is None:
+            return None
         try:
-            self.data.queue_save_project(path)
+            self.data.queue_save_project(
+                path,
+                finished=finished,
+                model_targets=model_targets,
+                assignment_targets=assignment_targets,
+            )
         except (ValueError, OSError) as exc:
             self.state.issue("warning", "Project not saved", str(exc), parent=self.window())
             return None
         return path
+
+    CHANGED_SET_TEXTS = {
+        "model": (
+            "model",
+            "Save changed model?",
+            "has changed since (evidence or fit)",
+            "Models loaded from a file are not saved with the project. Save "
+            "the changes to a model file (the original or a new one)?",
+            "CATAN model",
+            "catan_model.hdf5",
+        ),
+        "assignments": (
+            "assignments",
+            "Save changed assignments?",
+            "have changed since (matches, review status, inclusion or "
+            "manipulations)",
+            "Assignments loaded from a file are not saved with the project. "
+            "Save the changes to an assignments file (the original or a new one)?",
+            "CATAN assignments",
+            "catan_assignments.hdf5",
+        ),
+    }
+
+    def _ask_changed_set_targets(self, kind):
+        """For each model / assignment set loaded from a file and changed
+        since: save it to a file (dialog starting at its original file) or
+        not. Returns {name: path}, or None if the user cancelled the save."""
+        noun, title, changed, question, file_type, default_name = (
+            self.CHANGED_SET_TEXTS[kind]
+        )
+        targets = {}
+        for name in self.data.changed_external_sets(kind):
+            item = self.data.source_set(kind, name)
+            original = str(getattr(item, "path", "") or "")
+            label = assignment_label(name)
+            while True:
+                box = QMessageBox(self.window())
+                box.setIcon(QMessageBox.Icon.Question)
+                box.setWindowTitle(title)
+                box.setText(
+                    f"The {noun} {label} "
+                    + ("were" if kind == "assignments" else "was")
+                    + f" loaded from {display_path(original)} and {changed}."
+                )
+                box.setInformativeText(
+                    question
+                    + "\n\nIf not, the project keeps referring to the unchanged "
+                    "file, and these changes are lost when the project is opened again."
+                )
+                save_button = box.addButton("Save to file…", QMessageBox.ButtonRole.AcceptRole)
+                skip_button = box.addButton("Don't save", QMessageBox.ButtonRole.DestructiveRole)
+                cancel_button = box.addButton(QMessageBox.StandardButton.Cancel)
+                box.setDefaultButton(save_button)
+                fit_message_box_buttons(box)
+                box.exec()
+                clicked = box.clickedButton()
+                box.deleteLater()
+                if clicked is cancel_button or clicked is None:
+                    return None
+                if clicked is skip_button:
+                    break
+                folder, unresponsive = responsive_folder(
+                    Path(original).parent if original else None, self.data.root
+                )
+                warn_unresponsive(self.state, unresponsive)
+                target = choose_path(
+                    self,
+                    init_path=folder,
+                    display_text=f"Save {noun} {label}",
+                    only_existing=False,
+                    default_suffix="hdf5",
+                    file_filters=[(file_type, ("*.hdf5", "*.h5"))],
+                    state=self.state,
+                    default_filename=Path(original).name if original else default_name,
+                )
+                if target:
+                    targets[name] = target
+                    break
+                # No file chosen: ask again.
+        return targets
+
+    def _ask_changed_model_targets(self):
+        return self._ask_changed_set_targets("model")
 
     def _ask_project_path(self):
         folder = self.data.project_folder()
@@ -783,7 +982,11 @@ class MainMenu(QFrame):
             return None
 
         path = folder / f"{name}{suffix}"
-        if path.exists() and str(path) != self.data.project_path():
+        exists = fs_guard.exists(path)
+        if fs_guard.probe.timed_out:
+            warn_unresponsive(self.state, [str(folder)])
+            return None
+        if exists and str(path) != self.data.project_path():
             answer = QMessageBox.question(
                 self.window(),
                 "Replace project?",
@@ -802,11 +1005,14 @@ class MainMenu(QFrame):
         assignments. Asks only if sessions or a model are loaded already.
         Without ``path``, a file dialog."""
         if path is None:
-            folder = self.data.project_folder()
+            init_path, unresponsive = responsive_folder(
+                self.data.project_folder(), self.data.root
+            )
+            warn_unresponsive(self.state, unresponsive)
             path = choose_path(
                 self,
                 pick_dir=False,
-                init_path=str(folder if folder.is_dir() else self.data.root),
+                init_path=init_path,
                 display_text="Open CATAN project",
                 only_existing=True,
                 file_filters=[("CATAN project", (f"*{self.data.PROJECT_SUFFIX}",))],
@@ -823,14 +1029,42 @@ class MainMenu(QFrame):
         while name in self.data.available_assignments:
             name, number = f"{base} ({number})", number + 1
 
+        def registered():
+            if str(path).endswith(suffix):
+                self.data._project_path = str(fs_guard.lexical_path(path))
+                self.data.remember_recent_project(path)
+            self._on_source_registered("assignments")
+
         self._opening_project = True
         self.data.queue_import_source(
             "assignments",
             path,
             name,
             use_as_working=use_working,
-            on_loaded=lambda: self._on_source_registered("assignments"),
+            on_loaded=registered,
+            project_set=True,
         )
+
+    def open_recent_project(self, path):
+        """File ▸ Open recent: open ``path`` if it still exists, else offer
+        to remove it from the list."""
+        found = fs_guard.is_file(path)
+        if fs_guard.probe.timed_out:
+            warn_unresponsive(self.state, [str(Path(path).parent)])
+            return
+        if not found:
+            answer = QMessageBox.question(
+                self.window(),
+                "Project not found",
+                f"{display_path(str(path))} does not exist any more. "
+                "Remove it from the recent projects?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.data.forget_recent_project(path)
+            return
+        self.open_project(path)
 
     def save_data(self, key):
         if key not in {"model", "assignments"}:
@@ -876,7 +1110,7 @@ class MainMenu(QFrame):
                 return
 
             explanation = (
-                "Its contents will be cleared, leaving an empty Working entry."
+                "Its contents will be cleared, leaving an empty Project entry."
                 if name == "local"
                 else "It will be removed from the current CATAN workspace."
             )
@@ -903,6 +1137,23 @@ class MainMenu(QFrame):
 
         use_working = False
         replace_empty_model = False
+
+        if key == "model" and opt == "Create named copy…":
+            source_name = self.data.current_model_name
+            self._refresh_source_selector(key)
+
+            name, accepted = QInputDialog.getText(
+                self,
+                "Copy model",
+                "Name for the independent model copy:",
+                text=f"{assignment_label(source_name)} copy",
+            )
+
+            if accepted:
+                self.data.copy_model(name)
+                self._refresh_source_selector(key)
+
+            return
 
         if key == "assignments" and opt == "Create named copy…":
             source_name = self.data.current_assignments
@@ -987,6 +1238,15 @@ class MainMenu(QFrame):
         if ok:
             if key == "model":
                 if isinstance(name, str):
+                    name = name.strip()
+                    if not name or name in self.data.available_models:
+                        self.state.issue(
+                            "warning",
+                            "Model not created",
+                            "Choose a non-empty name that is not already in use.",
+                        )
+                        self._refresh_source_selector(key)
+                        return
                     self.data.add_model(name, load_path)
 
                 available_names = self.data.available_models
@@ -1070,9 +1330,13 @@ class MainMenu(QFrame):
             on_removed=lambda: self._refresh_source_selector("assignments"),
         )
 
-    def _show_assignments_configuration(self, problems=None, hint=None):
+    def _show_assignments_configuration(
+        self, problems=None, hint=None, *, step=None, on_load=None
+    ):
         """Open the assignments load configuration; ``problems`` (why
-        loading stopped) are shown in it, not in a separate message box."""
+        loading stopped) are shown in it, not in a separate message box.
+        ``step``: a project restore step (``_run_restore_step``) waiting for
+        the user's Load / Cancel; ``on_load`` replaces the default Load."""
         constructor = self.config_constructor
         source = self.data.assignments
         constructor.update_source(source)
@@ -1082,17 +1346,43 @@ class MainMenu(QFrame):
             )
             # A file waiting to be loaded: confirm (Load) or drop (Cancel).
             if source is not None and source.path and not source.status["loaded"]:
-                constructor.set_pending_load(
-                    on_load=self._load_assignments_from_source,
-                    on_cancel=lambda: self._cancel_assignments_import(source),
-                )
+                name = self.data.current_assignments
+
+                def load():
+                    if step is not None:
+                        step.resume()
+                    if on_load is not None:
+                        on_load()
+                    else:
+                        self._load_assignments_from_source(step=step)
+
+                def cancel():
+                    self._cancel_assignments_import(source)
+                    if step is not None:
+                        step.skip(
+                            f"Assignments {assignment_label(name)} not loaded",
+                            "Loading was cancelled in its configuration. The "
+                            "other data of the project is loaded.",
+                        )
+
+                if step is not None:
+                    # The restore waits for the user, not for a task.
+                    step.wait()
+                constructor.set_pending_load(on_load=load, on_cancel=cancel)
         else:
             constructor.open()
         self.update_buttons()
 
-    def _load_assignments_from_source(self):
+    def _load_assignments_from_source(self, on_loaded=None, *, step=None):
+        """``step``: a project restore step; done when loaded, its
+        configuration opened (waiting for Load / Cancel) on field problems."""
+        if step is not None:
+            on_loaded = step
         self.data.queue_load_assignments(
-            on_config_required=self._show_assignments_configuration,
+            on_config_required=lambda problems=None: self._show_assignments_configuration(
+                problems, step=step
+            ),
+            on_loaded=on_loaded,
         )
 
     def _ask_assignments_import_name(self, path):
@@ -1105,10 +1395,10 @@ class MainMenu(QFrame):
         layout.addWidget(QLabel("Assignments name"))
         layout.addWidget(name_edit)
 
-        use_working = QCheckBox("Replace empty Working assignments")
+        use_working = QCheckBox("Replace empty Project assignments")
         use_working.setEnabled(self.data.can_use_working_assignments())
         use_working.setToolTip(
-            "Replace the empty Working assignments after successful "
+            "Replace the empty Project assignments after successful "
             "loading. Uncheck to load a separate named dataset."
         )
         use_working.toggled.connect(name_edit.setDisabled)
@@ -1154,13 +1444,47 @@ class MainMenu(QFrame):
 
         if problems:
             source.status["loading_possible"] = False
-            self._show_assignments_configuration(problems)
+            if getattr(self, "_opening_project", False):
+                # Opening a project: after Load, continue as if the fields
+                # had matched (stored sessions, model and further sets).
+                def resolved():
+                    source._load_config_problems = []
+                    source.status["loading_possible"] = True
+                    self._on_source_registered("assignments")
+
+                self._show_assignments_configuration(problems, on_load=resolved)
+            else:
+                self._show_assignments_configuration(problems)
             return
 
         if not self._offer_assignments_provenance(source):
+            self._pending_assignment_sets = None
             return
 
-        self._load_assignments_from_source()
+        pending = getattr(self, "_pending_assignment_sets", None)
+        self._pending_assignment_sets = None
+        if not pending:
+            self._load_assignments_from_source(on_loaded=None)
+            return
+
+        def failed():
+            # The project's own set did not load: the further sets still do.
+            self.state.issue(
+                "warning",
+                f"Assignments {assignment_label(self.data.current_assignments)} "
+                "not loaded",
+                "Loading the project's assignments failed or stopped (details "
+                "in the log or its configuration). The further assignment sets "
+                "of the project are loaded.",
+                parent=self.window(),
+            )
+            self._restore_assignment_sets(*pending)
+
+        self._run_restore_step(
+            lambda step: self._load_assignments_from_source(step=step),
+            on_done=lambda: self._restore_assignment_sets(*pending),
+            on_failed=failed,
+        )
 
     def _offer_assignments_provenance(self, source) -> bool:
         """Offer the sessions and model stored with saved assignments.
@@ -1172,8 +1496,39 @@ class MainMenu(QFrame):
         """
         provenance = getattr(source, "provenance", None)
 
-        for note in (provenance or {}).get("ignored", ()):
+        ignored = list((provenance or {}).get("ignored", ()))
+        for note in ignored:
             self.state.logger.warning("Stored reference ignored: %s", note)
+        if ignored and getattr(self, "_opening_project", False):
+            # Unreadable / wrong files: skipped, the rest of the project loads.
+            self.state.issue(
+                "warning",
+                "Stored references not loaded",
+                "\n".join(ignored)
+                + "\n\nThe other data of the project is loaded.",
+                parent=self.window(),
+            )
+
+        # Opening a project: its further assignment sets are loaded after
+        # the main file's own set (not when a project file is only loaded
+        # as one assignment set).
+        self._pending_assignment_sets = None
+        if getattr(self, "_opening_project", False):
+            stored_sets = list((provenance or {}).get("assignment_sets") or ())
+            loaded = {
+                fs_guard.lexical_path(path)
+                for path in self.data.set_paths("assignments").values()
+            }
+            further = [
+                entry
+                for entry in stored_sets
+                if not entry.get("main")
+                and fs_guard.lexical_path(entry["path"]) not in loaded
+            ]
+            if further or any(
+                entry.get("active") and not entry.get("main") for entry in stored_sets
+            ):
+                self._pending_assignment_sets = (stored_sets, further)
 
         if not provenance or not (
             provenance.get("recipe") is not None
@@ -1199,15 +1554,32 @@ class MainMenu(QFrame):
                 )
 
         model_path = provenance.get("model_path")
-        current_model_path = getattr(self.data.model, "path", None)
+        stored_models = list(provenance.get("models") or ())
+        if not stored_models and model_path:
+            stored_models = [
+                {"name": None, "path": model_path, "active": True, "project": False}
+            ]
+        loaded_paths = {
+            fs_guard.lexical_path(path): name
+            for name, path in self.data.model_paths().items()
+        }
+        missing_models = [
+            entry
+            for entry in stored_models
+            if fs_guard.lexical_path(entry["path"]) not in loaded_paths
+        ]
 
         # Preferred: the CATAN session file (keeps alignment and loaded
         # data); the recipe re-registers from the original sources.
         sessions_file = provenance.get("sessions_file")
-        if sessions_file and not Path(sessions_file).is_file():
+        if sessions_file and not fs_guard.is_file(sessions_file):
             self.state.issue(
                 "warning",
-                "Stored session file not found",
+                (
+                    "Stored session file not reachable"
+                    if fs_guard.probe.timed_out
+                    else "Stored session file not found"
+                ),
                 f"{display_path(sessions_file)}\n\nThe sessions can only be loaded from "
                 "their original sources (loading recipe).",
                 parent=self.window(),
@@ -1223,10 +1595,7 @@ class MainMenu(QFrame):
             ] != [key(session.path) for session in sessions]
         else:
             sessions_differ = bool(sessions_file)
-        model_differs = bool(model_path) and (
-            current_model_path is None
-            or Path(current_model_path).resolve() != Path(model_path).resolve()
-        )
+        model_differs = bool(missing_models)
 
         if not sessions_differ and not model_differs:
             return True
@@ -1245,7 +1614,11 @@ class MainMenu(QFrame):
         elif sessions_differ:
             stored.append(f"{len(sessions)} sessions (loading recipe)")
         if model_differs:
-            stored.append(f"model {Path(model_path).name}")
+            stored.append(
+                f"model {Path(missing_models[0]['path']).name}"
+                if len(missing_models) == 1
+                else f"{len(missing_models)} models"
+            )
 
         # Opening a project into an empty workspace: load without asking.
         opening = getattr(self, "_opening_project", False)
@@ -1272,7 +1645,12 @@ class MainMenu(QFrame):
                     + (f"\n  … {len(sessions) - 8} more" if len(sessions) > 8 else "")
                 )
             if model_differs:
-                details.append(f"Model:\n  {display_path(model_path)}")
+                details.append(
+                    ("Model:\n" if len(missing_models) == 1 else "Models:\n")
+                    + "\n".join(
+                        f"  {display_path(entry['path'])}" for entry in missing_models
+                    )
+                )
 
             if have_current:
                 dialog.setInformativeText(
@@ -1333,26 +1711,243 @@ class MainMenu(QFrame):
                 )
 
         if model_differs:
-            replace = self.data.can_replace_empty_model()
-
-            if replace:
-                # An empty current model is replaced under its own name.
-                name = self.data.current_model_name
-            else:
-                base = Path(model_path).stem or "model"
-                name, number = base, 2
-                while name in self.data.available_models:
-                    name, number = f"{base} ({number})", number + 1
-
-            self.data.queue_import_source(
-                "model",
-                model_path,
-                name,
-                replace_empty_model=replace,
-                on_loaded=lambda: self._refresh_source_selector("model"),
-            )
+            self._restore_models(stored_models, missing_models, loaded_paths)
 
         return self.data.assignments is source
+
+    def _run_restore_step(self, start, *, on_done, on_failed):
+        """Run ``start(step)``: ``step()`` on success. If all tasks have
+        settled without it (a task raised, or the step stopped early),
+        ``on_failed`` runs instead, so restoring a project continues.
+        ``step.wait()`` suspends that check while the user decides (a load
+        configuration with Load / Cancel), ``step.resume()`` restores it,
+        ``step.skip(title, text)`` notes a skipped set and continues."""
+        tasks = self.state.tasks
+        state = {"over": False, "waiting": False}
+
+        def finish(callback):
+            if state["over"]:
+                return
+            state["over"] = True
+            try:
+                tasks.scheduling_settled.disconnect(check)
+            except (RuntimeError, TypeError):
+                pass
+            callback()
+
+        def evaluate():
+            if state["over"] or state["waiting"] or not isValid(self):
+                return
+            if not any(not task.background for task in tasks.tasks.values()):
+                finish(on_failed)
+
+        def check():
+            # scheduling_settled can be emitted while a task's result is
+            # being published (before its continuation runs): judge only
+            # after the current callbacks have returned.
+            if not state["over"]:
+                QTimer.singleShot(0, self, evaluate)
+
+        class Step:
+            def __call__(self_):
+                finish(on_done)
+
+            def wait(self_):
+                state["waiting"] = True
+
+            def resume(self_):
+                state["waiting"] = False
+                QTimer.singleShot(0, self, evaluate)
+
+            def skip(self_, title, text):
+                state["waiting"] = False
+
+                def note():
+                    self.state.issue("info", title, text, parent=self.window())
+                    on_done()
+
+                finish(note)
+
+        tasks.scheduling_settled.connect(check)
+        start(Step())
+        # A step that queued nothing never emits scheduling_settled.
+        QTimer.singleShot(0, self, evaluate)
+
+    def _restore_models(self, stored, missing, loaded_paths):
+        """Load the stored model sets not loaded yet (``missing``) under
+        their stored names; the stored active one becomes the current model.
+        An empty current model is replaced (older projects: by the active
+        model; otherwise by the model stored under its name)."""
+        active = next((entry for entry in stored if entry.get("active")), None)
+        # The active model last: an imported model becomes the current one.
+        order = sorted(missing, key=lambda entry: bool(entry.get("active")))
+        reserved = set(self.data.available_models)
+        current = self.data.current_model_name
+        replaced = False
+        expected = []
+
+        def activate_loaded():
+            # The active model was loaded already: select it again.
+            name = loaded_paths.get(fs_guard.lexical_path(active["path"]))
+            if name in self.data.available_models and name != self.data.current_model_name:
+                self.data.change_model(name)
+            self._refresh_source_selector("model")
+
+        for index, entry in enumerate(order):
+            stored_name = entry.get("name")
+            replace = False
+            if not replaced and self.data.can_replace_empty_model() and (
+                stored_name in (None, current) or (len(stored) == 1)
+            ):
+                # An empty current model is replaced under its own name.
+                name, replace, replaced = current, True, True
+            else:
+                base = stored_name or (
+                    Path(entry["path"]).name.removesuffix(".hdf5").removesuffix(".model")
+                    or "model"
+                )
+                name, number = base, 2
+                while name in reserved:
+                    name, number = f"{base} ({number})", number + 1
+            reserved.add(name)
+            expected.append((name, entry["path"]))
+            last = index == len(order) - 1
+            self.data.queue_import_source(
+                "model",
+                entry["path"],
+                name,
+                replace_empty_model=replace,
+                project_set=bool(entry.get("project")),
+                on_loaded=(
+                    activate_loaded
+                    if last and active is not None and active not in missing
+                    else (lambda: self._refresh_source_selector("model"))
+                ),
+            )
+
+        def report_missing():
+            # Each model loads in its own task: a failed one does not stop
+            # the others, but is reported.
+            def loaded(name, path):
+                model = self.data.model_set(name)
+                stored = getattr(model, "path", None)
+                return bool(stored) and fs_guard.lexical_path(
+                    stored
+                ) == fs_guard.lexical_path(path)
+
+            failed = [path for name, path in expected if not loaded(name, path)]
+            if failed:
+                self.state.issue(
+                    "warning",
+                    "Stored models not loaded",
+                    "Loading failed for:\n"
+                    + "\n".join(display_path(path) for path in failed)
+                    + "\n\nThe other data of the project was loaded.",
+                    parent=self.window(),
+                )
+            self._refresh_source_selector("model")
+
+        if expected:
+            self._run_restore_step(
+                lambda done: None, on_done=report_missing, on_failed=report_missing
+            )
+
+    def _restore_assignment_sets(self, stored, missing):
+        """Load the project's further assignment sets (``missing``) one
+        after another under their stored names (each is imported, then
+        loaded); finally the stored active set is selected again. Missing
+        files are skipped with a warning."""
+        main_name = self.data.current_assignments
+        names = {}
+        for entry in stored:
+            if entry.get("main"):
+                names[fs_guard.lexical_path(entry["path"])] = main_name
+        for name, path in self.data.set_paths("assignments").items():
+            names.setdefault(fs_guard.lexical_path(path), name)
+        queue = list(missing)
+        active = next((entry for entry in stored if entry.get("active")), None)
+
+        def finish():
+            target = (
+                None
+                if active is None
+                else names.get(fs_guard.lexical_path(active["path"]))
+            )
+            if (
+                target in self.data.available_assignments
+                and target != self.data.current_assignments
+            ):
+                self.data.change_assignments(target)
+            self._refresh_source_selector("assignments")
+
+        def next_set():
+            if not isValid(self):
+                return
+            if not queue:
+                finish()
+                return
+            entry = queue.pop(0)
+            if not fs_guard.is_file(entry["path"]):
+                self.state.issue(
+                    "warning",
+                    (
+                        "Stored assignments not reachable"
+                        if fs_guard.probe.timed_out
+                        else "Stored assignments not found"
+                    ),
+                    f"{display_path(entry['path'])}\n\nThe project lists this "
+                    "assignment set; it was not loaded.",
+                    parent=self.window(),
+                )
+                next_set()
+                return
+            base = entry.get("name") or Path(entry["path"]).stem
+            name, number = base, 2
+            while name in self.data.available_assignments:
+                name, number = f"{base} ({number})", number + 1
+            names[fs_guard.lexical_path(entry["path"])] = name
+
+            def failed():
+                # A set that raised while loading: report it and go on.
+                self._refresh_source_selector("assignments")
+                self.state.issue(
+                    "warning",
+                    f"Assignments {assignment_label(name)} not loaded",
+                    f"Loading {display_path(entry['path'])} failed (details in "
+                    "the log). The other data of the project is loaded.",
+                    parent=self.window(),
+                )
+                next_set()
+
+            self._run_restore_step(
+                lambda step: start_set(entry, name, step),
+                on_done=next_set,
+                on_failed=failed,
+            )
+
+        def start_set(entry, name, step):
+            def registered():
+                self._refresh_source_selector("assignments")
+                source = self.data.assignments
+                problems = getattr(source, "_load_config_problems", [])
+                if problems:
+                    # Fields do not match: the configuration opens with
+                    # Load / Cancel; the restore continues afterwards.
+                    source.status["loading_possible"] = False
+                    self._show_assignments_configuration(problems, step=step)
+                    return
+                self._load_assignments_from_source(step=step)
+
+            self.data.queue_import_source(
+                "assignments",
+                entry["path"],
+                name,
+                project_set=bool(entry.get("project")),
+                on_loaded=registered,
+                load_config=entry.get("load_config"),
+            )
+
+        next_set()
 
     def update_buttons(self):
 
@@ -1379,7 +1974,7 @@ class MainMenu(QFrame):
         else:
             self._clear_busy_icon(button)
             set_button_icon(button, "play", tooltip="Process pending model counts and fit")
-            button.setEnabled(model is not None and not model.loaded and sessions_loaded)
+            button.setEnabled(model is not None and sessions_loaded)
 
         # --- assignments
         button = self.loader["assignments"]["button_execute"]
@@ -1451,9 +2046,19 @@ class MainMenu(QFrame):
             for add_opt in add_options:
                 options.append(add_opt)
 
+        prefix = "Model" if key == "model" else "Assignments"
         for option in options:
-            selector.addItem(assignment_label(option), option)
+            selector.addItem(f"{prefix}: {assignment_label(option)}", option)
         selector.blockSignals(False)
+
+    def workspace_cleared(self):
+        """After MainWindow.clean_workspace: show the empty Project model
+        and assignment set; the root folder can be changed again."""
+        self._opening_project = False
+        for key in ("model", "assignments"):
+            self._refresh_source_selector(key)
+        self.button_root_path.setEnabled(True)
+        self.edit_root_path.setEnabled(True)
 
     def _refresh_source_selector(self, key):
         if not isValid(self):

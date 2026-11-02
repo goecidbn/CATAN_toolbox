@@ -6,6 +6,29 @@ from PySide6.QtWidgets import (
     QLabel,
 )
 
+SECTION_STYLE = "color: #8a929c; font-size: 8pt; letter-spacing: 0.5px;"
+TITLE_STYLE = "font-weight: 600;"
+
+
+def add_menu_section(menu, text, *, title=False):
+    """Visible section header. The dark theme draws QMenu.addSection as a
+    plain separator without its text. ``title``: the menu's heading (bold),
+    otherwise a small dimmed group label, separated from the entries above."""
+    if not title and not menu.isEmpty():
+        menu.addSeparator()
+
+    action = QWidgetAction(menu)
+    label = QLabel(text.upper() if not title else text, menu)
+    label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    label.setContentsMargins(12, 5 if title else 3, 12, 3 if title else 1)
+    label.setStyleSheet(TITLE_STYLE if title else SECTION_STYLE)
+    action.setDefaultWidget(label)
+    action.setEnabled(False)
+    menu.addAction(action)
+    if title:
+        menu.addSeparator()
+    return action
+
 
 def fit_message_box_buttons(box, padding=36):
     """Make every button of a message box wide enough for its label.

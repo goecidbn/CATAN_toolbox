@@ -39,6 +39,7 @@ _MANIPULATION_CATEGORIES = {
     "split": "footprints",
     "merge": "footprints",
     "exclude_footprint": "footprints",
+    "replace_with_union": "footprints",
     "exclude_neuron": "neurons",
     "neuron_merge": "assignments",
     "reassign": "assignments",

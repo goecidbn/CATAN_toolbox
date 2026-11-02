@@ -9,6 +9,7 @@ from catan.core.structures.load_config import LoadConfig, FieldSpec
 from catan.core.utils import pad_axis
 from catan.core.structures.session import SessionData
 from catan.core.structures.inclusion import snapshot_inclusion
+from catan.tracking.structures import manipulation_records
 from catan.core.spatial_coverage import (
     session_valid_mask,
     signed_border_distance,
@@ -24,6 +25,11 @@ PROVENANCE_PATHS = {
     "sessions_file": "/provenance/sessions_file",
     "loading_recipe": "/provenance/loading_recipe",
     "model_path": "/provenance/model_path",
+    # JSON list of all model sets: name, path (relative), active, project.
+    "models": "/provenance/models",
+    # JSON list of all assignment sets of a project: name, path (relative;
+    # "." = the main file's own set), active, project.
+    "assignments": "/provenance/assignments",
 }
 
 # Display background stored with the assignments
@@ -314,6 +320,8 @@ class Assignments:
         sources: list[dict],
         results: list[dict],
         affected_neurons,
+        remainders: list[dict] | None = None,
+        shapes: list | None = None,
     ) -> int:
 
         manipulation_id = self.next_manipulation_id
@@ -325,6 +333,12 @@ class Assignments:
             "sources": sources,
             "results": results,
         }
+        # Split with one source: the rest of the origin as a new footprint.
+        if remainders:
+            self.manipulations[manipulation_id]["remainders"] = remainders
+        # Replaced shapes (sparse columns), one per result.
+        if shapes:
+            self.manipulations[manipulation_id]["shapes"] = list(shapes)
 
         for neuron_id in affected_neurons:
             self.manipulation_id[int(neuron_id)] = manipulation_id
@@ -426,6 +440,9 @@ class Assignments:
                 continue
 
             values = np.asarray(values)
+            if n_neurons == 0 and values.ndim >= 2 and values.shape[0] == 0:
+                # Empty set saved without session columns.
+                values = values.reshape((0, n_sessions, *values.shape[2:]))
             if values.ndim < 2 or values.shape[:2] != self.ids.shape:
                 raise ValueError(
                     f"Statistic {name!r} has shape {values.shape}; "
@@ -536,6 +553,17 @@ class Assignments:
             enabled_only=False,
         )
         fields_to_save = deepcopy(fields_to_save)
+
+        if sessions is not None and self.ids.shape[0] == 0:
+            # A new, empty set (created in CATAN) has no session columns yet.
+            self.ids = np.full((0, len(sessions)), -1, dtype=int)
+            self.stats = {
+                name: np.asarray(values).reshape(
+                    (0, len(sessions), *np.asarray(values).shape[2:])
+                )
+                for name, values in self.stats.items()
+            }
+
         fields_to_save.setdefault("curation", {})["session_included"] = FieldSpec(
             path="/curation/session_included",
             required=False,
@@ -679,6 +707,33 @@ class Assignments:
             for (session_id, footprint_id, neuron_id) in values
         ]
 
+    @staticmethod
+    def _serialize_shapes(shapes) -> dict[str, np.ndarray]:
+        """Sparse columns (same length) as one CSC matrix's arrays."""
+        matrix = sparse.hstack(
+            [sparse.csc_matrix(shape, dtype=np.float32) for shape in shapes],
+            format="csc",
+        )
+        return {
+            "shape_indptr": np.asarray(matrix.indptr, dtype=np.int64),
+            "shape_indices": np.asarray(matrix.indices, dtype=np.int64),
+            "shape_data": np.asarray(matrix.data, dtype=np.float32),
+            "shape_rows": np.asarray([matrix.shape[0]], dtype=np.int64),
+        }
+
+    @staticmethod
+    def _deserialize_shapes(record) -> list:
+        indptr = np.asarray(record["shape_indptr"], dtype=np.int64).ravel()
+        matrix = sparse.csc_matrix(
+            (
+                np.asarray(record["shape_data"], dtype=np.float32).ravel(),
+                np.asarray(record["shape_indices"], dtype=np.int64).ravel(),
+                indptr,
+            ),
+            shape=(int(np.ravel(record["shape_rows"])[0]), len(indptr) - 1),
+        )
+        return [matrix[:, k] for k in range(matrix.shape[1])]
+
     def _serialize_manipulations(self) -> dict[str, dict]:
 
         serialized = {}
@@ -690,6 +745,18 @@ class Assignments:
                 "sources": (self._serialize_component_refs(record.get("sources", []))),
                 "results": (self._serialize_component_refs(record.get("results", []))),
             }
+            if record.get("remainders"):
+                serialized[str(int(manipulation_id))]["remainders"] = (
+                    self._serialize_component_refs(record["remainders"])
+                )
+            if record.get("shapes"):
+                serialized[str(int(manipulation_id))].update(
+                    self._serialize_shapes(record["shapes"])
+                )
+            # Footprint-keyed before/after state (format 2, undo).
+            serialized[str(int(manipulation_id))].update(
+                manipulation_records.serialize_fields(record)
+            )
 
         return serialized
 
@@ -723,6 +790,18 @@ class Assignments:
                     )
                 ),
             }
+            remainders = self._deserialize_component_refs(
+                record.get("remainders", np.empty((0, 3)))
+            )
+            if remainders:
+                self.manipulations[manipulation_id]["remainders"] = remainders
+            if "shape_indptr" in record:
+                self.manipulations[manipulation_id]["shapes"] = (
+                    self._deserialize_shapes(record)
+                )
+            self.manipulations[manipulation_id].update(
+                manipulation_records.deserialize_fields(record)
+            )
 
         self.next_manipulation_id = (
             max(self.manipulations) + 1 if self.manipulations else 0

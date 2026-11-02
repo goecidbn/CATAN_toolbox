@@ -10,11 +10,25 @@ def link_axis(axis, view):
     after the grid laid out the widgets (e.g. when an inset is first shown)
     the ticks stayed wrong until the camera was moved.
     """
-    axis.link_view(view)
+    from PySide6.QtCore import QTimer
 
-    def refresh(event=None):
+    axis.link_view(view)
+    pending = {"queued": False}
+
+    def update():
+        pending["queued"] = False
         if axis._linked_view is view:
             axis._view_changed()
+
+    def refresh(event=None):
+        update()
+        # The grid places its widgets one after another; a refresh during
+        # that pass can see a half-updated layout (first show of a grid
+        # with an axis column: the bottom axis kept an offset range).
+        # Repeat it once the layout pass is over.
+        if not pending["queued"]:
+            pending["queued"] = True
+            QTimer.singleShot(0, update)
 
     for node in (axis, view):
         node.events.resize.connect(refresh)

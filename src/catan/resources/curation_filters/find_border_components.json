@@ -33,16 +33,23 @@
           }
         },
         "threshold": {
-          "value": 2.0,
           "direction": "less",
-          "active": true
+          "active": true,
+          "value": 2.0
         }
       }
     ],
     "count": null,
     "comment": "",
     "apply_to": "same",
-    "manipulation": null,
+    "summary": null,
+    "manipulation": {
+      "kind": "exclude_neuron",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
     "review_statuses": null
   }
 }

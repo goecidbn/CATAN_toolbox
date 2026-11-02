@@ -10,12 +10,19 @@ class SeriesVisual:
         line_color=(1.0, 1.0, 1.0, 1.0),
         band_color=(1.0, 1.0, 1.0, 0.18),
         marker_size=7,
+        line_width=2.0,
+        marker_edge_color=None,
         order=0,
     ):
         self.parent = parent
         self.line_color = line_color
         self.band_color = band_color
         self.marker_size = marker_size
+        self.line_width = line_width
+        # A ring (e.g. surface-coloured) separates markers from lines below.
+        self.marker_edge_color = (
+            line_color if marker_edge_color is None else marker_edge_color
+        )
 
         self.band = visuals.Mesh(parent=parent)
         self.line = visuals.Line(parent=parent)
@@ -64,15 +71,15 @@ class SeriesVisual:
         self.line.set_data(
             pos=pos,
             color=self.line_color,
-            width=2.0,
+            width=self.line_width,
         )
 
         self.markers.set_data(
             pos=pos,
             size=self.marker_size,
             face_color=self.line_color,
-            edge_color=self.line_color,
-            edge_width=1.0,
+            edge_color=self.marker_edge_color,
+            edge_width=1.5 if self.marker_edge_color is not self.line_color else 1.0,
         )
 
         if errors_low is None or errors_high is None:

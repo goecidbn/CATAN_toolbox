@@ -20,6 +20,7 @@ SESSION_FIELDS = (
     "background",
     "background_template",
     "background_origin",
+    "background_coherence",
     "included",
     "synthetic",
     "centroids",
@@ -178,6 +179,7 @@ def read_session_snapshot(backend, ref, *, root="/"):
     # Empty construction: no footprint processing or alignment.
     session = SessionData()
     optional_fields = {
+        "background_coherence",
         "derived_statistics",
         "known_trace_keys",
         "trace_revision",

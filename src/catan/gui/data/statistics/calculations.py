@@ -11,6 +11,7 @@ from collections.abc import Callable
 import numpy as np
 from scipy import sparse, spatial
 
+from catan.gui.utils.session_labels import session_label
 from catan.core.spatial_coverage import (
     session_valid_mask,
     signed_border_distance,
@@ -201,6 +202,86 @@ def calculate_footprint_size(
     return get_stat_from_session(data, state, indexers, get_size)
 
 
+SHAPE_MEASURES = ("axis ratio", "eccentricity")
+
+
+def shape_measure_choices(data):
+    return SHAPE_MEASURES
+
+
+def footprint_axes(footprints, dims, thr):
+    """Variances (major, minor) of the pixel positions above ``thr`` of each
+    footprint's peak, along its longest and the perpendicular direction
+    (second moments; a pixel adds 1/12 per axis). NaN below 3 pixels."""
+    mask = normalize_csc_columns_to_max(footprints)
+    mask.data = (mask.data > thr).astype(np.float64)
+    mask.eliminate_zeros()
+
+    d1, d2 = dims[:2]
+    pixels = np.arange(d1 * d2)
+    x = (pixels % d2).astype(np.float64)
+    y = (pixels // d2).astype(np.float64)
+
+    mask_t = mask.T.tocsr()
+    n = np.asarray(mask.sum(axis=0)).ravel()
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mx, my = mask_t @ x / n, mask_t @ y / n
+        cxx = mask_t @ (x * x) / n - mx**2 + 1 / 12
+        cyy = mask_t @ (y * y) / n - my**2 + 1 / 12
+        cxy = mask_t @ (x * y) / n - mx * my
+
+    half_trace = (cxx + cyy) / 2
+    root = np.sqrt(((cxx - cyy) / 2) ** 2 + cxy**2)
+    major, minor = half_trace + root, np.maximum(half_trace - root, 1e-12)
+
+    small = n < 3
+    major[small] = np.nan
+    minor[small] = np.nan
+    return major, minor
+
+
+def calculate_footprint_eccentricity(
+    data: Data,
+    state: AppState,
+    indexers: dict[str, int] | None = None,
+    filters=(),
+    thr=0.2,
+    measure="axis ratio",
+) -> np.ndarray:
+    """Elongation of each footprint: axis ratio (longest / perpendicular
+    extent, 1 = round) or eccentricity (0 = round, -> 1 = line) of the
+    pixels above ``thr`` of its peak."""
+    if measure not in SHAPE_MEASURES:
+        raise ValueError(f"Unknown shape measure: {measure!r}")
+
+    def get_shape(session):
+        major, minor = footprint_axes(session.footprints, session.dims, thr)
+        if measure == "axis ratio":
+            return np.sqrt(major / minor)
+        return np.sqrt(1 - minor / major)
+
+    return get_stat_from_session(data, state, indexers, get_shape)
+
+
+def calculate_relative_footprint_size(
+    data: Data,
+    state: AppState,
+    indexers: dict[str, int] | None = None,
+    filters=(),
+    thr=0.01,
+) -> np.ndarray:
+    """Footprint size relative to the median size of the neuron's
+    footprints (all its active sessions)."""
+    sizes = calculate_footprint_size(data, state, None, thr=thr)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        median = np.nanmedian(np.where(np.isfinite(sizes), sizes, np.nan), axis=1)
+        relative = sizes / median[:, None]
+
+    return apply_indexers(relative, ("neuron", "session"), indexers)
+
+
 def calculate_temporal_correlation(
     data,
     state,
@@ -373,7 +454,7 @@ def calculate_border_proximity(
     def check_alignment_current(session_id):
         if data.alignment_is_stale(session_id):
             raise ValueError(
-                f"Session {session_id} has an outdated alignment. "
+                f"Session {session_label(data, session_id)} has an outdated alignment. "
                 "Rerun alignment before calculating border distance."
             )
 

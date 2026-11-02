@@ -45,11 +45,8 @@
           ],
           "context": "generic",
           "parameters": {
-            "containment": true,
-            "directional": true,
-            "normalize_by_target": false,
-            "support_threshold": 0.1,
-            "weighted": false
+            "normalize_by": "i",
+            "support_threshold": 0.1
           }
         },
         "threshold": {
@@ -95,11 +92,8 @@
           ],
           "context": "generic",
           "parameters": {
-            "containment": true,
-            "directional": true,
-            "normalize_by_target": true,
-            "support_threshold": 0.1,
-            "weighted": false
+            "normalize_by": "j",
+            "support_threshold": 0.1
           }
         },
         "threshold": {
@@ -140,8 +134,9 @@
             "threshold": {
               "direction": "greater",
               "active": true,
-              "value": 0.9
-            }
+              "value": 0.6
+            },
+            "optional": true
           },
           {
             "type": "group",
@@ -217,7 +212,7 @@
           }
         ],
         "count": null,
-        "comment": "Require the source footprints to have a high CNN classifier value (= realistic neuron-like shape) and be repeatedly detected (identified by subgroup)",
+        "comment": "Sources should look like cells (CNN ≥ 0.6 where loaded) and be repeatedly detected (identified by subgroup)",
         "apply_to": "source",
         "summary": null,
         "manipulation": null,
@@ -260,11 +255,8 @@
               "filters": [],
               "context": "generic",
               "parameters": {
-                "containment": false,
-                "directional": false,
-                "normalize_by_target": false,
-                "support_threshold": 0.1,
-                "weighted": false
+                "normalize_by": "IoU",
+                "support_threshold": 0.1
               }
             },
             "threshold": {
@@ -324,11 +316,11 @@
       "target": "footprint",
       "comparison": "eq",
       "value": 2,
-      "unit": "footprint",
+      "unit": "neuron",
       "anchor": "target",
       "separate_partner_sessions": false
     },
-    "comment": "Find target footprints containing fragments from at least two distinct source neurons in other sessions. Each source has ≥80% coverage by the target and covers 10–70% of the target. Repeated observations of one source footprint count once.",
+    "comment": "Find target footprints that contain two cells: footprints of two different neurons from other sessions (sources) each lie ≥ 70 % inside the target and cover 10–70 % of it. Of all compatible source pairs, the one the other sessions support most is chosen: there, the two cells appear as separate footprints more often than as one joint footprint.",
     "apply_to": "same",
     "summary": null,
     "manipulation": {

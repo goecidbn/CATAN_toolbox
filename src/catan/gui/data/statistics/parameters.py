@@ -16,6 +16,32 @@ class StatisticParameter:
     decimals: int = 3
     tooltip: str = ""
     choices: Callable | None = None
+    # Short name for compact displays ("thr=0.1"); the label otherwise.
+    short: str = ""
+    # False for options that do not change the values (loading, saving):
+    # left out of titles.
+    in_title: bool = True
+
+    @property
+    def short_label(self) -> str:
+        return self.short or self.label
+
+    def format_value(self, value) -> str:
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    def help_text(self) -> str:
+        """Tooltip: label, short name, default and description."""
+        name = self.label
+        if self.short and self.short != self.label:
+            name += f" ({self.short})"
+        text = f"{name}, default {self.format_value(self.default)}"
+        if self.tooltip:
+            text += f"\n\n{self.tooltip}"
+        return text
 
     def validate(self, value):
 

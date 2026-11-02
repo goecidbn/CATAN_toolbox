@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from functools import lru_cache
+import logging
 
 import numpy as np
 from scipy import sparse
@@ -17,6 +18,7 @@ from catan.gui.background_tasks.runtime import (
 from .blockwise import evaluate_blockwise
 from .distance_statistics import pair_plan
 from .session_relations import (
+    included_detections,
     NEURON_RELATIONS,
     DetectionReference,
     is_order_relation,
@@ -53,16 +55,75 @@ def _sparse_selection_applies(query, select_values):
     return zero.shape == (1,) and not bool(zero[0])
 
 
+# "Normalize by": the union (IoU), the smaller footprint, footprint i
+# (fraction of i covered by j) or footprint j (fraction of j covered by i).
+NORMALIZATIONS = ("IoU", "smaller", "i", "j")
+
+
+def normalize_by_choices(data=None):
+    return NORMALIZATIONS
+
+
+def check_normalization(normalize_by):
+    if normalize_by not in NORMALIZATIONS:
+        raise ValueError(
+            f"Unknown overlap normalization {normalize_by!r}; "
+            "expected one of " + ", ".join(NORMALIZATIONS) + "."
+        )
+
+
+_WEIGHTED_WARNED = set()
+
+
+def migrate_overlap_parameters(values):
+    """Older switches (directional / containment / normalize_by_target,
+    intensity-weighted) → "normalize_by"; weighted overlaps are binary now."""
+    old_keys = ("directional", "containment", "normalize_by_target", "weighted")
+
+    if not any(key in values for key in old_keys):
+        return values
+
+    values = dict(values)
+    directional = values.pop("directional", False)
+    containment = values.pop("containment", True)
+    by_target = values.pop("normalize_by_target", False)
+
+    if values.pop("weighted", False) and "weighted" not in _WEIGHTED_WARNED:
+        _WEIGHTED_WARNED.add("weighted")
+        logging.getLogger(__name__).warning(
+            "Intensity-weighted footprint overlap is no longer available; "
+            "binary supports are used instead."
+        )
+
+    if "normalize_by" not in values:
+        if directional:
+            values["normalize_by"] = "j" if by_target else "i"
+        else:
+            values["normalize_by"] = "smaller" if containment else "IoU"
+
+    return values
+
+
+def overlap_denominator(normalize_by, intersection, mass_i, mass_j):
+    """Denominator of the overlap; arrays broadcast like the operands."""
+    if normalize_by == "i":
+        return mass_i
+    if normalize_by == "j":
+        return mass_j
+    if normalize_by == "smaller":
+        return np.minimum(mass_i, mass_j)
+    return mass_i + mass_j - intersection
+
+
 def _prepare_session_supports(
     session,
     sid,
     rows,
     ids,
     *,
-    weighted,
     support_threshold,
 ):
-    """Processed supports with one column per tracked neuron row."""
+    """Processed binary supports with one column per tracked neuron row."""
     shape = tuple(session.dims)
     source = session.footprints
 
@@ -105,30 +166,22 @@ def _prepare_session_supports(
     values[~keep] = 0
     values[keep] /= peak[column_of[keep]]
     values[values < support_threshold] = 0
-
-    if not weighted:
-        values[values > 0] = 1
+    values[values > 0] = 1
 
     a.eliminate_zeros()
 
     mass = np.asarray(a.sum(axis=0), dtype=np.float32).ravel()
 
-    if weighted:
-        # Pixel-major copy for the pixelwise-minimum join.
-        partner = a.tocsr()
-        partner.sort_indices()
-    else:
-        # Binary supports: intersections are a sparse product.
-        partner = a.T.tocsr()
+    # Binary supports: intersections are a sparse product.
+    partner = a.T.tocsr()
 
     return a, partner, mass, shape
 
 
-def _intersect_supports(left, right, *, weighted):
+def _intersect_supports(left, right):
     """Nonzero intersections between columns of two processed supports.
 
-    Returns local column indices (i, j) and the summed pixelwise minimum.
-    Binary supports yield the number of shared pixels.
+    Returns local column indices (i, j) and the number of shared pixels.
     """
     empty = (
         np.empty(0, dtype=np.int64),
@@ -139,50 +192,15 @@ def _intersect_supports(left, right, *, weighted):
     if left[0].nnz == 0 or right[0].nnz == 0:
         return empty
 
-    if not weighted:
-        product = (left[1] @ right[0]).tocoo()
-        product.sum_duplicates()
-        keep = product.data > 0
+    product = (left[1] @ right[0]).tocoo()
+    product.sum_duplicates()
+    keep = product.data > 0
 
-        return (
-            product.row[keep].astype(np.int64),
-            product.col[keep].astype(np.int64),
-            product.data[keep].astype(np.float64),
-        )
-
-    a = left[0]
-    b = right[1]
-    n_right = b.shape[1]
-
-    pixels = a.indices
-    column = np.repeat(np.arange(a.shape[1], dtype=np.int64), np.diff(a.indptr))
-    value = a.data
-
-    counts = b.indptr[pixels + 1] - b.indptr[pixels]
-    shared = counts > 0
-
-    if not np.any(shared):
-        return empty
-
-    pixels, column, value, counts = (
-        pixels[shared],
-        column[shared],
-        value[shared],
-        counts[shared],
+    return (
+        product.row[keep].astype(np.int64),
+        product.col[keep].astype(np.int64),
+        product.data[keep].astype(np.float64),
     )
-
-    total = int(counts.sum())
-    starts = b.indptr[pixels] - (np.cumsum(counts) - counts)
-    entries = np.repeat(starts, counts) + np.arange(total)
-
-    partner = b.indices[entries].astype(np.int64)
-    contribution = np.minimum(np.repeat(value, counts), b.data[entries])
-
-    keys = np.repeat(column, counts) * n_right + partner
-    unique, inverse = np.unique(keys, return_inverse=True)
-    intersection = np.bincount(inverse, weights=contribution)
-
-    return unique // n_right, unique % n_right, intersection
 
 
 # Rows per requested-pair block (bounds memory, not correctness).
@@ -195,16 +213,14 @@ def overlap_query(
     state,
     query,
     *,
-    weighted=False,
-    containment=True,
-    directional=False,
-    normalize_by_target=False,
+    normalize_by="smaller",
     support_threshold=0.1,
     select_values=None,
     requested_pairs=None,
 ):
     if not 0 <= support_threshold < 1:
         raise ValueError("Support threshold must be in [0, 1).")
+    check_normalization(normalize_by)
 
     ids = np.array(state.assignments, dtype=int, copy=True)
     n, s = ids.shape
@@ -216,7 +232,10 @@ def overlap_query(
         "session_j",
     )
 
-    dims, aliases, references, coord, allowed = pair_plan(names, n, s, query, ids=ids)
+    detected = included_detections(data.sessions, ids)
+    dims, aliases, references, coord, allowed = pair_plan(
+        names, n, s, query, ids=detected
+    )
 
     ctx = current_task_context()
 
@@ -296,9 +315,7 @@ def overlap_query(
             if peak > 0:
                 values /= peak
                 values[values < support_threshold] = 0
-
-                if not weighted:
-                    values[:] = values > 0
+                values[:] = values > 0
 
         with progress_scope(90, 100, "Measuring footprint support"):
             a.eliminate_zeros()
@@ -325,7 +342,7 @@ def overlap_query(
             raise ValueError("Requested pairs must have four coordinate columns.")
 
         detection = (
-            DetectionReference(ids)
+            DetectionReference(detected)
             if any(f.relation in NEURON_RELATIONS for f in query.filters)
             else None
         )
@@ -439,19 +456,16 @@ def overlap_query(
                     fi = np.searchsorted(columns_i, fi)
                     fj = np.searchsorted(columns_j, fj)
 
-                    # Compare corresponding columns, not their Cartesian product.
-                    # Binary supports and weighted footprints both use min().
+                    # Compare corresponding columns, not their Cartesian product
+                    # (binary supports: min() counts shared pixels).
                     with progress_scope(40, 90, "Intersecting requested footprints"):
                         intersection = np.asarray(
                             a[:, fi].minimum(b[:, fj]).sum(axis=0)
                         ).ravel()
 
-                    if directional:
-                        denominator = mb[fj] if normalize_by_target else ma[fi]
-                    elif containment:
-                        denominator = np.minimum(ma[fi], mb[fj])
-                    else:
-                        denominator = ma[fi] + mb[fj] - intersection
+                    denominator = overlap_denominator(
+                        normalize_by, intersection, ma[fi], mb[fj]
+                    )
 
                     valid = (ma[fi] > 0) & (mb[fj] > 0) & (denominator > 0)
 
@@ -489,10 +503,7 @@ def overlap_query(
             aliases,
             references,
             select_values,
-            weighted=weighted,
-            containment=containment,
-            directional=directional,
-            normalize_by_target=normalize_by_target,
+            normalize_by=normalize_by,
             support_threshold=support_threshold,
         )
 
@@ -506,8 +517,8 @@ def overlap_query(
     def calculate_pair_scores(si, sj, columns_i, columns_j):
         nonlocal cache_bytes
 
-        # Both overlap normalizations are symmetric.
-        if not directional and si > sj:
+        # IoU and the smaller footprint are symmetric normalizations.
+        if normalize_by in ("IoU", "smaller") and si > sj:
             result = calculate_pair_scores(
                 sj,
                 si,
@@ -554,68 +565,24 @@ def overlap_query(
                     for j in range(b.shape[1]):
                         ja, jb = b.indptr[j : j + 2]
 
-                        shared, ai, bi = np.intersect1d(
+                        shared = np.intersect1d(
                             a.indices[ia:ib],
                             b.indices[ja:jb],
                             assume_unique=True,
-                            return_indices=True,
                         )
 
-                        if weighted:
-                            intersection[i, j] = np.minimum(
-                                a.data[ia:ib][ai],
-                                b.data[ja:jb][bi],
-                            ).sum(dtype=np.float64)
-                        else:
-                            intersection[i, j] = shared.size
+                        intersection[i, j] = shared.size
 
             else:
                 # Larger queries retain the efficient sparse matrix approach.
-                intersections = (sa.T @ sb).tocoo()
-
-                if weighted:
-                    intersection = np.zeros(
-                        (a.shape[1], b.shape[1]),
-                        dtype=np.float32,
-                    )
-
-                    for k, (i, j) in enumerate(
-                        progress_iter(
-                            zip(intersections.row, intersections.col),
-                            total=intersections.nnz,
-                            start=20,
-                        )
-                    ):
-                        if k % 128 == 0 and ctx is not None:
-                            ctx.check_cancelled()
-
-                        ia, ib = a.indptr[i : i + 2]
-                        ja, jb = b.indptr[j : j + 2]
-
-                        _, ai, bi = np.intersect1d(
-                            a.indices[ia:ib],
-                            b.indices[ja:jb],
-                            assume_unique=True,
-                            return_indices=True,
-                        )
-
-                        intersection[i, j] = np.minimum(
-                            a.data[ia:ib][ai],
-                            b.data[ja:jb][bi],
-                        ).sum(dtype=np.float64)
-
-                else:
-                    intersection = intersections.toarray()
+                intersection = (sa.T @ sb).toarray()
 
         with progress_scope(85, 100, "Normalizing overlap scores"):
-            if directional:
-                # Rows: source footprints (neuron_i, session_i).
-                # Columns: target footprints (neuron_j, session_j).
-                denominator = mb[None, :] if normalize_by_target else ma[:, None]
-            elif containment:
-                denominator = np.minimum(ma[:, None], mb[None, :])
-            else:
-                denominator = ma[:, None] + mb[None, :] - intersection
+            # Rows: source footprints (neuron_i, session_i).
+            # Columns: target footprints (neuron_j, session_j).
+            denominator = overlap_denominator(
+                normalize_by, intersection, ma[:, None], mb[None, :]
+            )
 
             valid = (ma[:, None] > 0) & (mb[None, :] > 0) & (denominator > 0)
 
@@ -865,10 +832,7 @@ def _sparse_overlap_selection(
     references,
     select_values,
     *,
-    weighted,
-    containment,
-    directional,
-    normalize_by_target,
+    normalize_by,
     support_threshold,
 ):
     """Selected overlap values, enumerating only intersecting footprints.
@@ -882,7 +846,15 @@ def _sparse_overlap_selection(
     ctx = current_task_context()
 
     collector = SparsePairCollector(
-        names, dims, aliases, references, n, s, query, select_values, ids=ids
+        names,
+        dims,
+        aliases,
+        references,
+        n,
+        s,
+        query,
+        select_values,
+        ids=included_detections(data.sessions, ids),
     )
 
     sources = set(collector.domain("session_i").tolist())
@@ -932,7 +904,6 @@ def _sparse_overlap_selection(
                         sid,
                         rows,
                         ids,
-                        weighted=weighted,
                         support_threshold=support_threshold,
                     ),
                 )
@@ -953,12 +924,7 @@ def _sparse_overlap_selection(
         ma = mass_i[local_i[keep]]
         mb = mass_j[local_j[keep]]
 
-        if directional:
-            denominator = mb if normalize_by_target else ma
-        elif containment:
-            denominator = np.minimum(ma, mb)
-        else:
-            denominator = ma + mb - intersection
+        denominator = overlap_denominator(normalize_by, intersection, ma, mb)
 
         valid = (ma > 0) & (mb > 0) & (denominator > 0)
         values = np.full(len(ni), np.nan, dtype=np.float32)
@@ -987,9 +953,7 @@ def _sparse_overlap_selection(
                 if shape_a != shape_b:
                     raise ValueError("Overlap requires the same registered pixel grid.")
 
-                local_a, local_b, intersection = _intersect_supports(
-                    left[1], right[1], weighted=weighted
-                )
+                local_a, local_b, intersection = _intersect_supports(left[1], right[1])
 
                 if not intersection.size:
                     continue

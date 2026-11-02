@@ -1,3 +1,5 @@
+import html
+
 import numpy as np
 from copy import deepcopy
 
@@ -5,8 +7,9 @@ from vispy import scene
 from vispy.visuals.transforms import STTransform
 from vispy.scene.visuals import Markers, Line, Image
 from vispy.geometry import Rect
+from vispy.util import keys
 
-from PySide6.QtCore import Signal, QTimer, Qt
+from PySide6.QtCore import Signal, QTimer, Qt, QPoint
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -30,11 +33,15 @@ from PySide6.QtWidgets import (
 
 from catan.core.image_correlation import calculate_shift_score_map
 from catan.core.structures.remap import Remapping
-from catan.core import footprint_alignment
+from catan.core import footprint_alignment, footprint_frame
 from catan.gui.resources.get_icon import get_fa_icon
 from catan.core.spatial_geometry import bounded_view
 
-from catan.gui.structures.alignment_draft import AlignmentDraft
+from catan.gui.structures.alignment_draft import (
+    AlignmentDraft,
+    footprint_projection,
+    unaligned_footprint_projection,
+)
 from catan.gui.panels.helper.ControlPanel import ControlPanel
 from catan.gui.background_tasks.runtime import (
     current_task_context,
@@ -49,6 +56,8 @@ from catan.gui.GUI_elements.fragments.alignment_shift_inset import (
     AlignmentShiftInset,
 )
 from catan.gui.GUI_elements.utils.vispy_axes import link_axis
+from catan.gui.utils.session_labels import session_label
+from catan.gui.GUI_elements.utils.tooltips import show_tooltip
 from catan.core.alignment import calculate_residual_flow
 
 
@@ -151,6 +160,16 @@ class ManualAlignmentEditor(QWidget):
         self._inset_session_id = None
         self._score_cache = {}
 
+        # Image shown for each session (by path): its "background" or the
+        # projection of its "footprints". A session compared with its own
+        # current geometry has a separate choice for that reference.
+        self._sources = {}
+        self._projections = {}
+        # Single-session view (diagonal of the session-correlation inset):
+        # the session's background alone, or against its own footprints.
+        self._self_view = None
+        self._pending_self_view = None
+
         self._hover_timer = QTimer(self)
         self._hover_timer.setSingleShot(True)
         self._hover_timer.setInterval(150)
@@ -201,6 +220,23 @@ class ManualAlignmentEditor(QWidget):
         self.view_mode.addItem("Correlation surface", "correlation")
         self.view_mode.addItem("Estimated flow", "flow")
 
+        self.moving_source = QComboBox(self.options)
+        self.reference_source = QComboBox(self.options)
+        for combo in (self.moving_source, self.reference_source):
+            combo.addItem("Background", "background")
+            combo.addItem("Footprints", "footprints")
+        self.moving_source.setToolTip(
+            "The image this session is aligned by and shown as: its background "
+            "or the projection of its included footprints (moved with the "
+            "alignment like the background). Automatic estimates use it too; "
+            "applied with the alignment. Sessions whose background does not "
+            "match their footprints use the footprints."
+        )
+        self.reference_source.setToolTip(
+            "Show the reference session's background or the projection of its "
+            "included footprints. Remembered per session."
+        )
+
         self.correlation_method = QComboBox(self)
         for label, method in (
             ("Cross-correlation", "correlation"),
@@ -229,6 +265,8 @@ class ManualAlignmentEditor(QWidget):
         )
 
         form.addRow("View", self.view_mode)
+        form.addRow("This session", self.moving_source)
+        form.addRow("Reference", self.reference_source)
         self.flow_scale = QDoubleSpinBox(self.options)
         self.flow_scale.setRange(0.1, 1000.0)
         self.flow_scale.setDecimals(1)
@@ -579,6 +617,7 @@ class ManualAlignmentEditor(QWidget):
 
         self.status_label = QLabel(self.canvas.native)
         self.status_label.setWordWrap(True)
+        self.status_label.setTextFormat(Qt.TextFormat.RichText)
         self.status_label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
         )
@@ -591,6 +630,47 @@ class ManualAlignmentEditor(QWidget):
                 padding: 4px 7px;
             }
         """)
+
+        self.self_view_bar = QWidget(self.canvas.native)
+        self.self_view_bar.setObjectName("alignmentSelfView")
+        self.self_view_bar.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation, True)
+        bar = QHBoxLayout(self.self_view_bar)
+        bar.setContentsMargins(6, 3, 6, 3)
+        bar.setSpacing(8)
+        self.self_view_compare = QCheckBox("Compare with footprints", self.self_view_bar)
+        self.self_view_compare.setToolTip(
+            "Overlay the projection of this session's included footprints "
+            "(green) on its background (magenta): do the footprints match "
+            "their background?"
+        )
+        bar.addWidget(self.self_view_compare)
+        # While comparing, the shift / rotation controls, wands and Refine
+        # flow edit the background correction (core.footprint_frame).
+        self.correction_label = QLabel("Editing: background correction", self.self_view_bar)
+        self.correction_label.setToolTip(
+            "Shift, rotation, the estimate buttons, Refine flow and Shift + drag "
+            "move this session's background onto its footprints (the "
+            "footprints stay). The corrected background is aligned to the other "
+            "sessions; Apply aligns the session anew."
+        )
+        bar.addWidget(self.correction_label)
+        self.self_view_bar.setStyleSheet("""
+            QWidget#alignmentSelfView {
+                background: rgba(35, 39, 45, 220);
+                border: 1px solid #59616c;
+                border-radius: 4px;
+            }
+            QCheckBox, QLabel { color: #e8eaed; }
+            QPushButton {
+                color: #e8eaed;
+                background: #343941;
+                border: 1px solid #69727f;
+                border-radius: 4px;
+                padding: 2px 6px;
+            }
+        """)
+        self.self_view_bar.hide()
+        self.self_view_compare.toggled.connect(lambda _checked: self._sync_from_draft())
 
         self.apply_button = QPushButton("Apply", self)
         self.view_controls.layout().addWidget(self.apply_button)
@@ -641,6 +721,12 @@ class ManualAlignmentEditor(QWidget):
 
 
         self.view_mode.currentIndexChanged.connect(self._on_view_mode_changed)
+        self.moving_source.currentIndexChanged.connect(
+            lambda _: self._set_source("moving", self.moving_source.currentData())
+        )
+        self.reference_source.currentIndexChanged.connect(
+            lambda _: self._set_source("reference", self.reference_source.currentData())
+        )
         self.correlation_method.currentIndexChanged.connect(self._render_preview)
         self.reference.currentIndexChanged.connect(self._on_reference_changed)
 
@@ -692,10 +778,16 @@ class ManualAlignmentEditor(QWidget):
         self._arrange_options()
 
         self._correlation_drag = None
+        # Shift + drag in the overlay moves this session's background.
+        self._shift_drag = None
         self._correlation_mouse_connections = (
             (self.canvas.events.mouse_press, self._on_correlation_press),
             (self.canvas.events.mouse_move, self._on_correlation_move),
             (self.canvas.events.mouse_release, self._on_correlation_release),
+            (self.canvas.events.mouse_press, self._on_shift_drag_press),
+            (self.canvas.events.mouse_move, self._on_shift_drag_move),
+            (self.canvas.events.mouse_release, self._on_shift_drag_release),
+            (self.canvas.events.key_press, self._on_shift_drag_key),
         )
 
         for signal, slot in self._correlation_mouse_connections:
@@ -798,6 +890,8 @@ class ManualAlignmentEditor(QWidget):
         ]
         display = [
             self.view_mode,
+            self.moving_source,
+            self.reference_source,
             self.flow_scale,
             self.flow_status,
             self.correlation_method,
@@ -910,6 +1004,7 @@ class ManualAlignmentEditor(QWidget):
                 self.canvas.native.width() - self.shift_controls.width() - 100,
             )
         )
+        self._layout_comparison_label()
         self.status_label.adjustSize()
         self.status_label.move(
             75,
@@ -920,23 +1015,85 @@ class ManualAlignmentEditor(QWidget):
         )
         self.status_label.raise_()
 
+        self.self_view_bar.adjustSize()
+        self.self_view_bar.move(75, max(margin, self.status_label.y() - self.self_view_bar.height() - 4))
+        self.self_view_bar.raise_()
+
         # The options panel expands downwards over the shift controls:
         # keep it on top.
         self.options.raise_()
 
+    # Overlay colours of the compared backgrounds (see _render_preview).
+    MOVING_COLOR = "#ff00ff"
+    REFERENCE_COLOR = "#00ff00"
+
     def _update_comparison_label(self, draft, reference_id):
-        if reference_id is None:
-            reference = "own background"
+        def tag(session):
+            return " · footprints" if self._shows_footprints(session) else ""
+
+        if draft.external:
+            moving = ("overview background", None, "")
         else:
-            reference = f"S{reference_id}"
+            moving = (draft.session.name, draft.session_id, tag(draft.session))
+
+        if self._showing_self_view(draft):
+            moving = (draft.session.name, draft.session_id, " · background")
+            reference = (
+                ("footprints", None, "") if self.self_view_compare.isChecked() else None
+            )
+        elif reference_id is None:
+            own = self._shows_footprints(draft.session, own=True)
+            reference = ("own footprints" if own else "own background", None, "")
+        else:
+            session = self.data.sessions[reference_id]
+            reference = (session.name, reference_id, tag(session))
 
         suffix = " · unapplied" if draft is self.draft and draft.dirty else ""
         deformation = " · ∿ flow" if draft.effective_flow is not None else " · rigid"
 
-        self.status_label.setText(
-            f"S{draft.session_id} ↔ {reference}" f"{deformation}{suffix}"
-        )
+        self._comparison_label = (moving, reference, deformation + suffix)
         self._position_options()
+
+    def _layout_comparison_label(self):
+        """'■ name (SX) ↔ ■ name (SY)' with the overlay colours; only the
+        session indices where the full names do not fit."""
+        parts = getattr(self, "_comparison_label", None)
+        if parts is None:
+            return
+
+        moving, reference, suffix = parts
+        # The correlation view has no overlay colours.
+        colored = self.view_mode.currentData() != "correlation"
+
+        def entry(item, color, full):
+            if item is None:
+                return "", ""
+            name, session_id, source = item
+            if session_id is None:
+                text = name
+            else:
+                text = session_label(self.data, session_id, short=not full)
+            text += source if full else source.replace(" · footprints", " · fp")
+            square = f'<span style="color:{color}">■</span> ' if colored else ""
+            return square + html.escape(text), ("■ " if colored else "") + text
+
+        available = self.status_label.maximumWidth() - 16
+        metrics = self.status_label.fontMetrics()
+
+        for full in (True, False):
+            (left, left_plain), (right, right_plain) = (
+                entry(moving, self.MOVING_COLOR, full),
+                entry(reference, self.REFERENCE_COLOR, full),
+            )
+            arrow = " ↔ " if reference is not None else ""
+            plain = f"{left_plain}{arrow}{right_plain}{suffix}"
+            fits = metrics.horizontalAdvance(plain) <= available
+            if fits:
+                break
+
+        # Rich-text labels wrap early: wrap only what does not fit.
+        self.status_label.setWordWrap(not fits)
+        self.status_label.setText(f"{left}{arrow}{right}{html.escape(suffix)}")
 
     def _pending_reference(self, draft, default):
         """Reference chosen for ``draft``'s session in the session-correlation
@@ -976,7 +1133,7 @@ class ManualAlignmentEditor(QWidget):
                 if not other.status["aligned"]:
                     continue
 
-                label = f"Session {index}: {other.name}"
+                label = session_label(self.data, index)
                 if self.data.alignment_is_stale(index):
                     label += " (outdated alignment)"
 
@@ -1034,18 +1191,261 @@ class ManualAlignmentEditor(QWidget):
 
         self._populate_references(preferred_id)
         self._update_correlation_current()
+
+        pending, self._pending_self_view = self._pending_self_view, None
+        if pending is not None and not draft.external and pending == draft.session_id:
+            self._enter_self_view(pending, render=False)
+        else:
+            self._exit_self_view(render=False)
+
         self._sync_from_draft()
 
     def _comparison_context(self):
         if self._hover_context is not None:
-            return self._hover_context
+            draft, reference, reference_id = self._hover_context
+        else:
+            index = self.reference.currentIndex()
+            draft, reference, reference_id = (
+                self.draft,
+                self._references[index],
+                self._reference_session_ids[index],
+            )
 
-        index = self.reference.currentIndex()
+        # The reference session's footprints instead of its background.
+        session = draft.session if reference_id is None else self.data.sessions[reference_id]
+        if self._shows_footprints(session, own=reference_id is None):
+            projection = self._projection(session, aligned=True)
+            if projection is not None and projection.shape == reference.shape:
+                reference = projection
+
+        return draft, reference, reference_id
+
+    # ------------------------------------------------------------------
+    # Displayed images: background or footprint projection per session
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_footprints(session):
+        footprints = getattr(session, "footprints", None)
         return (
-            self.draft,
-            self._references[index],
-            self._reference_session_ids[index],
+            getattr(session, "path", None) is not None
+            and footprints is not None
+            and footprints.shape[1] > 0
         )
+
+    @staticmethod
+    def _source_id(session, own=False):
+        return str(session.path) + (" (own geometry)" if own else "")
+
+    def _shows_footprints(self, session, own=False):
+        if not self._has_footprints(session):
+            return False
+        draft = self.draft
+        if not own and session is draft.session and draft.can_edit_correction:
+            # The edited session: the image it is aligned by.
+            return draft.alignment_source == "footprints"
+        # Others: as chosen here, else the image they are aligned by.
+        default = "background" if own else session.alignment_source
+        return self._sources.get(self._source_id(session, own), default) == "footprints"
+
+    def _projection(self, session, *, aligned):
+        """Normalised footprint projection (aligned: common frame; else the
+        original frame of the session's background template)."""
+        key = (
+            id(session),
+            aligned,
+            self.state.data_version,
+            id(session.remap),
+            id(session.footprints),
+        )
+        if key not in self._projections:
+            if len(self._projections) > 16:
+                self._projections.clear()
+            image = (
+                footprint_projection(session)
+                if aligned
+                else unaligned_footprint_projection(session)
+            )
+            self._projections[key] = None if image is None else self._normalize(image)
+        return self._projections[key]
+
+    def _draft_projection(self, draft):
+        """The session's footprint projection in its original frame (that of
+        the background template); None if unavailable."""
+        projection = self._projection(draft.session, aligned=False)
+        if projection is None or projection.shape != draft.template.shape:
+            return None
+        return projection
+
+    def _moving_template(self, draft):
+        """Image warped by ``draft``: the background template moved by the
+        draft's background correction or, when chosen, the footprint
+        projection in the same original frame."""
+        if not draft.external and self._shows_footprints(draft.session):
+            projection = self._draft_projection(draft)
+            if projection is not None:
+                return projection
+        return draft.corrected_template
+
+    def _source_key(self, draft, reference_id):
+        session = draft.session if reference_id is None else self.data.sessions[reference_id]
+        return (
+            self._shows_footprints(draft.session),
+            self._shows_footprints(session, own=reference_id is None),
+            footprint_frame.correction_key(draft.correction_dict()),
+        )
+
+    def _set_source(self, which, source):
+        if self._disposed or source is None:
+            return
+
+        own = False
+        if which == "moving":
+            session = self.draft.session
+        else:
+            _, _, reference_id = self._comparison_context()
+            own = reference_id is None
+            session = self.draft.session if own else self.data.sessions[reference_id]
+
+        if not self._has_footprints(session):
+            return
+
+        self._sources[self._source_id(session, own)] = source
+        draft = self.draft
+        if which == "moving" and draft.can_edit_correction:
+            # The edited session's alignment source (applied with it).
+            if not self.can_apply() or draft.alignment_source == source:
+                return
+            draft.alignment_source = source
+            self._exit_self_view(render=False)
+            self.state.alignment_draft_changed.emit()
+            return
+        self._exit_self_view(render=False)
+        self._render_preview()
+
+    def _sync_source_controls(self, draft, reference_id):
+        reference = draft.session if reference_id is None else self.data.sessions[reference_id]
+        for combo, session, own in (
+            (self.moving_source, None if draft.external else draft.session, False),
+            (self.reference_source, reference, reference_id is None),
+        ):
+            available = session is not None and self._has_footprints(session)
+            previous = combo.blockSignals(True)
+            combo.setCurrentIndex(
+                combo.findData(
+                    "footprints"
+                    if available and self._shows_footprints(session, own)
+                    else "background"
+                )
+            )
+            combo.setEnabled(available and not self._showing_self_view(draft))
+            combo.blockSignals(previous)
+
+    # ------------------------------------------------------------------
+    # Single-session view
+    # ------------------------------------------------------------------
+
+    def _showing_self_view(self, draft):
+        return (
+            self._self_view is not None
+            and draft is self.draft
+            and not draft.external
+            and draft.session_id == self._self_view
+        )
+
+    def _enter_self_view(self, session_id, *, render=True):
+        """Show ``session_id`` alone (its background), optionally against
+        its own footprints; selects the session first if needed."""
+        if self.draft.external or self.draft.session_id != session_id:
+            if not 0 <= session_id < len(self.data.sessions):
+                return
+            session = self.data.sessions[session_id]
+            if not session.status["spatial_loaded"] or session.background_template is None:
+                return
+            # set_draft continues once the panel follows the selection.
+            self._pending_self_view = session_id
+            self.state.current_session_id = session_id
+            return
+
+        self._clear_hover(render=False)
+        if self.view_mode.currentData() != "overlay":
+            # The overlay only (switching views leaves this mode).
+            previous = self.view_mode.blockSignals(True)
+            self.view_mode.setCurrentIndex(self.view_mode.findData("overlay"))
+            self.view_mode.blockSignals(previous)
+            self._self_view = session_id
+            self._on_view_mode_changed()
+        self._self_view = session_id
+        self.self_view_bar.show()
+        # The session's place in the common frame is not edited here; while
+        # comparing with the footprints the controls edit the background
+        # correction (_update_self_view_controls).
+        self._update_self_view_controls()
+        if render:
+            self._sync_from_draft()
+
+    def _exit_self_view(self, *, render=True):
+        if self._self_view is None:
+            return
+        self._self_view = None
+        self.self_view_bar.hide()
+        self._update_self_view_controls()
+        if render and not self._disposed:
+            self._sync_from_draft()
+
+    def _correction_available(self, draft=None):
+        """The session's background can be compared with (and corrected
+        onto) its footprints."""
+        draft = self.draft if draft is None else draft
+        return (
+            draft.can_edit_correction
+            and self._draft_projection(draft) is not None
+        )
+
+    def _correcting(self):
+        """Single-session view comparing background and footprints: the
+        shift / rotation controls edit the background correction."""
+        return (
+            self._showing_self_view(self.draft)
+            and self.self_view_compare.isChecked()
+            and self._correction_available()
+        )
+
+    def _edit_values(self):
+        """(dx, dy, angle) the controls edit: the background correction
+        (original frame) while correcting, else the session's alignment."""
+        return self.draft.correction if self._correcting() else self.draft.values
+
+    def _update_self_view_controls(self):
+        correcting = self._correcting()
+        self_view = self._showing_self_view(self.draft)
+        state = (correcting, self_view, self.draft.external)
+        if state == getattr(self, "_self_view_controls_state", None):
+            return
+        self._self_view_controls_state = state
+        self.shift_controls.setVisible(correcting or not self_view)
+        self.correction_label.setVisible(correcting)
+        self.footprint_button.setVisible(not self.draft.external and not correcting)
+        self.accept_offset.setVisible(not self.draft.external and not self_view)
+        tips = (
+            ("Background correction: horizontal shift, dx (pixels)",
+             "Background correction: vertical shift, dy (pixels)",
+             "Background correction: rotation")
+            if correcting
+            else ("Horizontal shift, dx (pixels)", "Vertical shift, dy (pixels)", "Session rotation")
+        )
+        for widget, tip in zip((self.dx, self.dy, self.angle), tips):
+            widget.setToolTip(tip)
+        self.refine_flow_button.setToolTip(
+            "Calculate an optical-flow correction of the background onto the "
+            "footprint projection from the current correction (no net shift). "
+            "Preview the result, then Apply changes."
+            if correcting
+            else "Calculate optical-flow correction from the current shift "
+            "and rotation against the selected reference session. "
+            "Preview the result, then Apply changes."
+        )
+        self._position_options()
 
     def _pair_shift_context(self, owner_id):
         if not 0 <= owner_id < len(self.data.sessions):
@@ -1092,6 +1492,15 @@ class ManualAlignmentEditor(QWidget):
             transpose,
             float(session.params["max_session_shift"]),
             reference_ids,
+            # The image the session is aligned by (draft: unapplied choice).
+            (
+                (
+                    self.draft.alignment_source,
+                    footprint_frame.correction_key(self.draft.correction_dict()),
+                )
+                if active
+                else session.alignment_source
+            ),
         )
 
         return key, reference_ids
@@ -1136,7 +1545,7 @@ class ManualAlignmentEditor(QWidget):
         active = session is self.draft.session
 
         template = np.asarray(
-            self.draft.template if active else session.background_template,
+            self._moving_template(self.draft) if active else session.alignment_template(),
             dtype=np.float32,
         ).copy()
 
@@ -1166,7 +1575,7 @@ class ManualAlignmentEditor(QWidget):
                 (
                     reference_id,
                     str(reference.path),
-                    reference.background_template.copy(),
+                    reference.alignment_template().copy(),
                     deepcopy(reference.remap),
                 )
             )
@@ -1475,6 +1884,7 @@ class ManualAlignmentEditor(QWidget):
         self._clear_hover()
 
     def _on_reference_changed(self, *_):
+        self._exit_self_view(render=False)
         self._clear_hover()
 
     # ------------------------------------------------------------------
@@ -1552,7 +1962,7 @@ class ManualAlignmentEditor(QWidget):
         self.correlation_inset.set_matrix(
             correlation,
             overlap,
-            [f"S{index} {session.name}" for index, session in enumerate(sessions)],
+            [session_label(sessions, index) for index in range(len(sessions))],
             outdated=[
                 index
                 for index in range(len(sessions))
@@ -1574,7 +1984,9 @@ class ManualAlignmentEditor(QWidget):
             references[i] = sorted(index[path] for path in (paths or ()) if path in index)
 
         compared = None
-        if not self.draft.external:
+        if self._showing_self_view(self.draft):
+            compared = (self.draft.session_id, self.draft.session_id)
+        elif not self.draft.external:
             _, _, reference_id = self._comparison_context()
             if reference_id is not None and reference_id != self.draft.session_id:
                 compared = (self.draft.session_id, reference_id)
@@ -1590,6 +2002,12 @@ class ManualAlignmentEditor(QWidget):
         self._update_correlation_highlights()
 
     def _choose_correlation_pair(self, row, column):
+        if row == column:
+            self._enter_self_view(row)
+            return
+
+        self._pending_self_view = None
+        self._exit_self_view(render=False)
         later, earlier = max(row, column), min(row, column)
 
         if not self.draft.external and later == self.draft.session_id:
@@ -1618,6 +2036,9 @@ class ManualAlignmentEditor(QWidget):
         return self.draft.make_remap()
 
     def _on_view_mode_changed(self, *_):
+        if self.view_mode.currentData() != "overlay":
+            self._exit_self_view(render=False)
+
         correlation = self.view_mode.currentData() == "correlation"
         self._fit_next_score = correlation
 
@@ -1632,7 +2053,8 @@ class ManualAlignmentEditor(QWidget):
         self.options.toggle_button.setToolTip(
             "Black: draggable total shift; magenta: pairwise peak."
             if correlation
-            else "Green: reference; magenta: current session; white: overlap."
+            else "Green: reference; magenta: current session; white: overlap. "
+            "Shift + drag: move the current session (rigid shift)."
         )
 
         flow_mode = self.view_mode.currentData() == "flow"
@@ -1673,6 +2095,7 @@ class ManualAlignmentEditor(QWidget):
 
         draft, reference, reference_id = self._comparison_context()
         applied_flow = draft.effective_flow
+        self._sync_source_controls(draft, reference_id)
 
         _set_status(self.deformation_status, 
             draft.flow_message
@@ -1706,22 +2129,51 @@ class ManualAlignmentEditor(QWidget):
             self._cancel_score_task()
             self._displayed_score_key = None
 
-            moving = self._normalize(
-                self._warp_template(
-                    draft.template,
-                    draft.dims,
-                    draft.transpose,
-                    dx,
-                    dy,
-                    angle,
-                    flow=draft.effective_flow,
+            def warped(template):
+                return self._normalize(
+                    self._warp_template(
+                        template,
+                        draft.dims,
+                        draft.transpose,
+                        dx,
+                        dy,
+                        angle,
+                        flow=draft.effective_flow,
+                    )
                 )
-            )
 
             rgb = np.empty(draft.dims + (3,), dtype=np.float32)
-            rgb[..., 0] = moving
-            rgb[..., 1] = reference
-            rgb[..., 2] = moving
+            if self._showing_self_view(draft):
+                # Background alone, or against the session's own footprints,
+                # in the session's original frame: the footprints stay, the
+                # background moves by its correction.
+                moving = self._normalize(draft.corrected_template)
+                projection = self._draft_projection(draft)
+                constructed = draft.session.background_origin == "footprints"
+                available = projection is not None and not constructed
+                # Say why instead of silently showing the background only.
+                self.self_view_compare.setEnabled(available)
+                self.self_view_compare.setToolTip(
+                    "Overlay the projection of this session's included footprints "
+                    "(green) on its background (magenta): do they match? The "
+                    "controls then move the background onto the footprints "
+                    "(background correction; also Shift + drag)."
+                    if available
+                    else "The background was constructed from the footprints."
+                    if constructed
+                    else "No footprint projection for this session (no included "
+                    "footprints, or its frame does not match the background)."
+                )
+                compare = self.self_view_compare.isChecked() and available
+                self._update_self_view_controls()
+                rgb[..., 0] = moving
+                rgb[..., 1] = projection if compare else moving
+                rgb[..., 2] = moving
+            else:
+                moving = warped(self._moving_template(draft))
+                rgb[..., 0] = moving
+                rgb[..., 1] = reference
+                rgb[..., 2] = moving
 
             self.image.transform = STTransform()
             self.image.set_data(rgb)
@@ -1752,6 +2204,7 @@ class ManualAlignmentEditor(QWidget):
                 if applied_flow is not None
                 else None
             ),
+            self._source_key(draft, reference_id),
         )
 
         if self._requested_score_key is not None and self._requested_score_key != key:
@@ -1897,7 +2350,7 @@ class ManualAlignmentEditor(QWidget):
         _, method, angle, transpose, _background_transposed = key[:5]
 
         reference = reference.copy()
-        template = draft.template.copy()
+        template = self._moving_template(draft).copy()
         dims = draft.dims
 
         flow = draft.effective_flow
@@ -1986,7 +2439,7 @@ class ManualAlignmentEditor(QWidget):
 
         self._score_task_id = self.state.tasks.start(
             "calculating",
-            f"Alignment correlation: session {draft.session_id}",
+            f"Alignment correlation: {session_label(self.data, draft.session_id)}",
             calculate,
             on_result=lambda result: self._on_score_ready(generation, key, result),
             background=True,
@@ -2047,6 +2500,7 @@ class ManualAlignmentEditor(QWidget):
             bool(draft.transpose),
             bool(draft.background_transposed),
             id(draft.effective_flow),
+            self._source_key(draft, reference_id),
         )
 
         if key == self._flow_key:
@@ -2059,7 +2513,7 @@ class ManualAlignmentEditor(QWidget):
         # Snapshot inputs on the GUI thread.
         self._flow_pending = (
             reference.copy(),
-            draft.template.copy(),
+            self._moving_template(draft).copy(),
             tuple(draft.dims),
             bool(draft.transpose),
             tuple(map(float, draft.values)),
@@ -2378,7 +2832,8 @@ class ManualAlignmentEditor(QWidget):
         self.estimate_shift_button.setEnabled(can_estimate)
 
         # Session alignments only; checked while the correction is applied.
-        self.footprint_button.setVisible(not self.draft.external)
+        correcting = self._correcting()
+        self.footprint_button.setVisible(not self.draft.external and not correcting)
         applied = self.draft.footprint_correction_applied
         computing = self._estimate_kind == "footprints"
         previous = self.footprint_button.blockSignals(True)
@@ -2393,8 +2848,13 @@ class ManualAlignmentEditor(QWidget):
         _, _, reference_id = self._comparison_context()
         self.refine_flow_button.setEnabled(
             can_estimate
-            and reference_id is not None
-            and not self.data.alignment_is_stale(reference_id)
+            and (
+                correcting
+                or (
+                    reference_id is not None
+                    and not self.data.alignment_is_stale(reference_id)
+                )
+            )
         )
 
         for widget in (
@@ -2407,7 +2867,9 @@ class ManualAlignmentEditor(QWidget):
             widget.setEnabled(available)
 
         # Session alignments only (not the overview background).
-        self.accept_offset.setVisible(not self.draft.external)
+        self.accept_offset.setVisible(
+            not self.draft.external and not self._showing_self_view(self.draft)
+        )
         self.accept_offset.setEnabled(available)
 
         self.transpose_background.setEnabled(
@@ -2422,11 +2884,11 @@ class ManualAlignmentEditor(QWidget):
             message = "Data changed. Reset to start a fresh draft."
         elif previewing_other:
             message = (
-                f"Previewing session {self._hover_context[0].session_id}. "
+                f"Previewing {session_label(self.data, self._hover_context[0].session_id)}. "
                 + (
                     "Draft remains the overview background."
                     if self.draft.external
-                    else f"Draft remains session {self.draft.session_id}."
+                    else f"Draft remains {session_label(self.data, self.draft.session_id)}."
                 )
             )
         elif not available:
@@ -2434,10 +2896,7 @@ class ManualAlignmentEditor(QWidget):
         elif self.draft.external:
             message = f"Editing the overview background: {self.draft.session.name}"
         else:
-            message = (
-                f"Editing session {self.draft.session_id}: "
-                f"{self.draft.session.name}"
-            )
+            message = f"Editing {session_label(self.data, self.draft.session_id)}"
 
         displayed_draft, _, _ = self._comparison_context()
 
@@ -2493,7 +2952,7 @@ class ManualAlignmentEditor(QWidget):
         answer = QMessageBox.question(
             self,
             "Remove session?",
-            f"Remove {session.name!r} from this CATAN project?\n\n"
+            f"Remove {session_label(self.data, self.draft.session_id)} from this CATAN project?\n\n"
             "Its original data files will remain unchanged.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -2520,7 +2979,7 @@ class ManualAlignmentEditor(QWidget):
         if not self.can_apply():
             return
 
-        self.draft.values[index] = value
+        self._edit_values()[index] = value
         self.state.alignment_draft_changed.emit()
 
     def _sync_from_draft(self):
@@ -2531,7 +2990,7 @@ class ManualAlignmentEditor(QWidget):
             self._clear_hover(render=False)
             for widget, value in zip(
                 (self.dx, self.dy, self.angle),
-                self.draft.values,
+                self._edit_values(),
             ):
                 previous = widget.blockSignals(True)
                 widget.setValue(float(value))
@@ -2567,6 +3026,8 @@ class ManualAlignmentEditor(QWidget):
             self._cancel_score_task()
             self.draft.values[:] = self.draft.initial
             self.draft.background_transposed = False
+            self.draft.alignment_source = self.draft.initial_alignment_source
+            self.draft.reset_correction()
             self.state.alignment_draft_changed.emit()
 
         if self.draft.is_current(self.data):
@@ -2645,6 +3106,7 @@ class ManualAlignmentEditor(QWidget):
         self.view_controls.deleteLater()
 
         self._end_correlation_drag()
+        self._end_shift_drag()
         for signal, slot in self._correlation_mouse_connections:
             signal.disconnect(slot)
 
@@ -2771,10 +3233,7 @@ class ManualAlignmentEditor(QWidget):
             if not np.isfinite(xy).all():
                 continue
 
-            if "session" in session.name.lower():
-                label = session.name
-            else:
-                label = f"Session {session_id}: {session.name}"
+            label = session_label(self.data, session_id)
             if self.data.alignment_is_stale(session_id):
                 label += " (outdated)"
 
@@ -2882,6 +3341,19 @@ class ManualAlignmentEditor(QWidget):
         self.shift_inset.lock_session(target_id)
         self._clear_hover()
 
+    def _set_correction_shift(self, dx, dy):
+        """The draft's background correction shift (original frame, px)."""
+        if not self.can_apply() or not self.draft.can_edit_correction:
+            return
+        value = (
+            np.clip(dx, self.dx.minimum(), self.dx.maximum()),
+            np.clip(dy, self.dy.minimum(), self.dy.maximum()),
+        )
+        if np.array_equal(value, self.draft.correction[:2]):
+            return
+        self.draft.correction[:2] = value
+        self.state.alignment_draft_changed.emit()
+
     def _set_inset_shift(self, dx, dy):
         if not self.can_apply():
             return
@@ -2969,6 +3441,106 @@ class ManualAlignmentEditor(QWidget):
         self._correlation_drag = None
         self.view.camera.interactive = camera_interactive
 
+    def _correction_unavailable_reason(self):
+        if not self.self_view_compare.isChecked() or not self.self_view_compare.isEnabled():
+            return (
+                "Shift + drag moves this session's background onto its "
+                "footprints: tick 'Compare with footprints' first."
+                if self.self_view_compare.isEnabled()
+                else self.self_view_compare.toolTip()
+            )
+        if not self.draft.can_edit_correction:
+            return "This session's background cannot be corrected."
+        return "Waiting for background tasks to finish."
+
+    def _on_shift_drag_press(self, event):
+        if (
+            event.button != 1
+            or keys.SHIFT not in event.modifiers
+            or self.view_mode.currentData() == "correlation"
+            or not self.image.visible
+        ):
+            return
+
+        # In the single-session view the background moves onto the
+        # footprints (its correction), not the session.
+        offset = self._showing_self_view(self.draft)
+        if offset and not (self._correcting() and self.can_apply()):
+            # Say why nothing moves.
+            show_tooltip(
+                self.canvas.native.mapToGlobal(QPoint(*map(int, event.pos[:2]))),
+                self._correction_unavailable_reason(),
+                self.canvas.native,
+            )
+            event.handled = True
+            return
+        if not self.can_apply():
+            return
+
+        displayed_draft, _, _ = self._comparison_context()
+        if displayed_draft is not self.draft:
+            # Hover previews of other sessions remain read-only.
+            return
+
+        transform = self.view.scene.node_transform(self.canvas.scene)
+        self._hover_timer.stop()
+        self._shift_drag = (
+            self.draft,
+            np.asarray(transform.imap(event.pos)[:2]),
+            self._edit_values()[:2].copy(),
+            self.view.camera.interactive,
+            offset,
+        )
+        self.view.camera.interactive = False
+        event.handled = True
+
+    def _on_shift_drag_move(self, event):
+        if self._shift_drag is None:
+            return
+
+        event.handled = True
+        draft, start_point, start_shift, _, offset = self._shift_drag
+
+        if draft is not self.draft or not self.can_apply():
+            self._end_shift_drag()
+            return
+
+        # Scene x / y are image columns / rows: the drag is the shift
+        # change in background pixels, independent of the zoom.
+        transform = self.view.scene.node_transform(self.canvas.scene)
+        point = np.asarray(transform.imap(event.pos)[:2])
+        shift = start_shift + point - start_point
+        if offset:
+            # Shown in the original frame: the drag is the correction change.
+            self._set_correction_shift(float(shift[0]), float(shift[1]))
+            return
+        self._set_inset_shift(float(shift[0]), float(shift[1]))
+
+    def _on_shift_drag_release(self, event):
+        if event.button == 1 and self._shift_drag is not None:
+            event.handled = True
+            self._end_shift_drag()
+
+    def _on_shift_drag_key(self, event):
+        if self._shift_drag is None or event.key != keys.ESCAPE:
+            return
+
+        # Escape restores the shift (offset) from before the drag.
+        draft, _, start_shift, _, offset = self._shift_drag
+        self._end_shift_drag()
+        if draft is self.draft:
+            restore = self._set_correction_shift if offset else self._set_inset_shift
+            restore(float(start_shift[0]), float(start_shift[1]))
+        event.handled = True
+
+    def _end_shift_drag(self):
+        if self._shift_drag is None:
+            return
+
+        camera_interactive = self._shift_drag[3]
+        self._shift_drag = None
+        self.view.camera.interactive = camera_interactive
+
     def _toggle_footprint_correction(self, checked):
         """Add the footprint correction (calculated on first use for the
         current geometry) or remove it."""
@@ -2998,7 +3570,141 @@ class ManualAlignmentEditor(QWidget):
             tuple(map(float, draft.values)),
             bool(draft.transpose),
             bool(draft.background_transposed),
+            self._correcting(),
+            tuple(map(float, draft.correction)),
         )
+
+    def _estimate_correction(self, kind):
+        """Wand / Refine flow while correcting: the background onto its own
+        footprint projection (original frame, high-passed comparison as the
+        automatic correction, core.footprint_frame)."""
+        draft = self.draft
+        context = self._estimate_context()
+        background = np.asarray(draft.template, dtype=np.float32).copy()
+        projection = np.asarray(self._draft_projection(draft), dtype=np.float32).copy()
+        dims = tuple(draft.dims)
+        dx, dy, angle = map(float, draft.correction)
+        radius = float(draft.session.params.get("max_session_rotation", 10.0))
+        coarse_step = float(draft.session.params.get("rotation_step", 1.0))
+        fine_step = float(draft.session.params.get("rotation_refine_step", 0.1))
+        angle_limits = (self.angle.minimum(), self.angle.maximum())
+
+        self._estimate_generation += 1
+        generation = self._estimate_generation
+        _set_status(self.estimate_status, f"Estimating the background correction ({kind})…")
+
+        def rigid(shift, rotation):
+            return {"shift": shift, "rotation": rotation, "flow": None, "source": "manual"}
+
+        def calculate():
+            ctx = current_task_context()
+
+            def check_cancelled():
+                if ctx is not None:
+                    ctx.check_cancelled()
+
+            try:
+                if not np.any(projection) or np.ptp(background) == 0:
+                    raise ValueError("Background and footprints need nonconstant image data.")
+
+                if kind == "shift":
+                    # Shift of the background (rotated as now) onto the footprints.
+                    rotated = footprint_frame.apply_correction(background, rigid((0.0, 0.0), angle))
+                    result = footprint_frame.background_coherence(rotated, projection)
+                    if not footprint_frame.matched(result):
+                        raise ValueError(result.get("reason") or "No match with the footprints.")
+                    ox, oy = result["offset"]
+                    return {
+                        "kind": kind,
+                        "target": "correction",
+                        "values": (-ox, -oy),
+                        "message": (
+                            f"Background correction: dx={-ox:+.2f}, dy={-oy:+.2f} px "
+                            f"(z {result['zscore']:.1f}). Rotation retained; preview only."
+                        ),
+                    }
+
+                if kind == "rotation":
+                    lo = max(angle_limits[0], angle - radius)
+                    hi = min(angle_limits[1], angle + radius)
+                    scores = {}
+
+                    def score(candidate):
+                        candidate = round(float(candidate), 4)
+                        if candidate not in scores:
+                            check_cancelled()
+                            moved = footprint_frame.apply_correction(
+                                background, rigid((dx, dy), candidate)
+                            )
+                            scores[candidate] = footprint_frame.background_coherence(
+                                moved, projection, max_shift=2
+                            ).get("correlation_zero", -np.inf)
+                        return scores[candidate]
+
+                    def grid(start, stop, step):
+                        count = max(1, int(np.ceil((stop - start) / step)))
+                        return np.linspace(start, stop, count + 1)
+
+                    best = angle
+                    for candidate in grid(lo, hi, coarse_step):
+                        if score(candidate) > score(best) + 1e-10:
+                            best = round(float(candidate), 4)
+                    for candidate in grid(max(lo, best - coarse_step), min(hi, best + coarse_step), fine_step):
+                        if score(candidate) > score(best) + 1e-10:
+                            best = round(float(candidate), 4)
+                    return {
+                        "kind": kind,
+                        "target": "correction",
+                        "values": (best,),
+                        "message": (
+                            f"Background correction: rotation {best:.2f}°. "
+                            "Shift retained; preview only."
+                        ),
+                    }
+
+                # Flow onto the footprint projection, keeping the rigid part.
+                candidate = footprint_frame.correction_remap(dims, rigid((dx, dy), angle))
+                candidate.estimate_flow(
+                    ManualAlignmentEditor._normalize(background),
+                    {
+                        "footprints": {
+                            "aligned_template": ManualAlignmentEditor._normalize(projection),
+                            "valid_mask": np.ones(dims, dtype=bool),
+                            "flow_candidate": True,
+                        }
+                    },
+                    residual=True,
+                    zero_mean=True,
+                )
+                check_cancelled()
+                if candidate.flow is None:
+                    raise ValueError(
+                        candidate.flow_info.get("reason")
+                        or "No acceptable flow correction was found."
+                    )
+                return {
+                    "kind": "flow",
+                    "target": "correction",
+                    "flow": np.asarray(candidate.flow, dtype=np.float32),
+                    "message": (
+                        "Background flow correction is ready for inspection. "
+                        "Apply changes to commit it."
+                    ),
+                }
+            except TaskCancelled:
+                raise
+            except Exception as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
+
+        self._estimate_kind = kind
+        self._estimate_task_id = self.state.tasks.start(
+            "calculating",
+            f"Estimating background correction {kind}",
+            calculate,
+            on_result=lambda result: self._on_estimate_ready(generation, context, result),
+            background=True,
+        )
+        self._update_availability()
 
     def _estimate_alignment(self, kind):
         if not self.can_apply() or self._estimate_task_id is not None:
@@ -3008,9 +3714,15 @@ class ManualAlignmentEditor(QWidget):
         if draft is not self.draft:
             return
 
+        if self._correcting():
+            if kind != "footprints":
+                self._estimate_correction(kind)
+            return
+
         context = self._estimate_context()
         reference = np.asarray(reference, dtype=np.float64).copy()
-        template = self._normalize(draft.template).copy()
+        # The image the session is aligned by (background or footprints).
+        template = self._normalize(self._moving_template(draft)).copy()
         dims = tuple(draft.dims)
         transpose = bool(draft.transpose)
         dx, dy, angle = map(float, draft.values)
@@ -3318,6 +4030,15 @@ class ManualAlignmentEditor(QWidget):
                 result["error"],
                 parent=self.window(),
             )
+        elif result.get("target") == "correction":
+            if result["kind"] == "flow":
+                self.draft.accept_correction_flow(result["flow"])
+            elif result["kind"] == "shift":
+                self.draft.correction[:2] = result["values"]
+            else:
+                self.draft.correction[2] = result["values"][0]
+            _set_status(self.estimate_status, result["message"])
+            self.state.alignment_draft_changed.emit()
         else:
             if result["kind"] == "footprints":
                 self.draft.store_footprint_correction(result["remap"], result["result"])
@@ -3342,6 +4063,28 @@ class ManualAlignmentEditor(QWidget):
         self._estimate_kind = None
         _set_status(self.estimate_status, "Estimation stopped. Click Estimate to retry.")
         self._update_availability()
+
+
+def confirm_draft_discard(state, parent, text):
+    """Ask once whether to discard the unapplied draft. While the question
+    is open, further requests (e.g. panels following the current session on
+    every task-queue update) are declined instead of asking again."""
+    if state.draft_discard_question_open:
+        return False
+
+    state.draft_discard_question_open = True
+    try:
+        answer = QMessageBox.question(
+            parent,
+            "Replace alignment draft?",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+    finally:
+        state.draft_discard_question_open = False
+
+    return answer == QMessageBox.StandardButton.Yes
 
 
 def select_alignment_draft(data, session_id, parent=None, *, proposal=None):
@@ -3379,15 +4122,12 @@ def select_alignment_draft(data, session_id, parent=None, *, proposal=None):
         return None
 
     if old is not None and old.dirty:
-        answer = QMessageBox.question(
+        if not confirm_draft_discard(
+            state,
             parent,
-            "Replace alignment draft?",
-            f"Discard the unapplied changes for session {old.session_id} "
+            f"Discard the unapplied changes for {session_label(data, old.session_id)} "
             "and start a new draft?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        ):
             return None
 
     draft = AlignmentDraft(data, session_id, proposal=proposal)
@@ -3423,14 +4163,11 @@ def select_overview_background_draft(data, parent=None):
         return None
 
     if old is not None and old.dirty:
-        answer = QMessageBox.question(
+        if not confirm_draft_discard(
+            state,
             parent,
-            "Replace alignment draft?",
             "Discard the unapplied alignment changes and start a new draft?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        ):
             return None
 
     draft = AlignmentDraft(data, None, session=background)
@@ -3439,12 +4176,20 @@ def select_overview_background_draft(data, parent=None):
     return draft
 
 
+def _draft_label(data, draft):
+    """'name (SX)' of a draft's session (the overview background: its name)."""
+    if draft.external:
+        return draft.session.name
+
+    return session_label(data, draft.session_id)
+
+
 class ManualAlignmentDialog(QDialog):
     def __init__(self, data, draft, parent=None):
         super().__init__(parent)
 
         self.result_remap = None
-        self.setWindowTitle(f"Manual alignment — {draft.session.name}")
+        self.setWindowTitle(f"Manual alignment — {_draft_label(data, draft)}")
         self.resize(900, 750)
 
         layout = QVBoxLayout(self)
@@ -3475,7 +4220,9 @@ class ManualAlignmentDialog(QDialog):
             return
 
         self.editor.set_draft(draft)
-        self.setWindowTitle(f"Manual alignment — {draft.session.name}")
+        self.setWindowTitle(
+            f"Manual alignment — {_draft_label(self.editor.data, draft)}"
+        )
 
 
 def open_manual_alignment(
@@ -3494,7 +4241,7 @@ def open_manual_alignment(
         message = QLabel(failure_reason, dialog)
         message.setWordWrap(True)
         dialog.layout().insertWidget(0, message)
-        dialog.setWindowTitle(f"Alignment failed — {draft.session.name}")
+        dialog.setWindowTitle(f"Alignment failed — {_draft_label(data, draft)}")
 
     try:
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -3510,6 +4257,7 @@ def open_manual_alignment(
                 remap=dialog.result_remap,
                 background_spec=None,
                 expected_version=draft.expected_version,
+                **draft.commit_options(),
             )
     finally:
         data.state.alignment_draft_changed.disconnect(dialog._sync_draft)

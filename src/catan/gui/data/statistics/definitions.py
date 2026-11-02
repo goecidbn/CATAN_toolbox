@@ -4,11 +4,17 @@ from .types import StatisticDefinition
 from .queries import ReductionSpec
 from .parameters import StatisticParameter
 from .distance_statistics import distance_query
-from .overlap_statistics import overlap_query
-from .cooccurrence_statistics import cooccurrence_query
+from .overlap_statistics import (
+    migrate_overlap_parameters,
+    normalize_by_choices,
+    overlap_query,
+)
+from .cooccurrence_statistics import cooccurrence_query, cooccurrence_requested_pairs
 from .footprint_pairs import footprint_similarity_requested_pairs
 from .union_similarity import (
     calculate_footprint_union_similarity,
+    calculate_partner_session_match,
+    partner_session_match_requested_pairs,
     calculate_union_similarity,
     footprint_union_similarity_requested_pairs,
     union_similarity_requested_pairs,
@@ -34,6 +40,22 @@ from catan.core.changes import (
     TRACKED_STATISTIC_STRUCTURE,
 )
 
+def FOOTPRINT_THRESHOLD(default):
+    """Pixels counted for a footprint: above this fraction of its peak."""
+    return StatisticParameter(
+        key="thr",
+        short="thr",
+        label="Pixel threshold",
+        kind=float,
+        default=default,
+        minimum=0.0,
+        maximum=0.99,
+        step=0.01,
+        decimals=3,
+        tooltip="Pixels above this fraction of the footprint's peak are counted.",
+    )
+
+
 CALCULATED_STATISTICS = {
     "none": StatisticDefinition(
         key="none",
@@ -50,6 +72,46 @@ CALCULATED_STATISTICS = {
         dims=("neuron", "session"),
         category="neuron",
         getter=calculations.calculate_footprint_size,
+        parameters=(FOOTPRINT_THRESHOLD(0.01),),
+    ),
+    "relative_footprint_size": StatisticDefinition(
+        key="relative_footprint_size",
+        title="Relative footprint size",
+        description=(
+            "Footprint size relative to the median size of the neuron's "
+            "footprints (1 = typical for this neuron)."
+        ),
+        dims=("neuron", "session"),
+        category="neuron",
+        getter=calculations.calculate_relative_footprint_size,
+        parameters=(FOOTPRINT_THRESHOLD(0.01),),
+    ),
+    "footprint_eccentricity": StatisticDefinition(
+        key="footprint_eccentricity",
+        title="Footprint elongation",
+        description=(
+            "Shape of the footprint pixels above a threshold, from their "
+            "extent along the longest and the perpendicular direction: "
+            "axis ratio (1 = round) or eccentricity (0 = round, 1 = line)."
+        ),
+        dims=("neuron", "session"),
+        category="neuron",
+        getter=calculations.calculate_footprint_eccentricity,
+        parameters=(
+            FOOTPRINT_THRESHOLD(0.2),
+            StatisticParameter(
+                key="measure",
+                short="measure",
+                label="Measure",
+                kind=str,
+                default="axis ratio",
+                tooltip=(
+                    "axis ratio: longest / perpendicular extent (≥ 1). "
+                    "eccentricity: sqrt(1 − minor² / major²), 0 round … 1 line."
+                ),
+                choices=calculations.shape_measure_choices,
+            ),
+        ),
     ),
     "border_proximity": StatisticDefinition(
         key="border_proximity",
@@ -64,6 +126,7 @@ CALCULATED_STATISTICS = {
         parameters=(
             StatisticParameter(
                 key="common_border",
+                short="shared border",
                 label="Shared border",
                 kind=bool,
                 default=False,
@@ -107,6 +170,7 @@ CALCULATED_STATISTICS = {
         parameters=(
             StatisticParameter(
                 key="compare_with",
+                short="vs",
                 label="Compare with",
                 kind=str,
                 default="",
@@ -115,6 +179,7 @@ CALCULATED_STATISTICS = {
             ),
             StatisticParameter(
                 key="max_distance",
+                short="d_max",
                 label="Match distance (px)",
                 kind=float,
                 default=10.0,
@@ -143,6 +208,7 @@ CALCULATED_STATISTICS = {
         parameters=(
             StatisticParameter(
                 key="key",
+                short="trace",
                 label="Trace Key",
                 kind=str,
                 default="S_dff",
@@ -151,6 +217,7 @@ CALCULATED_STATISTICS = {
             ),
             StatisticParameter(
                 key="prctile",
+                short="pct",
                 label="Percentile",
                 kind=float,
                 default=20,
@@ -165,6 +232,7 @@ CALCULATED_STATISTICS = {
             ),
             StatisticParameter(
                 key="frequency",
+                short="f",
                 label="Sampling frequency (Hz)",
                 kind=float,
                 default=15.0,
@@ -175,6 +243,7 @@ CALCULATED_STATISTICS = {
             ),
             StatisticParameter(
                 key="load_all",
+                in_title=False,
                 label="Load all traces",
                 kind=bool,
                 default=False,
@@ -186,6 +255,7 @@ CALCULATED_STATISTICS = {
             ),
             StatisticParameter(
                 key="save_results",
+                in_title=False,
                 label="Save results",
                 kind=bool,
                 default=True,
@@ -254,6 +324,7 @@ CALCULATED_STATISTICS = {
         parameters=(
             StatisticParameter(
                 key="gamma",
+                short="γ",
                 label="Gamma",
                 kind=float,
                 default=0.1,
@@ -262,8 +333,10 @@ CALCULATED_STATISTICS = {
                 step=0.05,
                 decimals=3,
                 tooltip=(
-                    "Exponent of the overlap penalty in cosine_union. "
-                    "Larger values penalize limited overlap more strongly."
+                    "Similarity = cosine of the overlapping parts × "
+                    "(support overlap / smaller support)^γ, maximised over "
+                    "shifts. 0 ignores how much the supports overlap; larger "
+                    "values penalize partial overlap more strongly."
                 ),
             ),
         ),
@@ -418,6 +491,35 @@ CALCULATED_STATISTICS["footprint_union_similarity"] = StatisticDefinition(
 )
 
 # Union counterpart of union_distances (neuron pairs, e.g. merge candidates).
+CALCULATED_STATISTICS["partner_session_match"] = StatisticDefinition(
+    key="partner_session_match",
+    title="Partner's own match",
+    description=(
+        "For a session footprint of neuron_i and the neuron neuron_j: how "
+        "well neuron_j's own footprint in that session matches its union "
+        "(footprint → union similarity); 0 if neuron_j has no footprint "
+        "there. Low values: neuron_j has no good footprint in this session, "
+        "so the footprint of neuron_i could be its missing one. Pairs with "
+        "centroids 10 px or more apart are omitted."
+    ),
+    dims=("neuron_i", "neuron_j", "session"),
+    category="pair",
+    getter=calculate_partner_session_match,
+    pairs_getter=partner_session_match_requested_pairs,
+    allowed_reductions=None,
+    default_reductions={
+        "neuron_i": ReductionSpec("keep"),
+        "neuron_j": ReductionSpec("keep"),
+        "session": ReductionSpec("single", 0),
+    },
+    parameters=CALCULATED_STATISTICS["footprint_similarity"].parameters,
+    independent_pairs=True,
+    compact_values=True,
+    component_axes=(("neuron_i", "session"),),
+    curation_kind="reassignment",
+    relationship_axes=(("neuron_i", "session"), ("neuron_j", None)),
+)
+
 CALCULATED_STATISTICS["union_similarity"] = StatisticDefinition(
     key="union_similarity",
     title="Union similarity",
@@ -465,6 +567,7 @@ CALCULATED_STATISTICS["track_split"] = StatisticDefinition(
     parameters=(
         StatisticParameter(
             key="measure",
+            short="measure",
             label="Measure",
             kind=str,
             default="gap",
@@ -477,6 +580,7 @@ CALCULATED_STATISTICS["track_split"] = StatisticDefinition(
         ),
         StatisticParameter(
             key="min_group",
+            short="n_min",
             label="Minimum group size",
             kind=int,
             default=2,
@@ -493,8 +597,9 @@ CALCULATED_STATISTICS["footprint_overlap"] = StatisticDefinition(
     key="footprint_overlap",
     title="Footprint overlap",
     description=(
-        "Overlap of registered footprints without additional shifting. "
-        "Returns a fraction between 0 and 1."
+        "Overlap of registered footprints without additional shifting: "
+        "shared support pixels divided by the union (IoU), the smaller "
+        "footprint, footprint i or footprint j. Between 0 and 1."
     ),
     dims=(
         "neuron_i",
@@ -516,27 +621,22 @@ CALCULATED_STATISTICS["footprint_overlap"] = StatisticDefinition(
     },
     parameters=(
         StatisticParameter(
-            key="weighted",
-            label="Intensity-weighted",
-            kind=bool,
-            default=False,
+            key="normalize_by",
+            short="norm",
+            label="Normalize by",
+            kind=str,
+            default="smaller",
             tooltip=(
-                "Use peak-normalized intensities and their pixelwise "
-                "minimum as the intersection. Otherwise count support pixels."
+                "Denominator of the shared support pixels. IoU: union of both "
+                "supports. smaller: the smaller support (symmetric containment). "
+                "i: footprint i — fraction of i covered by j. "
+                "j: footprint j (or union j) — fraction of j covered by i."
             ),
-        ),
-        StatisticParameter(
-            key="containment",
-            label="Normalize by smaller footprint",
-            kind=bool,
-            default=True,
-            tooltip=(
-                "Enabled: intersection divided by the smaller footprint area. "
-                "Disabled: intersection divided by union area."
-            ),
+            choices=normalize_by_choices,
         ),
         StatisticParameter(
             key="support_threshold",
+            short="thr",
             label="Relative support threshold",
             kind=float,
             default=0.1,
@@ -545,37 +645,25 @@ CALCULATED_STATISTICS["footprint_overlap"] = StatisticDefinition(
             step=0.05,
             decimals=3,
             tooltip=(
-                "Ignore pixels below this fraction of each footprint's "
-                "own maximum. 0.1 means 10% of its peak."
-            ),
-        ),
-        StatisticParameter(
-            key="directional",
-            label="Directional coverage",
-            kind=bool,
-            default=False,
-            tooltip=(
-                "Measure the fraction of one footprint covered by the other. "
-                "Overrides 'Normalize by smaller footprint'. "
-                "By default, normalize by the source footprint (i)."
-            ),
-        ),
-        StatisticParameter(
-            key="normalize_by_target",
-            label="Normalize directional coverage by target",
-            kind=bool,
-            default=False,
-            tooltip=(
-                "When directional coverage is enabled, normalize by the "
-                "target footprint (j), instead of the source footprint (i)."
+                "Support of a footprint: pixels at or above this fraction of "
+                "its own maximum. 0.1 means 10% of its peak."
             ),
         ),
     ),
+    migrate_parameters=migrate_overlap_parameters,
 )
 
 _CALCULATED_DEPENDENCIES = {
     "footprint_size": (
         frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
+        frozenset({"spatial"}),
+    ),
+    "footprint_eccentricity": (
+        frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
+        frozenset({"spatial"}),
+    ),
+    "relative_footprint_size": (
+        frozenset({ChangeKind.FOOTPRINT_GEOMETRY, ChangeKind.INCLUSION}),
         frozenset({"spatial"}),
     ),
     "border_proximity": (
@@ -666,6 +754,7 @@ CALCULATED_STATISTICS["union_distances"].relationship_axes = (
 # suggestions may sample them on a subset of neurons.
 for key in (
     "footprint_size",
+    "footprint_eccentricity",
     "border_proximity",
     "centroid_shift",
     "footprint_similarity",
@@ -683,6 +772,7 @@ distance_keys = (
     "union_distances",
     # Depend on the same footprint/union geometry and inclusion.
     "footprint_union_similarity",
+    "partner_session_match",
     "union_similarity",
     "track_split",
 )
@@ -721,6 +811,7 @@ CALCULATED_STATISTICS["footprint_union_overlap"] = StatisticDefinition(
         "session": ReductionSpec("single", 0),
     },
     parameters=CALCULATED_STATISTICS["footprint_overlap"].parameters,
+    migrate_parameters=migrate_overlap_parameters,
     independent_pairs=True,
     compact_values=True,
     component_axes=(("neuron_i", "session"),),
@@ -780,6 +871,8 @@ CALCULATED_STATISTICS["cooccurrence"] = StatisticDefinition(
     dims=("neuron_i", "neuron_j", "session"),
     getter=query_only_getter,
     query_getter=cooccurrence_query,
+    pairs_getter=cooccurrence_requested_pairs,
+    requested_reduced_axes=("session",),
     default_reductions={
         "neuron_i": ReductionSpec("keep"),
         "neuron_j": ReductionSpec("keep"),
@@ -802,4 +895,61 @@ CALCULATED_STATISTICS["cooccurrence"] = StatisticDefinition(
         ("neuron_i", None),
         ("neuron_j", None),
     ),
+)
+
+# Possible values of counting statistics (integer-centred histogram range):
+# presence per session is 0 or 1 (a session sum: 0 … active sessions),
+# assignment differences count sessions.
+CALCULATED_STATISTICS["occurence"].value_bounds = (0, 1)
+CALCULATED_STATISTICS["cooccurrence"].value_bounds = (0, 1)
+CALCULATED_STATISTICS["assignment_difference"].value_bounds = lambda n_sessions: (
+    0,
+    n_sessions,
+)
+
+# Overlap of the seeds a session exports for seeded redetection (detected
+# and inferred footprints).
+from .seed_overlap import SEED_KINDS, calculate_seed_overlap  # noqa: E402
+
+CALCULATED_STATISTICS["seed_overlap"] = StatisticDefinition(
+    key="seed_overlap",
+    title="Seed overlap",
+    description=(
+        "Overlap of two neurons' redetection seeds in a session: their "
+        "included footprints or, where a neuron has none, its union "
+        "footprint at the interpolated position (inferred footprint). Same "
+        "measure as footprint overlap. Pairs with union centroids 10 px or "
+        "more apart are omitted; each pair once (neuron_i < neuron_j)."
+    ),
+    dims=("neuron_i", "neuron_j", "session"),
+    category="pair",
+    getter=calculate_seed_overlap,
+    allowed_reductions=None,
+    default_reductions={
+        "neuron_i": ReductionSpec("keep"),
+        "neuron_j": ReductionSpec("keep"),
+        "session": ReductionSpec("keep"),
+    },
+    parameters=(
+        *CALCULATED_STATISTICS["footprint_overlap"].parameters,
+        StatisticParameter(
+            key="seeds",
+            short="seeds",
+            label="Seed pairs",
+            kind=str,
+            default="all",
+            tooltip=(
+                "all: any two seeds. inferred: at least one of the two is an "
+                "inferred footprint (detected pairs: footprint overlap)."
+            ),
+            choices=lambda data=None: SEED_KINDS,
+        ),
+    ),
+    independent_pairs=True,
+    compact_values=True,
+    relationship_axes=(("neuron_i", "session"), ("neuron_j", "session")),
+    dependencies=CALCULATED_STATISTICS["footprint_union_similarity"].dependencies,
+    availability_dependencies=CALCULATED_STATISTICS[
+        "footprint_union_similarity"
+    ].availability_dependencies,
 )

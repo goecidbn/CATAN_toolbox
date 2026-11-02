@@ -9,14 +9,15 @@ from PySide6.QtWidgets import (
     QSlider,
     QLabel,
     QWidget,
-    QCheckBox,
     QDoubleSpinBox,
     QComboBox,
+    QMessageBox,
 )
 
 from catan.core.structures import NeuronComponent
 from catan.tracking.structures import ReviewStatus
 from catan.gui.data.assignment_colors import assignment_label
+from catan.gui.panels.helper.ReviewStatusFilter import ReviewStatusFilter
 
 
 class NeuronNavigationBar(QWidget):
@@ -41,6 +42,10 @@ class NeuronNavigationBar(QWidget):
 
         self.footprint_edit = QLineEdit()
         self.footprint_edit.setFixedWidth(60)
+        # Only a click gives it the keyboard focus (not Tab, not a hidden
+        # button passing its focus on): it takes the arrow keys, which
+        # otherwise step through the neurons.
+        self.footprint_edit.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
         self.footprint_id_prev = QPushButton("<")
         self.footprint_id_prev.setFixedWidth(30)
@@ -55,8 +60,13 @@ class NeuronNavigationBar(QWidget):
         selector_layout.addWidget(self.footprint_slider, stretch=1)
         selector_layout.addWidget(self.footprint_id_next)
 
-        self.only_open_checkbox = QCheckBox("Only open")
-        selector_layout.addWidget(self.only_open_checkbox)
+        self.review_filter = ReviewStatusFilter(self)
+        self.review_filter.setToolTip(
+            "Review states the arrows step through (in the selection, or "
+            "through all neurons without one)."
+        )
+        self.review_filter.changed.connect(self.update_neuron_count_label)
+        selector_layout.addWidget(self.review_filter)
 
         self.footprint_slider.sliderMoved.connect(self._on_slider_moved)
         self.footprint_slider.sliderReleased.connect(
@@ -135,9 +145,7 @@ class NeuronNavigationBar(QWidget):
                 else int(np.count_nonzero(included))
             )
 
-        selected = self.state.selected_components
-
-        if len(self._navigation_selection()) <= 1:
+        if not self._in_selection_mode():
             text = f"Iterating {total} neurons"
         else:
             text = f"Selected {len(self.navigation_neuron_ids())} " f"/ {total} neurons"
@@ -159,6 +167,7 @@ class NeuronNavigationBar(QWidget):
 
         neuron_ids = self.navigation_neuron_ids()
         if not neuron_ids:
+            self._report_nothing_left()
             return
 
         focused = self.state.focused_component
@@ -206,11 +215,9 @@ class NeuronNavigationBar(QWidget):
         if count == 0:
             return []
 
-        selected = self._navigation_selection()
-
-        if selected and len(selected) > 1:
+        if self._in_selection_mode():
             neuron_ids = np.asarray(
-                [component.neuron_id for component in selected],
+                [component.neuron_id for component in self._navigation_selection()],
                 dtype=int,
             )
         else:
@@ -220,12 +227,40 @@ class NeuronNavigationBar(QWidget):
 
         neuron_ids = neuron_ids[included[neuron_ids]]
 
-        if self.only_open_checkbox.isChecked():
-            status = assignments.review_status
+        statuses = self.review_filter.visible_statuses
+        if len(statuses) < len(ReviewStatus):
+            status = np.asarray(assignments.review_status)
             neuron_ids = neuron_ids[neuron_ids < len(status)]
-            neuron_ids = neuron_ids[status[neuron_ids] != ReviewStatus.REVIEWED]
+            neuron_ids = neuron_ids[
+                np.isin(status[neuron_ids], [int(s) for s in statuses])
+            ]
 
         return np.unique(neuron_ids).tolist()
+
+    def _in_selection_mode(self) -> bool:
+        """Step through the selection: a selected set (preset results,
+        statistic picks; also when one neuron is left) or several clicked
+        neurons. Otherwise through all neurons."""
+        selected = self._navigation_selection()
+        return bool(selected) and (self.state.selection_is_set or len(selected) > 1)
+
+    def _report_nothing_left(self):
+        statuses = self.review_filter.visible_statuses
+        where = "selected neurons" if self._in_selection_mode() else "neurons"
+
+        if len(statuses) < len(ReviewStatus):
+            labels = ", ".join(
+                status.label for status in ReviewStatus if status in statuses
+            )
+            detail = f" with review status: {labels or 'none'}"
+        else:
+            detail = ""
+
+        QMessageBox.information(
+            self.window(),
+            "Nothing left to step through",
+            f"No more {where}{detail} (excluded neurons are skipped).",
+        )
 
     def _navigation_selection(self) -> list[NeuronComponent]:
         """One representative per selected neuron, preserving selection order."""
@@ -251,7 +286,7 @@ class NeuronNavigationBar(QWidget):
 
         selected = self._navigation_selection()
 
-        if selected and len(selected) > 1:
+        if self._in_selection_mode():
             maximum = len(selected) - 1
         else:
             maximum = self.state.assignments.shape[0] - 1
@@ -275,7 +310,7 @@ class NeuronNavigationBar(QWidget):
         # Multiple selected neurons:
         # slider position = index into selection.
         # --------------------------------------------------
-        if selected and len(selected) > 1:
+        if self._in_selection_mode():
             if not 0 <= int(value) < len(selected):
                 self.update_setup()
                 return
@@ -329,7 +364,7 @@ class NeuronNavigationBar(QWidget):
         # Multiple-selection mode:
         # slider represents position within selection.
         # --------------------------------------------------
-        if selected and len(selected) > 1:
+        if self._in_selection_mode():
             index = next(
                 (
                     i
@@ -373,6 +408,13 @@ class NeuronNavigationBar(QWidget):
     def _on_neuron_edit_return(
         self,
     ):
+        try:
+            self._focus_typed_neuron()
+        finally:
+            # Arrow keys step through neurons again right away.
+            self.footprint_edit.clearFocus()
+
+    def _focus_typed_neuron(self):
 
         try:
             neuron_id = int(self.footprint_edit.text())

@@ -436,9 +436,6 @@ class Model:
         """
         Currently takes over h almost as provided - add weights to  improve fit, or fit to NN-distr specifically?
         """
-        if self.loaded:
-            print("Model was loaded from file - fitting to counts not allowed.")
-            return
         bin_counts = counts[..., 0].sum()
         if bin_counts < min_counts:
             raise Exception(
@@ -540,9 +537,6 @@ class Model:
         )
 
     def fit_two_noise(self, evidence, min_counts=20):
-        if self.loaded:
-            print("Model was loaded from file - fitting to counts not allowed.")
-            return
 
         if evidence["cross2"][..., 0].sum() < min_counts:
             raise Exception(

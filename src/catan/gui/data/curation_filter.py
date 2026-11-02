@@ -69,6 +69,10 @@ class CurationFilterCondition:
 
     id: str = field(default_factory=lambda: uuid4().hex)
 
+    # Skipped (as if absent) when its statistic is unavailable, e.g. an
+    # imported value that some data sets lack (prune_unavailable_optional).
+    optional: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class CountSpec:
@@ -299,6 +303,11 @@ class CurationFilterGroupResult:
     neuron_domain: set[int] = field(default_factory=set)
     footprint_domain: set[NeuronComponent] = field(default_factory=set)
 
+    # Relationship results: the candidate sources (for per-source counts
+    # that accept zero partners).
+    source_neuron_domain: set[int] = field(default_factory=set)
+    source_footprint_domain: set[NeuronComponent] = field(default_factory=set)
+
     counts: dict[FilterMatch, int] = field(default_factory=dict)
     target_evidence: dict[NeuronComponent, set[NeuronComponent]] | None = None
     endpoint_kinds: tuple[str, str] | None = None
@@ -325,9 +334,16 @@ class CurationFilterResult:
 
     bound_inspections: dict = field(default_factory=dict)
 
+    # Split / merge: whole footprint -> (chosen partner pair, SessionVotes).
+    manipulation_votes: dict = field(default_factory=dict)
+
     # Threshold recipes resolved for this evaluation:
     # {condition id: (value, upper_value)}.
     resolved_thresholds: dict = field(default_factory=dict)
+
+    # Optional conditions (and groups left empty by them) skipped because
+    # their statistic is unavailable.
+    skipped_nodes: tuple = ()
 
     def evidence_for_neuron(
         self,
@@ -419,6 +435,7 @@ class CurationFilterEvaluator:
         engine: StatisticEngine,
     ):
         self.engine = engine
+        self._manipulation_votes = {}
 
     @reports_progress("Evaluating curator preset")
     def evaluate(
@@ -432,8 +449,15 @@ class CurationFilterEvaluator:
         # Thresholds are resolved on a copy; the caller's filter keeps its
         # recipes and units.
         root = deepcopy(root)
+        skipped = prune_unavailable_optional(root, self.engine.registry)
+
+        if skipped and not root.children:
+            raise CurationFilterError(
+                "All conditions are optional and their statistics are unavailable."
+            )
 
         self._bound_inspections = {}
+        self._manipulation_votes = {}
 
         if root.apply_to != "same":
             raise CurationFilterError("The root group has no parent source or target.")
@@ -478,7 +502,9 @@ class CurationFilterEvaluator:
             group_results=group_results,
             root_result=root_result,
             bound_inspections=self._bound_inspections,
+            manipulation_votes=self._manipulation_votes,
             resolved_thresholds=resolved,
+            skipped_nodes=tuple(skipped),
         )
 
     def resolve_thresholds(self, root):
@@ -496,6 +522,10 @@ class CurationFilterEvaluator:
             if is_filter_group(node):
                 for child in node.children:
                     visit(child)
+                return
+
+            # Skipped on evaluation (prune_unavailable_optional).
+            if is_unavailable_optional(node, self.engine.registry):
                 return
 
             threshold = node.threshold
@@ -722,7 +752,7 @@ class CurationFilterEvaluator:
 
         if any(child.apply_to != expected for child in support_groups):
             raise CurationFilterError(
-                f"Count anchored to {spec.anchor}: use Apply to: "
+                f"Count anchored to {spec.anchor}: set 'applied to' to "
                 f"{expected.replace('_', ' ')}."
             )
 
@@ -807,6 +837,8 @@ class CurationFilterEvaluator:
 
         selected_pairs = set()
 
+        voting = self._manipulation_voter(group)
+
         for pairs, sources in progress_iter(zip(buckets.values(), partner_sets), total=len(partner_sets), start=65, stop=95, every=1):
             if ctx is not None:
                 ctx.check_cancelled()
@@ -832,6 +864,21 @@ class CurationFilterEvaluator:
                     ):
                         adjacent[i].add(j)
                         adjacent[j].add(i)
+
+            if voting is not None:
+                # Split / merge: the compatible pair the other sessions
+                # support most (manipulation_votes); none without support.
+                anchor = next(iter(pairs))
+                anchor = anchor.source if spec.anchor == "source" else anchor.target
+                choice = self._voted_pair(voting, anchor, vertices, adjacent)
+                chosen = set() if choice is None else set(choice)
+
+                selected_pairs.update(
+                    pair
+                    for pair in pairs
+                    if (pair.target if spec.anchor == "source" else pair.source) in chosen
+                )
+                continue
 
             # Find one largest mutually compatible set.
             # A-B and B-C alone must not qualify the set A-B-C.
@@ -875,6 +922,51 @@ class CurationFilterEvaluator:
             },
             target_evidence=pair_target_evidence(selected_pairs),
         )
+
+    def _manipulation_voter(self, group):
+        """(kind, SessionVoter) for split / merge groups counting exactly
+        two partners, else None."""
+        kind = None if group.manipulation is None else group.manipulation.kind
+        spec = group.count
+
+        if kind not in ("split", "merge") or spec is None or spec.target != "footprint":
+            return None
+
+        if spec.comparison != "eq" or spec.value != 2:
+            return None
+
+        from catan.gui.data.manipulation_votes import SessionVoter
+
+        return kind, SessionVoter(self.engine.data.sessions, self.engine.state.assignments)
+
+    def _voted_pair(self, voting, anchor, vertices, adjacent):
+        """Best mutually compatible partner pair of ``anchor`` (the whole
+        footprint) by the other sessions' votes; None if no pair is
+        supported. Recorded in ``self._manipulation_votes``."""
+        kind, voter = voting
+        best = None
+
+        for i, a in enumerate(vertices):
+            for j in adjacent[i]:
+                if j <= i:
+                    continue
+
+                b = vertices[j]
+
+                if kind == "split" and a.neuron_id == b.neuron_id:
+                    continue
+
+                votes = voter.votes(anchor, (a, b))
+                rank = (votes.margin(kind), votes.separate + votes.joint)
+
+                if votes.supports(kind) and (best is None or rank > best[0]):
+                    best = (rank, (a, b), votes)
+
+        if best is None:
+            return None
+
+        self._manipulation_votes[anchor] = (best[1], best[2])
+        return best[1]
 
     @staticmethod
     def _summary_pairs(binding, sources, targets):
@@ -1334,6 +1426,12 @@ class CurationFilterEvaluator:
 
             result.neuron_domain = combine(*(r.neuron_domain for r in child_results))
             result.footprint_domain = combine(*(r.footprint_domain for r in child_results))
+            result.source_neuron_domain = combine(
+                *(r.source_neuron_domain for r in child_results)
+            )
+            result.source_footprint_domain = combine(
+                *(r.source_footprint_domain for r in child_results)
+            )
 
         if group is self._review_root and self._review_allowed is not None:
             allowed = self._review_allowed
@@ -1456,10 +1554,15 @@ class CurationFilterEvaluator:
                     )
 
                 elif group.count is not None:
-                    _, evidence = self._count_buckets(
-                        projected,
-                        group.count.target,
-                        group.count.unit,
+                    # Per-source counts select sources: no target evidence.
+                    _, evidence = (
+                        (None, {})
+                        if group.count.anchor == "source"
+                        else self._count_buckets(
+                            projected,
+                            group.count.target,
+                            group.count.unit,
+                        )
                     )
 
                     projected = replace(
@@ -1728,12 +1831,21 @@ class CurationFilterEvaluator:
             }
 
         if result.match_level == "relationship":
-            neuron, session = self._relationship_axes_for_stat(table.stat)[1]
+            source_axes, target_axes = self._relationship_axes_for_stat(table.stat)
+            neuron, session = target_axes
 
             result.neuron_domain = self._count_neurons & coords(neuron)
 
             result.footprint_domain = (
                 set() if session is None else components(neuron, session)
+            )
+
+            neuron, session = source_axes
+            result.source_neuron_domain = self._count_neurons & (coords(neuron) or set())
+            result.source_footprint_domain = (
+                set()
+                if session is None or coords(neuron) is None or coords(session) is None
+                else components(neuron, session)
             )
 
         elif result.match_level == "reassignment":
@@ -1926,6 +2038,17 @@ class CurationFilterEvaluator:
     @reports_progress('Counting matches')
     def _apply_count(self, group, result):
         spec = group.count
+
+        # "No / at most n partners per source" selects sources, as the
+        # ordinary count selects targets.
+        if (
+            spec.anchor == "source"
+            and spec.accepts(0)
+            and not spec.separate_partner_sessions
+            and result.match_level == "relationship"
+        ):
+            return self._apply_source_count(result, spec)
+
         if spec.anchor == "source" or spec.separate_partner_sessions:
             return self._filter_relationship_count(result, spec)
 
@@ -1971,6 +2094,51 @@ class CurationFilterEvaluator:
                 matches,
                 spec.target,
             ),
+        )
+
+    @reports_progress("Counting partners per source")
+    def _apply_source_count(self, result, spec):
+        """Sources (footprints or neurons) with an accepted number of
+        partners, including sources without any (counted over the sources'
+        domain); returns their identities like the ordinary count."""
+        source_kind, target_kind = result.endpoint_kinds
+
+        if spec.target == "footprint" and source_kind != "footprint":
+            raise CurationFilterError("The sources are neurons. Count per neuron.")
+
+        if spec.unit == "footprint" and target_kind != "footprint":
+            raise CurationFilterError("The partners are neurons. Count distinct neurons.")
+
+        buckets = {}
+        for pair in progress_iter(result.matches, stop=60):
+            subject = pair.source if spec.target == "footprint" else pair.source.neuron_id
+            partner = pair.target if spec.unit == "footprint" else pair.target.neuron_id
+            buckets.setdefault(subject, set()).add(partner)
+
+        domain = (
+            result.source_footprint_domain
+            if spec.target == "footprint"
+            else result.source_neuron_domain
+        )
+
+        counts = {subject: len(buckets.get(subject, ())) for subject in domain}
+        matches = {subject for subject, value in counts.items() if spec.accepts(value)}
+
+        return CurationFilterGroupResult(
+            group_id=result.group_id,
+            match_level=spec.target,
+            matches=matches,
+            evidence_by_match={
+                subject: {subject} if isinstance(subject, NeuronComponent) else set()
+                for subject in matches
+            },
+            neuron_domain=(
+                set(domain)
+                if spec.target == "neuron"
+                else {c.neuron_id for c in domain}
+            ),
+            footprint_domain=set(domain) if spec.target == "footprint" else set(),
+            counts=counts,
         )
 
     @reports_progress("Constructing candidate matches")
@@ -2462,6 +2630,38 @@ def table_supports_component_identity(
     return False
 
 
+def is_unavailable_optional(node, registry) -> bool:
+    return (
+        is_filter_condition(node)
+        and node.optional
+        and node.query.statistic_key not in registry
+    )
+
+
+def prune_unavailable_optional(root, registry):
+    """Remove optional conditions with unavailable statistics from ``root``
+    (in place), and the groups this leaves empty: they no longer constrain
+    their parent. Returns the removed node ids."""
+    removed = []
+
+    def visit(group):
+        kept = []
+        for child in group.children:
+            if is_unavailable_optional(child, registry):
+                removed.append(child.id)
+                continue
+            if is_filter_group(child) and child.children:
+                visit(child)
+                if not child.children:
+                    removed.append(child.id)
+                    continue
+            kept.append(child)
+        group.children = kept
+
+    visit(root)
+    return removed
+
+
 def is_filter_condition(node) -> bool:
     return getattr(node, "node_type", None) == "condition"
 
@@ -2519,6 +2719,9 @@ def curation_filter_node_to_dict(
         if threshold.unit is not None:
             threshold_data["unit"] = threshold.unit
 
+        if threshold.strict and threshold.direction != "between":
+            threshold_data["strict"] = True
+
         # Curator thresholds are currently axis-independent,
         # but retain this if ThresholdSpec has an axis field.
         axis = getattr(
@@ -2530,12 +2733,15 @@ def curation_filter_node_to_dict(
         if axis is not None:
             threshold_data["axis"] = axis
 
-        return {
+        document = {
             "type": "condition",
             "id": node.id,
             "query": node.query.to_dict(),
             "threshold": threshold_data,
         }
+        if node.optional:
+            document["optional"] = True
+        return document
 
     if is_filter_group(node):
 
@@ -2588,6 +2794,7 @@ def curation_filter_node_from_dict(data: dict):
                 threshold_data.get("upper_reference")
             ),
             "unit": threshold_data.get("unit"),
+            "strict": bool(threshold_data.get("strict", False)),
         }
         if threshold_data.get("upper_value") is not None:
             threshold_kwargs["upper_value"] = float(threshold_data["upper_value"])
@@ -2604,6 +2811,7 @@ def curation_filter_node_from_dict(data: dict):
         condition_kwargs = {
             "query": StatisticQuery.from_dict(data["query"]),
             "threshold": threshold,
+            "optional": bool(data.get("optional", False)),
         }
 
         if "id" in data:

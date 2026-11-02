@@ -85,6 +85,9 @@ def main() -> int:
     # app.aboutToQuit.connect(lambda: print("aboutToQuit"))
 
     settings = None
+    # CATAN's own exit cleanup, also run before a hard exit (Python's atexit
+    # handlers are skipped there: PySide's waits for the worker threads).
+    exit_cleanup = []
 
     if options.fresh:
         settings_directory = TemporaryDirectory(prefix="catan-fresh-")
@@ -101,6 +104,7 @@ def main() -> int:
             settings_directory.cleanup()
 
         atexit.register(discard_fresh_settings)
+        exit_cleanup.append(discard_fresh_settings)
 
     # # Temporary Linux freeze diagnostics.
     # import faulthandler
@@ -149,9 +153,67 @@ def main() -> int:
     #         traceback_log.close()
 
     if owns_application:
-        return app.exec()
+        code = app.exec()
+        if not _finish_background_work(window, SHUTDOWN_GRACE_S):
+            # A worker is stuck (e.g. a read from a hanging network mount):
+            # Qt would wait for it before the process ends. Files are
+            # written atomically, so ending now leaves no partial file.
+            print(
+                f"CATAN: background work did not stop within {SHUTDOWN_GRACE_S:g} s; "
+                "exiting without waiting for it.",
+                file=sys.stderr,
+                flush=True,
+            )
+            for cleanup in exit_cleanup:
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+            sys.stdout.flush()
+            os._exit(code)
+        return code
 
     return 0
+
+
+# Closing CATAN cancels running work and waits this long (s) for it to end.
+SHUTDOWN_GRACE_S = 2.0
+
+
+def _finish_background_work(window, timeout):
+    """Cancel tasks and file inspections; True if every worker thread
+    ended within ``timeout`` seconds."""
+    import threading
+    import time
+
+    from PySide6.QtCore import QThreadPool
+
+    from catan.gui.GUI_elements.fragments.file_inspection import FileInspection
+
+    try:
+        window.state.tasks.cancel_all()
+    except Exception as exc:  # the window may be half torn down
+        print(f"CATAN: cancelling tasks on exit failed: {exc}", file=sys.stderr)
+    FileInspection.cancel_all()
+
+    deadline = time.monotonic() + timeout
+
+    def remaining_ms():
+        return max(0, int((deadline - time.monotonic()) * 1000))
+
+    done = all(
+        pool.waitForDone(remaining_ms())
+        for pool in (QThreadPool.globalInstance(), *FileInspection.pools())
+    )
+
+    # Plain Python threads Python would join at exit (daemon threads are not).
+    for thread in threading.enumerate():
+        if thread is threading.main_thread() or thread.daemon:
+            continue
+        thread.join(remaining_ms() / 1000)
+        done = done and not thread.is_alive()
+
+    return done
 
 
 # import threading

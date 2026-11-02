@@ -23,7 +23,9 @@ from catan.core.io import (
     get_backend,
 )
 from catan.core.structures import NeuronComponent, SessionData, sessiondata_type
+from catan.core import footprint_frame
 from catan.core.structures.load_config import FieldSpec, LoadConfig
+from catan.gui.utils.session_labels import session_label, session_labels
 from catan.core.structures.session_snapshot import (
     prepare_session_snapshot,
 )
@@ -48,6 +50,11 @@ from catan.gui.background_tasks.file_writes import (
 )
 
 from catan.gui.data.assignment_comparison import AssignmentComparison
+from catan.gui.utils.fs_guard import (
+    is_file as fs_guard_is_file,
+    lexical_path,
+    probe as fs_guard_probe,
+)
 from catan.gui.data.units import DisplayUnits
 
 
@@ -105,11 +112,30 @@ def model_fingerprint(model):
     return digest.hexdigest()
 
 
+def is_project_set(item):
+    """Whether a model or assignment set belongs to the project (created in
+    CATAN, or restored as such): saved with the project. Sets loaded from a
+    file are only referenced; their changes are saved on request to a chosen
+    file."""
+    flag = getattr(item, "project_set", None)
+    if flag is None:
+        return not getattr(item, "loaded", False) and not getattr(item, "path", None)
+    return bool(flag)
+
+
+is_project_model = is_project_set
+
+
+def model_has_content(model):
+    return model is not None and bool(model.fitted or any(model.counts.values()))
+
+
 def read_assignments_provenance(path, *, ctx=None):
     """Sessions and model stored with saved assignments, or None.
 
     {"recipe": loading recipe document or None, "model_path": str or None,
-    "sessions_file": CATAN session file or None}.
+    "sessions_file": CATAN session file or None, "models": model sets,
+    "assignment_sets": assignment sets of a project, "ignored": notes}.
     Call from a background worker.
     """
     from catan.tracking.structures.assignments import PROVENANCE_PATHS
@@ -140,6 +166,14 @@ def read_assignments_provenance(path, *, ctx=None):
     recipe = text(values.get("loading_recipe"))
     model_path = text(values.get("model_path"))
     sessions_file = text(values.get("sessions_file"))
+    try:
+        models = json.loads(text(values.get("models")) or "[]")
+    except ValueError:
+        models = []
+    try:
+        assignment_sets = json.loads(text(values.get("assignments")) or "[]")
+    except ValueError:
+        assignment_sets = []
 
     # Project files reference relative to the main file.
     folder = Path(path).expanduser().resolve().parent
@@ -147,6 +181,18 @@ def read_assignments_provenance(path, *, ctx=None):
         None if value is None else str((folder / value).resolve())
         for value in (model_path, sessions_file)
     )
+    # All model sets (name, path, active, project); older projects only
+    # stored the active model's path.
+    models = [
+        {
+            "name": entry.get("name") or None,
+            "path": str((folder / entry["path"]).resolve()),
+            "active": bool(entry.get("active")),
+            "project": bool(entry.get("project")),
+        }
+        for entry in models
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry["path"]
+    ]
 
     try:
         recipe = None if recipe is None else json.loads(recipe)
@@ -176,13 +222,72 @@ def read_assignments_provenance(path, *, ctx=None):
             else:
                 sessions_file = None
 
-    if recipe is None and model_path is None and sessions_file is None:
-        return {"recipe": None, "model_path": None, "sessions_file": None, "ignored": ignored} if ignored else None
+    usable = []
+    for entry in models:
+        target = Path(entry["path"])
+        if target.resolve() == this:
+            ignored.append(f"{target.name} refers to the assignments file itself")
+        elif target.is_file() and hdf5_object_type(target) != "ModelData":
+            ignored.append(f"{target.name} is not a CATAN model file")
+        else:
+            usable.append(entry)
+    models = usable
+
+    # All assignment sets of a project (name, path, active, project, main);
+    # the main file's own set has path ".". Older files: none listed.
+    sets = []
+    for entry in assignment_sets:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        main = entry["path"] in {"", "."}
+        target = this if main else (folder / entry["path"]).resolve()
+        if not main and target == this:
+            continue
+        # Foreign assignment files (e.g. other matching tools) are kept: their
+        # fields are checked on import, a mismatch opens the configuration.
+        sets.append(
+            {
+                "name": entry.get("name") or None,
+                "path": str(target),
+                "active": bool(entry.get("active")),
+                "project": bool(entry.get("project")),
+                "main": main,
+                "load_config": (
+                    entry["load_config"]
+                    if isinstance(entry.get("load_config"), dict)
+                    else None
+                ),
+            }
+        )
+
+    if not models and model_path is not None:
+        # Older project: only the active model, as a project model when it
+        # lies next to the main file.
+        models = [
+            {
+                "name": None,
+                "path": model_path,
+                "active": True,
+                "project": Path(model_path).parent == folder
+                and Path(model_path).name.endswith(".model.hdf5"),
+            }
+        ]
+
+    if (
+        recipe is None
+        and model_path is None
+        and sessions_file is None
+        and not models
+        and not sets
+    ):
+        return {"recipe": None, "model_path": None, "sessions_file": None, "models": [], "assignment_sets": [], "ignored": ignored} if ignored else None
 
     return {
         "recipe": recipe,
         "model_path": model_path,
         "sessions_file": sessions_file,
+        "models": models,
+        "assignment_sets": sets,
         "ignored": ignored,
     }
 
@@ -474,6 +579,70 @@ class Data(Tracking):
             session.path, {group_name: {field_name: spec}}
         )
 
+    LOADED_GROUPS = ("spatial", "traces", "quality")
+
+    def loaded_field_specs(self, session):
+        """Field specs the loaded groups were read with. Groups loaded
+        before this was recorded (restored sessions): the configuration
+        at the first request."""
+        record = session.__dict__.setdefault("_loaded_field_specs", {})
+        config = session.source_config
+
+        for group in self.LOADED_GROUPS:
+            if not session.status[f"{group}_loaded"]:
+                record.pop(group, None)
+            elif group not in record and config is not None and group in config.groups:
+                record[group] = deepcopy(dict(config.groups[group].fields))
+
+        return record
+
+    def session_config_changes(self, session):
+        """What applying the session's configuration would do:
+        ``missing``: enabled groups not loaded; ``reload``: loaded traces /
+        quality groups whose fields changed; ``background``: the loaded
+        spatial group's background field changed; ``unsupported``: other
+        changed fields of the loaded spatial group (footprints cannot be
+        replaced in place)."""
+        changes = {"missing": [], "reload": [], "background": False, "unsupported": []}
+        config = session.source_config
+
+        if config is None:
+            return changes
+
+        record = self.loaded_field_specs(session)
+
+        for group in self.LOADED_GROUPS:
+            settings = config.groups.get(group)
+
+            if settings is None:
+                continue
+
+            if not session.status[f"{group}_loaded"]:
+                if settings.enabled:
+                    changes["missing"].append(group)
+                continue
+
+            loaded = record.get(group, {})
+            changed = [
+                key
+                for key in set(loaded) | set(settings.fields)
+                if loaded.get(key) != settings.fields.get(key)
+            ]
+
+            if not changed:
+                continue
+
+            if group != "spatial":
+                changes["reload"].append(group)
+                continue
+
+            changes["background"] = (
+                "background" in changed and settings.fields.get("background") is not None
+            )
+            changes["unsupported"] = sorted(key for key in changed if key != "background")
+
+        return changes
+
     @staticmethod
     def _missing_session_fields(session, fields_to_load):
         return {
@@ -506,6 +675,18 @@ class Data(Tracking):
         if "spatial" in fields_to_load:
             session.params["correct_rotation"] = correct_rotation
             self.apply_alignment_settings(session)
+            # Background relative to its footprints, from the recipe.
+            if recipe_options.get("alignment_source") is not None:
+                session.params["alignment_source"] = recipe_options["alignment_source"]
+            if recipe_options.get("background_correction") is not None:
+                footprint_frame.set_correction(
+                    session.params,
+                    dict(recipe_options["background_correction"], source="manual"),
+                )
+            elif recipe_options.get("footprint_offset") is not None:
+                session.params["footprint_offset"] = deepcopy(
+                    recipe_options["footprint_offset"]
+                )
 
         session.load_data(
             fields_to_load,
@@ -521,6 +702,11 @@ class Data(Tracking):
             ),
             ctx=current_task_context(),
         )
+
+        record = session.__dict__.setdefault("_loaded_field_specs", {})
+        for group, fields in fields_to_load.items():
+            if group in self.LOADED_GROUPS and session.status[f"{group}_loaded"]:
+                record[group] = deepcopy(dict(fields))
 
         if "spatial" in fields_to_load:
             self._report_flow_fallback(session)
@@ -589,7 +775,7 @@ class Data(Tracking):
 
         self.state.tasks.start(
             "loading",
-            f"Loading data for {session.name}",
+            f"Loading data for {session_label(session)}",
             self._load_session_fields,
             session_id=session_id,
             fields_to_load=fields_to_load,
@@ -730,6 +916,7 @@ class Data(Tracking):
                 session_id,
                 callback=callback,
                 batch=batch,
+                automatic=True,
             )
             return
 
@@ -809,11 +996,13 @@ class Data(Tracking):
                 session = self.sessions[index]
 
                 if not session.status["spatial_loaded"]:
-                    raise ValueError(f"Load spatial data for session {index} first.")
+                    raise ValueError(
+                        f"Load spatial data for session {session_label(self, index)} first."
+                    )
 
                 if session.background_template is None:
                     raise ValueError(
-                        f"Session {index} has no original background template."
+                        f"Session {session_label(self, index)} has no original background template."
                     )
 
         except (ValueError, IndexError) as exc:
@@ -844,18 +1033,16 @@ class Data(Tracking):
                 # Refresh dependent geometry without replacing the chosen transform.
                 remap = session.remap
             else:
-                remap = self.propose_session_remapping(
-                    session_id,
-                    background_template=template,
-                )
+                # Aligned by its alignment template (background or footprints).
+                remap = self.propose_session_remapping(session_id)
 
             if not remap.report.success:
                 message = (
-                    f"Automatic alignment of {session.name!r} needs confirmation.\n"
+                    f"Automatic alignment of {session_label(session)} needs confirmation.\n"
                     f"{remap.confirmation}\n"
                     "Check the proposal, then use it, adjust it or remove the session."
                     if remap.confirmation
-                    else f"Automatic alignment failed for {session.name!r}.\n"
+                    else f"Automatic alignment failed for {session_label(session)}.\n"
                     f"Reason: {remap.report.reason or 'unknown'}."
                 )
                 return {
@@ -904,7 +1091,7 @@ class Data(Tracking):
 
         return tasks.start(
             "loading",
-            f"Update alignment for {self.sessions[session_id].name}",
+            f"Update alignment for {session_label(self, session_id)}",
             run,
             on_result=publish,
         )
@@ -957,7 +1144,8 @@ class Data(Tracking):
 
             if plan["load_sessions"]:
                 raise ValueError(
-                    f"Load spatial data for sessions {plan['load_sessions']} first."
+                    f"Load spatial data for sessions "
+                    f"{session_labels(self, plan['load_sessions'])} first."
                 )
 
         except (ValueError, IndexError) as exc:
@@ -1013,17 +1201,31 @@ class Data(Tracking):
         )
 
     def queue_update_model(
-        self, session_id: int, to_present: bool = True, callback=None, *, batch=None
+        self,
+        session_id: int,
+        to_present: bool = True,
+        callback=None,
+        *,
+        batch=None,
+        automatic=False,
     ):
         if batch is not None and batch.cancelled:
             return
 
-        if self.model is not None and self.model.loaded:
-            self.state.issue(
-                "warning",
-                "Model registration not allowed",
-                f"Model '{self.current_model_name}' was loaded from file and cannot be updated. Please create a new model to fit to data.",
-            )
+        # Automatic updates on session registration leave a model loaded
+        # from a file unchanged; explicit processing / fitting updates it.
+        if automatic and self.model is not None and not is_project_set(self.model):
+            if getattr(self, "_loaded_model_notice", None) != id(self.model):
+                self._loaded_model_notice = id(self.model)
+                self.state.issue(
+                    "info",
+                    "Loaded model not updated",
+                    f"Model '{self.current_model_name}' was loaded from a file and is not "
+                    "updated automatically. Use its process button (▶) to update its "
+                    "evidence and fit, or create a new model.",
+                )
+            if callback is not None:
+                callback()
             return
         session = self.sessions[session_id]
 
@@ -1038,7 +1240,7 @@ class Data(Tracking):
 
         self.state.tasks.start(
             "model update",
-            f"Update model for {session.name}",
+            f"Update model for {session_label(session)}",
             self.update_counts,
             session_id=session_id,
             finished=when_finished,
@@ -1101,7 +1303,7 @@ class Data(Tracking):
         self._model_fit_batches = []
         self._model_fit_requested = False
 
-        if self.model is None or self.model.loaded:
+        if self.model is None:
             return
 
         counts = self.model.aggregate_counts(
@@ -1147,10 +1349,6 @@ class Data(Tracking):
         """Fit the current model kind to its evidence (background task)."""
         if self.model is None:
             raise ValueError("No model available.")
-        if self.model.loaded:
-            raise ValueError(
-                "This model was loaded from a file; fitting it is not allowed."
-            )
         if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
             raise ValueError("Wait for current processing to finish before fitting.")
 
@@ -1236,7 +1434,14 @@ class Data(Tracking):
         use_as_working=False,
         replace_empty_model=False,
         on_loaded=None,
+        project_set=False,
+        load_config=None,
     ):
+        """Load a model / assignments file as ``name``. ``project_set``: it
+        belongs to the project (restored from a project file) and is saved
+        with it; otherwise it is a referenced external set. ``load_config``:
+        the assignments' stored load configuration (dict, from a project),
+        instead of the suggested one."""
         if key not in {"model", "assignments"}:
             raise ValueError(f"Unsupported source type: {key}")
 
@@ -1249,6 +1454,8 @@ class Data(Tracking):
                 use_as_working=use_as_working,
                 replace_empty_model=replace_empty_model,
                 on_loaded=on_loaded,
+                project_set=project_set,
+                load_config=load_config,
             ),
             ready=lambda: (
                 not self._model_fit_requested and self.state.current_request is None
@@ -1264,6 +1471,8 @@ class Data(Tracking):
         use_as_working=False,
         replace_empty_model=False,
         on_loaded=None,
+        project_set=False,
+        load_config=None,
     ):
         if key not in {"model", "assignments"}:
             raise ValueError(f"Unsupported source type: {key}")
@@ -1295,7 +1504,7 @@ class Data(Tracking):
         ):
             self.state.issue(
                 "warning",
-                "Working assignments are not empty",
+                "Project assignments are not empty",
                 "Load this file as a separate assignments dataset.",
             )
             return
@@ -1310,6 +1519,8 @@ class Data(Tracking):
                 use_as_working=use_as_working,
                 replace_empty_model=replace_empty_model,
                 on_loaded=on_loaded,
+                project_set=project_set,
+                load_config=load_config,
             )
 
         path = os.path.abspath(os.path.expanduser(os.fspath(path)))
@@ -1341,11 +1552,23 @@ class Data(Tracking):
                 candidate.path = path
 
             else:
-                config = self.state.config_manager.suggest_config_for(
-                    path=path,
-                    source_type="assignments",
-                    ctx=ctx,
-                )
+                config = None
+                if load_config is not None:
+                    try:
+                        config = LoadConfig.from_dict(load_config)
+                        if config.source_type != "assignments":
+                            raise ValueError("not an assignments configuration")
+                    except (ValueError, KeyError, TypeError) as exc:
+                        self.state.logger.warning(
+                            f"Stored load configuration of {path} not used: {exc}"
+                        )
+                        config = None
+                if config is None:
+                    config = self.state.config_manager.suggest_config_for(
+                        path=path,
+                        source_type="assignments",
+                        ctx=ctx,
+                    )
 
                 check = read_operation(
                     "assignments_preflight",
@@ -1362,6 +1585,7 @@ class Data(Tracking):
                 candidate.source_config = config
                 candidate._load_config_problems = check["problems"]
                 candidate.provenance = read_assignments_provenance(path, ctx=ctx)
+                candidate.project_set = bool(project_set)
 
             if ctx is not None:
                 ctx.check_cancelled()
@@ -1401,6 +1625,7 @@ class Data(Tracking):
             if key == "model":
                 # Unchanged since loading: a project save references the file.
                 candidate._saved_fingerprint = model_fingerprint(candidate)
+                candidate.project_set = bool(project_set)
                 # Passing an object avoids the synchronous file-loading path.
                 self.add_model(name, candidate)
             else:
@@ -1497,6 +1722,10 @@ class Data(Tracking):
             )
             background.dims = tuple(reference.dims)
             background.params = deepcopy(reference.params)
+            # An image without footprints: aligned by itself.
+            background.params.pop("alignment_source", None)
+            background.params.pop("footprint_offset", None)
+            background.params.pop("background_correction", None)
             background.background_template = reference.prepare_background_template(
                 image, background_orientation=orientation
             )
@@ -1773,7 +2002,7 @@ class Data(Tracking):
 
             tasks.start(
                 "loading",
-                f"Refine alignment from footprints: {session.name}",
+                f"Refine alignment from footprints: {session_label(session)}",
                 self._build_realignment_update,
                 sid,
                 background_template=session.background_template,
@@ -1879,8 +2108,20 @@ class Data(Tracking):
             background,
             background_orientation=getattr(self, "background_orientation", "auto"),
         )
+        # Proposed as it will be aligned: moved onto the session's footprints
+        # (a new estimate, as on commit with a new background).
+        probe = {}
+        corrected = candidate_template
+        projection = session.footprint_template()
+        if projection is not None and session.background_origin != "footprints":
+            footprint_frame.correct_background(
+                probe, candidate_template, projection, reestimate=True
+            )
+            corrected = footprint_frame.apply_correction(
+                candidate_template, footprint_frame.correction_of(probe)
+            )
         candidate_remap = self.propose_session_remapping(
-            session_id, background_template=(candidate_template)
+            session_id, background_template=corrected
         )
 
         return (candidate_template, candidate_remap)
@@ -1895,14 +2136,14 @@ class Data(Tracking):
             return
 
         if info.get("mode") == "flow_only":
-            title = f"Alignment failed: {session.name}"
+            title = f"Alignment failed: {session_label(session)}"
             recovery = (
                 "Inspect the background and its orientation in Session "
                 "Alignment. Correct them if needed, then rerun alignment "
                 "or apply a manual alignment."
             )
         else:
-            title = f"Flow correction skipped: {session.name}"
+            title = f"Flow correction skipped: {session_label(session)}"
             recovery = (
                 "The rigid alignment remains usable. Inspect it in "
                 "Session Alignment; adjust the geometry or background "
@@ -1924,7 +2165,15 @@ class Data(Tracking):
         remap,
         background_spec,
         expected_version,
+        background_correction=None,
+        alignment_source=None,
+        realign=False,
     ):
+        """``background_correction`` / ``alignment_source``: new values for
+        the session (None keeps them; build_realignment_update). ``realign``:
+        estimate the session's alignment anew from its corrected background
+        (a changed correction moves the background); if that fails, ``remap``
+        is committed and the user is told."""
         if self.state.data_version != expected_version:
             self.state.issue(
                 "warning",
@@ -1955,15 +2204,66 @@ class Data(Tracking):
                 self.state.alignment_draft = None
                 self.state.alignment_draft_changed.emit()
 
+        session = self.sessions[session_id]
+
+        def build():
+            proposal = remap
+            note = None
+            if realign:
+                probe = dict(session.params)
+                if isinstance(background_correction, dict):
+                    footprint_frame.set_correction(
+                        probe, dict(background_correction, source="manual")
+                    )
+                if alignment_source in footprint_frame.ALIGNMENT_SOURCES:
+                    probe["alignment_source"] = alignment_source
+                aligned_by_background = (
+                    probe.get("alignment_source", session.alignment_source) == "background"
+                )
+                if aligned_by_background:
+                    corrected = footprint_frame.apply_correction(
+                        np.asarray(background_template, dtype=np.float32),
+                        footprint_frame.correction_of(probe),
+                    )
+                    candidate = self.propose_session_remapping(
+                        session_id, background_template=corrected
+                    )
+                    if candidate.report.success:
+                        proposal = candidate
+                    else:
+                        note = (
+                            candidate.confirmation
+                            or candidate.report.reason
+                            or "unknown reason"
+                        )
+            result = self._build_realignment_update(
+                session_id,
+                background_template=background_template,
+                remap=proposal,
+                background_spec=background_spec,
+                background_correction=background_correction,
+                alignment_source=alignment_source,
+            )
+            result["realign_note"] = note
+            return result
+
+        def publish_with_note(result):
+            publish(result)
+            if result.get("realign_note"):
+                self.state.issue(
+                    "warning",
+                    f"Alignment kept: {session_label(self, session_id)}",
+                    "The background correction was applied, but the session "
+                    "could not be aligned anew from the corrected background "
+                    f"({result['realign_note']}). Check its alignment in the "
+                    "alignment editor.",
+                )
+
         tasks.start(
             "loading",
-            f"Commit alignment for {self.sessions[session_id].name}",
-            self._build_realignment_update,
-            session_id,
-            background_template=background_template,
-            remap=remap,
-            background_spec=background_spec,
-            on_result=publish,
+            f"Commit alignment for {session_label(self, session_id)}",
+            build,
+            on_result=publish_with_note,
         )
 
     def _publish_realignment_update(self, result, expected_version):
@@ -1982,6 +2282,13 @@ class Data(Tracking):
 
         for sid, values in result["updates"].items():
             self.sessions[sid].__dict__.update(values)
+
+        # The committed background is the loaded one now.
+        session = self.sessions[result["session_id"]]
+        spatial = self.loaded_field_specs(session).get("spatial")
+        background = session.source_config.groups["spatial"].fields.get("background")
+        if spatial is not None and background is not None:
+            spatial["background"] = deepcopy(background)
 
         for sid, records in result["comparison_updates"].items():
             self.sessions[sid].remap.remap_data = records
@@ -2118,6 +2425,8 @@ class Data(Tracking):
                     from_data=session,
                     **kwargs,
                 )
+                # Restored data: its configuration is what was loaded.
+                self.loaded_field_specs(session)
                 registered_ids.append(session_id)
                 added_ids.append(session_id)
 
@@ -2275,9 +2584,21 @@ class Data(Tracking):
         if union is not None and union.included is not None:
             arrays.append(union.included)
 
-        arrays.extend(
-            session.included for session in self.sessions if session.included is not None
-        )
+        # The set's own session inclusion: live for the active set, stored
+        # (item: switching stores it) for the others.
+        if assignments is self.assignments:
+            arrays.extend(
+                session.included
+                for session in self.sessions
+                if session.status["spatial_loaded"] and session.included is not None
+            )
+        else:
+            stored = getattr(assignments, "session_inclusion", None) or {}
+            arrays.extend(
+                stored[str(session.path)]
+                for session in self.sessions
+                if str(session.path) in stored
+            )
 
         for values in arrays:
             values = np.ascontiguousarray(values)
@@ -2342,14 +2663,48 @@ class Data(Tracking):
         if current is not None:
             return Path(current).name[: -len(self.PROJECT_SUFFIX)]
         root = self.root or str(self._default_matching_directory())
-        return Path(root).expanduser().resolve().name or "catan"
+        return lexical_path(root).name or "catan"
 
     def project_path(self):
-        """Main file of the active assignments, or None (not saved yet)."""
+        """Main file of the project (set when saved or opened), else that of
+        the active assignments, or None (not saved yet)."""
+        explicit = getattr(self, "_project_path", None)
+        if explicit:
+            return str(explicit)
         path = getattr(self.assignments, "path", None)
         if path and str(path).endswith(self.PROJECT_SUFFIX):
             return str(path)
         return None
+
+    RECENT_PROJECTS_KEY = "projects/recent"
+    RECENT_PROJECTS_MAX = 10
+
+    def recent_projects(self):
+        """Main files of recently saved / opened projects, newest first."""
+        raw = self.state.settings.value(self.RECENT_PROJECTS_KEY, "[]")
+        try:
+            paths = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+        except (TypeError, ValueError):
+            return []
+        return [str(path) for path in paths if path]
+
+    def _store_recent_projects(self, paths):
+        self.state.settings.setValue(
+            self.RECENT_PROJECTS_KEY,
+            json.dumps(list(paths)[: self.RECENT_PROJECTS_MAX], ensure_ascii=False),
+        )
+
+    def remember_recent_project(self, path):
+        path = str(lexical_path(path))
+        self._store_recent_projects(
+            [path] + [other for other in self.recent_projects() if other != path]
+        )
+
+    def forget_recent_project(self, path=None):
+        """Remove ``path`` from the list (None: clear it)."""
+        self._store_recent_projects(
+            [] if path is None else [p for p in self.recent_projects() if p != str(path)]
+        )
 
     def preset_matches(self, path, config):
         """Whether the required fields of ``config`` exist in ``path``."""
@@ -2413,22 +2768,171 @@ class Data(Tracking):
 
     def model_needs_saving(self, model=None):
         model = self.model if model is None else model
-        if model is None or not (model.fitted or any(model.counts.values())):
+        if model is None or not (
+            model_has_content(model) or self._created_set("model", model)
+        ):
             return False
         path = getattr(model, "path", None)
         return (
             not path
-            or not Path(path).is_file()
+            # Unreachable (dead mount) counts as missing: saved again.
+            or not fs_guard_is_file(path)
             or getattr(model, "_saved_fingerprint", None) != model_fingerprint(model)
         )
 
+    # Model and assignment sets are saved alike: project sets (created in
+    # CATAN or restored as such) with the project, sets loaded from a file
+    # only to a file the user chooses, and only when changed.
+
+    def _sets(self, kind):
+        if kind not in {"model", "assignments"}:
+            raise ValueError(f"Unsupported set kind: {kind}")
+        return self._model if kind == "model" else self._assignments
+
+    def set_has_content(self, kind, item):
+        if kind == "model":
+            return model_has_content(item)
+        return item is not None and (
+            bool(np.any(np.asarray(item.ids) >= 0)) or bool(item.manipulations)
+        )
+
+    def _created_set(self, kind, item):
+        """A set created in CATAN (New, empty / Copy): saved with the
+        project even while empty. The default Working set only with content."""
+        return (
+            item is not None
+            and is_project_set(item)
+            and item is not self._sets(kind).get("local")
+        )
+
+    def assignments_need_saving(self, assignments):
+        if not (
+            self.set_has_content("assignments", assignments)
+            or self._created_set("assignments", assignments)
+        ):
+            return False
+        path = getattr(assignments, "path", None)
+        return (
+            not path
+            or not fs_guard_is_file(path)
+            or getattr(assignments, "_saved_fingerprint", None)
+            != self.assignments_fingerprint(assignments)
+        )
+
+    def set_needs_saving(self, kind, item):
+        if kind == "model":
+            return self.model_needs_saving(item)
+        return self.assignments_need_saving(item)
+
+    def source_set(self, kind, name):
+        """The model / assignment set ``name``, or None."""
+        return self._sets(kind).get(name)
+
+    def model_set(self, name):
+        """The model set ``name``, or None."""
+        return self.source_set("model", name)
+
+    def set_paths(self, kind):
+        """{name: file} of the model / assignment sets that have one."""
+        return {
+            name: str(item.path)
+            for name, item in self._sets(kind).items()
+            if item is not None and getattr(item, "path", None)
+        }
+
+    def model_paths(self):
+        return self.set_paths("model")
+
+    def changed_external_sets(self, kind):
+        """Names of sets loaded from a file and changed since loading or
+        saving: saved only to a file the user chooses (not with the project)."""
+        return [
+            name
+            for name, item in self._sets(kind).items()
+            if item is not None
+            and not is_project_set(item)
+            and self.set_has_content(kind, item)
+            and self.set_needs_saving(kind, item)
+        ]
+
+    def changed_external_models(self):
+        return self.changed_external_sets("model")
+
+    def unsaved_models(self):
+        """Names of models with changes a project save would write (project
+        models) or offer to write (changed external models)."""
+        return [
+            name
+            for name, model in self._model.items()
+            if model is not None and self.model_needs_saving(model)
+        ]
+
+    # Further project assignment sets (the main file holds one): not
+    # ".catan.hdf5", so they are no project main files themselves.
+    SET_SUFFIXES = {"model": ".model.hdf5", "assignments": ".assignments.hdf5"}
+
+    @classmethod
+    def _project_set_file(cls, folder, project, set_name, taken, kind="model"):
+        """File for a project set: ``<project>.model.hdf5`` (models, if no
+        other model uses it), else ``<project>.<set><suffix>``."""
+        suffix = cls.SET_SUFFIXES[kind]
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(set_name)).strip("_") or kind
+        candidates = [folder / f"{project}.{safe}{suffix}"]
+        if kind == "model":
+            candidates.insert(0, folder / f"{project}{suffix}")
+        number = 2
+        while True:
+            for candidate in candidates:
+                if str(candidate) not in taken:
+                    return str(candidate)
+            candidates = [folder / f"{project}.{safe}_{number}{suffix}"]
+            number += 1
+
+    @classmethod
+    def _project_model_file(cls, folder, project, set_name, taken):
+        return cls._project_set_file(folder, project, set_name, taken, "model")
+
+    def _main_assignments_name(self, main_path):
+        """The assignment set the project main file holds: the project set
+        already saved there, else Working, the active set or another project
+        set (with matches first), else Working."""
+        project_sets = [
+            name for name, item in self._assignments.items()
+            if item is not None and is_project_set(item)
+        ]
+        for name in project_sets:
+            path = getattr(self._assignments[name], "path", None)
+            if path and lexical_path(path) == main_path:
+                return name
+        with_content = [
+            name for name in project_sets
+            if self.set_has_content("assignments", self._assignments[name])
+        ]
+        for name in ("local", self.current_assignments, *with_content):
+            if name in with_content:
+                return name
+        if "local" in project_sets:
+            return "local"
+        return self.current_assignments
+
     @after_display_tasks
-    def queue_save_project(self, path, *, finished=None):
-        """Save the active assignments to the main file ``path`` with the
-        sessions and the model next to it (``<name>.sessions.hdf5``,
-        ``<name>.model.hdf5``). Unchanged sessions/model already in a file
-        are referenced instead of written again. References are relative
-        to the main file."""
+    def queue_save_project(
+        self, path, *, finished=None, model_targets=None, assignment_targets=None
+    ):
+        """Save the project: the main file ``path`` holds one assignment set
+        (``_main_assignments_name``) and references to the sessions (written
+        next to it as ``<name>.sessions.hdf5`` unless already in one file) and
+        to all model and assignment sets, with the active ones. Project sets
+        (created in CATAN) are written next to it when changed
+        (``<name>.model.hdf5`` / ``<name>.<set>.model.hdf5``,
+        ``<name>.<set>.assignments.hdf5``); sets loaded from a file are only
+        referenced — a changed one is written where ``model_targets`` /
+        ``assignment_targets`` (name → path, chosen by the user) say, else its
+        file stays unchanged. References are relative to the main file."""
+        targets = {
+            "model": dict(model_targets or {}),
+            "assignments": dict(assignment_targets or {}),
+        }
         tasks = self.state.tasks
         if tasks.processing_busy():
             self.state.issue(
@@ -2441,12 +2945,28 @@ class Data(Tracking):
             self.state.issue("info", "Nothing to save", "No assignments are available.")
             return
 
-        path = Path(path).expanduser().resolve()
+        path = lexical_path(path)
         if not path.name.endswith(self.PROJECT_SUFFIX):
             raise ValueError(f"A project file ends with {self.PROJECT_SUFFIX}.")
         folder = path.parent
         name = path.name[: -len(self.PROJECT_SUFFIX)]
-        folder.mkdir(parents=True, exist_ok=True)
+
+        # GUI thread: a dead network mount must not freeze it.
+        created = fs_guard_probe(
+            lambda p: p.mkdir(parents=True, exist_ok=True) or True, folder
+        )
+        if not created:
+            self.state.issue(
+                "warning",
+                "Project not saved",
+                f"The folder {folder} "
+                + (
+                    "does not respond (network mount hanging?)."
+                    if fs_guard_probe.timed_out
+                    else "cannot be created."
+                ),
+            )
+            return
 
         steps = []
         sessions_file = self.catan_sessions_file() if self.sessions else None
@@ -2454,44 +2974,146 @@ class Data(Tracking):
             sessions_file = str(folder / f"{name}.sessions.hdf5")
             steps.append(lambda then, target=sessions_file: self.queue_save_sessions(target, finished=then))
 
-        model_file = None
-        if self.model is not None and (self.model.fitted or any(self.model.counts.values())):
-            if self.model_needs_saving():
-                model_file = str(folder / f"{name}.model.hdf5")
+        main_set = self._main_assignments_name(path)
+        main_source = self._assignments.get(main_set)
+
+        # Files of the sets: kept where they are unless a project set changed
+        # (written next to the main file) or the user chose a file for a
+        # changed external set.
+        files = {"model": {}, "assignments": {}}
+        taken = {str(path)} | {
+            str(lexical_path(item.path))
+            for kind in files
+            for item in self._sets(kind).values()
+            if item is not None and getattr(item, "path", None)
+        }
+        written = []
+        for kind in ("model", "assignments"):
+            for set_name, item in self._sets(kind).items():
+                if item is None or (kind == "assignments" and set_name == main_set):
+                    continue
+                if not (
+                    self.set_has_content(kind, item) or self._created_set(kind, item)
+                ):
+                    continue
+                current = getattr(item, "path", None)
+                if not self.set_needs_saving(kind, item):
+                    files[kind][set_name] = str(current)
+                    continue
+                if is_project_set(item):
+                    current_lexical = None if not current else lexical_path(current)
+                    if (
+                        current_lexical is not None
+                        and current_lexical != path
+                        and current_lexical.parent == folder
+                        and current_lexical.name.startswith(f"{name}.")
+                    ):
+                        target = str(current_lexical)
+                    else:
+                        target = self._project_set_file(folder, name, set_name, taken, kind)
+                elif targets[kind].get(set_name):
+                    target = str(lexical_path(targets[kind][set_name]))
+                elif current:
+                    # Changes not saved: the project keeps the unchanged file.
+                    files[kind][set_name] = str(current)
+                    continue
+                else:
+                    continue
+                taken.add(target)
+                files[kind][set_name] = target
+                written.append((kind, item, target))
                 steps.append(
-                    lambda then, target=model_file: self.queue_save_result("model", target, finished=then)
+                    lambda then, kind=kind, target=target, source=item: self.queue_save_result(
+                        kind, target, finished=then, source=source
+                    )
                 )
-            else:
-                model_file = str(self.model.path)
 
         def relative(target):
-            return os.path.relpath(Path(target).resolve(), folder)
+            return os.path.relpath(lexical_path(target), folder)
 
         provenance = self.assignments_provenance()
         provenance.pop("model_path", None)
         provenance.pop("sessions_file", None)
         if sessions_file:
             provenance["sessions_file"] = relative(sessions_file)
-        if model_file:
-            provenance["model_path"] = relative(model_file)
+        active_model = self.current_model_name
+        if active_model in files["model"]:
+            # Read by older CATAN versions: the active model only.
+            provenance["model_path"] = relative(files["model"][active_model])
+        if files["model"]:
+            provenance["models"] = json.dumps(
+                [
+                    {
+                        "name": set_name,
+                        "path": relative(file),
+                        "active": set_name == active_model,
+                        "project": is_project_set(self._model[set_name]),
+                    }
+                    for set_name, file in files["model"].items()
+                ],
+                ensure_ascii=False,
+            )
+        # All assignment sets; the main file's own set has path ".".
+        provenance["assignments"] = json.dumps(
+            [
+                {
+                    "name": main_set,
+                    "path": ".",
+                    "active": main_set == self.current_assignments,
+                    "project": True,
+                }
+            ]
+            + [
+                {
+                    "name": set_name,
+                    "path": relative(file),
+                    "active": set_name == self.current_assignments,
+                    "project": is_project_set(self._assignments[set_name]),
+                    # How the file was read (fields of a foreign file), so
+                    # reopening does not ask for the configuration again.
+                    **(
+                        {"load_config": config.to_dict()}
+                        if (config := self._assignments[set_name].source_config)
+                        is not None
+                        else {}
+                    ),
+                }
+                for set_name, file in files["assignments"].items()
+            ],
+            ensure_ascii=False,
+        )
 
-        source = self.assignments
-
-        def assignments_saved():
-            source.path = str(path)
+        def project_saved():
+            self._project_path = str(path)
+            self.remember_recent_project(path)
+            for kind, item, target in written:
+                if kind == "assignments":
+                    item.path = target
+                    item.status["loaded"] = True
+            if main_source is not None:
+                main_source.path = str(path)
+                main_source.project_set = True
+                # The file now holds what is in memory: nothing left to load
+                # (otherwise a new project's registration stays blocked).
+                main_source.status["loaded"] = True
             self.notify_change(C.ASSIGNMENT_SET)
             if finished is not None:
                 finished()
 
         steps.append(
             lambda then: self.queue_save_result(
-                "assignments", str(path), provenance=provenance, finished=then, main_file=True
+                "assignments",
+                str(path),
+                provenance=provenance,
+                finished=then,
+                main_file=True,
+                source=main_source,
             )
         )
 
         def run(index):
             if index == len(steps):
-                assignments_saved()
+                project_saved()
                 return
             steps[index](lambda: run(index + 1))
 
@@ -2522,7 +3144,17 @@ class Data(Tracking):
         names = []
 
         for name, assignments in self._assignments.items():
-            if assignments is None or not np.any(assignments.ids >= 0):
+            if assignments is None:
+                continue
+
+            if self._created_set("assignments", assignments) and not getattr(
+                assignments, "path", None
+            ):
+                # Created in CATAN and never saved, even while empty.
+                names.append(name)
+                continue
+
+            if not np.any(assignments.ids >= 0):
                 continue
 
             saved = getattr(assignments, "_saved_fingerprint", None)
@@ -2533,10 +3165,13 @@ class Data(Tracking):
         return names
 
     @after_display_tasks
-    def queue_save_result(self, key, path, *, provenance=None, finished=None, main_file=False):
+    def queue_save_result(
+        self, key, path, *, provenance=None, finished=None, main_file=False, source=None
+    ):
         """Save the model or the assignments. ``provenance`` (assignments):
         references stored with them (default: assignments_provenance());
-        ``finished`` runs after a successful save."""
+        ``finished`` runs after a successful save; ``source``: the model /
+        assignments to save (default: the active one)."""
         if key not in {"model", "assignments"}:
             raise ValueError(f"Unsupported result type: {key}")
 
@@ -2551,7 +3186,8 @@ class Data(Tracking):
             )
             return
 
-        source = getattr(self, key)
+        if source is None:
+            source = getattr(self, key)
 
         if source is None:
             self.state.issue(
@@ -2568,11 +3204,18 @@ class Data(Tracking):
         try:
             prepared = (
                 source.prepare_save(
-                    sessions=tuple(self.sessions),
+                    # An inactive set's own inclusion and synthetic components.
+                    sessions=tuple(self.staged_sessions_for(source)),
                     provenance=(
                         self.assignments_provenance() if provenance is None else provenance
                     ),
-                    overview_background=self._overview_background_snapshot(),
+                    # Display state of the project: with the main file (or a
+                    # single export), not with further sets.
+                    overview_background=(
+                        self._overview_background_snapshot()
+                        if main_file or source is self.assignments
+                        else None
+                    ),
                     main_file=main_file,
                 )
                 if key == "assignments"
@@ -2599,6 +3242,8 @@ class Data(Tracking):
             fingerprint = model_fingerprint(source)
 
             def saved():
+                # A created model stays a project model once it has a file.
+                source.project_set = is_project_set(source)
                 # Referenced by assignments saved later.
                 source.path = os.path.abspath(os.path.expanduser(str(path)))
                 source._saved_fingerprint = fingerprint
@@ -2622,7 +3267,10 @@ class Data(Tracking):
         *,
         include_missing=False,
         seed=0,
+        review_statuses=None,
     ):
+        """``review_statuses``: export only neurons in these review states
+        (None: all); the others are left out of the export copies."""
         from catan.core.redetection import build_seeds
         from catan.gui.background_tasks.runtime import TaskCancelled
 
@@ -2707,6 +3355,18 @@ class Data(Tracking):
         union.footprints = source.union.footprints.copy()
         union.included = np.asarray(source.union.included, dtype=bool).copy()
 
+        if review_statuses is not None:
+            # Left-out neurons: excluded in the copies only.
+            status = np.asarray(source.review_status)
+            left_out = ~np.isin(status, [int(s) for s in review_statuses])
+            union.included[left_out] = False
+            for session_id, item in enumerate(sessions):
+                if session_id >= ids.shape[1]:
+                    continue
+                footprints = ids[left_out, session_id]
+                footprints = footprints[(footprints >= 0) & (footprints < len(item.included))]
+                item.included[footprints] = False
+
         jobs = [(int(session_id), str(path)) for session_id, path in jobs]
 
         destination_keys = [os.path.normcase(os.path.abspath(path)) for _, path in jobs]
@@ -2744,7 +3404,7 @@ class Data(Tracking):
                 values = prepared = A = None
 
                 try:
-                    ctx.message(f"Preparing redetection seeds: {session.name}")
+                    ctx.message(f"Preparing redetection seeds: {session_label(session)}")
 
                     values = build_seeds(
                         sessions,
@@ -2815,19 +3475,19 @@ class Data(Tracking):
 
                     if omitted:
                         issues.append(
-                            f"{session.name}: omitted {omitted} seeds "
+                            f"{session_label(session)}: omitted {omitted} seeds "
                             "because no detected location was available "
                             "or the seed fell outside the imaging window. "
                             "Their IDs are stored in omitted_ids."
                         )
 
-                    ctx.message(f"Exported {session.name}: " f"{A.shape[1]} seeds")
+                    ctx.message(f"Exported {session_label(session)}: " f"{A.shape[1]} seeds")
 
                 except TaskCancelled:
                     raise
 
                 except Exception as exc:
-                    issues.append(f"{session.name}: {exc}")
+                    issues.append(f"{session_label(session)}: {exc}")
 
                 finally:
                     # Release this session's output before loading
@@ -2898,7 +3558,7 @@ class Data(Tracking):
 
         return tasks.start(
             "saving",
-            f"Saving inclusion: {session.name}",
+            f"Saving inclusion: {session_label(session)}",
             save_prepared_file_task,
             self.state,
             str(path),
@@ -3139,6 +3799,39 @@ class Data(Tracking):
             C.MODEL_COUNTS, C.MODEL_PARAMETERS, C.PROCESSING_STATUS
         )  # Notify that model has changed
 
+    def copy_model(self, name: str):
+        """Independent copy of the current model (evidence, parameters, fit
+        state) as the new current model ``name``; it is not tied to the
+        source's file, so it is saved like a new model."""
+        name = str(name).strip()
+        source = self.model
+        if not name or name in self._model:
+            self.state.issue(
+                "warning",
+                "Model not copied",
+                "Choose a non-empty name that is not already in use.",
+            )
+            return False
+        if source is None:
+            self.state.issue("info", "Model not copied", "No current model to copy.")
+            return False
+        tasks = self.state.tasks
+        if tasks.processing_busy() or tasks.processing_requested:
+            self.state.issue(
+                "info",
+                "Model not copied",
+                "Wait for current processing to finish, then copy the model.",
+            )
+            return False
+        model = deepcopy(source)
+        model.loaded = False
+        model.path = None
+        model._saved_fingerprint = None
+        model.source_config = None
+        model.project_set = True
+        self.add_model(name, model)
+        return True
+
     def change_model(self, name: str):
         super().change_model(name)
         self.notify_change(
@@ -3238,6 +3931,91 @@ class Data(Tracking):
 
         return True
 
+    def clear_workspace(self):
+        """Remove all sessions, models and assignment sets (a fresh start,
+        e.g. before loading another animal). Working stays as an empty
+        model and assignment set; the root folder is kept. Saving is the
+        caller's business (MainWindow.clean_workspace). Returns False when
+        processing is still running."""
+        from catan.core.memory import release_free_memory
+
+        tasks = self.state.tasks
+        if (
+            tasks.tasks
+            or tasks.processing_busy()
+            or tasks.processing_requested
+            or tasks.has_deferred_processing()
+        ):
+            self.state.issue(
+                "info",
+                "Workspace not cleared",
+                "Finish or cancel the current operations first.",
+            )
+            return False
+
+        sessions = list(self.sessions)
+
+        # Interaction state refers to the old sessions and neurons.
+        self.state.alignment_draft = None
+        self.state.alignment_pending_reference = None
+        self.reset_data()
+        self.current_session = None
+
+        # Without notifying yet: one change below once everything is reset.
+        self._model = {}
+        Tracking.add_model(self, "local")
+
+        working = Assignments()
+        working.source_config = self.state.config_manager.suggest_config_for(
+            path=None, source_type="assignments"
+        )
+        self._assignments = {"local": working}
+        self._current_assignments = "local"
+        self._stale_assignments = {"local": set()}
+        self._ensure_assignment_session_count(working)
+
+        self._project_path = None
+        self._loaded_model_notice = None
+        self._model_fit_requested = False
+        self._model_fit_batches = []
+        self.alignment_offsets = []
+        self.overview_background = None
+        self._comparison_cache = {}
+        self._inactive_views = {}
+        # Pending union refreshes belong to the old assignments.
+        self._union_refresh = {
+            "assignments": None,
+            "neurons": set(),
+            "token": self._union_refresh["token"] + 1,
+        }
+        self.statistic_engine.clear_cache()
+
+        self.state.apply_session_change(
+            working.ids, {index: None for index in range(len(sessions))}, {}
+        )
+        self.state.current_session_id = None
+        self.state.alignment_draft_changed.emit()
+
+        self.notify_change(
+            C.SESSION_REMOVED,
+            C.ASSIGNMENT_SET,
+            *ASSIGNMENT_CONTENT_CHANGES,
+            C.FOOTPRINT_GEOMETRY,
+            C.BACKGROUND_IMAGE,
+            C.OVERVIEW_BACKGROUND,
+            C.ALIGNMENT_SETTINGS,
+            C.DATA_AVAILABILITY,
+            C.MODEL_COUNTS,
+            C.MODEL_PARAMETERS,
+        )
+
+        for session in sessions:
+            self.state.alignment_review_finished.emit(session)
+
+        del sessions
+        release_free_memory()
+        return True
+
     def can_replace_empty_model(self, name=None):
         if name is None:
             name = self.current_model_name
@@ -3302,7 +4080,9 @@ class Data(Tracking):
                 background = exc
             self._apply_stored_overview_background(background)
 
-    def queue_load_assignments(self, *, on_config_required=None):
+    def queue_load_assignments(self, *, on_config_required=None, on_loaded=None):
+        """Load the active (registered, not yet loaded) assignment set;
+        ``on_loaded`` runs after it was published."""
         source = self.assignments
         source_name = self.current_assignments
 
@@ -3314,6 +4094,7 @@ class Data(Tracking):
         if self._source_loading_ready():
             return self._queue_load_assignments_now(
                 on_config_required=on_config_required,
+                on_loaded=on_loaded,
             )
 
         def dispatch():
@@ -3332,6 +4113,7 @@ class Data(Tracking):
 
             self._queue_load_assignments_now(
                 on_config_required=on_config_required,
+                on_loaded=on_loaded,
             )
 
         return self.state.tasks.queue_after_processing(
@@ -3342,12 +4124,13 @@ class Data(Tracking):
             ),
         )
 
-    def _queue_load_assignments_now(self, *, on_config_required=None):
+    def _queue_load_assignments_now(self, *, on_config_required=None, on_loaded=None):
         tasks = self.state.tasks
 
         if not self._source_loading_ready():
             return self.queue_load_assignments(
                 on_config_required=on_config_required,
+                on_loaded=on_loaded,
             )
 
         source = self.assignments
@@ -3512,8 +4295,8 @@ class Data(Tracking):
             if use_as_working and not self.can_use_working_assignments():
                 self.state.issue(
                     "warning",
-                    "Working assignments were not replaced",
-                    "The working assignments are no longer empty. "
+                    "Project assignments were not replaced",
+                    "The Project assignments are no longer empty. "
                     "Load the file again as a separate dataset.",
                 )
                 return
@@ -3558,6 +4341,9 @@ class Data(Tracking):
             self._apply_stored_overview_background(
                 source.__dict__.pop("_overview_background", None)
             )
+
+            if on_loaded is not None:
+                on_loaded()
 
         return tasks.start(
             "loading",
@@ -3934,7 +4720,8 @@ class Data(Tracking):
 
             if plan["load_sessions"]:
                 raise ValueError(
-                    f"Load spatial data for sessions {plan['load_sessions']} first."
+                    f"Load spatial data for sessions "
+                    f"{session_labels(self, plan['load_sessions'])} first."
                 )
 
         except (ValueError, IndexError) as exc:
@@ -4243,6 +5030,11 @@ class Data(Tracking):
                 )
                 return
 
+            # Created in this project: saved with it, not into the source's file.
+            candidate.path = None
+            candidate.project_set = True
+            candidate._saved_fingerprint = None
+            candidate.provenance = None
             self._assignments[name] = candidate
             self._stale_assignments[name] = stale
 
@@ -4281,7 +5073,7 @@ class Data(Tracking):
         for session in self.sessions:
             if not session.path or session.source_config is None:
                 raise ValueError(
-                    f"Session {session.name!r} has no source path or load configuration."
+                    f"Session {session_label(session)} has no source path or load configuration."
                 )
 
             options = dict(
@@ -4304,6 +5096,21 @@ class Data(Tracking):
             # The displayed background may have been constructed from footprints.
             if session.background_origin == "footprints":
                 options["background_mode"] = "footprints"
+
+            # Footprints relative to their background (core.footprint_frame).
+            options.pop("alignment_source", None)
+            options.pop("footprint_offset", None)
+            options.pop("background_correction", None)
+            if session.params.get("alignment_source") is not None:
+                options["alignment_source"] = session.params["alignment_source"]
+            correction = session.background_correction
+            # Estimated corrections are estimated again on loading; a manual
+            # one is kept (rigid part: a flow field does not fit a recipe).
+            if correction is not None and correction.get("source") != "auto":
+                options["background_correction"] = {
+                    "shift": [float(value) for value in correction["shift"]],
+                    "rotation": float(correction.get("rotation", 0.0)),
+                }
 
             entries.append(
                 {
@@ -4407,6 +5214,31 @@ class Data(Tracking):
                 if not isinstance(options["correct_rotation"], bool):
                     raise ValueError("correct_rotation must be true or false.")
 
+                if options.get("alignment_source") not in {None, "background", "footprints"}:
+                    raise ValueError("Invalid alignment source.")
+
+                if "footprint_offset" in options:
+                    offset = np.asarray(options["footprint_offset"], dtype=float)
+                    if offset.shape != (2,) or not np.isfinite(offset).all():
+                        raise ValueError("footprint_offset must be two numbers (dx, dy).")
+
+                if "background_correction" in options:
+                    correction = options["background_correction"]
+                    shift = np.asarray(
+                        (correction or {}).get("shift", ()), dtype=float
+                    ).reshape(-1)
+                    rotation = (correction or {}).get("rotation", 0.0)
+                    if (
+                        not isinstance(correction, dict)
+                        or shift.shape != (2,)
+                        or not np.isfinite(shift).all()
+                        or not isinstance(rotation, (int, float))
+                    ):
+                        raise ValueError(
+                            "background_correction must be "
+                            '{"shift": [dx, dy], "rotation": degrees}.'
+                        )
+
                 session = SessionData(
                     path=source,
                     name=entry.get("name"),
@@ -4442,7 +5274,7 @@ class Data(Tracking):
 
         self.state.tasks.start(
             "calculating",
-            f"Register neurons for {session.name}",
+            f"Register neurons for {session_label(session)}",
             fn,
             ready=lambda session=session, session_id=session_id: (
                 session.status["aligned"]
@@ -4561,14 +5393,15 @@ class Data(Tracking):
 
         if footprint_id < 0:
             raise ValueError(
-                f"Neuron {neuron_id} has no footprint " f"in session {session_id}."
+                f"Neuron {neuron_id} has no footprint "
+                f"in session {session_label(self, session_id)}."
             )
 
         session = self.sessions[session_id]
 
         if not (0 <= footprint_id < session.n_neurons):
             raise ValueError(
-                f"Invalid footprint ID {footprint_id} " f"for session {session_id}."
+                f"Invalid footprint ID {footprint_id} " f"for session {session_label(self, session_id)}."
             )
 
         # ---------------------------------------------
@@ -4682,6 +5515,118 @@ class Data(Tracking):
             self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
 
         return retired
+
+    def replace_footprints_with_union(
+        self, components, *, skipped=None
+    ) -> list[NeuronComponent]:
+        """Give footprints the shape of their neuron's union built from its
+        other footprints, placed at each footprint's own centroid. The
+        footprints keep their IDs and activity. Per neuron, at least one
+        other included footprint must remain to build the union from.
+
+        ``skipped``: a list collecting (component, reason) of footprints
+        that cannot be replaced; without it they raise ValueError."""
+
+        def refuse(neuron_id, sessions, reason):
+            if skipped is None:
+                raise ValueError(reason)
+            skipped.extend((NeuronComponent(neuron_id, s), reason) for s in sessions)
+        from catan.core.redetection import detected_position, place_footprint
+
+        if self.assignments is None or self.assignments.union is None:
+            raise ValueError("Load or calculate assignments first.")
+
+        ids = self.assignments.ids
+        replaced = self.replaced_shape_footprints()
+        by_neuron = {}
+        for component in components:
+            if component.session_id is None or not self.is_included(component):
+                continue
+            by_neuron.setdefault(int(component.neuron_id), set()).add(
+                int(component.session_id)
+            )
+
+        plans = []
+        for neuron_id, sessions in sorted(by_neuron.items()):
+            remaining = [
+                int(s)
+                for s in np.flatnonzero(ids[neuron_id] >= 0)
+                if int(s) not in sessions
+                and self.sessions[int(s)].included[int(ids[neuron_id, s])]
+            ]
+            if not remaining:
+                refuse(
+                    neuron_id,
+                    sorted(sessions),
+                    f"Neuron {neuron_id}: no other footprint remains to build "
+                    "the union from.",
+                )
+                continue
+
+            # Prefer detected shapes: footprints replaced earlier are union
+            # shapes themselves.
+            detected = [
+                s for s in remaining if (s, int(ids[neuron_id, s])) not in replaced
+            ]
+            remaining = detected or remaining
+
+            union = self.partial_union_footprint(neuron_id, remaining)
+
+            for session_id in sorted(sessions):
+                session = self.sessions[session_id]
+                fp_id = int(ids[neuron_id, session_id])
+                shape = place_footprint(
+                    union, tuple(session.dims), detected_position(session, fp_id)
+                )
+                if shape is None:
+                    refuse(
+                        neuron_id,
+                        [session_id],
+                        f"Neuron {neuron_id}, {session_label(self, session_id)}: "
+                        "the union shape lies outside the image.",
+                    )
+                    continue
+                plans.append((neuron_id, session_id, fp_id, shape, remaining))
+
+        replaced = []
+        for neuron_id, session_id, fp_id, shape, remaining in plans:
+            self.sessions[session_id].replace_footprint(fp_id, shape)
+            ref = {
+                "session_id": session_id,
+                "neuron_id": neuron_id,
+                "footprint_id": fp_id,
+            }
+            record_id = self.assignments.register_manipulation(
+                manipulation_type="replace_shape",
+                origin=[ref],
+                sources=[
+                    {
+                        "session_id": s,
+                        "neuron_id": neuron_id,
+                        "footprint_id": int(ids[neuron_id, s]),
+                    }
+                    for s in remaining
+                ],
+                results=[ref],
+                shapes=[shape],
+                affected_neurons=[neuron_id],
+            )
+            # Undoable (format 2): no footprint changes its neuron.
+            self.assignments.manipulations[record_id].update(
+                format=2, before=[], after=[], review_before=[],
+                created=[], excluded=[], included=[],
+            )
+            replaced.append(NeuronComponent(neuron_id, session_id))
+
+        if replaced:
+            self.update_moved_footprint_stats(
+                [(n, n, s) for n, s, *_ in plans]
+            )
+            self.rebuild_union_neurons(sorted({n for n, *_ in plans}))
+            self.state.assignments = self.assignments.ids
+            self.notify_change(C.FOOTPRINT_GEOMETRY, *ASSIGNMENT_CONTENT_CHANGES)
+
+        return replaced
 
     def reinclude_component(self, component: NeuronComponent | int) -> None:
 
@@ -4832,6 +5777,19 @@ class Data(Tracking):
 
         return target_neuron
 
+    def replaced_shape_footprints(self) -> set[tuple[int, int]]:
+        """(session_id, footprint_id) of footprints whose shape the active
+        assignment set replaced (replace_footprints_with_union)."""
+        if self.assignments is None:
+            return set()
+        return {
+            (int(ref["session_id"]), int(ref["footprint_id"]))
+            for manipulation in self.assignments.manipulations.values()
+            if manipulation["type"] == "replace_shape"
+            and not manipulation.get("undone")
+            for ref in manipulation.get("results", [])
+        }
+
     def partial_union_footprint(self, neuron_id, sessions):
         """Union footprint of a neuron built from ``sessions`` only (as
         rebuilding the union would after removing the other footprints)."""
@@ -4928,7 +5886,37 @@ class Data(Tracking):
 
         return commit(self, prepared)
 
-    def _apply_manipulation(self, kind, sources, targets):
+    def manipulation_undo_chain(self, record_ids):
+        """Records undone together with ``record_ids`` (one or several,
+        newest first): they and the later manipulations depending on them."""
+        from catan.gui.data.curation_actions import undo_chain
+
+        return undo_chain(self, record_ids)
+
+    def undo_manipulations(self, record_ids, *, finished=None):
+        """Undo a chain of manipulation records (see
+        manipulation_undo_chain) as one isolated, committed change.
+        ``finished(prepared)`` gets the result (``prepared.notes``: footprints
+        that could not go back to their neuron)."""
+        from catan.gui.data.curation_actions import ValidationReport, prepare_undo
+
+        if self.state.tasks.processing_busy() or self.state.tasks.processing_requested:
+            raise ValueError("Wait for current processing to finish.")
+
+        def perform():
+            prepared = prepare_undo(self, record_ids)
+            prepared.validation = ValidationReport("passed")
+            result = self.commit_manipulation(prepared)
+            if finished is not None:
+                finished(result)
+            return result
+
+        if self.state.tasks.defer_for_background(perform):
+            return None
+        return perform()
+
+    def _apply_manipulation(self, kind, sources, targets, **resolution):
+        """``resolution``: detach_occupied / exclude_occupied, see prepare()."""
         from catan.gui.data.curation_actions import (
             ManipulationPlan,
             ManipulationSpec,
@@ -4942,7 +5930,7 @@ class Data(Tracking):
         )
 
         def perform():
-            prepared = self.prepare_manipulation(plan)
+            prepared = self.prepare_manipulation(plan, **resolution)
 
             prepared.validation = self.validate_prepared_manipulation(
                 prepared,
@@ -4995,7 +5983,9 @@ class Data(Tracking):
             target,
         )
 
-    def reassign_footprint(self, source, target_neuron=None):
+    def reassign_footprint(self, source, target_neuron=None, *, occupied=None):
+        """occupied: None (raise OccupiedDestination), "exclude" or "detach"
+        the footprint the target neuron already has in this session."""
         return self._apply_manipulation(
             ("new_neuron" if target_neuron is None else "reassign"),
             (source,),
@@ -5009,6 +5999,8 @@ class Data(Tracking):
                     ),
                 )
             ),
+            detach_occupied=occupied == "detach",
+            exclude_occupied=occupied == "exclude",
         )
 
     def _merge_neuron_request_inplace(self, request):
@@ -5027,9 +6019,8 @@ class Data(Tracking):
         source = request.source_id
         target = request.target_id
 
-        if self.neuron_merge_distance(source, target) > 10.0:
-            raise ValueError("The union centroids are now more than 10 px apart.")
-
+        # No distance limit: the target was chosen deliberately (the
+        # curator batch keeps its 10 px check).
         # Prepare changes separately. Publish only after union rebuilding
         # and row compaction have succeeded.
         candidate = copy(assignments)
@@ -5220,6 +6211,12 @@ class Data(Tracking):
         origin_refs = [component_ref(component) for component in request.origin]
         source_refs = [component_ref(component) for component in sources]
 
+        # A split with one source: the rest of the target becomes a new
+        # neuron (computed before the target is retired).
+        remainder = None
+        if request.type == "split" and len(sources) == 1:
+            remainder = self._remainder_footprint(origin_refs[0], source_refs)
+
         # ============================================
         # Retire original detections
         # ============================================
@@ -5241,6 +6238,17 @@ class Data(Tracking):
             )
             added_components.append(added_component)
 
+        remainders = []
+        if remainder is not None:
+            new_neuron_id = len(self.assignments.ids)
+            self.assignments.pad_empty(n_neurons=1, n_sessions=0)
+            remainders.append(
+                self._add_footprint_to_neuron(
+                    remainder, target_session_id, new_neuron_id
+                )
+            )
+            target_neurons.append(new_neuron_id)
+
         # Only expose the finished transaction to GUI /
         # statistics.
         self.state.assignments = self.assignments.ids
@@ -5249,6 +6257,7 @@ class Data(Tracking):
             origin=origin_refs,
             sources=source_refs,
             results=[component_ref(comp) for comp in added_components],
+            remainders=[component_ref(comp) for comp in remainders],
             affected_neurons=target_neurons,
         )
 
@@ -5256,6 +6265,43 @@ class Data(Tracking):
             C.FOOTPRINT_GEOMETRY,
             *ASSIGNMENT_CONTENT_CHANGES,
         )
+
+        return [*added_components, *remainders]
+
+    def _remainder_footprint(self, origin_ref, source_refs):
+        """The origin footprint without its source pieces (see
+        catan.core.footprint_remainder)."""
+        from catan.core.footprint_remainder import remainder_footprint
+
+        origin_session = self.sessions[int(origin_ref["session_id"])]
+        whole = origin_session.footprints[:, int(origin_ref["footprint_id"])]
+        pieces = [
+            self.sessions[int(ref["session_id"])].footprints[
+                :, int(ref["footprint_id"])
+            ]
+            for ref in source_refs
+        ]
+
+        remainder = remainder_footprint(whole, pieces)
+        if remainder is None:
+            raise ValueError(
+                "Nothing of the target footprint remains outside the source."
+            )
+        return remainder
+
+    def _add_footprint_to_neuron(self, footprint, session_id, neuron_id):
+        """Append ``footprint`` to a session as a synthetic component and
+        assign it to the empty slot (neuron_id, session_id)."""
+        target_session = self.sessions[session_id]
+        new_fp_id = target_session.append_synthetic_component(footprint)
+
+        self.assignments.ids[neuron_id, session_id] = new_fp_id
+        self.update_moved_footprint_stats([(None, neuron_id, int(session_id))])
+        self.rebuild_union_neurons([neuron_id])
+        self.assignments.union.included[neuron_id] = True
+        self.state.assignments = self.assignments.ids
+
+        return NeuronComponent(neuron_id, session_id)
 
     def restore_manipulations(self) -> None:
         """
@@ -5272,6 +6318,35 @@ class Data(Tracking):
 
         for manipulation_id in sorted(self.assignments.manipulations):
             manipulation = self.assignments.manipulations[manipulation_id]
+
+            # Replaced shapes: the stored shape, footprint IDs unchanged
+            # (none for an undone replacement: the detected shape stays).
+            if manipulation["type"] == "replace_shape" and manipulation.get("undone"):
+                continue
+            if manipulation["type"] == "replace_shape":
+                from catan.core.redetection import detected_position, place_footprint
+
+                shapes = list(manipulation.get("shapes", []))
+                for k, (ref, shape) in enumerate(
+                    zip(manipulation.get("results", []), shapes)
+                ):
+                    session = self.sessions[int(ref["session_id"])]
+                    if int(ref["footprint_id"]) >= session.n_neurons:
+                        raise ValueError(
+                            f"Manipulation {manipulation_id} references a "
+                            "missing footprint."
+                        )
+                    # Centred on the detected shape (older records placed
+                    # the union with x and y swapped).
+                    fp_id = int(ref["footprint_id"])
+                    placed = place_footprint(
+                        shape, tuple(session.dims), detected_position(session, fp_id)
+                    )
+                    if placed is not None:
+                        shapes[k] = shape = placed
+                    session.replace_footprint(fp_id, shape)
+                manipulation["shapes"] = shapes
+                continue
 
             # -----------------------------------------
             # Restore excluded origin footprints
@@ -5312,6 +6387,31 @@ class Data(Tracking):
                     result_ref=result_ref,
                     manipulation_id=manipulation_id,
                 )
+
+            # Split with one source: the rest of the origin, appended after
+            # the copied pieces (as when it was applied).
+            for result_ref in manipulation.get("remainders", []):
+                session = self.sessions[int(result_ref["session_id"])]
+                footprint_id = int(result_ref["footprint_id"])
+
+                if (
+                    footprint_id < session.n_neurons
+                    and footprint_id < len(session.synthetic)
+                    and session.synthetic[footprint_id]
+                ):
+                    continue
+
+                if footprint_id != session.n_neurons:
+                    raise ValueError(
+                        f"Cannot restore manipulation {manipulation_id}: "
+                        f"expected next footprint ID {session.n_neurons}, "
+                        f"but the saved remainder uses {footprint_id}."
+                    )
+
+                remainder = self._remainder_footprint(
+                    manipulation["origin"][0], sources
+                )
+                session.append_synthetic_component(remainder)
 
     def _restore_synthetic_component(
         self, *, source_ref: dict, result_ref: dict, manipulation_id: int

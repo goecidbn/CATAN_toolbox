@@ -1,0 +1,79 @@
+{
+  "schema_version": 2,
+  "name": "Cleanup: size outliers",
+  "category": "footprints",
+  "root": {
+    "type": "group",
+    "id": "e61f002e4fe642a994659ef8c21d28ac",
+    "operator": "or",
+    "match_level": "footprint",
+    "children": [
+      {
+        "type": "condition",
+        "id": "9f0f23187b71437787e72f21e61d9c39",
+        "query": {
+          "statistic_key": "relative_footprint_size",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic",
+          "parameters": {
+            "thr": 0.1
+          }
+        },
+        "threshold": {
+          "direction": "less",
+          "active": true,
+          "value": 0.5
+        }
+      },
+      {
+        "type": "condition",
+        "id": "df95ac225a414aa7ab8efe120164c3ad",
+        "query": {
+          "statistic_key": "relative_footprint_size",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic",
+          "parameters": {
+            "thr": 0.1
+          }
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 2.0
+        }
+      }
+    ],
+    "count": null,
+    "comment": "Footprints less than half or more than twice the median size of their neuron's footprints: possibly a fragment, a merge with a neighbour or a misassignment. For review (no action).",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": null,
+    "review_statuses": null
+  }
+}

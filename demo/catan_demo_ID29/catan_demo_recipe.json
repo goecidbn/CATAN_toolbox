@@ -1,0 +1,394 @@
+{
+  "type": "catan-loading-recipe",
+  "version": 1,
+  "sessions": [
+    {
+      "path": "20240719/results_CaImAn_20240719_29_barnstedt_20260222233006_Medien_XY.hdf5",
+      "name": "20240719",
+      "load_config": {
+        "format_version": 1,
+        "source_type": "session",
+        "public": true,
+        "native": true,
+        "groups": {
+          "spatial": {
+            "title": "Spatial data",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+              "footprints": {
+                "path": "/estimates/A",
+                "source": "field",
+                "attribute": null,
+                "required": true,
+                "source_path": null
+              },
+              "background": {
+                "path": "/image",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": "mc/ID29_20240719_Cn.tiff"
+              }
+            }
+          },
+          "quality": {
+            "title": "Quality data",
+            "type": "dynamic",
+            "enabled": true,
+            "fields": {
+              "SNR": {
+                "path": "/estimates/SNR_comp",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "CNN": {
+                "path": "/estimates/cnn_preds",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "r-values": {
+                "path": "/estimates/r_values",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              }
+            }
+          },
+          "traces": {
+            "title": "Trace data",
+            "type": "dynamic",
+            "enabled": false,
+            "fields": {
+              "C": {
+                "path": "/estimates/C",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "F_dff_dec": {
+                "path": "/estimates/F_dff_dec",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "S_dff": {
+                "path": "/estimates/S_dff",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              }
+            }
+          }
+        },
+        "subconfigs": {},
+        "uid": "4fb5ee51-00f8-4db9-a3ba-4210b60b3f87",
+        "name": "CaImAn"
+      },
+      "load_options": {
+        "background_orientation": "transpose",
+        "correct_rotation": false,
+        "background_mode": "configured"
+      }
+    },
+    {
+      "path": "20240720/results_CaImAn_20240720_29_barnstedt_20260223002652_Medien_XY.hdf5",
+      "name": "20240720",
+      "load_config": {
+        "format_version": 1,
+        "source_type": "session",
+        "public": true,
+        "native": true,
+        "groups": {
+          "spatial": {
+            "title": "Spatial data",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+              "footprints": {
+                "path": "/estimates/A",
+                "source": "field",
+                "attribute": null,
+                "required": true,
+                "source_path": null
+              },
+              "background": {
+                "path": "/image",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": "mc/ID29_20240720_Cn.tiff"
+              }
+            }
+          },
+          "quality": {
+            "title": "Quality data",
+            "type": "dynamic",
+            "enabled": true,
+            "fields": {
+              "SNR": {
+                "path": "/estimates/SNR_comp",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "CNN": {
+                "path": "/estimates/cnn_preds",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "r-values": {
+                "path": "/estimates/r_values",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              }
+            }
+          },
+          "traces": {
+            "title": "Trace data",
+            "type": "dynamic",
+            "enabled": false,
+            "fields": {
+              "C": {
+                "path": "/estimates/C",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "F_dff_dec": {
+                "path": "/estimates/F_dff_dec",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "S_dff": {
+                "path": "/estimates/S_dff",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              }
+            }
+          }
+        },
+        "subconfigs": {},
+        "uid": "e3266bd6-a608-422d-aa7f-2ac19e853b1b",
+        "name": "CaImAn"
+      },
+      "load_options": {
+        "background_orientation": "transpose",
+        "correct_rotation": false,
+        "background_mode": "configured"
+      }
+    },
+    {
+      "path": "20240721/results_CaImAn_20240721_29_barnstedt_20260223010258_Medien_XY.hdf5",
+      "name": "20240721",
+      "load_config": {
+        "format_version": 1,
+        "source_type": "session",
+        "public": true,
+        "native": true,
+        "groups": {
+          "spatial": {
+            "title": "Spatial data",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+              "footprints": {
+                "path": "/estimates/A",
+                "source": "field",
+                "attribute": null,
+                "required": true,
+                "source_path": null
+              },
+              "background": {
+                "path": "/image",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": "mc/ID29_20240721_Cn.tiff"
+              }
+            }
+          },
+          "quality": {
+            "title": "Quality data",
+            "type": "dynamic",
+            "enabled": true,
+            "fields": {
+              "SNR": {
+                "path": "/estimates/SNR_comp",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "CNN": {
+                "path": "/estimates/cnn_preds",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "r-values": {
+                "path": "/estimates/r_values",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              }
+            }
+          },
+          "traces": {
+            "title": "Trace data",
+            "type": "dynamic",
+            "enabled": false,
+            "fields": {
+              "C": {
+                "path": "/estimates/C",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "F_dff_dec": {
+                "path": "/estimates/F_dff_dec",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "S_dff": {
+                "path": "/estimates/S_dff",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              }
+            }
+          }
+        },
+        "subconfigs": {},
+        "uid": "cae5c693-ac56-4730-9cc0-a5591703be23",
+        "name": "CaImAn"
+      },
+      "load_options": {
+        "background_orientation": "transpose",
+        "correct_rotation": false,
+        "background_mode": "configured"
+      }
+    },
+    {
+      "path": "20240722/results_CaImAn_20240722_29_barnstedt_20260223013725_Medien_XY.hdf5",
+      "name": "20240722",
+      "load_config": {
+        "format_version": 1,
+        "source_type": "session",
+        "public": true,
+        "native": true,
+        "groups": {
+          "spatial": {
+            "title": "Spatial data",
+            "type": "static",
+            "enabled": true,
+            "fields": {
+              "footprints": {
+                "path": "/estimates/A",
+                "source": "field",
+                "attribute": null,
+                "required": true,
+                "source_path": null
+              },
+              "background": {
+                "path": "/image",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": "mc/ID29_20240722_Cn.tiff"
+              }
+            }
+          },
+          "quality": {
+            "title": "Quality data",
+            "type": "dynamic",
+            "enabled": true,
+            "fields": {
+              "SNR": {
+                "path": "/estimates/SNR_comp",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "CNN": {
+                "path": "/estimates/cnn_preds",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "r-values": {
+                "path": "/estimates/r_values",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              }
+            }
+          },
+          "traces": {
+            "title": "Trace data",
+            "type": "dynamic",
+            "enabled": false,
+            "fields": {
+              "C": {
+                "path": "/estimates/C",
+                "source": "field",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "F_dff_dec": {
+                "path": "/estimates/F_dff_dec",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              },
+              "S_dff": {
+                "path": "/estimates/S_dff",
+                "source": "dataset",
+                "attribute": null,
+                "required": false,
+                "source_path": null
+              }
+            }
+          }
+        },
+        "subconfigs": {},
+        "uid": "ee2c9ab8-e041-47dc-bb23-24c61c64fc7e",
+        "name": "CaImAn"
+      },
+      "load_options": {
+        "background_orientation": "transpose",
+        "correct_rotation": false,
+        "background_mode": "configured"
+      }
+    }
+  ]
+}

@@ -1,27 +1,29 @@
 """Prepare a realignment without mutating live sessions or assignments."""
 
-from copy import deepcopy
+from copy import copy, deepcopy
 
 import numpy as np
 from scipy import sparse
 
+from catan.core import footprint_frame
 from catan.core.data import center_of_mass
 from catan.core.io.isolated_read import read_fields
 
 
 def _build_comparison_updates(tracking, sessions, session_id, template, remap):
-    """Refresh comparison evidence without changing committed transforms."""
+    """Refresh comparison evidence without changing committed transforms.
+    ``template``: the changed session's new alignment template (background
+    or footprint projection, SessionData.alignment_template)."""
     changed = sessions[session_id]
     changed_path = str(changed.path)
-    template_changed = changed.background_template is None or not np.array_equal(
-        changed.background_template, template
-    )
+    current = changed.alignment_template()
+    template_changed = current is None or not np.array_equal(current, template)
     updates = {}
 
     for sid in range(session_id, len(sessions)):
         item = sessions[sid]
         target_remap = remap if sid == session_id else item.remap
-        target_template = template if sid == session_id else item.background_template
+        target_template = template if sid == session_id else item.alignment_template()
         if target_remap is None or target_template is None:
             continue
 
@@ -123,8 +125,15 @@ def build_realignment_update(
     background_template,
     remap,
     background_spec,
+    background_correction=None,
+    alignment_source=None,
     ctx=None,
 ):
+    """``background_correction`` (footprint_frame correction dict, "auto"
+    to estimate it anew) / ``alignment_source`` ("background", "footprints"
+    or "auto"): new values for the session (None keeps the current ones; a
+    new background, ``background_spec``, gets a new estimate unless a
+    correction is given; footprint_frame)."""
     sessions = tuple(tracking.sessions)
     session = sessions[session_id]
     if not session.status["spatial_loaded"]:
@@ -167,6 +176,39 @@ def build_realignment_update(
             "Original footprint dimensions/count differ from the loaded session. "
             "Realignment cannot safely preserve component IDs."
         )
+
+    params = dict(session.params)
+    reestimate = background_spec is not None and background_correction is None
+    if isinstance(background_correction, str):
+        if background_correction != "auto":
+            raise ValueError(f"Unknown background correction {background_correction!r}.")
+        reestimate = True
+    elif background_correction is not None:
+        correction = dict(background_correction, source="manual")
+        shift = np.asarray(correction.get("shift"), dtype=float).reshape(-1)
+        if shift.shape != (2,) or not np.isfinite(shift).all():
+            raise ValueError("Invalid background correction.")
+        footprint_frame.set_correction(params, correction)
+    if alignment_source is not None:
+        if alignment_source == "auto":
+            params.pop("alignment_source", None)
+        elif alignment_source in footprint_frame.ALIGNMENT_SOURCES:
+            params["alignment_source"] = alignment_source
+        else:
+            raise ValueError(f"Unknown alignment source {alignment_source!r}.")
+
+    raw_projection = footprint_frame.projection(raw, dims, included[:n_raw])
+    # The background in the footprints' frame (footprints are never moved).
+    if background_spec is not None or session.background_origin != "footprints":
+        coherence = footprint_frame.correct_background(
+            params, template, raw_projection, reestimate=reestimate
+        )
+    else:
+        coherence = None
+        footprint_frame.set_correction(params, None)
+    corrected = footprint_frame.apply_correction(
+        template, footprint_frame.correction_of(params)
+    )
 
     remap = deepcopy(remap)
     aligned = remap.apply_remap(raw, use_optical_flow=True)
@@ -271,10 +313,14 @@ def build_realignment_update(
 
     updates[session_id].update(
         background_template=template,
-        background=remap.apply_remap(template, use_optical_flow=True),
+        background=remap.apply_remap(corrected, use_optical_flow=True),
         background_origin=(
             "loaded" if background_spec is not None else session.background_origin
         ),
+        background_coherence=coherence,
+        params=params,
+        _footprint_template_cache=None,
+        _corrected_template_cache=None,
         remap=remap,
         source_config=config,
         included=included,
@@ -296,8 +342,26 @@ def build_realignment_update(
         if sid == session_id:
             values["status"]["aligned"] = True
 
+    if raw_projection is not None:
+        updates[session_id]["_footprint_template_cache"] = (
+            (id(updates[session_id]["footprints"]), id(remap)),
+            raw_projection,
+        )
+
+    # The session's alignment template with the new values.
+    probe = copy(session)
+    probe.params = params
+    probe.background_coherence = coherence
+    probe.background_origin = updates[session_id]["background_origin"]
+    alignment_template = (
+        raw_projection
+        if probe.alignment_source == "footprints"
+        and probe.background_origin != "footprints"
+        and raw_projection is not None
+        else corrected
+    )
     comparison_updates = _build_comparison_updates(
-        tracking, sessions, session_id, template, remap
+        tracking, sessions, session_id, alignment_template, remap
     )
 
     return {

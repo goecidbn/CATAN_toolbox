@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
 )
 
+from catan.gui.utils.session_labels import session_label, session_tag
 from catan.core.changes import (
     ChangeKind as C,
     DataChange,
@@ -36,6 +37,7 @@ from catan.gui.panels import BasePlot, styles, StatisticsData
 from catan.gui.data.statistics import PickTable
 from catan.gui.data.statistics.session_relations import (
     DetectionReference,
+    included_detections,
     is_order_relation,
     relation_mask,
 )
@@ -604,15 +606,19 @@ class Display(QWidget):
                     footprint_id = self.state.get_footprint_from_component(component)
 
                 component_text = (
-                    f"{session_id},{neuron_id}"
+                    f"N{neuron_id} {session_tag(session_id)}"
                     if session_id is not None
-                    else f"—,{neuron_id}"
+                    else f"N{neuron_id} —"
                 )
+
+                component_item = QTableWidgetItem(component_text)
+                if session_id is not None:
+                    component_item.setToolTip(session_label(self.data, session_id))
 
                 self.stats_table.setItem(
                     row_index,
                     column,
-                    QTableWidgetItem(component_text),
+                    component_item,
                 )
                 column += 1
 
@@ -653,12 +659,12 @@ class Display(QWidget):
         if self.entity_mode == "footprint":
 
             if self.row_mode == "single":
-                return ["(s,n)", "footprint"]
+                return ["neuron, session", "footprint"]
 
             return [
-                "(s,n) A",
+                "neuron, session A",
                 # "footprint A",
-                "(s,n) B",
+                "neuron, session B",
                 # "footprint B",
             ]
 
@@ -1789,7 +1795,11 @@ class Controller(BasePlot.TableController):
 
                 elif is_order_relation(pair_filter.relation):
                     # component_j is the reference; try both orientations.
-                    detection = DetectionReference(self.data.assignments.ids)
+                    detection = DetectionReference(
+                        included_detections(
+                            self.data.sessions, self.data.assignments.ids
+                        )
+                    )
 
                     def related(a, b):
                         return bool(

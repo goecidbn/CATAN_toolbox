@@ -519,6 +519,10 @@ class StatisticDefinition:
 
     parameters: tuple[StatisticParameter, ...] = ()
 
+    # Maps parameters of older versions (saved presets / panel settings) to
+    # the current ones before validation.
+    migrate_parameters: Callable[[dict], dict] | None = None
+
     # Supports independently constrained neuron/session pairs.
     independent_pairs: bool = False
 
@@ -531,6 +535,10 @@ class StatisticDefinition:
     # pairs_getter(data, state, query, *, requested_pairs, **parameters).
     # It returns all requested rows; selection follows on compacted values.
     pairs_getter: Callable | None = None
+
+    # Axes the pairs_getter may reduce (no error method), e.g. the shared
+    # session axis of co-occurrence; all other axes must be kept or fixed.
+    requested_reduced_axes: tuple[str, ...] = ()
 
     # Compact stored values after calculation and reduction.
     compact_values: bool = False
@@ -565,6 +573,11 @@ class StatisticDefinition:
     # distances accept model distance recipes (threshold_references);
     # None: anything else.
     value_kind: Literal["distance", "area"] | None = None
+
+    # Possible values of one entry before reductions, (lower, upper) (a side
+    # may be None), or a callable n_active_sessions -> (lower, upper). Sets
+    # the range of integer-centred histograms (plotdata_histogram).
+    value_bounds: tuple | Callable[[int], tuple] | None = None
 
     def is_affected_by(self, event: DataChange) -> bool:
         if self.dependencies is None:
@@ -674,6 +687,8 @@ class StatisticDefinition:
 
     def resolve_parameters(self, values=None):
         values = dict(values or {})
+        if self.migrate_parameters is not None:
+            values = self.migrate_parameters(values)
         known = {spec.key for spec in self.parameters}
 
         unknown = values.keys() - known
@@ -687,26 +702,33 @@ class StatisticDefinition:
             for spec in self.parameters
         }
 
-    def title_with_parameters(self, values=None):
+    def parameters_short(self, values=None, *, changed_only=False):
+        """Compact parameter text, e.g. "norm=smaller, thr=0.1"; options
+        that do not change the values are left out."""
         values = self.resolve_parameters(values)
-
-        if not self.parameters:
-            return self.title
 
         parts = []
         for spec in self.parameters:
             value = values[spec.key]
+            if not spec.in_title or (changed_only and value == spec.default):
+                continue
+            parts.append(f"{spec.short_label}={spec.format_value(value)}")
 
-            if isinstance(value, bool):
-                text = "yes" if value else "no"
-            elif isinstance(value, float):
-                text = f"{value:g}"
-            else:
-                text = str(value)
+        return ", ".join(parts)
 
-            parts.append(f"{spec.label}={text}")
+    def parameters_help(self, values=None):
+        """One line per parameter: label, current value, description."""
+        values = self.resolve_parameters(values)
 
-        return f"{self.title} [" + ", ".join(parts) + "]"
+        return "\n".join(
+            f"{spec.label} ({spec.short_label}) = {spec.format_value(values[spec.key])}: "
+            f"{spec.tooltip}".rstrip(": ")
+            for spec in self.parameters
+        )
+
+    def title_with_parameters(self, values=None):
+        text = self.parameters_short(values)
+        return f"{self.title} [{text}]" if text else self.title
 
     def get_default_reductions(self) -> dict[str, ReductionSpec]:
         if self.default_reductions is not None:

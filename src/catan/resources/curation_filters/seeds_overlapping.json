@@ -1,0 +1,62 @@
+{
+  "schema_version": 2,
+  "name": "Seeds: overlapping seeds",
+  "category": "footprints",
+  "root": {
+    "type": "group",
+    "id": "864b9844d02547b8b9038becd1aafcb8",
+    "operator": "and",
+    "match_level": "relationship",
+    "children": [
+      {
+        "type": "condition",
+        "id": "5ec7f49283204a2db3f5f1f8f215aa4e",
+        "query": {
+          "statistic_key": "seed_overlap",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
+            {
+              "target": "neuron",
+              "relation": "different",
+              "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {
+            "normalize_by": "smaller",
+            "support_threshold": 0.2,
+            "seeds": "all"
+          }
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 0.7
+        }
+      }
+    ],
+    "count": null,
+    "comment": "Seeds of two neurons in the same session that share more than 70 % of the smaller seed's pixels (support ≥ 20 % of each seed's peak). Seeds are the included footprints and, for neurons without a footprint in a session, their union footprint at the interpolated position (inferred, shown in cyan with 'Show inferred footprints'). Overlapping seeds compete for the same pixels in seeded redetection: merge the neurons, reassign or exclude one. Set 'Seed pairs' to 'inferred' to skip pairs of detected footprints (see 'Cleanup: within-session duplicates').",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": null,
+    "review_statuses": null
+  }
+}

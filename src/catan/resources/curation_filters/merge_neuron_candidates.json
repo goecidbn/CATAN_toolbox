@@ -37,9 +37,9 @@
           "parameters": {}
         },
         "threshold": {
-          "value": 4.965,
           "direction": "less",
-          "active": true
+          "active": true,
+          "value": 4.965
         }
       },
       {
@@ -79,23 +79,70 @@
               }
             },
             "threshold": {
-              "value": 0.9,
               "direction": "greater",
-              "active": true
+              "active": true,
+              "value": 0.9
             }
           }
         ],
         "count": null,
         "comment": "",
         "apply_to": "same",
+        "summary": null,
         "manipulation": null,
         "review_statuses": null
+      },
+      {
+        "type": "condition",
+        "id": "a3042d32453942738039ef7d5dc21b57",
+        "query": {
+          "statistic_key": "cooccurrence",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "sum",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
+            {
+              "target": "neuron",
+              "relation": "different",
+              "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {}
+        },
+        "threshold": {
+          "direction": "less",
+          "active": true,
+          "value": 0.0
+        }
       }
     ],
     "count": null,
-    "comment": "",
+    "comment": "Fragmented tracks: two neurons whose unions are close (< 4.97 px) and similar (≥ 0.9) and that never have footprints in the same session (co-occurrence 0) — one cell split into two tracks. Merge the source neuron into the target.",
     "apply_to": "same",
-    "manipulation": null,
+    "summary": null,
+    "manipulation": {
+      "kind": "neuron_merge",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
     "review_statuses": null
   }
 }

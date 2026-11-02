@@ -2,7 +2,7 @@ import numpy as np
 
 from . import plotdata_histogram
 
-from catan.gui.data.assignment_colors import assignment_color
+from catan.gui.data.assignment_colors import assignment_colors
 from . import plotdata_scatter
 from .errors import StatisticsPlotError
 from catan.gui.data.assignment_colors import assignment_label
@@ -13,7 +13,7 @@ ASSIGNMENTS_REF = "__assignments__"
 class ComparisonHistogram(plotdata_histogram.PlotData):
     """Several histograms with common bins and adjacent dataset bars."""
 
-    def __init__(self, tables, bins, data):
+    def __init__(self, tables, bins, data, bounds=None):
         self.names = tuple(tables)
 
         if not self.names:
@@ -25,6 +25,7 @@ class ComparisonHistogram(plotdata_histogram.PlotData):
         # Determine the shared range without concatenating all datasets.
         lower = np.inf
         upper = -np.inf
+        integers = True
 
         for table in tables.values():
             values = np.asarray(table.values).reshape(-1)
@@ -36,8 +37,16 @@ class ComparisonHistogram(plotdata_histogram.PlotData):
                 if finite.size:
                     lower = min(lower, float(finite.min()))
                     upper = max(upper, float(finite.max()))
+                    integers = integers and plotdata_histogram.integer_valued(finite)
 
-        if np.isfinite(lower):
+        step = None
+        if np.isfinite(lower) and integers:
+            # Integer-centred bins over the possible range, as single
+            # histograms (plotdata_histogram.histogram_edges).
+            edges, step = plotdata_histogram.histogram_edges(
+                np.asarray([lower, upper]), bins, bounds=bounds
+            )
+        elif np.isfinite(lower):
             edges = np.histogram_bin_edges(
                 np.asarray([lower, upper]),
                 bins=bins,
@@ -46,9 +55,10 @@ class ComparisonHistogram(plotdata_histogram.PlotData):
             edges = np.linspace(0.0, 1.0, bins + 1)
 
         self.shared_edges = edges
+        self.integer_step = step
 
         self.parts = tuple(
-            plotdata_histogram.build_plot_data(table, bins=edges)
+            plotdata_histogram.build_plot_data(table, bins=edges, integer_step=step)
             for table in tables.values()
         )
 
@@ -96,15 +106,16 @@ class ComparisonHistogram(plotdata_histogram.PlotData):
             ]
         )
 
-        self.dataset_colors = np.asarray(
-            [assignment_color(name) for name in self.names],
-            dtype=np.float32,
-        )
+        self._bin_count = bin_count
 
-        self.bar_colors = np.tile(
-            self.dataset_colors,
-            (bin_count, 1),
-        )
+    # Computed on use: user colour changes apply to the shown plot.
+    @property
+    def dataset_colors(self):
+        return assignment_colors(self.names)
+
+    @property
+    def bar_colors(self):
+        return np.tile(self.dataset_colors, (self._bin_count, 1))
 
     def ref_sets_for_rows(self, rows):
         rows = np.atleast_1d(rows).astype(int, copy=False)
@@ -151,12 +162,18 @@ class ComparisonHistogram(plotdata_histogram.PlotData):
     def tooltip_for_bin(self, bin_index):
         actual_bin, dataset = divmod(bin_index, len(self.names))
         closing = "]" if actual_bin == len(self.shared_edges) - 2 else ")"
+        left = self.shared_edges[actual_bin]
+        right = self.shared_edges[actual_bin + 1]
+
+        if self.integer_step is not None:
+            values = plotdata_histogram.integer_bin_label(left, right).capitalize()
+        else:
+            values = f"Values: [{left:.4g}, {right:.4g}{closing}"
 
         return (
             f"{self.names[dataset]}\n"
             f"{self.title['x']}\n"
-            f"Values: [{self.shared_edges[actual_bin]:.4g}, "
-            f"{self.shared_edges[actual_bin + 1]:.4g}{closing}\n"
+            f"{values}\n"
             f"Count: {int(self.bin_counts[bin_index])}"
         )
 

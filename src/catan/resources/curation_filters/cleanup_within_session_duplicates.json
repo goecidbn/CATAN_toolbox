@@ -1,0 +1,212 @@
+{
+  "schema_version": 2,
+  "name": "Cleanup: within-session duplicates",
+  "category": "footprints",
+  "root": {
+    "type": "group",
+    "id": "f3f770b7054a4de18dd5a8612fda3dd1",
+    "operator": "and",
+    "match_level": "relationship",
+    "children": [
+      {
+        "type": "condition",
+        "id": "6b6799952c3c4c3ea8ef7bd62fa8eef8",
+        "query": {
+          "statistic_key": "footprint_overlap",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
+            {
+              "target": "session",
+              "relation": "same",
+              "collapse_same": true
+            },
+            {
+              "target": "neuron",
+              "relation": "different",
+              "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {
+            "normalize_by": "j",
+            "support_threshold": 0.1
+          }
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 0.8
+        }
+      },
+      {
+        "type": "condition",
+        "id": "1edc121b5fb545bdb247a8144895968e",
+        "query": {
+          "statistic_key": "footprint_overlap",
+          "reductions": {
+            "neuron_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "neuron_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_i": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session_j": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [
+            {
+              "target": "session",
+              "relation": "same",
+              "collapse_same": true
+            },
+            {
+              "target": "neuron",
+              "relation": "different",
+              "collapse_same": true
+            }
+          ],
+          "context": "generic",
+          "parameters": {
+            "normalize_by": "i",
+            "support_threshold": 0.1
+          }
+        },
+        "threshold": {
+          "direction": "less",
+          "active": true,
+          "value": 0.8
+        }
+      },
+      {
+        "type": "group",
+        "id": "4fdedcb918364b14819338c6dcc6ccb9",
+        "operator": "or",
+        "match_level": "neuron",
+        "children": [
+          {
+            "type": "condition",
+            "id": "c242c22baa78494daa3acb43ac610cdb",
+            "query": {
+              "statistic_key": "occurence",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "sum",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [],
+              "context": "generic",
+              "parameters": {}
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 2.0
+            }
+          },
+          {
+            "type": "condition",
+            "id": "8bd920b9d65048a79b57ad86760c8bc7",
+            "query": {
+              "statistic_key": "footprint_union_similarity",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "min",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "same",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {
+                "gamma": 0.1
+              }
+            },
+            "threshold": {
+              "direction": "less",
+              "active": true,
+              "value": 0.85
+            }
+          }
+        ],
+        "count": null,
+        "comment": "Only remove footprints of weakly supported neurons: seen in ≤ 2 sessions, or with a footprint matching its own union poorly (< 0.85). A consistently tracked neuron inside a larger footprint points to an artifact of the larger one (split candidate) instead.",
+        "apply_to": "target",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": null,
+    "comment": "Two neurons' footprints in the same session where the target lies ≥ 80 % inside the source while the source is not mostly inside the target (the target is the smaller one): the target footprint is excluded. Near-identical pairs (both ≥ 80 %) are not listed — decide which to keep by hand.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": {
+      "kind": "exclude_footprint",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
+    "review_statuses": null
+  }
+}

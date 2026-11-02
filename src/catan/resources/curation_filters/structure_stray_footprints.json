@@ -1,0 +1,271 @@
+{
+  "schema_version": 2,
+  "name": "Structure: stray footprints",
+  "category": "assignments",
+  "root": {
+    "type": "group",
+    "id": "1a0811bd38fc449280009e875ffbc5ed",
+    "operator": "and",
+    "match_level": "neuron",
+    "children": [
+      {
+        "type": "condition",
+        "id": "a9a8b4671f9d4e7b81577107e7a49a7b",
+        "query": {
+          "statistic_key": "occurence",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "sum",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic",
+          "parameters": {}
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 3.0
+        }
+      },
+      {
+        "type": "group",
+        "id": "e3c1598993684ecda47ef580c9186a6a",
+        "operator": "and",
+        "match_level": "footprint",
+        "children": [
+          {
+            "type": "condition",
+            "id": "9c13ddc623564e87a1f08555eea7e4f8",
+            "query": {
+              "statistic_key": "centroid_shift",
+              "reductions": {
+                "neuron": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_j": {
+                  "method": "min",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "session",
+                  "relation": "different",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {}
+            },
+            "threshold": {
+              "direction": "greater",
+              "active": true,
+              "reference": {
+                "kind": "model_distance",
+                "coefficients": {
+                  "h": 1.0
+                }
+              },
+              "unit": "px"
+            }
+          },
+          {
+            "type": "group",
+            "id": "e1326adb6ab540caa4f9e14613367acb",
+            "operator": "and",
+            "match_level": "relationship",
+            "children": [
+              {
+                "type": "condition",
+                "id": "a05946f1e0a344abac30ec1fc9094978",
+                "query": {
+                  "statistic_key": "footprint_union_distance",
+                  "reductions": {
+                    "neuron_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "neuron_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [
+                    {
+                      "target": "neuron",
+                      "relation": "different",
+                      "collapse_same": true
+                    }
+                  ],
+                  "context": "generic",
+                  "parameters": {}
+                },
+                "threshold": {
+                  "direction": "less",
+                  "active": true,
+                  "reference": {
+                    "kind": "percentile",
+                    "sample": "Same neuron",
+                    "level": 75.0
+                  },
+                  "unit": "px"
+                }
+              },
+              {
+                "type": "condition",
+                "id": "989695c3cdf8482882cd5ee2c69d54db",
+                "query": {
+                  "statistic_key": "footprint_union_similarity",
+                  "reductions": {
+                    "neuron_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "neuron_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [
+                    {
+                      "target": "neuron",
+                      "relation": "different",
+                      "collapse_same": true
+                    }
+                  ],
+                  "context": "generic",
+                  "parameters": {
+                    "gamma": 0.1
+                  }
+                },
+                "threshold": {
+                  "direction": "greater",
+                  "active": true,
+                  "reference": {
+                    "kind": "percentile",
+                    "sample": "Same neuron",
+                    "level": 5.0
+                  }
+                }
+              },
+              {
+                "type": "condition",
+                "id": "ed3ec891aa4d4e3aa1c870a07f966b9d",
+                "query": {
+                  "statistic_key": "partner_session_match",
+                  "reductions": {
+                    "neuron_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "neuron_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [
+                    {
+                      "target": "neuron",
+                      "relation": "different",
+                      "collapse_same": true
+                    }
+                  ],
+                  "context": "generic",
+                  "parameters": {
+                    "gamma": 0.1
+                  }
+                },
+                "threshold": {
+                  "direction": "less",
+                  "active": true,
+                  "reference": {
+                    "kind": "percentile",
+                    "sample": "Same neuron",
+                    "level": 5.0
+                  }
+                }
+              }
+            ],
+            "count": {
+              "target": "footprint",
+              "comparison": "eq",
+              "value": 0,
+              "unit": "neuron",
+              "anchor": "source",
+              "separate_partner_sessions": false
+            },
+            "comment": "No unmatched partner (orphan criteria): no other neuron whose union is as close (≤ p75) and similar (≥ p5) as same-neuron footprints and that has no good footprint of its own in this session (own match < p5 of same-neuron matches). Such a footprint may be that neuron's missing one and is not removed.",
+            "apply_to": "same",
+            "summary": null,
+            "manipulation": null,
+            "review_statuses": null
+          }
+        ],
+        "count": {
+          "target": "neuron",
+          "comparison": "ge",
+          "value": 1,
+          "unit": "footprint",
+          "anchor": "target",
+          "separate_partner_sessions": false
+        },
+        "comment": "Stray footprints: at least the hard-core distance h of the fitted model (closest spacing of two cells) away from every other footprint of the neuron, and not the missing footprint of another neuron (those: misassigned / orphans).",
+        "apply_to": "same",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": null,
+    "comment": "Neurons (≥ 3 sessions) whose track jumps to a different cell in single sessions and back: bad matches with stray footprints. A lasting change (two groups of footprints) is not listed here — see 'Track mismatch: two footprint groups'. Review the highlighted footprints: exclude them or move them to a new neuron.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": null,
+    "review_statuses": [
+      0,
+      2
+    ]
+  }
+}

@@ -34,7 +34,11 @@ from catan.tracking.structures import ReviewStatus
 from .display_area import DisplayArea
 from .main_menu import MainMenu
 from .utils.menu_creation import fit_message_box_buttons
+from catan.gui.data.assignment_colors import assignment_label, load_assignment_colors
 
+
+# The main menu does not grow beyond this (px); the panels take the rest.
+MAIN_MENU_MAX_WIDTH = 620
 
 class MainWindow(QMainWindow):
 
@@ -58,6 +62,7 @@ class MainWindow(QMainWindow):
         )
 
         self.state = AppState(settings=self.settings)
+        load_assignment_colors(self.settings)
 
         self.data: Data = Data(self.state)
         self.state.tasks.start_queue_timer()
@@ -97,6 +102,20 @@ class MainWindow(QMainWindow):
             action = file_menu.addAction(label)
             action.setShortcut(QKeySequence(shortcut))
             action.triggered.connect(lambda checked=False, slot=slot: slot())
+            if label == "Open project…":
+                self.recent_menu = file_menu.addMenu("Open recent")
+                self.recent_menu.aboutToShow.connect(self._fill_recent_projects)
+
+        # Starter guide: Help menu, ? button (main menu), startup offer.
+        from catan.gui.guide.anchors import install_main_window_anchors
+        from catan.gui.guide.controller import GuideController
+
+        install_main_window_anchors(self)
+        self.guide = GuideController(self)
+        help_menu = self.menuBar().addMenu("Help")
+        guide_menu = help_menu.addMenu("Starter guide")
+        guide_menu.aboutToShow.connect(lambda: self.guide.build_menu(guide_menu))
+        QTimer.singleShot(800, self.guide.offer_on_startup)
 
         print_debug = QAction("Print debug info", self)
         print_debug.setShortcut("Ctrl+D")
@@ -242,6 +261,39 @@ class MainWindow(QMainWindow):
 
         app.setStyleSheet(style)
 
+    def _fill_recent_projects(self):
+        """File ▸ Open recent: project name and folder, newest first."""
+        from pathlib import Path
+
+        menu = self.recent_menu
+        menu.clear()
+        main_menu = self.gui_elements["main_menu"]
+        suffix = Data.PROJECT_SUFFIX
+        paths = main_menu.data.recent_projects()
+        if not paths:
+            menu.addAction("No recent projects").setEnabled(False)
+            return
+        for path in paths:
+            name = Path(path).name
+            name = name[: -len(suffix)] if name.endswith(suffix) else name
+            # Full folder (projects of other root folders), home as ~.
+            folder = str(Path(path).parent)
+            home = str(Path.home())
+            if folder.startswith(home):
+                folder = "~" + folder[len(home):]
+            if len(folder) > 60:
+                folder = folder[:20] + "…" + folder[-39:]
+            action = menu.addAction(f"{name}  —  {folder}".replace("&", "&&"))
+            action.setToolTip(path)
+            action.triggered.connect(
+                lambda checked=False, path=path: main_menu.open_recent_project(path)
+            )
+        menu.setToolTipsVisible(True)
+        menu.addSeparator()
+        menu.addAction("Clear list").triggered.connect(
+            lambda: main_menu.data.forget_recent_project()
+        )
+
     def print_debug_info(self):
         click_events.print_debug(self.state, self.data)
 
@@ -250,7 +302,7 @@ class MainWindow(QMainWindow):
         print("\n".join(memory_report(self.data)))
 
     def _confirm_unsaved_assignments(self) -> bool:
-        """Offer saving changed assignments before closing.
+        """Offer saving changed assignments and models before closing.
 
         Returns True to close now. Saving runs in the background; the
         window closes again once it has finished.
@@ -258,87 +310,125 @@ class MainWindow(QMainWindow):
         if getattr(self, "_closing_after_save", False):
             return True
 
+        def close_after_save():
+            self._closing_after_save = True
+            # After the save's own bookkeeping.
+            QTimer.singleShot(0, self.close)
+
+        return self._offer_saving("closing", close_after_save) != "cancel"
+
+    def _offer_saving(self, purpose, after_save):
+        """Ask whether to save changed assignments / models before
+        ``purpose`` (e.g. "closing"). Returns "clean" (nothing changed),
+        "discard", "cancel" or "saving": the project save runs in the
+        background and calls ``after_save`` once it has finished (a failed
+        or cancelled save does not)."""
         unsaved = self.data.unsaved_assignments()
+        models = self.data.unsaved_models()
 
-        if not unsaved:
-            return True
+        if not unsaved and not models:
+            return "clean"
 
-        current = self.data.current_assignments
-        others = [name for name in unsaved if name != current]
+        external = set(self.data.changed_external_sets("assignments")) | set(
+            self.data.changed_external_models()
+        )
 
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setWindowTitle("Unsaved assignments")
-        dialog.setText("The assignments have changes that were not saved.")
-        dialog.setInformativeText(
-            (
-                f"Save the current assignments ({current}) before closing?"
-                if current in unsaved
-                else ""
+        dialog.setWindowTitle("Unsaved changes")
+        dialog.setText("Assignments or models have changes that were not saved.")
+        parts = []
+        if unsaved:
+            parts.append(
+                "Changed assignments: "
+                + ", ".join(assignment_label(name) for name in unsaved)
             )
-            + (
-                "\n\nAlso changed (switch to them to save): " + ", ".join(others)
-                if others
-                else ""
+        if models:
+            parts.append(
+                "Changed models: " + ", ".join(assignment_label(name) for name in models)
             )
-        )
+        if external:
+            parts.append(
+                "Loaded from a file (saved only where you choose): "
+                + ", ".join(assignment_label(name) for name in sorted(external))
+            )
+        parts.append(f"Save the project before {purpose}?")
+        dialog.setInformativeText("\n\n".join(parts))
 
-        save_button = (
-            dialog.addButton("Save…", QMessageBox.ButtonRole.AcceptRole)
-            if current in unsaved
-            else None
-        )
+        save_button = dialog.addButton("Save…", QMessageBox.ButtonRole.AcceptRole)
         dialog.addButton("Discard changes", QMessageBox.ButtonRole.DestructiveRole)
         cancel_button = dialog.addButton(QMessageBox.StandardButton.Cancel)
-        dialog.setDefaultButton(save_button or cancel_button)
+        dialog.setDefaultButton(save_button)
         fit_message_box_buttons(dialog)
         dialog.exec()
 
         clicked = dialog.clickedButton()
 
         if clicked is cancel_button:
-            return False
+            return "cancel"
 
         if clicked is not save_button:
-            return True
+            return "discard"
 
-        path = self.gui_elements["main_menu"].save_project()
+        # The project save writes sessions and models first, the
+        # assignments last; ``finished`` runs after all of them.
+        self.gui_elements["main_menu"].save_project(finished=after_save)
+        return "saving"
 
-        if path is None:
-            # No file chosen: stay open.
-            return False
-
-        # Close once the save finished and nothing is left unsaved; the save
-        # may start only after display workers stopped.
+    def clean_workspace(self):
+        """Remove all sessions, models and assignment sets from this window
+        (before loading another dataset), offering to save changes first
+        as when closing."""
         tasks = self.state.tasks
-
-        def disconnect():
-            tasks.task_finished.disconnect(on_finished)
-            tasks.task_failed.disconnect(on_failed)
-            tasks.task_cancelled.disconnect(on_failed)
-
-        def on_finished(group, task_id):
-            if group != "saving":
+        if (
+            tasks.processing_busy()
+            or tasks.processing_requested
+            or tasks.has_deferred_processing()
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Clean all",
+                "Processing is still running. Cancel it and remove all data "
+                "from this window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
                 return
 
-            # Saved-state bookkeeping runs right after this signal. A project
-            # save writes sessions and model first: wait for the assignments.
-            def check():
-                if current not in self.data.unsaved_assignments():
-                    disconnect()
-                    self._closing_after_save = True
-                    self.close()
+        outcome = self._offer_saving(
+            "removing all data", lambda: QTimer.singleShot(0, self._clean_when_idle)
+        )
+        if outcome in ("cancel", "saving"):
+            return
 
-            QTimer.singleShot(0, check)
+        if outcome == "clean":
+            answer = QMessageBox.question(
+                self,
+                "Clean all",
+                "Remove all sessions, models and assignment sets from this "
+                "window?\n\nFiles on disk are not deleted.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
 
-        def on_failed(group, task_id):
-            if group == "saving":
-                disconnect()
+        self._clean_when_idle()
 
-        tasks.task_finished.connect(on_finished)
-        tasks.task_failed.connect(on_failed)
-        tasks.task_cancelled.connect(on_failed)
-        return False
+    def _clean_when_idle(self, attempts=50):
+        """Cancel remaining tasks (also display work of the old data) and
+        clear once they have ended; they may still finish in their threads."""
+        tasks = self.state.tasks
+        if tasks.tasks or tasks.processing_requested:
+            if attempts == 50:
+                tasks.cancel_all()
+            if attempts > 0:
+                QTimer.singleShot(100, lambda: self._clean_when_idle(attempts - 1))
+                return
+
+        if self.data.clear_workspace():
+            self.gui_elements["main_menu"].workspace_cleared()
 
     def closeEvent(self, event):
         # print("MainWindow closeEvent")
@@ -420,6 +510,10 @@ class MainWindow(QMainWindow):
         display_layout.addWidget(navigation_bar, 0)
 
         splitter.addWidget(display)
+        # Extra width goes to the panels; the menu stops at a maximum.
+        main_menu.setMaximumWidth(MAIN_MENU_MAX_WIDTH)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
         ## --- Build the UI ---
         main_app = QWidget(self)  # MainApp(self)
@@ -429,6 +523,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
 
         self.setCentralWidget(main_app)
+
+        # Qt recreates a shown top-level window when its first QOpenGLWidget
+        # (vispy canvas) is added, which makes the window vanish briefly on the
+        # first plot panel. A hidden one present before show() avoids that.
+        try:
+            from PySide6.QtOpenGLWidgets import QOpenGLWidget
+
+            self._gl_surface_placeholder = QOpenGLWidget(main_app)
+            self._gl_surface_placeholder.setFixedSize(0, 0)
+            self._gl_surface_placeholder.hide()
+        except ImportError:
+            self._gl_surface_placeholder = None
 
         self.gui_elements = {
             "main_menu": main_menu,
@@ -549,9 +655,15 @@ class MainWindow(QMainWindow):
                 focused = self.state.focused_component
                 components = [] if focused is None else [focused]
                 target_label = "focused"
+                # Focused neuron without a session (e.g. browsing with the
+                # navigation bar): the whole neuron.
+                if focused is not None and focused.session_id is None:
+                    whole_neurons = True
 
         if not components:
             return
+
+        focused_neuron = target_label == "focused" and whole_neurons and not batch
 
         source = self.data.assignments
         version = self.state.data_version
@@ -574,7 +686,25 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if batch or len(targets) > 1:
+        if focused_neuron:
+            # Exclude (X) is reversible: no question. Removal is not
+            # recorded as a manipulation: confirm (Enter = remove).
+            if remove:
+                neuron_id = int(components[0].neuron_id)
+                answer = QMessageBox.question(
+                    self,
+                    "Remove neuron",
+                    f"Remove neuron {neuron_id} ({len(targets)} footprint"
+                    f"{'s' if len(targets) != 1 else ''})?\n\n"
+                    "Its assignment entries will be removed (cannot be undone; "
+                    "X excludes it instead). Source files are unchanged.",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Ok,
+                )
+                if answer != QMessageBox.StandardButton.Ok:
+                    return
+
+        elif batch or len(targets) > 1:
             action = "Remove" if remove else "Exclude"
             n_neurons = len({target[0] for target in targets})
             n_sessions = len({target[1] for target in targets})

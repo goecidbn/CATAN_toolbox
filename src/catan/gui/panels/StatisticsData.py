@@ -54,10 +54,12 @@ from catan.gui.data.statistics.queries import (
     normalize_generic_session_pair_reductions,
     linked_pair_axes,
 )
+from catan.gui.GUI_elements.utils.menu_creation import add_menu_section
 from catan.gui.utils.popups import constrain_popup
 from catan.gui.data.statistics.session_relations import (
     DESCRIPTIONS as RELATION_DESCRIPTIONS,
     FOLLOWING_RELATIONS,
+    NEURON_RELATIONS as SINGLE_REFERENCE_RELATIONS,
     PREVIOUS_RELATIONS,
     is_order_relation,
 )
@@ -289,6 +291,10 @@ class ReductionPopup(QDialog):
             layout.addLayout(assignment_row)
 
         if stat_def.parameters:
+            parameters_title = QLabel("Parameters")
+            parameters_title.setToolTip(stat_def.parameters_help())
+            layout.addWidget(parameters_title)
+
             form = QFormLayout()
             values = self.selector.current_parameters()
 
@@ -352,7 +358,8 @@ class ReductionPopup(QDialog):
                 else:
                     raise TypeError(f"Unsupported parameter type: {spec.kind}")
 
-                editor.setToolTip(spec.tooltip)
+                help_text = spec.help_text()
+                editor.setToolTip(help_text)
 
                 changed.connect(
                     lambda value, key=spec.key: self.selector._on_parameter_changed(
@@ -360,7 +367,9 @@ class ReductionPopup(QDialog):
                     )
                 )
 
-                form.addRow(spec.label, editor)
+                label = QLabel(spec.label)
+                label.setToolTip(help_text)
+                form.addRow(label, editor)
 
             layout.addLayout(form)
 
@@ -670,6 +679,23 @@ def format_query_expression(
     return expression
 
 
+def wrap_text(text: str, metrics, width: int) -> str:
+    """``text`` with line breaks between words so that lines fit ``width``
+    (longer words stay whole)."""
+    lines = []
+    for paragraph in text.split("\n"):
+        line = ""
+        for word in paragraph.split(" "):
+            candidate = f"{line} {word}" if line else word
+            if line and metrics.horizontalAdvance(candidate) > width:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+        lines.append(line)
+    return "\n".join(lines)
+
+
 class StatisticQuerySelector(QWidget):
     queryChanged = Signal(object)  # StatisticQuery | None
     assignmentChanged = Signal(object)
@@ -709,8 +735,9 @@ class StatisticQuerySelector(QWidget):
         self.assignment_selection_enabled = False
         self.assignment_name = None
 
+        # No width limit: the statistic title and summary are shown in full
+        # (wrapped in the narrow y column, see _set_button_text).
         self.stat_button = QToolButton()
-        self.stat_button.setMaximumWidth(120)
 
         self.stat_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.stat_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -726,7 +753,6 @@ class StatisticQuerySelector(QWidget):
         self._build_stat_menu()
 
         self.reduction_button = QToolButton()
-        self.reduction_button.setMaximumWidth(160)
         self.reduction_button.setText("Reductions")
         self.reduction_button.clicked.connect(self._open_reduction_popup)
 
@@ -923,7 +949,7 @@ class StatisticQuerySelector(QWidget):
                 if not section:
                     continue
 
-                submenu.addSection(group_title)
+                add_menu_section(submenu, group_title)
 
                 for key, stat_def in section:
                     self._add_stat_action(
@@ -1038,13 +1064,27 @@ class StatisticQuerySelector(QWidget):
     def current_stat_def(self):
         return self.engine.registry[self.current_stat_key()]
 
+    def _single_reference_session(self):
+        button = getattr(self, "session_filter_button", None)
+        return (
+            button is not None
+            and "session_j" in self.current_stat_def().dims
+            and button.current_relation() in SINGLE_REFERENCE_RELATIONS
+        )
+
     def raw_query(self) -> StatisticQuery | None:
         if self.current_stat_key() == "none":
             return None
 
+        reductions = dict(self.current_reductions)
+        if self._single_reference_session():
+            # The one reference value per row (any collapsing reduction
+            # gives it; "keep" / "single" would not).
+            reductions["session_j"] = ReductionSpec("mean")
+
         return StatisticQuery(
             statistic_key=self.current_stat_key(),
-            reductions=tuple(sorted(self.current_reductions.items())),
+            reductions=tuple(sorted(reductions.items())),
             filters=self.current_filters(),
             context=self.query_mode,
             parameters=tuple(sorted(self.current_parameters().items())),
@@ -1164,12 +1204,24 @@ class StatisticQuerySelector(QWidget):
 
         self._emit_query_changed_once()
 
+    def _set_button_text(self, button, text):
+        """Full text; in the y column (beside the plot) wrapped to lines of
+        about 18 characters instead of widening the column."""
+        if self.axis == "y":
+            metrics = button.fontMetrics()
+            text = wrap_text(text, metrics, metrics.averageCharWidth() * 18)
+        button.setText(text)
+
     def _update_stat_button(self):
         stat_def = self.current_stat_def()
-        title = stat_def.title_with_parameters(self.current_parameters())
+        parameters = self.current_parameters()
+        title = stat_def.title_with_parameters(parameters)
 
-        self.stat_button.setText(stat_def.title)
-        self.stat_button.setToolTip(f"{title}\n\n{stat_def.description}")
+        self._set_button_text(self.stat_button, stat_def.title)
+        tooltip = f"{title}\n\n{stat_def.description}"
+        if stat_def.parameters:
+            tooltip += "\n\nParameters:\n" + stat_def.parameters_help(parameters)
+        self.stat_button.setToolTip(tooltip)
 
     def _update_filter_visibility(self):
         stat_def = self.current_stat_def()
@@ -1313,6 +1365,7 @@ class StatisticQuerySelector(QWidget):
 
         if self.current_stat_key() == "none":
             self.reduction_button.setText("-")
+            self.reduction_button.setToolTip("")
             return
 
         for dim in stat_def.dims:
@@ -1324,9 +1377,21 @@ class StatisticQuerySelector(QWidget):
 
             parts.append(format_reduction_short(dim, spec))
 
+        text = ", ".join(parts)
+        tooltip = "Reductions and parameters (click to edit)."
+
         if stat_def.parameters:
-            parts.append("Parameters…")
-        self.reduction_button.setText(", ".join(parts))
+            # Only the changed parameters, compact ("thr=0.2"); all in the
+            # tooltip.
+            parameters = self.current_parameters()
+            changed = stat_def.parameters_short(parameters, changed_only=True)
+            text = " · ".join(
+                part for part in (text, changed or "default parameters") if part
+            )
+            tooltip += "\n\nParameters:\n" + stat_def.parameters_help(parameters)
+
+        self._set_button_text(self.reduction_button, text)
+        self.reduction_button.setToolTip(tooltip)
 
     def reduction_methods_for_dim(
         self,
@@ -1338,6 +1403,11 @@ class StatisticQuerySelector(QWidget):
             stat_def,
             self.current_filters(),
         ):
+            return ()
+
+        # "with first / previous / next / last instance": one reference
+        # session per row, so there is nothing to choose for session_j.
+        if dim == "session_j" and self._single_reference_session():
             return ()
 
         general = allowed_reduction_methods(

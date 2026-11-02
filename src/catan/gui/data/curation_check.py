@@ -67,6 +67,7 @@ class ConditionCheck:
     neurons: tuple = ()  # neurons the rows were restricted to
     note: str = ""
     error: str = ""
+    skipped: bool = False  # optional, statistic unavailable
     # All rows (not only the listed ones): ordered footprints of the row
     # (source first for pairs) -> value.
     lookup: dict = field(default_factory=dict)
@@ -269,9 +270,11 @@ def _group_count(result, group, neurons, footprints=None):
     if group.count is None or group_result is None or not group_result.counts:
         return ""
 
+    # Per partner session counts are keyed (subject, partner session).
     counts = [
         (subject, value)
-        for subject, value in group_result.counts.items()
+        for key, value in group_result.counts.items()
+        for subject in [key[0] if isinstance(key, tuple) else key]
         if set(match_neurons(subject)) & set(neurons)
         and (
             footprints is None
@@ -537,6 +540,12 @@ def _scope_rows(columns, component_axes, scope):
 def _fill_condition(engine, check, scope):
     neurons = tuple(scope.neurons)
     check.neurons = neurons
+
+    condition = check.condition
+    if condition.optional and condition.query.statistic_key not in engine.registry:
+        check.skipped = True
+        check.note = "Skipped: optional condition, statistic unavailable."
+        return
 
     if not neurons:
         check.note = "No rows: no partner reached this subgroup."

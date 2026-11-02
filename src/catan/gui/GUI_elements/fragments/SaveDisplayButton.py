@@ -54,7 +54,11 @@ class SaveDisplayButton(QToolButton):
         self.show()
 
     def eventFilter(self, watched, event):
-        if watched is self.canvas.native and event.type() in (
+        try:
+            native = self.canvas.native
+        except RuntimeError:  # the panel is being deleted
+            return False
+        if watched is native and event.type() in (
             QEvent.Type.Resize,
             QEvent.Type.Show,
         ):

@@ -1,5 +1,5 @@
 from pathlib import Path
-from PySide6.QtCore import QObject, Qt, Signal, QSignalBlocker
+from PySide6.QtCore import QObject, Qt, Signal, QSignalBlocker, QTimer
 
 from PySide6.QtWidgets import (
     QInputDialog,
@@ -88,6 +88,51 @@ class FieldConfigConstructor(QObject):
         self.source_changed.connect(self._on_source_changed)
 
         self.update_source(source)
+
+    _changes_of = None
+
+    def enable_apply(self, changes_of, on_apply):
+        """Show "Apply changes": loads what the configuration changed.
+        ``changes_of()`` returns Data.session_config_changes of the source;
+        ``on_apply()`` loads them."""
+        from PySide6.QtWidgets import QPushButton
+
+        self._changes_of = changes_of
+        self.apply_button = QPushButton("Apply changes", self.config_options)
+        self.apply_button.clicked.connect(lambda: (self.close_window(), on_apply()))
+        self.config_layout.insertWidget(
+            self.config_layout.indexOf(self.problem_banner) + 1, self.apply_button
+        )
+        self.update_apply()
+
+    def update_apply(self):
+        """Enable "Apply changes" when the configuration differs from the
+        loaded data; the tooltip says what would be loaded."""
+        if self._changes_of is None or self.source is None:
+            return
+
+        changes = self._changes_of()
+        actions = []
+        if changes["missing"]:
+            actions.append("load " + ", ".join(changes["missing"]))
+        if changes["reload"]:
+            actions.append("reload " + ", ".join(changes["reload"]))
+        if changes["background"]:
+            actions.append("align and load the changed background (preview first)")
+
+        self.apply_button.setEnabled(bool(actions))
+        tooltip = (
+            "Apply the configuration: " + "; ".join(actions) + "."
+            if actions
+            else "The loaded data matches this configuration."
+        )
+        if changes["unsupported"]:
+            tooltip += (
+                "\nChanged spatial fields ("
+                + ", ".join(changes["unsupported"])
+                + ") cannot replace loaded footprints."
+            )
+        self.apply_button.setToolTip(tooltip)
 
     def build_content(self):
         if self._content_built:
@@ -218,9 +263,16 @@ class FieldConfigConstructor(QObject):
 
     def update_source(self, source: SessionData | Assignments | None):
         if source is not self.source:
+            pending = getattr(self, "_pending", None)
             self.clear_problems()
             self._pending = None
             self.pending_buttons.hide()
+            if pending is not None:
+                # Another source selected while a file waited for Load /
+                # Cancel: that file counts as cancelled (a waiting project
+                # restore continues), after the switch has completed.
+                self.close_window()
+                QTimer.singleShot(0, pending[1])
         expanded = self.toggle_config_options.isChecked()
 
         self.source = source
@@ -519,6 +571,8 @@ class FieldConfigConstructor(QObject):
         """Refresh configuration controls without announcing data changes."""
         if self.source is None or not self._content_built:
             return
+
+        self.update_apply()
 
         config = self.source.source_config
 

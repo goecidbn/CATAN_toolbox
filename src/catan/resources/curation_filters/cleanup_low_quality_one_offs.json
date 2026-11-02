@@ -1,0 +1,494 @@
+{
+  "schema_version": 2,
+  "name": "Cleanup: low-quality one-offs",
+  "category": "neurons",
+  "root": {
+    "type": "group",
+    "id": "604268dbc972443d9028eee8ff26b677",
+    "operator": "and",
+    "match_level": "neuron",
+    "children": [
+      {
+        "type": "condition",
+        "id": "5252e61bb9d44e31b91bf6a1a4e86feb",
+        "query": {
+          "statistic_key": "occurence",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "sum",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic",
+          "parameters": {}
+        },
+        "threshold": {
+          "direction": "less",
+          "active": true,
+          "value": 1.0
+        }
+      },
+      {
+        "type": "group",
+        "id": "3fa2b6aeceaa443184bb4d0863e82870",
+        "operator": "or",
+        "match_level": "neuron",
+        "children": [
+          {
+            "type": "group",
+            "id": "8d6d65cf6fcb41a699bd341ca9910a71",
+            "operator": "or",
+            "match_level": "footprint",
+            "children": [
+              {
+                "type": "condition",
+                "id": "37e27a88776a44098521939b2e93fd73",
+                "query": {
+                  "statistic_key": "footprint_size",
+                  "reductions": {
+                    "neuron": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [],
+                  "context": "generic",
+                  "parameters": {
+                    "thr": 0.01
+                  }
+                },
+                "threshold": {
+                  "direction": "less",
+                  "active": true,
+                  "value": 30.0,
+                  "unit": "px²"
+                }
+              },
+              {
+                "type": "condition",
+                "id": "518fbf1597604588b85d16b148a59458",
+                "query": {
+                  "statistic_key": "footprint_eccentricity",
+                  "reductions": {
+                    "neuron": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [],
+                  "context": "generic",
+                  "parameters": {
+                    "measure": "axis ratio",
+                    "thr": 0.2
+                  }
+                },
+                "threshold": {
+                  "direction": "greater",
+                  "active": true,
+                  "value": 3.5
+                }
+              }
+            ],
+            "count": null,
+            "comment": "Obviously not a cell: (nearly) empty footprint or line-like (axis ratio ≥ 3.5).",
+            "apply_to": "same",
+            "summary": null,
+            "manipulation": null,
+            "review_statuses": null
+          },
+          {
+            "type": "group",
+            "id": "ac7ba06176f14bf38995436713606b83",
+            "operator": "and",
+            "match_level": "footprint",
+            "children": [
+              {
+                "type": "group",
+                "id": "5b4aa9685129481abae77ff38f02c7f2",
+                "operator": "or",
+                "match_level": "footprint",
+                "children": [
+                  {
+                    "type": "condition",
+                    "id": "69b4d93c67b447ba9f216b12a0f78d37",
+                    "query": {
+                      "statistic_key": "footprint_eccentricity",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [],
+                      "context": "generic",
+                      "parameters": {
+                        "measure": "axis ratio",
+                        "thr": 0.2
+                      }
+                    },
+                    "threshold": {
+                      "direction": "greater",
+                      "active": true,
+                      "value": 2.0
+                    }
+                  },
+                  {
+                    "type": "condition",
+                    "id": "a866506fa10f4bd890978ed3bed33754",
+                    "query": {
+                      "statistic_key": "footprint_size",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [],
+                      "context": "generic",
+                      "parameters": {
+                        "thr": 0.01
+                      }
+                    },
+                    "threshold": {
+                      "direction": "less",
+                      "active": true,
+                      "reference": {
+                        "kind": "percentile",
+                        "sample": "Condition values",
+                        "level": 5.0
+                      },
+                      "unit": "px²"
+                    }
+                  },
+                  {
+                    "type": "condition",
+                    "id": "7b22a06030e1420780c699761eb688c9",
+                    "query": {
+                      "statistic_key": "session:CNN",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [],
+                      "context": "generic",
+                      "parameters": {}
+                    },
+                    "threshold": {
+                      "direction": "less",
+                      "active": true,
+                      "reference": {
+                        "kind": "percentile",
+                        "sample": "Condition values",
+                        "level": 5.0
+                      }
+                    },
+                    "optional": true
+                  },
+                  {
+                    "type": "condition",
+                    "id": "ede62d295f904f55a7d38433670cdb14",
+                    "query": {
+                      "statistic_key": "session:SNR",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [],
+                      "context": "generic",
+                      "parameters": {}
+                    },
+                    "threshold": {
+                      "direction": "less",
+                      "active": true,
+                      "reference": {
+                        "kind": "percentile",
+                        "sample": "Condition values",
+                        "level": 5.0
+                      }
+                    },
+                    "optional": true
+                  },
+                  {
+                    "type": "condition",
+                    "id": "c9bab248edc04130b6780a1b26531d04",
+                    "query": {
+                      "statistic_key": "session:r-values",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [],
+                      "context": "generic",
+                      "parameters": {}
+                    },
+                    "threshold": {
+                      "direction": "less",
+                      "active": true,
+                      "reference": {
+                        "kind": "percentile",
+                        "sample": "Condition values",
+                        "level": 5.0
+                      }
+                    },
+                    "optional": true
+                  }
+                ],
+                "count": null,
+                "comment": "Questionable: elongated (axis ratio ≥ 2), or among the 5 % lowest footprints in size or — where loaded (optional) — imported CNN, SNR or r-value.",
+                "apply_to": "same",
+                "summary": null,
+                "manipulation": null,
+                "review_statuses": null
+              },
+              {
+                "type": "group",
+                "id": "4ef349a7cb9a41ed81a507cd48d12920",
+                "operator": "and",
+                "match_level": "relationship",
+                "children": [
+                  {
+                    "type": "condition",
+                    "id": "f318b6e64dea4733b6b56e1e2d9d119a",
+                    "query": {
+                      "statistic_key": "footprint_union_distance",
+                      "reductions": {
+                        "neuron_i": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "neuron_j": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [
+                        {
+                          "target": "neuron",
+                          "relation": "different",
+                          "collapse_same": true
+                        }
+                      ],
+                      "context": "generic",
+                      "parameters": {}
+                    },
+                    "threshold": {
+                      "direction": "less",
+                      "active": true,
+                      "reference": {
+                        "kind": "percentile",
+                        "sample": "Same neuron",
+                        "level": 75.0
+                      },
+                      "unit": "px"
+                    }
+                  },
+                  {
+                    "type": "condition",
+                    "id": "e1a35c7cf4674020ae5f4d7583b4cf10",
+                    "query": {
+                      "statistic_key": "footprint_union_similarity",
+                      "reductions": {
+                        "neuron_i": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "neuron_j": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [
+                        {
+                          "target": "neuron",
+                          "relation": "different",
+                          "collapse_same": true
+                        }
+                      ],
+                      "context": "generic",
+                      "parameters": {
+                        "gamma": 0.1
+                      }
+                    },
+                    "threshold": {
+                      "direction": "greater",
+                      "active": true,
+                      "reference": {
+                        "kind": "percentile",
+                        "sample": "Same neuron",
+                        "level": 5.0
+                      }
+                    }
+                  },
+                  {
+                    "type": "condition",
+                    "id": "7e27f5e203414f3faa2379d277cb9328",
+                    "query": {
+                      "statistic_key": "partner_session_match",
+                      "reductions": {
+                        "neuron_i": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "neuron_j": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [
+                        {
+                          "target": "neuron",
+                          "relation": "different",
+                          "collapse_same": true
+                        }
+                      ],
+                      "context": "generic",
+                      "parameters": {
+                        "gamma": 0.1
+                      }
+                    },
+                    "threshold": {
+                      "direction": "less",
+                      "active": true,
+                      "reference": {
+                        "kind": "percentile",
+                        "sample": "Same neuron",
+                        "level": 5.0
+                      }
+                    }
+                  }
+                ],
+                "count": {
+                  "target": "footprint",
+                  "comparison": "eq",
+                  "value": 0,
+                  "unit": "neuron",
+                  "anchor": "source",
+                  "separate_partner_sessions": false
+                },
+                "comment": "No unmatched partner (orphan criteria): no other neuron whose union is as close (≤ p75) and similar (≥ p5) as same-neuron footprints and that has no good footprint of its own in this session (own match < p5 of same-neuron matches). Such a footprint may be that neuron's missing one and is not removed.",
+                "apply_to": "same",
+                "summary": null,
+                "manipulation": null,
+                "review_statuses": null
+              }
+            ],
+            "count": null,
+            "comment": "Questionable, and no other neuron it could belong to.",
+            "apply_to": "same",
+            "summary": null,
+            "manipulation": null,
+            "review_statuses": null
+          }
+        ],
+        "count": null,
+        "comment": "",
+        "apply_to": "same",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": null,
+    "comment": "Neurons detected in a single session whose footprint is not cell-like, from CATAN's shape and size measures and, where loaded, imported quality values (optional conditions). Already reviewed neurons are skipped.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": {
+      "kind": "exclude_neuron",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
+    "review_statuses": [
+      0,
+      2
+    ]
+  }
+}
