@@ -1131,6 +1131,7 @@ class CuratorActions(QGroupBox):
             )
             prepared.validation.require_pass()
 
+            navigation = self._navigation_state()
             self.committing = True
             try:
                 self.data.commit_manipulation(prepared)
@@ -1146,6 +1147,8 @@ class CuratorActions(QGroupBox):
                     )
             finally:
                 self.committing = False
+
+            self._keep_navigation(prepared, navigation, targets)
 
             self.controller._results_note = (
                 "Data changed since evaluation; "
@@ -1190,6 +1193,54 @@ class CuratorActions(QGroupBox):
         self.pending = None
         self._buttons()
         QTimer.singleShot(0, lambda: self._advance(token))
+
+    def _navigation_state(self):
+        """Selection and focus before a curator manipulation."""
+        selected = self.state.selected_components
+        return (
+            None if selected is None else list(selected),
+            self.state.focused_component,
+        )
+
+    def _keep_navigation(self, prepared, navigation, targets):
+        """After a curator manipulation, keep stepping through the matches:
+        commit() adds the result neurons to the selection and focuses a
+        result (a source neuron when the focused target footprint was
+        replaced), so the navigation bar went on from there and landed on
+        non-matches (no highlight, no target selector). The selection keeps
+        the neurons selected before (renumbered); the focus returns to the
+        target's neuron while it has footprints."""
+        selected_before, focus_before = navigation
+        ids = self.data.assignments.ids
+
+        def current(neuron):
+            new = prepared.row_map.get(int(neuron))
+            return None if new is None or not (ids[new] >= 0).any() else int(new)
+
+        if selected_before is None:
+            self.state.update_selected_components(None, [])
+        else:
+            kept = {
+                neuron
+                for component in selected_before
+                if (neuron := current(component.neuron_id)) is not None
+            }
+            self.state.update_selected_components(
+                [
+                    component
+                    for component in (self.state.selected_components or ())
+                    if int(component.neuron_id) in kept
+                ],
+                [],
+            )
+
+        for component in (*targets, focus_before):
+            if component is None:
+                continue
+            neuron = current(component.neuron_id)
+            if neuron is not None:
+                self.state.focused_component = NeuronComponent(neuron, None)
+                break
 
     def _highlight_outcome(self, prepared, endpoints):
         """Highlight results (targets) and the plans' sources at their new
@@ -1305,9 +1356,11 @@ class CuratorActions(QGroupBox):
             )
             prepared.validation.require_pass()
 
+            navigation = self._navigation_state()
             self.committing = True
             try:
                 self.data.commit_manipulation(prepared)
+                self._keep_navigation(prepared, navigation, ())
 
                 result = self.controller.current_result
                 if result is not None:

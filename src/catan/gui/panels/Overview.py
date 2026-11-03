@@ -646,6 +646,18 @@ class Display(BasePlot.BaseCanvas):
         visual.visible = True
         self.update()
 
+    def clear_display(self):
+        """Remove background, neuron points and the shared border."""
+        self.clean()
+        background = self.plotting.pop("background", None)
+        if background is not None:
+            background.parent = None
+        self.common_boundary_overlay.visible = False
+        for visuals in self.plotting["overlays"].values():
+            for visual in visuals or ():
+                visual.visible = False
+        self.update()
+
     def clean(self, with_union=True):
 
         for key, visual in self.plotting["visuals"].items():
@@ -2001,6 +2013,11 @@ class Controller(BasePlot.CanvasController):
             self._refresh_common_boundary()
 
     def _on_session_changed(self):
+        if not self.data.sessions:
+            # Nothing loaded (e.g. after Clean all): empty canvas.
+            self.canvas.clear_display()
+            return
+
         if (
             self.data.assignments is None
             or self.data.assignments.ids.shape[1] == 0

@@ -81,6 +81,10 @@ FLOOR_DEPTH = 0.8
 ROTATE_ON_FOCUS_KEY = "footprints/rotate_on_focus"
 ROTATION_DURATION_KEY = "footprints/rotation_duration_s"
 SHOW_COORDINATES_KEY = "footprints/show_coordinates"
+HOVER_NEURON_KEY = "footprints/hover_neuron"
+# The hovered footprint's other footprints: faint hover colour, fading out.
+HOVER_NEURON_ALPHA = 0.35
+HOVER_NEURON_FADE_S = 2.0
 
 INFERRED_RGBA = np.array(
     [0.0, 166 / 255, 178 / 255, 1.0],
@@ -131,6 +135,7 @@ class Display(BasePlot.BaseCanvas):
         "highlighted",
         "highlighted_source",
         "highlighted_target",
+        "hovered_neuron",
         "hovered",
     ]
 
@@ -142,6 +147,11 @@ class Display(BasePlot.BaseCanvas):
 
         # None means follow the globally active assignments.
         self._assignment_name = (config or {}).get("assignments_name")
+
+        # Fading "hovered_neuron" overlay (show_hovered_neuron).
+        self._hover_fade = []
+        self._hover_fade_timer = None
+        self._hover_fade_clock = None
 
         self.grid = self.central_widget.add_grid(spacing=0)
         self.view = self.grid.add_view(row=0, col=0)
@@ -1270,7 +1280,11 @@ class Display(BasePlot.BaseCanvas):
             rec.key, neuron_rec.mesh_vertices[rec.vertex_start : rec.vertex_stop]
         )
         faces = neuron_rec.mesh_faces[rec.face_start : rec.face_stop] - rec.vertex_start
-        cols = self.styles.get_color_array(style, verts[:, 2], alpha=0.6)
+        cols = self.styles.get_color_array(
+            style,
+            verts[:, 2],
+            alpha=HOVER_NEURON_ALPHA if style == "hovered_neuron" else 0.6,
+        )
 
         if rec.inferred:
             rgba = INFERRED_RGBA.copy()
@@ -1284,6 +1298,52 @@ class Display(BasePlot.BaseCanvas):
             cols = np.tile(rgba, (len(verts), 1))
 
         return {"vertices": verts, "faces": faces, "vertex_colors": cols}
+
+    def show_hovered_neuron(self, components):
+        """The other footprints of the hovered footprint's neuron in a faint
+        hover colour, fading out over HOVER_NEURON_FADE_S; None hides."""
+        from PySide6.QtCore import QElapsedTimer, QTimer
+
+        self.update_style(components or None, "hovered_neuron")
+        visuals = [
+            visual
+            for visual in self.plotting["overlays"].get("hovered_neuron", [])
+            if visual.visible
+        ]
+        self._hover_fade = [
+            (visual, np.array(visual.mesh_data.get_vertex_colors(), copy=True))
+            for visual in visuals
+        ]
+
+        timer = self._hover_fade_timer
+        if timer is None:
+            timer = self._hover_fade_timer = QTimer(self.native)
+            timer.setInterval(40)
+            timer.timeout.connect(self._step_hover_fade)
+            self._hover_fade_clock = QElapsedTimer()
+
+        if not self._hover_fade:
+            timer.stop()
+            return
+        self._hover_fade_clock.start()
+        timer.start()
+
+    def _step_hover_fade(self):
+        remaining = 1.0 - self._hover_fade_clock.elapsed() / (1000.0 * HOVER_NEURON_FADE_S)
+
+        for visual, colors in self._hover_fade:
+            if remaining <= 0:
+                visual.visible = False
+                continue
+            faded = colors.copy()
+            faded[:, 3] *= remaining
+            visual.mesh_data.set_vertex_colors(faded)
+            visual.mesh_data_changed()
+
+        if remaining <= 0:
+            self._hover_fade = []
+            self._hover_fade_timer.stop()
+        self.update()
 
     def on_mouse_release(self, event):
 
@@ -2698,6 +2758,32 @@ class Controller(BasePlot.CanvasController):
         parameters.checkbox_rotate_on_focus.toggled.connect(store)
         parameters.rotation_duration_spin.valueChanged.connect(store)
 
+    def _update_hovered_neuron(self, hovered):
+        """Hovering a footprint flashes its neuron's other footprints
+        ("Show neuron on hover"); restarted only when the hover changes."""
+        if isinstance(hovered, NeuronComponent):
+            hovered = [hovered]
+        hovered = [c for c in hovered or () if c.session_id is not None]
+        key = tuple(sorted((int(c.neuron_id), int(c.session_id)) for c in hovered))
+        if key == getattr(self, "_hovered_neuron_key", None):
+            return
+        self._hovered_neuron_key = key
+
+        parameters = self.controls.get("parameter")
+        enabled = parameters is None or parameters.checkbox_hover_neuron.isChecked()
+        siblings = []
+        if enabled:
+            hovered_keys = set(key)
+            neurons = {neuron for neuron, _ in key}
+            siblings = [
+                NeuronComponent(*data_key)
+                for data_key in self.canvas.plotting["data"]
+                if isinstance(data_key, tuple)
+                and data_key[0] in neurons
+                and data_key not in hovered_keys
+            ]
+        self.canvas.show_hovered_neuron(siblings)
+
     def _restore_coordinates_preference(self):
         """"Coordinate grid" (user preference, QSettings)."""
         parameters = self.controls["parameter"]
@@ -2714,6 +2800,21 @@ class Controller(BasePlot.CanvasController):
                 self.state.settings.setValue(SHOW_COORDINATES_KEY, bool(on))
 
         parameters.show_coordinates_changed.connect(apply)
+
+        # "Show neuron on hover" (user preference).
+        if settings is not None:
+            parameters.checkbox_hover_neuron.setChecked(
+                settings.value(HOVER_NEURON_KEY, True, type=bool)
+            )
+
+        def store_hover(on):
+            if self.state.settings is not None:
+                self.state.settings.setValue(HOVER_NEURON_KEY, bool(on))
+            if not on:
+                self._hovered_neuron_key = None
+                self.canvas.show_hovered_neuron(None)
+
+        parameters.checkbox_hover_neuron.toggled.connect(store_hover)
 
     def build_controls(self):
         super().build_controls()
@@ -2944,10 +3045,9 @@ class Controller(BasePlot.CanvasController):
     def update_styles(self):
         canvas = self.canvas
 
-        canvas.update_style(
-            canvas.components_from_active(self.state.hovered_components) or None,
-            "hovered",
-        )
+        hovered = canvas.components_from_active(self.state.hovered_components) or None
+        canvas.update_style(hovered, "hovered")
+        self._update_hovered_neuron(hovered)
         canvas.update_style(
             canvas.components_from_active(
                 self.state.selected_components,
@@ -3679,6 +3779,14 @@ class FootprintParametersController(ControlPanel.ControlPanel):
         )
         self.checkbox_coordinates.toggled.connect(self.show_coordinates_changed)
         self.form.addRow(self.checkbox_coordinates)
+
+        self.checkbox_hover_neuron = QCheckBox("Show neuron on hover")
+        self.checkbox_hover_neuron.setChecked(True)
+        self.checkbox_hover_neuron.setToolTip(
+            "Hovering a footprint briefly shows the other footprints of its "
+            "neuron in a faint hover colour (fading out within 2 s)."
+        )
+        self.form.addRow(self.checkbox_hover_neuron)
 
         ## rotate the view once around the newly focused neuron
         self.checkbox_rotate_on_focus = QCheckBox("Rotate on focus")

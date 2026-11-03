@@ -39,6 +39,7 @@ from catan.core.changes import (
     SESSION_STRUCTURE_CHANGES,
 )
 from catan.gui.panels import StatisticsData
+from catan.gui.GUI_elements.utils.vispy_axes import link_axis
 from catan.gui.panels.helper import HistogramMesh, series_with_confidence, ControlPanel
 
 from catan.gui.background_tasks.runtime import current_task_context
@@ -70,6 +71,7 @@ from catan.gui.data.statistics.plotdata_comparison import (
     ASSIGNMENTS_REF,
     ComparisonHistogram,
     ComparisonScatter,
+    AggregatedComparisonScatter,
 )
 
 from catan.gui.background_tasks.runtime import TaskCancelled
@@ -358,16 +360,16 @@ class Display(BasePlot.BaseCanvas):
 
         self.axes["x"] = create_axis("bottom")
         self.grid.add_widget(self.axes["x"], row=2, col=1)
-        self.axes["x"].link_view(self.view)
+        link_axis(self.axes["x"], self.view)
         _use_integer_ticks(self.axes["x"].axis, lambda: self._integer_bin_step())
 
         self.axes["y"] = create_axis("left")
         self.grid.add_widget(self.axes["y"], row=1, col=0)
-        self.axes["y"].link_view(self.view)
+        link_axis(self.axes["y"], self.view)
 
         self.axes["y_2nd"] = create_axis("right")
         self.grid.add_widget(self.axes["y_2nd"], row=1, col=2)
-        self.axes["y_2nd"].link_view(self.right_view)
+        link_axis(self.axes["y_2nd"], self.right_view)
 
         self.axes["y_2nd"].visible = False
 
@@ -2528,10 +2530,10 @@ class Controller(BasePlot.CanvasController):
             return self._histogram_assignment_names()
 
         if self._scatter_comparison_enabled() and slot in {"x", "y"}:
-            name = (
-                self.config.get(f"scatter_assignments_{slot}")
-                or self.data.current_assignments
-            )
+            name = self.config.get(f"scatter_assignments_{slot}")
+            # A set chosen earlier but not loaded now: the active one.
+            if name not in self.data.available_assignments:
+                name = self.data.current_assignments
             return (name,) if name is not None else ()
 
         return ()
@@ -2564,6 +2566,11 @@ class Controller(BasePlot.CanvasController):
 
                 if task_id is not None:
                     self.state.tasks.cancel(task_id)
+
+        if not required:
+            # Nothing to plot any more (e.g. x set back to None): clear.
+            self.rebuild_plot()
+            return
 
         if which is None:
             slots = tuple(
@@ -2605,6 +2612,15 @@ class Controller(BasePlot.CanvasController):
             self.current_results[which] = None
             self._release_plot_data()
             self.rebuild_plot()
+            return
+
+        # No sessions (e.g. after Clean all): an empty plot, not an error.
+        # The query stays; loading data recalculates it.
+        if not self.data.sessions:
+            self.current_results[which] = None
+            self._release_plot_data()
+            self.canvas.hide_plot_error()
+            self._update_statistics_status()
             return
 
         existing = self.current_results[which]
@@ -2808,7 +2824,14 @@ class Controller(BasePlot.CanvasController):
         if self.plot_type != "histogram":
             return ()
 
-        return tuple(dict.fromkeys(self.config.get("histogram_assignments", ())))
+        # Sets chosen earlier but not loaded now (e.g. another project) are
+        # left out instead of failing the whole plot; the choice is kept.
+        loaded = set(self.data.available_assignments)
+        return tuple(
+            name
+            for name in dict.fromkeys(self.config.get("histogram_assignments", ()))
+            if name in loaded
+        )
 
     def _populate_comparison_menu(self):
         menu = self.controls["comparison_menu"]
@@ -2920,7 +2943,8 @@ class Controller(BasePlot.CanvasController):
                 f"X: {assignment_label(plot_data.names[0])}",
                 f"Y: {assignment_label(plot_data.names[1])}",
                 (
-                    f"{plot_data.n_markers} points; "
+                    # Neurons (an aggregated marker holds several).
+                    f"{len(plot_data.marker_rows)} points; "
                     f"{plot_data.unmatched_count} X neurons unmatched"
                 ),
             ]
@@ -3151,13 +3175,21 @@ class Controller(BasePlot.CanvasController):
                 x_name = self._assignment_names_for_slot("x")[0]
                 y_name = self._assignment_names_for_slot("y")[0]
 
-                return ComparisonScatter(
+                points = ComparisonScatter(
                     tables["x"][x_name],
                     tables["y"][y_name],
                     x_name,
                     y_name,
                     self.data,
                 )
+                # Integer values (e.g. occurrence in both sets): one marker
+                # per value pair, sized by its number of neurons.
+                integer = plotdata_scatter.integer_values(points)
+                self.controls["aggregate_scatter"].setVisible(integer)
+
+                if integer and self.config.get("aggregate_scatter", True):
+                    return AggregatedComparisonScatter(points)
+                return points
 
             plot_data = plotdata_scatter.build_plot_data(
                 x_table=tables["x"],

@@ -25,6 +25,14 @@ class Styles:
             "size": 1.5,
             "edge_width": 0.0,
         },
+        # The hovered footprint's other footprints (Footprints panel).
+        "hovered_neuron": {
+            "cmap": "Blues",
+            "alpha": 0.35,
+            "width": 2.0,
+            "size": 2.0,
+            "edge_width": 1.5,
+        },
         "hovered": {
             "cmap": "Blues",
             "alpha": 0.8,

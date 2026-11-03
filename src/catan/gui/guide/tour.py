@@ -16,7 +16,9 @@ views side by side, e.g. to show linked views; default: the chapter's
 area left open for clicks; default: the display area for several panels,
 the step's panel, else the anchor itself; "none": only the anchor),
 ``also_open`` (further anchors left open and framed, e.g. the navigation
-bar a panel step refers to),
+bar a panel step refers to), ``bright`` (anchors left open and undimmed
+without a frame, e.g. the whole curator while its parts are framed; also
+per chapter),
 ``wait_for`` (a condition: Next stays disabled until it held once during
 the step; the guide never moves on by itself, except ``advance_when``: a
 condition that moves on as soon as it holds, e.g. once loading started),
@@ -132,6 +134,8 @@ ACTIONS = (
     "load_merge_preset",
     "load_split_preset",
     "evaluate_and_select",
+    "evaluate_select_both",
+    "clean_workspace",
     "open_condition",
     "reveal_anchor",
     "load_alternative_assignments",
@@ -180,6 +184,7 @@ class Step:
     panels: tuple[str, ...] = ()
     interactive: str | None = None
     also_open: tuple[str, ...] = ()
+    bright: tuple[str, ...] = ()
     on_enter: str | None = None
     on_leave: str | None = None
     advance_when: str | None = None
@@ -224,6 +229,7 @@ class Chapter:
     requires: tuple[str, ...] = ()
     setup: str | None = None
     panels: tuple[str, ...] = ()
+    bright: tuple[str, ...] = ()
 
     @property
     def ready(self):
@@ -321,6 +327,7 @@ def _parse_chapter(entry):
                 panels=tuple(raw.get("panels", ())),
                 interactive=raw.get("interactive"),
                 also_open=tuple(raw.get("also_open", ())),
+                bright=tuple(raw.get("bright", ())),
                 on_enter=raw.get("on_enter"),
                 on_leave=raw.get("on_leave"),
                 advance_when=raw.get("advance_when"),
@@ -343,8 +350,9 @@ def _parse_chapter(entry):
             if step.interactive not in (None, "none", *KNOWN_ANCHORS):
                 problems.append(f"interactive anchor {step.interactive!r}")
             problems += [
-                f"also_open anchor {name!r}"
-                for name in step.also_open
+                f"{kind} anchor {name!r}"
+                for kind, names in (("also_open", step.also_open), ("bright", step.bright))
+                for name in names
                 if name not in KNOWN_ANCHORS
             ]
             problems += [
@@ -370,8 +378,12 @@ def _parse_chapter(entry):
             requires=tuple(entry.get("requires", ())),
             setup=entry.get("setup"),
             panels=tuple(entry.get("panels", ())),
+            bright=tuple(entry.get("bright", ())),
         )
         problems = [
+            f"bright anchor {name!r}" for name in chapter.bright if name not in KNOWN_ANCHORS
+        ]
+        problems += [
             f"condition {name!r}"
             for name in chapter.requires
             if name not in CONDITIONS

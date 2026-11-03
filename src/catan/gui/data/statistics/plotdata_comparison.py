@@ -391,3 +391,34 @@ class ComparisonScatter(plotdata_scatter.PlotData):
             f"{self.title['x']}: {self.x[marker_index]:.4g}\n"
             f"{self.title['y']}: {self.y[marker_index]:.4g}"
         )
+
+
+class AggregatedComparisonScatter(plotdata_scatter.AggregatedScatter, ComparisonScatter):
+    """ComparisonScatter of integer values with one marker per value pair,
+    sized by its number of neurons (as AggregatedScatter). Picking a
+    marker selects all its neurons; dataset mapping as ComparisonScatter."""
+
+    def __init__(self, points: ComparisonScatter):
+        plotdata_scatter.AggregatedScatter.__init__(self, points)
+        self.names = points.names
+        self.data = points.data
+        self.local_selection = None
+        self.unmatched_count = points.unmatched_count
+        self.x_ids = points.x_ids
+        self.y_ids = points.y_ids
+        self.title = points.title
+
+    def tooltip_for_marker(self, marker_index):
+        count = int(self.counts[marker_index])
+        rows = self.rows_for_markers(marker_index)
+        neurons = self.x_ids[self.x_rows[rows[:5]]]
+        listed = ", ".join(str(int(n)) for n in neurons) + (", …" if count > 5 else "")
+
+        return "\n".join(
+            [
+                f"{count} neuron{'s' if count != 1 else ''} "
+                f"({assignment_label(self.names[0])}: {listed})",
+                f"{self.title['x']}: {self.x[marker_index]:.4g}",
+                f"{self.title['y']}: {self.y[marker_index]:.4g}",
+            ]
+        )

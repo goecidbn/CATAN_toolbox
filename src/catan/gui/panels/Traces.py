@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
 )
 
+from catan.gui.GUI_elements.utils.vispy_axes import link_axis
 from catan.core.changes import (
     ChangeKind as C,
     DataChange,
@@ -84,7 +85,7 @@ class Display(BasePlot.BaseCanvas):
         self.axes.axis.axis_width = 2
         self.axes.axis.tick_width = 1
         self.grid.add_widget(self.axes, row=1, col=0)
-        self.axes.link_view(self.view)
+        link_axis(self.axes, self.view)
 
         # # 🔑 Control layout sizing
         self.axes.height_min = 64

@@ -83,9 +83,9 @@ catan = "catan.cli:main"
 catan-gui = "catan.gui.app:main"
 
 [project.urls]
-Homepage = "https://github.com/woxxel/CATAN_toolbox"
-Documentation = "https://github.com/woxxel/CATAN_toolbox/wiki"
-Issues = "https://github.com/woxxel/CATAN_toolbox/issues"
+Homepage = "https://github.com/goecidbn/CATAN_toolbox"
+Documentation = "https://github.com/goecidbn/CATAN_toolbox/wiki"
+Issues = "https://github.com/goecidbn/CATAN_toolbox/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

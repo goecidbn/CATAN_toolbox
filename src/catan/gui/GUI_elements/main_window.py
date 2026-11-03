@@ -45,7 +45,7 @@ class MainWindow(QMainWindow):
     def __init__(self, *, settings=None):
         super().__init__()
 
-        self.setWindowTitle("CATAN - Curating and Tracking Neurons")
+        self.setWindowTitle("CATAN - Curation and Analysis of Tracked Across-sessions Neurons")
 
         QCoreApplication.setOrganizationName("WolfLabs")
         QCoreApplication.setApplicationName("CATAN")
@@ -115,6 +115,7 @@ class MainWindow(QMainWindow):
         help_menu = self.menuBar().addMenu("Help")
         guide_menu = help_menu.addMenu("Starter guide")
         guide_menu.aboutToShow.connect(lambda: self.guide.build_menu(guide_menu))
+        self._add_title_corner()
         QTimer.singleShot(800, self.guide.offer_on_startup)
 
         print_debug = QAction("Print debug info", self)
@@ -260,6 +261,44 @@ class MainWindow(QMainWindow):
         )
 
         app.setStyleSheet(style)
+
+    REPOSITORY_URL = "https://github.com/goecidbn/CATAN_toolbox"
+
+    def _add_title_corner(self):
+        """Right end of the menu bar: CATAN version and a GitHub button
+        (repository, issues for bugs and requests)."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtWidgets import QHBoxLayout, QLabel, QToolButton, QWidget
+        import qtawesome as qta
+
+        from catan.gui.utils.app_version import catan_version
+
+        version = catan_version()
+        corner = QWidget(self.menuBar())
+        layout = QHBoxLayout(corner)
+        layout.setContentsMargins(0, 0, 6, 0)
+        layout.setSpacing(4)
+
+        label = QLabel(f"CATAN {version.split('+')[0]}")
+        label.setStyleSheet("color: #9aa3ad;")
+        label.setToolTip(f"CATAN version {version}")
+        layout.addWidget(label)
+
+        button = QToolButton()
+        button.setAutoRaise(True)
+        button.setIcon(qta.icon("fa5b.github", color="#c8ccd2"))
+        button.setToolTip(
+            "CATAN on GitHub — report bugs, request features or suggest "
+            "improvements as issues there"
+        )
+        button.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(self.REPOSITORY_URL))
+        )
+        layout.addWidget(button)
+
+        self.version_label, self.github_button = label, button
+        self.menuBar().setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
     def _fill_recent_projects(self):
         """File ▸ Open recent: project name and folder, newest first."""

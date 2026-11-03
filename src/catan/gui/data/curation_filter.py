@@ -489,7 +489,13 @@ class CurationFilterEvaluator:
         with progress_scope(2, 3, "Preparing curator domains"):
             self._prepare_count_domains(root)
         with progress_scope(3, 97):
-            root_result = self._evaluate_group(root, condition_results, group_results)
+            root_result = self._evaluate_group(
+                root,
+                condition_results,
+                group_results,
+                # The root keeps only neurons of the chosen review states.
+                restrict_neurons=self._review_allowed,
+            )
 
         neurons = set()
 
@@ -580,6 +586,7 @@ class CurationFilterEvaluator:
         condition: CurationFilterCondition,
         *,
         requested_pairs=None,
+        neuron_rows=None,
     ) -> CurationFilterConditionResult:
         if not condition.threshold.active:
             raise CurationFilterError(
@@ -596,6 +603,7 @@ class CurationFilterEvaluator:
                 condition.query,
                 condition.threshold.mask,
                 requested_pairs=requested_pairs,
+                neuron_rows=neuron_rows,
             )
 
         if table is None:
@@ -1129,10 +1137,16 @@ class CurationFilterEvaluator:
         initial_pairs=None,
         initial_kinds=None,
         endpoint_domain=None,
+        restrict_neurons=None,
     ) -> CurationFilterGroupResult:
         """``endpoint_domain``: footprints for which this group's result must
         be exact (a source subgroup only checks the parent's sources). Other
-        footprints may be missing from the result."""
+        footprints may be missing from the result.
+
+        ``restrict_neurons``: neurons for which the result of a neuron /
+        footprint group must be exact (those its parent can still match).
+        Conditions of neuron-local statistics are then evaluated for these
+        neurons only, and an AND group narrows them after every child."""
 
         if initial_pairs is None and endpoint_domain is not None:
             initial_pairs = self._domain_pairs(group, endpoint_domain)
@@ -1215,7 +1229,24 @@ class CurationFilterEvaluator:
         endpoint_kinds = initial_kinds
         remaining_pairs = None if initial_pairs is None else set(initial_pairs)
 
+        # Neurons a neuron / footprint group can still match.
+        neuron_level = group.match_level in ("neuron", "footprint")
+        surviving = None
+        if neuron_level:
+            surviving = None if restrict_neurons is None else set(restrict_neurons)
+            if endpoint_domain is not None:
+                domain_neurons = {component.neuron_id for component in endpoint_domain}
+                surviving = (
+                    domain_neurons if surviving is None else surviving & domain_neurons
+                )
+
         progressive = group.operator == "and" and group.match_level == "relationship"
+        # Children only need results for the pairs this group can still
+        # match: the surviving pairs of an AND group, or the pairs an OR
+        # group was given (its own result only has to be exact there).
+        restricted = group.match_level == "relationship" and (
+            progressive or group.operator == "or"
+        )
 
         for progress_index, (child) in enumerate(ordinary_children):
             with progress_step(
@@ -1232,7 +1263,7 @@ class CurationFilterEvaluator:
                         requested_pairs = None
 
                         if (
-                            progressive
+                            restricted
                             and remaining_pairs is not None
                             and self.engine.supports_requested_pairs(child.query)
                         ):
@@ -1263,6 +1294,7 @@ class CurationFilterEvaluator:
                             condition_result = self._evaluate_condition(
                                 child,
                                 requested_pairs=requested_pairs,
+                                neuron_rows=surviving,
                             )
 
                         condition_results[child.id] = condition_result
@@ -1301,14 +1333,32 @@ class CurationFilterEvaluator:
                 elif is_filter_group(child):
 
                     try:
+                        # A pair-wise subgroup can be evaluated on the
+                        # remaining pairs only (counts or partner sets
+                        # inside would change on fewer pairs).
+                        initial = (
+                            remaining_pairs
+                            if restricted
+                            and remaining_pairs is not None
+                            and child.match_level == "relationship"
+                            and self._pairwise_group(child)
+                            else None
+                        )
+
                         with progress_scope(0, 85):
                             child_result = self._evaluate_group(
                                 child,
                                 condition_results,
                                 group_results,
+                                initial_pairs=initial,
                                 endpoint_domain=(
                                     endpoint_domain
                                     if group.match_level == "footprint"
+                                    else None
+                                ),
+                                restrict_neurons=(
+                                    surviving
+                                    if child.match_level in ("neuron", "footprint")
                                     else None
                                 ),
                             )
@@ -1346,6 +1396,14 @@ class CurationFilterEvaluator:
                         remaining_pairs = set(child_result.matches)
                     else:
                         remaining_pairs.intersection_update(child_result.matches)
+
+                if neuron_level and group.operator == "and":
+                    matched = {
+                        neuron
+                        for match in child_result.matches
+                        for neuron in match_neurons(match)
+                    }
+                    surviving = matched if surviving is None else surviving & matched
 
         # -----------------------------------------
         # Empty group
@@ -1607,6 +1665,30 @@ class CurationFilterEvaluator:
                     )
         group_results[group.id] = result
         return result
+
+    @staticmethod
+    def _pairwise_group(group):
+        """Whether a relationship group decides each pair on its own: no
+        count and no partner-set / partner-summary subgroups, also in
+        nested groups. Its matches among given pairs are then the same as
+        among all pairs."""
+        if group.count is not None:
+            return False
+
+        for child in group.children:
+            if not is_filter_group(child):
+                continue
+
+            if child.apply_to in BETWEEN_BINDINGS:
+                return False
+
+            if child.apply_to == "same" and not (
+                child.match_level == "relationship"
+                and CurationFilterEvaluator._pairwise_group(child)
+            ):
+                return False
+
+        return True
 
     def _domain_pairs(self, group, domain):
         """Candidate pairs of a relationship group needed for ``domain``.

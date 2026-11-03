@@ -227,6 +227,9 @@ class GuideController(QObject):
             "load_merge_preset": lambda: self._load_preset(MERGE_PRESET),
             "load_split_preset": lambda: self._load_preset(SPLIT_PRESET),
             "evaluate_and_select": self._evaluate_and_select,
+            "evaluate_select_both": lambda: self._evaluate_and_select(highlight="both"),
+            # Broom button: asks to save / discard first, as on a click.
+            "clean_workspace": lambda: self.window.clean_workspace(),
             "open_condition": self._open_condition,
             "reveal_anchor": self._reveal_anchor,
             "load_alternative_assignments": self._load_alternative_assignments,
@@ -837,6 +840,17 @@ class GuideController(QObject):
             rects += self.state.guide_anchors.rects(name, self.window)
         return rects
 
+    def _bright_rects(self):
+        """Areas left open and undimmed without a frame (Step.bright and
+        the chapter's bright anchors, e.g. the whole curator)."""
+        if self._prerequisites or self._panel_prompt or self.step is None:
+            return []
+        names = tuple(self.step.bright) + tuple(getattr(self.chapter, "bright", ()) or ())
+        rects = []
+        for name in names:
+            rects += self.state.guide_anchors.rects(name, self.window)
+        return rects
+
     def _panel_header_rects(self):
         """Headers of the shown panels (split buttons, view menus): the
         bubble keeps clear of them while it asks for panels."""
@@ -865,19 +879,23 @@ class GuideController(QObject):
         if open_rect is None:
             open_rect = rect
         extra = self._also_open_rects()
+        bright = self._bright_rects()
         framed = (
             self.state.guide_anchors.rects(anchor, window) if rect is not None else []
         ) + extra
         keep_clear = framed + (self._panel_header_rects() if self._panel_prompt else [])
-        key = (rect, open_rect, tuple(framed), tuple(keep_clear), self._modal_rect)
+        key = (
+            rect, open_rect, tuple(framed), tuple(keep_clear), tuple(bright), self._modal_rect,
+        )
 
         if force or key != getattr(self, "_last_rect", None) or (
             self.overlay.size() != window.size()
         ):
             self._last_rect = key
-            self.overlay.set_hole(open_rect, extra)
-            # The anchor's parts framed; the rest of a larger open area dimmed.
-            self.frame.frame(open_rect, framed or None)
+            self.overlay.set_hole(open_rect, extra + bright)
+            # The anchor's parts framed; the rest of a larger open area dimmed
+            # (except bright areas).
+            self.frame.frame(open_rect, framed or None, clear=bright)
             central = window.centralWidget()
             bounds = central.geometry() if central is not None else window.rect()
             self.bubble.place(
@@ -1362,9 +1380,10 @@ class GuideController(QObject):
     def _preset_is(self, key):
         return self._controller("match_curator").filter_store.working_preset_key == key
 
-    def _evaluate_and_select(self):
+    def _evaluate_and_select(self, highlight=None):
         """Evaluate the curator's preset, then select its matches (once
-        the evaluation finished; a few ticks)."""
+        the evaluation finished; a few ticks); ``highlight``: then set the
+        curator's highlight mode (e.g. "both")."""
         controller = self._controller("match_curator")
         if controller is None:
             return
@@ -1378,6 +1397,11 @@ class GuideController(QObject):
                 QTimer.singleShot(250, self, lambda: select(attempts - 1))
                 return
             current.menu.select_button.click()
+            if highlight is not None:
+                selector = current.menu.highlight_selector
+                index = selector.findData(highlight)
+                if index >= 0:
+                    selector.setCurrentIndex(index)
 
         QTimer.singleShot(250, self, select)
 

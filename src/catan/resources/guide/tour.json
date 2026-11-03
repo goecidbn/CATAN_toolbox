@@ -825,7 +825,7 @@
           "do_it": "open_condition",
           "do_it_label": "Open one for me",
           "on_enter": "reveal_anchor",
-          "text": "Each line in a group is a <b>condition</b>: a statistic and a threshold. Click one to open its editor (or let me):<ul><li><b>Statistic</b> — chosen as in the statistics panel, with reductions and neuron / session relations.</li><li><b>Match when</b> ≥, ≤ or between.</li><li>Where the bound comes from: <b>a fixed number</b>; <b>a percentile</b> of the values sampled from your data (resampled on every evaluation, so it adapts to each animal); or <b>from the fitted model</b> — e.g. 2·σ<sub>det</sub> + 2·σ<sub>move</sub>, following every refit.</li></ul><b>Optional</b> skips a condition whose statistic is missing. The editor closes when you click outside it (Cancel keeps the condition unchanged)."
+          "text": "Each line in a group is a <b>condition</b>: a statistic and a threshold.<ul><li><b>Click</b> a condition (after evaluating) to highlight the footprints / neurons that fulfil it.</li><li><b>Right-click</b> it for its menu: <b>Edit…</b> opens the editor (or let me), <b>Remove</b> deletes it — as does the <b>×</b>.</li><li>The grab area <b>⠿</b> at its front moves it, also into another group.</li></ul>The editor sets:<ul><li><b>Statistic</b> — chosen as in the statistics panel, with reductions and neuron / session relations.</li><li><b>Match when</b> ≥, ≤ or between.</li><li>Where the bound comes from: <b>a fixed number</b>; <b>a percentile</b> of the values sampled from your data (resampled on every evaluation, so it adapts to each animal); or <b>from the fitted model</b> — e.g. 2·σ<sub>det</sub> + 2·σ<sub>move</sub>, following every refit.</li></ul><b>Optional</b> skips a condition whose statistic is missing. The editor closes when you click outside it (Cancel keeps the condition unchanged)."
         },
         {
           "title": "Review status filter",
@@ -872,9 +872,14 @@
           "anchor": "panel.footprints",
           "panel": "match_curator",
           "wait_for": "matches_selected",
-          "do_it": "evaluate_and_select",
-          "do_it_label": "Evaluate and select for me",
-          "text": "Evaluate and select the matches (or let me). In each match, the <b>source</b> (violet) is what would be moved — here the neuron merged away — and the <b>target</b> (orange) where it goes.<br><br>Adjust them by hand: <b>Ctrl + click</b> cycles a footprint through source → target → not highlighted. Edited highlights become a candidate in the curator, ready to apply — or move them yourself with right-click ▸ <b>Move footprints of neuron N ▸ Highlighted footprints</b>."
+          "do_it": "evaluate_select_both",
+          "do_it_label": "Evaluate, select and highlight both for me",
+          "text": "In the curator: <b>Evaluate</b>, then <b>Select matching neurons</b>, and set the highlight selector below the results to <b>Highlight both</b> (or let me). In each match, the <b>source</b> (violet) is what would be moved — here the neuron merged away — and the <b>target</b> (orange) where it goes.<br><br>Adjust them by hand: <b>Ctrl + click</b> cycles a footprint through source → target → not highlighted. Edited highlights become a candidate in the curator, ready to apply — or move them yourself with right-click ▸ <b>Move footprints of neuron N ▸ Highlighted footprints</b>.",
+          "also_open": [
+            "curation.evaluate",
+            "curation.select_button",
+            "curation.highlight_selector"
+          ]
         },
         {
           "id": "split",
@@ -902,13 +907,16 @@
           "title": "Your own presets",
           "anchor": "curation.preset_menu",
           "panel": "match_curator",
-          "text": "The presets are starting points — build your own: <b>+ condition</b> and <b>+ group</b> add parts, <b>⠿</b> drags them, <b>ⓘ</b> holds your comment, a click on a condition edits it. The <b>⋮</b> menu next to the preset <b>saves</b> it (Save as… keeps the original), sets it as default or files it into a category. Thresholds from percentiles or the model carry over to other animals."
+          "text": "The presets are starting points — build your own: <b>+ condition</b> and <b>+ group</b> add parts, the grab area <b>⠿</b> moves them, <b>ⓘ</b> holds your comment, <b>right-click</b> a condition ▸ <b>Edit…</b> changes it (a plain click highlights what fulfils it), <b>×</b> or right-click ▸ <b>Remove</b> deletes it. The <b>⋮</b> menu next to the preset <b>saves</b> it (Save as… keeps the original), sets it as default or files it into a category. Thresholds from percentiles or the model carry over to other animals."
         }
       ],
       "panels": [
         "match_curator",
         "footprints",
         "tracked_overview"
+      ],
+      "bright": [
+        "panel.curation"
       ]
     },
     {
@@ -943,7 +951,7 @@
         {
           "title": "The active set",
           "anchor": "menu.assignments_selector",
-          "text": "The assignments selector lists all loaded sets; the one just loaded is now <b>active</b>. The active set is what the panels show, statistics and curation work on, and what you edit.<br><br>Neuron IDs differ between sets. When you switch, the focus, the selection and the navigation bar move to the <b>matching</b> neuron of the new set: the one sharing most footprints (without shared footprints, the nearest union)."
+          "text": "The assignments selector lists all loaded sets; the one just loaded is now <b>active</b>. The active set is what the panels show, statistics and curation work on, and what you edit; the navigation bar steps through <i>its</i> neuron IDs.<br><br>Neuron IDs belong to their set: neuron 12 of one set is in general not neuron 12 of the other. How neurons of two sets correspond comes next, when comparing them."
         },
         {
           "title": "Two sets side by side",
@@ -952,7 +960,7 @@
           "wait_for": "footprints_other_set_shown",
           "do_it": "show_other_set",
           "do_it_label": "Set it up for me",
-          "text": "Open a second <b>Neuron footprints</b> panel (split with <b>+ →</b>) and choose the other set in its selector at the bottom (or let me). It shows the <b>matching</b> neuron of that set for the focused one — so differences stand out: a cut track shows only part of the footprints, a swapped footprint sits with the neighbour.<br><br>Step through neurons with ← / →; both panels follow. Right-click a footprint of the other set to focus its counterpart or make that set active."
+          "text": "Open a second <b>Neuron footprints</b> panel (split with <b>+ →</b>) and choose the other set in its selector at the bottom (or let me). For the focused neuron it shows the <b>matching</b> neuron of that set: the one sharing most footprints with it (without shared footprints, the one with the nearest union). So differences stand out: a cut track shows only part of the footprints, a swapped footprint sits with the neighbour.<br><br>Step through neurons with ← / →; both panels follow. Right-click a footprint of the other set to focus its counterpart or make that set active."
         },
         {
           "title": "Finding differences",
@@ -974,7 +982,7 @@
           "wait_for": "sets_compared",
           "do_it": "compare_occurrence",
           "do_it_label": "Compare for me",
-          "text": "The statistics options (gear) ▸ <b>Assignments</b> overlay one histogram per set — e.g. the <i>Occurrence</i>: the cut tracks of the second set shift neurons to fewer sessions (or let me show it). In scatter plots, <b>Compare assignments</b> takes x from one set and y from another, e.g. a neuron's occurrence in both.",
+          "text": "The statistics options (gear) ▸ <b>Assignments</b> overlay one histogram per set — e.g. the <i>Occurrence</i>: the cut tracks of the second set shift neurons to fewer sessions (or let me show it). In scatter plots, <b>Compare assignments</b> takes x from one set and y from another, e.g. a neuron's occurrence in both; for whole-number statistics, equal value pairs share one marker whose size shows how many neurons it holds.",
           "panels": [
             "statistics",
             "tracked_overview"
@@ -1020,7 +1028,14 @@
         },
         {
           "title": "That's it",
-          "text": "You have seen the whole workflow: load, align, model, register, inspect, work with footprints and statistics, and curate. Reopen any chapter with the <b>?</b> button."
+          "text": "You have seen the whole workflow: load, align, model, register, inspect, work with footprints and statistics, and curate. Reopen any chapter with the <b>?</b> button.<br><br>CATAN is developed openly on <a href=\"https://github.com/goecidbn/CATAN_toolbox\">GitHub</a> (also the GitHub button at the top right, next to the version). Found a bug, missing a feature or have an idea for an improvement? Please report it as an <a href=\"https://github.com/goecidbn/CATAN_toolbox/issues\">issue</a> — with the CATAN version and, for bugs, what you did."
+        },
+        {
+          "title": "Keep exploring or start with your data",
+          "text": "The demo stays loaded: <b>keep it</b> if you want to explore further.<br><br><b>Wipe it</b> if you want to start with your own data: the <b>broom</b> button next to the root folder clears the workspace — sessions, models and assignment sets (it first offers to save what is unsaved). Then choose your root folder and add your sessions with <b>+</b>.",
+          "anchor": "load.clean_all",
+          "do_it": "clean_workspace",
+          "do_it_label": "Wipe it for me"
         }
       ]
     }

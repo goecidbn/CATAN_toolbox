@@ -759,14 +759,33 @@ class StatisticEngine(QObject):
         return table
 
     @reports_progress("Building statistic table")
+    def supports_neuron_rows(self, query):
+        """Whether the query's rows are single neurons whose values depend
+        only on that neuron (``neuron_local``): they can be evaluated for
+        some neurons by masking all other assignment rows."""
+        from .sampling import neuron_rows_local
+
+        definition = self.registry.get(query.statistic_key)
+        return (
+            definition is not None
+            and definition.neuron_local
+            and neuron_rows_local(definition, query)
+        )
+
     def evaluate_matching_table(
         self,
         query,
         select_values,
         *,
         requested_pairs=None,
+        neuron_rows=None,
     ):
-        """Return selected rows without caching a threshold-specific result."""
+        """Return selected rows without caching a threshold-specific result.
+
+        ``neuron_rows``: only rows of these neurons are needed (curator:
+        neurons that can still match). Used for ``supports_neuron_rows``
+        queries without a cached result; the rows of these neurons are
+        exactly those of the full evaluation."""
         if query is None or query.statistic_key == "none":
             return None
 
@@ -800,7 +819,58 @@ class StatisticEngine(QObject):
         while isinstance(getter, partial):
             getter = getter.func
 
-        if requested_pairs is not None and definition.pairs_getter is not None:
+        if (
+            neuron_rows is not None
+            and requested_pairs is None
+            and self.supports_neuron_rows(query)
+            and not self.peek_cached(query)[0]
+        ):
+            from .sampling import _masked_bindings
+
+            rows = np.asarray(sorted(neuron_rows), dtype=np.int64)
+            ids = np.asarray(self.state.assignments, dtype=np.int64)
+            masked = np.full_like(ids, -1)
+            masked[rows] = ids[rows]
+            data, state = _masked_bindings(self.data, self.state, masked)
+
+            with progress_scope(0, 85):
+                stat = self._evaluate_uncached(
+                    query,
+                    definition,
+                    select_values=(
+                        select
+                        if getattr(getter, "supports_value_selection", False)
+                        else None
+                    ),
+                    data=data,
+                    state=state,
+                )
+
+            if definition.compact_values:
+                with progress_scope(85, 88, "Compacting statistic values"):
+                    _compact_statistic_values(stat)
+
+            with progress_scope(88, 95, "Constructing statistic table"):
+                table = PickTable.from_stat(stat)
+
+            remaining = tuple(
+                f
+                for f in (query.filters or ())
+                if f.target not in stat.applied_pair_filters
+            )
+
+            if remaining:
+                table = table.filtered(remaining)
+
+            with progress_scope(95, 99, "Filtering statistic table"):
+                refs = table.refs_for_rows(np.arange(table.n_rows))
+                neurons = refs.get("neuron", refs.get("neuron_i"))
+                keep = select(table.values)
+                if neurons is not None:
+                    keep &= np.isin(np.asarray(neurons), rows)
+                table = table.subset_rows(np.flatnonzero(keep))
+
+        elif requested_pairs is not None and definition.pairs_getter is not None:
             # All requested rows, then the selection on compacted values,
             # exactly as for the full calculation below.
             with progress_scope(0, 85):

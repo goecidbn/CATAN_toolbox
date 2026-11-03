@@ -66,6 +66,11 @@ class SessionVoter:
         self.ids = np.asarray(ids)
         self._supports = {}
         self._cache = {}
+        # Per whole: each other session's footprints inside it (their
+        # supports as columns).
+        self._members = {}
+        # Per (whole, piece): per session, which members cover the piece.
+        self._coverage = {}
 
     def _session_supports(self, session_id):
         supports = self._supports.get(session_id)
@@ -92,9 +97,64 @@ class SessionVoter:
         return supports
 
     def _support(self, component):
+        """Dense 0/1 support of a footprint (from its CSC column: the
+        supports are binary without explicit zeros)."""
         supports, _, _ = self._session_supports(component.session_id)
         footprint = int(self.ids[component.neuron_id, component.session_id])
-        return np.asarray(supports[:, footprint].todense()).ravel()
+        dense = np.zeros(supports.shape[0], dtype=np.float32)
+        start, stop = supports.indptr[footprint], supports.indptr[footprint + 1]
+        dense[supports.indices[start:stop]] = 1.0
+        return dense
+
+
+    def _inside_members(self, whole):
+        """Per session (None for the whole's own): the supports of the
+        included footprints lying mostly inside ``whole`` (one row each),
+        or an empty tuple without any. The same for every pair of pieces."""
+        members_by_session = self._members.get(whole)
+        if members_by_session is not None:
+            return members_by_session
+
+        whole_support = self._support(whole)
+        members_by_session = []
+        for session_id in range(self.ids.shape[1]):
+            if session_id == whole.session_id:
+                members_by_session.append(None)
+                continue
+
+            supports, sizes, included = self._session_supports(session_id)
+            inside = np.asarray(supports.T @ whole_support).ravel()
+            members = np.flatnonzero(
+                included & (sizes > 0) & (inside >= INSIDE_FRACTION * sizes)
+            )
+            # Columns = members (CSC: small; a CSR copy would hold one
+            # index entry per image pixel).
+            members_by_session.append(supports[:, members] if len(members) else ())
+
+        self._members[whole] = members_by_session
+        return members_by_session
+
+    def _covers(self, whole, piece):
+        """Per session (None for the whole's own, () without members): for
+        each member of ``whole`` there, whether it covers ``piece``.
+        Computed once per piece, shared by all pairs it belongs to."""
+        key = (whole, piece)
+        covers = self._coverage.get(key)
+        if covers is not None:
+            return covers
+
+        support = self._support(piece)
+        size = max(float(support.sum()), 1.0)
+        # members.T (CSR view of the CSC columns) @ dense: cost of the
+        # members' few nonzeros only.
+        covers = [
+            members
+            if members is None or isinstance(members, tuple)
+            else np.asarray(members.T @ support).ravel() / size >= COVER_FRACTION
+            for members in self._inside_members(whole)
+        ]
+        self._coverage[key] = covers
+        return covers
 
     def votes(self, whole, pieces):
         """SessionVotes of ``whole`` (a footprint) split into the two
@@ -104,33 +164,18 @@ class SessionVoter:
         if cached is not None:
             return cached
 
-        whole_support = self._support(whole)
-        piece_supports = [self._support(piece) for piece in pieces]
-        piece_sizes = np.array([support.sum() for support in piece_supports])
+        first, second = (self._covers(whole, piece) for piece in pieces)
 
         votes = []
-        for session_id in range(self.ids.shape[1]):
-            if session_id == whole.session_id:
+        for a, b in zip(first, second):
+            if a is None:
                 continue
 
-            supports, sizes, included = self._session_supports(session_id)
-            inside = np.asarray(supports.T @ whole_support).ravel()
-            members = np.flatnonzero(
-                included & (sizes > 0) & (inside >= INSIDE_FRACTION * sizes)
-            )
-
-            if not len(members):
+            if isinstance(a, tuple):
                 votes.append(EMPTY)
                 continue
 
-            covered = np.stack(
-                [
-                    np.asarray(supports[:, members].T @ support).ravel()
-                    / max(size, 1.0)
-                    for support, size in zip(piece_supports, piece_sizes)
-                ],
-                axis=1,
-            ) >= COVER_FRACTION
+            covered = np.column_stack([a, b])
 
             if np.any(covered.all(axis=1)):
                 votes.append(JOINT)

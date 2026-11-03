@@ -77,6 +77,7 @@ class GuideFrame(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._rects = []
+        self._clear = []
         self._dim = False
         self._area = QRect()
         self._phase = 0
@@ -85,10 +86,10 @@ class GuideFrame(QWidget):
         self._pulse.timeout.connect(self._step_pulse)
         self.hide()
 
-    def frame(self, area, rects):
+    def frame(self, area, rects, clear=()):
         """Frames around ``rects`` inside ``area`` (window coordinates);
         the rest of ``area`` is dimmed lightly when the targets are only a
-        part of it. No rects: hidden."""
+        part of it, except ``clear`` rects. No rects: hidden."""
         rects = [r for r in rects or () if r is not None and not r.isEmpty()]
         if not rects:
             self._rects = []
@@ -106,6 +107,11 @@ class GuideFrame(QWidget):
         offset = bounds.topLeft()
         self._rects = [
             r.adjusted(-MARGIN, -MARGIN, MARGIN, MARGIN).translated(-offset) for r in rects
+        ]
+        self._clear = [
+            r.adjusted(-MARGIN, -MARGIN, MARGIN, MARGIN).translated(-offset)
+            for r in clear or ()
+            if r is not None and not r.isEmpty()
         ]
         self._dim = area is not None and not any(r.contains(area) for r in rects)
         # Only the open area is dimmed lightly (targets may lie outside it).
@@ -135,10 +141,12 @@ class GuideFrame(QWidget):
         if self._dim:
             path = QPainterPath()
             path.addRect(self._area)
+            keep = QPainterPath()
             for r in self._rects:
-                path.addRoundedRect(r, 4, 4)
-            path.setFillRule(Qt.FillRule.OddEvenFill)
-            painter.fillPath(path, SOFT_DIM)
+                keep.addRoundedRect(r, 4, 4)
+            for r in self._clear:
+                keep.addRect(r)
+            painter.fillPath(path.subtracted(keep), SOFT_DIM)
 
         # 0 … 1 … 0 over 30 steps
         wave = abs(15 - self._phase) / 15
@@ -191,7 +199,8 @@ class GuideBubble(QFrame):
         self.text = QLabel()
         self.text.setWordWrap(True)
         self.text.setTextFormat(Qt.TextFormat.RichText)
-        self.text.setOpenExternalLinks(False)
+        # Links (e.g. the GitHub repository) open in the browser.
+        self.text.setOpenExternalLinks(True)
         self.text.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         # Scrolls only when the window is too small for the whole text.
         self.text_area = QScrollArea()
