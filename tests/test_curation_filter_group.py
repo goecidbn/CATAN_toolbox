@@ -5,6 +5,10 @@ from importlib.resources import files
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+# GUI package tests: need PySide6 (the headless CI job runs -m "not gui").
+pytest.importorskip("PySide6")
+pytestmark = pytest.mark.gui
+
 from PySide6.QtWidgets import QApplication
 
 import catan.gui.GUI_elements  # noqa: F401  (import order: avoids a cycle)
@@ -35,8 +39,11 @@ def test_merge_preset_header_can_shrink(app):
     widget = _widget(_preset("footprint_manipulation_merge_candidates"))
     widget.show()
     app.processEvents()
-    # Was 770 px with all selectors on one header line.
-    assert widget.minimumSizeHint().width() <= 450
+    # Was 770 px (110 average characters) with all selectors on one header
+    # line. Measured in characters: fonts differ per platform (CI "minimal"
+    # has no font database, ~2.3x wider glyphs).
+    char_width = widget.fontMetrics().averageCharWidth()
+    assert widget.minimumSizeHint().width() <= 64 * char_width
     widget.deleteLater()
 
 

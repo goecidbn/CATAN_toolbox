@@ -2,6 +2,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
+import pytest
+
+# GUI package tests: need PySide6 (the headless CI job runs -m "not gui").
+pytest.importorskip("PySide6")
+pytestmark = pytest.mark.gui
 
 from catan.gui.structures.data import Data, is_project_set, read_assignments_provenance
 

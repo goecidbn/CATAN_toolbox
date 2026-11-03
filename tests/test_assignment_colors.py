@@ -3,6 +3,10 @@ import colorsys
 import numpy as np
 import pytest
 
+# GUI package tests: need PySide6 (the headless CI job runs -m "not gui").
+pytest.importorskip("PySide6")
+pytestmark = pytest.mark.gui
+
 from catan.gui.data import assignment_colors as ac
 
 

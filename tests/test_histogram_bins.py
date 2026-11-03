@@ -5,6 +5,11 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
+
+# GUI package tests: need PySide6 (the headless CI job runs -m "not gui").
+pytest.importorskip("PySide6")
+pytestmark = pytest.mark.gui
 
 # Import in app order (known cycle via panels.helper.Threshold).
 import catan.gui.GUI_elements.main_window  # noqa: F401,E402

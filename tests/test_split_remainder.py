@@ -1,9 +1,9 @@
 import numpy as np
+import pytest
 from scipy import sparse
 
 from catan.core.footprint_remainder import remainder_footprint
 from catan.core.structures import NeuronComponent
-from catan.gui.structures.request_handler import RequestHandler
 
 
 def column(values):
@@ -26,7 +26,17 @@ def test_nothing_remains():
     assert remainder_footprint(column(cell), [column(cell)]) is None
 
 
+def _request_handler():
+    # GUI package: needs PySide6 (the remainder tests above run headless).
+    pytest.importorskip("PySide6")
+    from catan.gui.structures.request_handler import RequestHandler
+
+    return RequestHandler
+
+
+@pytest.mark.gui
 def test_split_request_with_one_source():
+    RequestHandler = _request_handler()
     request = RequestHandler("split", NeuronComponent(29, 2))
     request.advance_stage()
     assert not request.is_complete
@@ -46,7 +56,9 @@ def test_split_request_with_one_source():
     assert "Sources" in request.destination_status_text()
 
 
+@pytest.mark.gui
 def test_merge_still_needs_its_source():
+    RequestHandler = _request_handler()
     request = RequestHandler("merge", NeuronComponent(30, 0))
     request.add_component(NeuronComponent(39, 0))
     request.advance_stage()

@@ -4,6 +4,12 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
+
+# GUI package tests: need PySide6 (the headless CI job runs -m "not gui").
+pytest.importorskip("PySide6")
+pytestmark = pytest.mark.gui
+
 from catan.gui.data.statistics.definitions import CALCULATED_STATISTICS
 
 

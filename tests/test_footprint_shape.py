@@ -3,6 +3,11 @@ from importlib.resources import files
 
 import numpy as np
 from scipy import sparse
+import pytest
+
+# GUI package tests: need PySide6 (the headless CI job runs -m "not gui").
+pytest.importorskip("PySide6")
+pytestmark = pytest.mark.gui
 
 import catan.gui.GUI_elements  # noqa: F401  (import order, see CLAUDE.md)
 from catan.gui.data.curation_filter import curation_filter_from_dict

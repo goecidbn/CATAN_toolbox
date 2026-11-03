@@ -2,6 +2,10 @@ from importlib.resources import files
 
 import pytest
 
+# GUI package tests: need PySide6 (the headless CI job runs -m "not gui").
+pytest.importorskip("PySide6")
+pytestmark = pytest.mark.gui
+
 from catan.gui.guide.anchors import KNOWN_ANCHORS
 from catan.gui.guide.tour import ACTIONS, CONDITIONS, PANEL_MODES, load_tour, parse_tour
 
