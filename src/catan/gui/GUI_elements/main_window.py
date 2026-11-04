@@ -106,6 +106,14 @@ class MainWindow(QMainWindow):
                 self.recent_menu = file_menu.addMenu("Open recent")
                 self.recent_menu.aboutToShow.connect(self._fill_recent_projects)
 
+        # Analysis output: detected footprints only (splits / merges undone).
+        file_menu.addSeparator()
+        file_menu.addAction("Export for activity analysis…").triggered.connect(
+            lambda checked=False: menu().export_analysis()
+        )
+        self.analysis_output_menu = file_menu.addMenu("Analysis file with project")
+        self.analysis_output_menu.aboutToShow.connect(self._fill_analysis_output_menu)
+
         # Starter guide: Help menu, ? button (main menu), startup offer.
         from catan.gui.guide.anchors import install_main_window_anchors
         from catan.gui.guide.controller import GuideController
@@ -299,6 +307,21 @@ class MainWindow(QMainWindow):
 
         self.version_label, self.github_button = label, button
         self.menuBar().setCornerWidget(corner, Qt.Corner.TopRightCorner)
+
+    def _fill_analysis_output_menu(self):
+        """File ▸ Analysis file with project: ask / always / never (only
+        when the assignments have splits, merges or replaced shapes)."""
+        menu = self.analysis_output_menu
+        menu.clear()
+        main_menu = self.gui_elements["main_menu"]
+        current = main_menu.analysis_output_mode()
+        for mode, label in main_menu.ANALYSIS_OUTPUT_CHOICES:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(mode == current)
+            action.triggered.connect(
+                lambda checked=False, mode=mode: main_menu.set_analysis_output_mode(mode)
+            )
 
     def _fill_recent_projects(self):
         """File ▸ Open recent: project name and folder, newest first."""

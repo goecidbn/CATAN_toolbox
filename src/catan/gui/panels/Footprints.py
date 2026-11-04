@@ -1,7 +1,7 @@
 import time
 
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Literal
 
 from vispy import scene, color
@@ -13,10 +13,11 @@ from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QSignalBlocker
 
 from PySide6.QtGui import (
     QCursor,
-    QAction,
     QColor,
     QIcon,
     QPixmap,
+    QKeySequence,
+    QShortcut,
 )
 
 from PySide6.QtWidgets import (
@@ -36,9 +37,10 @@ from PySide6.QtWidgets import (
     QApplication,
     QToolButton,
     QMessageBox,
-    QWidgetAction,
     QScrollArea,
     QButtonGroup,
+    QListWidget,
+    QListWidgetItem,
 )
 
 import importlib
@@ -64,7 +66,6 @@ from catan.gui.structures import request_handler
 from catan.gui.GUI_elements.utils.menu_creation import (
     add_menu_section,
     get_colored_label,
-    add_label_to_menu,
     fit_message_box_buttons,
 )
 from catan.gui.GUI_elements.fragments.ResetViewButton import ResetViewButton
@@ -85,6 +86,8 @@ HOVER_NEURON_KEY = "footprints/hover_neuron"
 # The hovered footprint's other footprints: faint hover colour, fading out.
 HOVER_NEURON_ALPHA = 0.35
 HOVER_NEURON_FADE_S = 2.0
+# Picking a target neuron: the neurons that are no candidate fade to this.
+PICK_FADED_ALPHA = 0.08
 
 INFERRED_RGBA = np.array(
     [0.0, 166 / 255, 178 / 255, 1.0],
@@ -124,6 +127,29 @@ class NeuronRecord:
     thr: float  # threshold used for this footprint (store to check if changed)
 
 
+@dataclass
+class TargetPick:
+    """Picking the target neuron of a reassignment / move (Display.
+    start_reassign_pick / start_move_pick); shown by TargetPickerBar."""
+
+    kind: str  # "reassign" or "move"
+    component: NeuronComponent  # the right-clicked footprint
+    source_id: int
+    moved: list  # sessions of the source's footprints that move
+    radius: float  # candidates within (px), widened by "Load more"
+    rows: dict = field(default_factory=dict)  # neuron -> (label, html lines)
+    candidates: set = field(default_factory=set)
+    sections: list = field(default_factory=list)  # (title, [neuron])
+    title: str = ""
+    summary: list = field(default_factory=list)  # html lines
+    note: str = ""
+    more_text: str = ""
+    allow_new: bool = True
+    new_tooltip: str = ""
+    moved_union: object = None
+    previous_highlight: tuple = None
+
+
 class Display(BasePlot.BaseCanvas):
 
     main_visual = Mesh
@@ -150,6 +176,7 @@ class Display(BasePlot.BaseCanvas):
 
         # Fading "hovered_neuron" overlay (show_hovered_neuron).
         self._hover_fade = []
+        self._hover_alpha = {}
         self._hover_fade_timer = None
         self._hover_fade_clock = None
 
@@ -173,6 +200,17 @@ class Display(BasePlot.BaseCanvas):
 
         self.parameter_overlay = None
         self.request_display = RequestDisplay(self.native, self.data)
+        self.pick_bar = TargetPickerBar(self.native)
+
+        # Why the focused neuron is not drawn (_update_not_drawn_hint).
+        self.not_drawn_hint = QLabel(self.native)
+        self.not_drawn_hint.setWordWrap(False)
+        self.not_drawn_hint.setStyleSheet(
+            "QLabel { color: #e8eaed; background-color: rgba(30, 34, 40, 220);"
+            " border: 1px solid #c87920; border-radius: 6px; padding: 4px 8px; }"
+        )
+        self.not_drawn_hint.hide()
+        self._pick = None
 
         self.events.resize.connect(self._on_canvas_resize)
 
@@ -564,6 +602,7 @@ class Display(BasePlot.BaseCanvas):
         selected = self.display_selected_components
 
         if assignments is None or assignments.union is None or focused is None:
+            self._update_not_drawn_hint(None)
             return
 
         self.state.timeit("Initial setup")
@@ -572,6 +611,7 @@ class Display(BasePlot.BaseCanvas):
         n_neurons = assignments.ids.shape[0]
 
         if not 0 <= this_neuron < n_neurons:
+            self._update_not_drawn_hint(None)
             return
 
         selected_neurons = {
@@ -621,9 +661,12 @@ class Display(BasePlot.BaseCanvas):
             to_plot_neurons = [neuron for neuron in to_plot_neurons if included[neuron]]
 
         in_scope = {int(neuron) for neuron in to_plot_neurons}
+        # The focused neuron is always drawn: excluded (flipping through
+        # curator results) or without a union centroid (no distance to
+        # itself), it was dropped and the panel showed only its tag.
         to_plot_neurons = np.union1d(
             np.asarray(to_plot_neurons, dtype=int),
-            np.asarray(sorted(required_neurons), dtype=int),
+            np.asarray(sorted(required_neurons | {int(this_neuron)}), dtype=int),
         )
 
         review_mask = ReviewStatusFilter.neuron_mask(
@@ -646,6 +689,19 @@ class Display(BasePlot.BaseCanvas):
 
         to_plot_neurons = to_plot_neurons[review_mask]
 
+        # Picking a target: the candidates are always shown (without fitting
+        # the view to them), every other neuron fades.
+        pick = self._pick
+        picked = None
+        if pick is not None:
+            picked = {pick.source_id, *pick.candidates}
+            to_plot_neurons = np.union1d(
+                to_plot_neurons,
+                np.asarray(
+                    [n for n in pick.candidates if 0 <= n < n_neurons], dtype=int
+                ),
+            )
+
         session_filter = self.controls["parameter"].checkbox_session_only.isChecked()
         filter_focused = self.controls["parameter"].checkbox_filter_focused.isChecked()
 
@@ -657,13 +713,13 @@ class Display(BasePlot.BaseCanvas):
         for neuron in to_plot_neurons:
             included = bool(self.display_assignments.union.included[neuron])
 
-            if not included:
+            if neuron == this_neuron:
+                key = "focused"
+                alpha = self.styles.opts[key]["alpha"] * (1.0 if included else 0.5)
+
+            elif not included:
                 key = "default"
                 alpha = 0.1
-
-            elif neuron == this_neuron:
-                key = "focused"
-                alpha = self.styles.opts[key]["alpha"]
 
             elif neuron in selected_neurons and display_scope == "selection":
                 # "Nearby": selected neurons look like any other neighbour.
@@ -673,6 +729,10 @@ class Display(BasePlot.BaseCanvas):
             else:
                 key = "default"
                 alpha = self.styles.opts[key]["alpha"]
+
+            if picked is not None and neuron not in picked:
+                key = "default"
+                alpha = PICK_FADED_ALPHA
 
             ## create new data if not yet present
             if neuron not in self.plotting["data"]:
@@ -754,6 +814,70 @@ class Display(BasePlot.BaseCanvas):
         # Fit the view when distant highlighted neurons were added.
         self.reset_camera(
             full=not self.camera_set or bool(self.plotting.get("required_only"))
+        )
+        self._update_not_drawn_hint(int(this_neuron))
+
+    def _update_not_drawn_hint(self, neuron):
+        """Below the neuron tag: why the focused neuron is not drawn (an
+        empty panel otherwise looked broken)."""
+        reason = None
+        if neuron is not None and neuron not in self.plotting["visuals"]:
+            reason = self._not_drawn_reason(neuron)
+
+        label = self.not_drawn_hint
+        label.setVisible(reason is not None)
+        if reason is None:
+            return
+        label.setText(reason)
+        label.adjustSize()
+        anchor = (
+            self.review_status_label.geometry()
+            if self.review_status_label.isVisible()
+            else self.reset_view_button.geometry()
+        )
+        label.move(8, anchor.bottom() + 6)
+        label.raise_()
+
+    def _not_drawn_reason(self, neuron):
+        ids = self.display_assignments.ids
+        sessions = [int(s) for s in np.flatnonzero(ids[neuron] >= 0)]
+        if not sessions:
+            return f"Neuron {neuron} has no footprints."
+
+        def tags(session_ids):
+            return ", ".join(session_tag(s) for s in session_ids[:6]) + (
+                " …" if len(session_ids) > 6 else ""
+            )
+
+        empty = [
+            s for s in sessions
+            if self.data.sessions[s].footprints[:, int(ids[neuron, s])].nnz == 0
+        ]
+        if len(empty) == len(sessions):
+            return (
+                f"Neuron {neuron}: its footprint{'s are' if len(empty) > 1 else ' is'} "
+                f"empty ({tags(empty)}) — nothing to draw."
+            )
+
+        shown = [s for s in sessions if self.data.session_is_active(s)]
+        if not shown:
+            return f"Neuron {neuron}: only in inactive sessions ({tags(sessions)})."
+
+        parameters = self.controls["parameter"]
+        if (
+            parameters.checkbox_session_only.isChecked()
+            and parameters.checkbox_filter_focused.isChecked()
+        ):
+            session_id = int(self.controls["session_filter"].slider.value())
+            if session_id not in sessions:
+                return (
+                    f"Neuron {neuron} has no footprint in {session_tag(session_id)} "
+                    f"(session filter); it is in {tags(sessions)}."
+                )
+
+        return (
+            f"Neuron {neuron}: nothing above the display threshold "
+            f"({tags(sessions)})."
         )
 
     def alignment_preview(self):
@@ -857,12 +981,30 @@ class Display(BasePlot.BaseCanvas):
         # union_centroids = np.nanmean(
         #     self.data.neurons.centroids[displayed_neurons, ...], axis=1
         # )
-        union_centroids = self.display_assignments.union.centroids[
-            displayed_neurons, ...
-        ]
+        union_centroids = np.asarray(
+            self.display_assignments.union.centroids[displayed_neurons, ...], dtype=float
+        )[:, :2]
+        union_centroids = union_centroids[np.isfinite(union_centroids).all(axis=1)]
 
-        centroid_min = np.nanmin(union_centroids, axis=0)
-        centroid_max = np.nanmax(union_centroids, axis=0)
+        if not len(union_centroids):
+            # No union centroid (e.g. a one-off whose union is empty): the
+            # drawn footprints' own centres. A NaN center blanked the panel
+            # for good (the camera's z center is kept between resets).
+            union_centroids = np.asarray(
+                [
+                    record.center_xyz[:2]
+                    for key, record in self.plotting["data"].items()
+                    if isinstance(key, tuple) and key[0] in self.plotting["visuals"]
+                ],
+                dtype=float,
+            ).reshape(-1, 2)
+            union_centroids = union_centroids[np.isfinite(union_centroids).all(axis=1)]
+
+        if not len(union_centroids):
+            return
+
+        centroid_min = union_centroids.min(axis=0)
+        centroid_max = union_centroids.max(axis=0)
 
         ## calculate ranges
         x_range = np.clip(
@@ -884,6 +1026,10 @@ class Display(BasePlot.BaseCanvas):
 
         # Coordinate floor under the lowest session, over the shown area.
         self.coordinates.set_extent(x_range, y_range, -FLOOR_DEPTH * z_stretch)
+
+        # A camera left without a finite center gets a full reset.
+        if not np.all(np.isfinite(self.view.camera.center)):
+            full = True
 
         if full:
             ## not working well, yet. rotation is somewhat preserved
@@ -1120,9 +1266,12 @@ class Display(BasePlot.BaseCanvas):
                 rgba = INFERRED_RGBA.copy()
 
             else:
+                # A whole excluded neuron is drawn only when focused or
+                # required (plot_neurons): then with all its footprints.
                 if (
                     not parameters.checkbox_show_excluded.isChecked()
                     and not session.included[footprint_id]
+                    and assignments.union.included[neuron]
                 ):
                     continue
 
@@ -1301,19 +1450,19 @@ class Display(BasePlot.BaseCanvas):
 
     def show_hovered_neuron(self, components):
         """The other footprints of the hovered footprint's neuron in a faint
-        hover colour, fading out over HOVER_NEURON_FADE_S; None hides."""
-        from PySide6.QtCore import QElapsedTimer, QTimer
+        hover colour, fading out over HOVER_NEURON_FADE_S; None hides.
 
-        self.update_style(components or None, "hovered_neuron")
-        visuals = [
-            visual
-            for visual in self.plotting["overlays"].get("hovered_neuron", [])
-            if visual.visible
-        ]
-        self._hover_fade = [
-            (visual, np.array(visual.mesh_data.get_vertex_colors(), copy=True))
-            for visual in visuals
-        ]
+        All footprints form one mesh (one upload per hover change) and the
+        fade only changes an alpha uniform (no uploads while fading): one
+        overlay per footprint made large datasets lag (60 sessions)."""
+        from PySide6.QtCore import QElapsedTimer, QTimer
+        from vispy.visuals.filters import Alpha
+
+        if "hovered_neuron" not in self.plotting["overlays"]:
+            self.add_overlay("hovered_neuron")
+        visuals = self.plotting["overlays"].get("hovered_neuron") or []
+        for visual in visuals:
+            visual.visible = False
 
         timer = self._hover_fade_timer
         if timer is None:
@@ -1321,24 +1470,48 @@ class Display(BasePlot.BaseCanvas):
             timer.setInterval(40)
             timer.timeout.connect(self._step_hover_fade)
             self._hover_fade_clock = QElapsedTimer()
+        timer.stop()
+        self._hover_fade = []
 
-        if not self._hover_fade:
-            timer.stop()
+        records = self.style_records(components, "hovered_neuron") if components else []
+        parts = [self.plot_data_from_rec(rec, "hovered_neuron") for rec in records]
+        parts = [part for part in parts if len(part["faces"])]
+        if not visuals or not parts:
+            self.update()
             return
+
+        offsets = np.cumsum([0] + [len(part["vertices"]) for part in parts[:-1]])
+        visual = visuals[0]
+        visual.set_data(
+            vertices=np.concatenate([part["vertices"] for part in parts]),
+            faces=np.concatenate(
+                [part["faces"] + offset for part, offset in zip(parts, offsets)]
+            ),
+            vertex_colors=np.concatenate([part["vertex_colors"] for part in parts]),
+        )
+        # Per visual (vispy visuals are frozen: no new attributes).
+        fade = self._hover_alpha.get(id(visual))
+        if fade is None or fade[0] is not visual:
+            fade = (visual, Alpha(1.0))
+            visual.attach(fade[1])
+            self._hover_alpha = {id(visual): fade}
+        fade = fade[1]
+        fade.alpha = 1.0
+        visual.visible = True
+        self._hover_fade = [(visual, fade)]
+
         self._hover_fade_clock.start()
         timer.start()
+        self.update()
 
     def _step_hover_fade(self):
         remaining = 1.0 - self._hover_fade_clock.elapsed() / (1000.0 * HOVER_NEURON_FADE_S)
 
-        for visual, colors in self._hover_fade:
+        for visual, fade in self._hover_fade:
             if remaining <= 0:
                 visual.visible = False
-                continue
-            faded = colors.copy()
-            faded[:, 3] *= remaining
-            visual.mesh_data.set_vertex_colors(faded)
-            visual.mesh_data_changed()
+            else:
+                fade.alpha = remaining
 
         if remaining <= 0:
             self._hover_fade = []
@@ -1346,6 +1519,11 @@ class Display(BasePlot.BaseCanvas):
         self.update()
 
     def on_mouse_release(self, event):
+
+        if self._pick is not None:
+            self._on_pick_release(event)
+            event.handled = True
+            return
 
         component = (
             self.find_closest_component(event.pos) if event.pos is not None else None
@@ -1452,6 +1630,9 @@ class Display(BasePlot.BaseCanvas):
 
     def update_hover(self, component):
         self._hover_component = component
+        if self._pick is not None:
+            self._update_pick_hover(component)
+            return
         self.handle_tooltip(component)
         self.state.update_hovered_components(self.component_to_active(component))
 
@@ -1606,26 +1787,20 @@ class Display(BasePlot.BaseCanvas):
             similarity, d_shift, p_same = None, None, None
         return similarity, d_shift, p_same, ref_session_id
 
-    def add_info_str(
+    def info_html(
         self,
-        menu,
         this_component: NeuronComponent,
         candidate: int,
         which: str = "previous",
         cmap=MATCH_QUALITY_CMAP,
     ):
-
+        """Match quality of a footprint vs. the candidate's footprint in the
+        previous / next session it has one (coloured html)."""
         similarity, shift, p_same, session_id = self.calculate_tracking_statistics(
             this_component, candidate, with_session=which
         )
         if session_id is None:
-            # similarity is None or shift is None or p_same is None or
-            add_label_to_menu(
-                menu,
-                f"no {which} session found",
-                enabled=False,
-            )
-            return
+            return f"no {which} session found"
         ds = abs(this_component.session_id - session_id)
 
         arrow = "\u25bc" if which == "previous" else "\u25b2"
@@ -1637,13 +1812,7 @@ class Display(BasePlot.BaseCanvas):
         html_probability, html_similarity, html_shift = match_quality_html(
             similarity, shift, p_same, cmap, units=self.data.units
         )
-
-        add_label_to_menu(
-            menu,
-            f"{arrow} {html_probability} - {html_session},\t{html_similarity},\t{html_shift}",
-            enabled=False,
-        )
-
+        return f"{arrow} {html_probability} - {html_session}, {html_similarity}, {html_shift}"
     def footprint_set_statistics(self, union_footprint, neuron_id):
         """Similarity, shift (px) and model probability between a footprint
         (e.g. the union of moved footprints) and a neuron's union footprint."""
@@ -1674,27 +1843,19 @@ class Display(BasePlot.BaseCanvas):
 
         return similarity, d_shift, p_same
 
-    def add_set_info_str(
-        self, menu, union_footprint, neuron_id, cmap=MATCH_QUALITY_CMAP
-    ):
-        """add_info_str() for a set of footprints vs. a neuron's union."""
+    def set_info_html(self, union_footprint, neuron_id, cmap=MATCH_QUALITY_CMAP):
+        """info_html() for a set of footprints vs. a neuron's union."""
         similarity, shift, p_same = self.footprint_set_statistics(
             union_footprint, neuron_id
         )
 
         if similarity is None:
-            add_label_to_menu(menu, "no union footprint to compare", enabled=False)
-            return
+            return "no union footprint to compare"
 
         html_probability, html_similarity, html_shift = match_quality_html(
             similarity, shift, p_same, cmap, units=self.data.units
         )
-        add_label_to_menu(
-            menu,
-            f"\u25c6 {html_probability or 'p=–'} - union,\t{html_similarity},\t{html_shift}",
-            enabled=False,
-        )
-
+        return f"\u25c6 {html_probability or 'p=–'} - union, {html_similarity}, {html_shift}"
     def _activate_display_assignments(self, component):
         if self.data.change_assignments(self.assignment_name):
             self.state.focused_component = component
@@ -1794,12 +1955,12 @@ class Display(BasePlot.BaseCanvas):
 
         ## === assignment (which neuron) ===
         add_menu_section(menu, "Assignment")
-        submenu_change = QMenu("Reassign this footprint", menu)
-        if len(self.data.sessions) > 1:
-            self.fill_reassignment_menu(submenu_change, this_component)
-        else:
-            submenu_change.setEnabled(False)
-        menu.addMenu(submenu_change)
+        reassign = menu.addAction("Reassign this footprint…")
+        reassign.setEnabled(len(self.data.sessions) > 1)
+        reassign.setToolTip(
+            "Then click the new neuron in the view or in the list below it."
+        )
+        reassign.triggered.connect(lambda: self.start_reassign_pick(this_component))
         self.add_move_footprints_menu(menu, this_component)
 
         ## === shape of this footprint ===
@@ -1817,7 +1978,17 @@ class Display(BasePlot.BaseCanvas):
         )
         merge.triggered.connect(lambda: self.start_merge(this_component))
 
+        self.add_cut_action(menu, this_component, no_request)
         self.add_replace_with_union_menu(menu, this_component)
+
+        if self.data.shape_decisions():
+            from catan.gui.GUI_elements.fragments.shape_decision_dialog import (
+                open_decisions_list,
+            )
+
+            menu.addAction("Shape decisions…").triggered.connect(
+                lambda: open_decisions_list(self.native, self.state, self.data)
+            )
 
         ## === inclusion ===
         add_menu_section(menu, "Inclusion")
@@ -1849,137 +2020,353 @@ class Display(BasePlot.BaseCanvas):
     REASSIGN_RADIUS_PX = 10.0
     REASSIGN_RADIUS_STEP_PX = 10.0
 
-    def fill_reassignment_menu(self, submenu, this_component, radius=None):
-        """Entries of "Reassign this footprint": the focused neuron first,
-        then neighbours within ``radius`` by distance (those with a footprint
-        in this session last), "to new neuron" and "Load more". Hovering a
-        candidate highlights its footprints."""
-        if radius is None:
-            radius = min(self.REASSIGN_RADIUS_PX, self.state.adjacency_radius)
+    # Reassignment candidates: within this radius (px), "Load more" adds
+    # this much each time.
+    REASSIGN_RADIUS_PX = 10.0
+    REASSIGN_RADIUS_STEP_PX = 10.0
 
-        submenu.clear()
+    # ---------------------------------------------------------------
+    # Picking a target neuron (reassign a footprint, move footprints):
+    # the context menu only starts it; the candidates are listed in the
+    # bar at the bottom of the view (TargetPickerBar) and can be chosen
+    # there or by clicking a neuron in the view, which stays rotatable.
+    # ---------------------------------------------------------------
 
-        if not submenu.property("hover_connected"):
-            submenu.setProperty("hover_connected", True)
-            submenu.hovered.connect(self._on_reassignment_hovered)
-            submenu.aboutToHide.connect(
-                lambda: self.state.update_hovered_components(None)
+    def start_reassign_pick(self, component):
+        """"Reassign this footprint…": pick its new neuron."""
+        self._start_pick(
+            TargetPick(
+                "reassign",
+                component,
+                int(component.neuron_id),
+                [int(component.session_id)],
+                min(self.REASSIGN_RADIUS_PX, self.state.adjacency_radius),
             )
+        )
 
-        this_neuron = this_component.neuron_id
-        sid = this_component.session_id
+    def start_move_pick(self, component, moved):
+        """"Move footprints of neuron N ▸ <scope>…": pick the target neuron
+        of the footprints in sessions ``moved``."""
+        if self.state.current_request is not None:
+            return
+        self._start_pick(
+            TargetPick(
+                "move",
+                component,
+                int(component.neuron_id),
+                [int(s) for s in moved],
+                max(self.MERGE_RADIUS_PX, self.state.adjacency_radius),
+            )
+        )
+
+    @property
+    def picking(self):
+        return self._pick is not None
+
+    def _start_pick(self, pick):
+        if not self.displays_active_assignments:
+            return
+        self.cancel_pick()
+
+        # Restored when the pick ends.
+        pick.previous_highlight = (
+            list(self.state.highlighted_components or ()),
+            dict(self.state.highlight_roles),
+        )
+        self._pick = pick
+        self._fill_pick(pick)
+
+        # What is moved: violet (source).
+        moved = [NeuronComponent(pick.source_id, s) for s in pick.moved]
+        self.state.update_highlighted_components(
+            moved, roles={c: "source" for c in moved}
+        )
+        self.pick_bar.show_pick(pick)
+        self.native.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.pick_bar.pick_changed.emit()
+
+    def cancel_pick(self, restore=True):
+        pick = self._pick
+        if pick is None:
+            return
+        self._pick = None
+        self.pick_bar.clear_pick()
+        self.state.update_hovered_components(None)
+        QToolTip.hideText()
+        if restore:
+            self._restore_highlight(pick.previous_highlight)
+        self.pick_bar.pick_changed.emit()
+
+    def widen_pick(self):
+        """"Load more": a wider radius for the candidates."""
+        pick = self._pick
+        if pick is None:
+            return
+        pick.radius += (
+            self.MERGE_RADIUS_STEP_PX
+            if pick.kind == "move"
+            else self.REASSIGN_RADIUS_STEP_PX
+        )
+        self._fill_pick(pick)
+        self.pick_bar.show_pick(pick)
+        self.pick_bar.pick_changed.emit()
+
+    def choose_pick_target(self, neuron):
+        """Apply the pick: ``neuron`` the target, None a new neuron."""
+        pick = self._pick
+        if pick is None:
+            return
         ids = self.data.assignments.ids
-
-        ## display current match
-        add_label_to_menu(
-            submenu,
-            f"<b>Current assignment (neuron {this_neuron}, "
-            f"{session_label(self.data, sid)})</b>",
-            enabled=False,
-        )
-        self.add_info_str(submenu, this_component, this_neuron, "next")
-        self.add_info_str(submenu, this_component, this_neuron, "previous")
-        submenu.addSeparator()
-
-        neuron_candidates, distances = self.find_nearby_neurons(
-            this_component, radius=radius
-        )
-        ordered = [int(n) for n in neuron_candidates[np.argsort(distances)]]
-
-        ## the focused neuron is always offered, at the top
-        focused = self.state.focused_component
-        focused_neuron = None if focused is None else int(focused.neuron_id)
-        if focused_neuron is not None and focused_neuron != this_neuron:
-            ordered = [n for n in ordered if n != focused_neuron]
-            add_label_to_menu(submenu, "<b>Focused neuron</b>", enabled=False)
-            self._add_reassignment_candidate(submenu, this_component, focused_neuron)
-
-        ## neurons that already have a footprint in this session come last
-        ## (reassigning asks how to resolve the conflict)
-        free = [n for n in ordered if ids[n, sid] < 0]
-        occupied = [n for n in ordered if ids[n, sid] >= 0]
-
-        if free:
-            units = self.data.units
-            add_label_to_menu(
-                submenu,
-                f"<b>Within {units.to_display(radius, 'distance'):.0f} "
-                f"{units.label('distance')}</b>",
-                enabled=False,
-            )
-        for candidate in free:
-            self._add_reassignment_candidate(submenu, this_component, candidate)
-
-        if occupied:
-            add_label_to_menu(
-                submenu,
-                f"<b>Already have a footprint in {session_label(self.data, sid)}</b>",
-                enabled=False,
-            )
-        for candidate in occupied:
-            self._add_reassignment_candidate(submenu, this_component, candidate)
-
-        ## Option to create new neuron for this footprint
-        act_new = QAction("... to new neuron", submenu)
-        act_new.triggered.connect(
-            lambda: self.change_neuron_assignment_dialog(this_component)
-        )
-        submenu.addAction(act_new)
-
-        ## widen the search without closing the menu
-        units = self.data.units
-        wider = radius + self.REASSIGN_RADIUS_STEP_PX
-        more = QPushButton(
-            f"Load more (within {units.to_display(wider, 'distance'):.0f} "
-            f"{units.label('distance')})"
-        )
-        more.setFlat(True)
-        more.setStyleSheet("text-align: left; padding: 3px 15px;")
-        more.clicked.connect(
-            lambda: QTimer.singleShot(
-                0,
-                lambda: self.fill_reassignment_menu(submenu, this_component, wider),
-            )
-        )
-        more_action = QWidgetAction(submenu)
-        more_action.setDefaultWidget(more)
-        submenu.addAction(more_action)
-
-    def _add_reassignment_candidate(self, submenu, this_component, candidate):
-        ids = self.data.assignments.ids
-        sid = this_component.session_id
-
-        label = f"... to neuron {candidate}"
-        if ids[candidate, sid] >= 0:
-            label += f" (has footprint {int(ids[candidate, sid])})"
-
-        act_candidate = QAction(label, submenu)
-        act_candidate.setData(int(candidate))
-        act_candidate.triggered.connect(
-            lambda checked, new_neuron=candidate: self.change_neuron_assignment_dialog(
-                this_component, new_neuron
-            )
-        )
-        submenu.addAction(act_candidate)
-
-        self.add_info_str(submenu, this_component, candidate, "next")
-        self.add_info_str(submenu, this_component, candidate, "previous")
-        submenu.addSeparator()
-
-    def _on_reassignment_hovered(self, action):
-        """Highlight all footprints of the hovered candidate neuron."""
-        neuron = action.data()
-        ids = self.data.assignments.ids
-
-        if not isinstance(neuron, int) or not 0 <= neuron < ids.shape[0]:
-            self.state.update_hovered_components(None)
+        if neuron is not None:
+            neuron = int(neuron)
+            if neuron == pick.source_id or not 0 <= neuron < ids.shape[0]:
+                self.pick_bar.set_message(
+                    f"Neuron {neuron} is the one being moved: pick another neuron."
+                )
+                return
+        elif not pick.allow_new:
             return
 
+        self.cancel_pick()
+        if pick.kind == "move":
+            self.start_neuron_merge(
+                pick.source_id, neuron, sessions=np.asarray(pick.moved, dtype=int)
+            )
+        else:
+            self.change_neuron_assignment_dialog(pick.component, neuron)
+
+    def hover_pick_target(self, neuron):
+        """Highlight all footprints of ``neuron`` (None: nothing)."""
+        ids = self.data.assignments.ids
+        if neuron is None or not 0 <= neuron < ids.shape[0]:
+            self.state.update_hovered_components(None)
+            return
         self.state.update_hovered_components(
-            [NeuronComponent(neuron, int(s)) for s in np.flatnonzero(ids[neuron] >= 0)]
+            [NeuronComponent(int(neuron), int(s)) for s in np.flatnonzero(ids[neuron] >= 0)]
             or None
         )
 
+    def _on_pick_release(self, event):
+        if event.button == 2:
+            self.cancel_pick()
+            return
+        if event.button != 1 or event.pos is None or self.is_drag(event.pos):
+            return
+        component = self.find_closest_component(event.pos)
+        if component is not None:
+            self.choose_pick_target(int(component.neuron_id))
+
+    def _update_pick_hover(self, component):
+        """Hovering a neuron in the view: all its footprints, its row in the
+        bar and its match quality as tooltip."""
+        pick = self._pick
+        neuron = None if component is None else int(component.neuron_id)
+        self.hover_pick_target(neuron)
+        self.pick_bar.mark(neuron)
+        if neuron is None:
+            QToolTip.hideText()
+            return
+        if neuron == pick.source_id:
+            text = f"<b>Neuron {neuron}</b><br>being moved"
+        else:
+            label, lines = self._pick_row(pick, neuron)
+            text = (
+                f"<b>Into {label}</b><br>"
+                + "<br>".join(lines)
+                + "<br><i>Click to choose · Esc cancels</i>"
+            )
+        show_tooltip(QCursor.pos(), text, self.native)
+
+    def _union_distance(self, first, second):
+        centroids = self.display_assignments.union.centroids
+        distance = float(np.linalg.norm(centroids[first] - centroids[second]))
+        return distance if np.isfinite(distance) else np.inf
+
+    def _pick_row(self, pick, neuron, distance=None):
+        """(label, html lines) of a candidate; computed once per pick."""
+        if neuron in pick.rows:
+            return pick.rows[neuron]
+
+        ids = self.display_assignments.ids
+        units = self.data.units
+        if distance is None:
+            distance = self._union_distance(pick.source_id, neuron)
+        details = [f"{int(np.count_nonzero(ids[neuron] >= 0))} footprints"]
+        details.append(
+            f"{units.to_display(distance, 'distance'):.1f} "
+            f"{units.label('distance')} apart"
+            if np.isfinite(distance)
+            else "no union"
+        )
+
+        if pick.kind == "move":
+            if not self.display_assignments.union.included[neuron]:
+                details.append("excluded")
+            lines = [self.set_info_html(pick.moved_union, neuron)]
+        else:
+            session = pick.moved[0]
+            if ids[neuron, session] >= 0:
+                details.append(f"has footprint {int(ids[neuron, session])}")
+            lines = [
+                self.info_html(pick.component, neuron, "next"),
+                self.info_html(pick.component, neuron, "previous"),
+            ]
+
+        pick.rows[neuron] = (f"neuron {neuron} ({', '.join(details)})", lines)
+        return pick.rows[neuron]
+
+    def _fill_pick(self, pick):
+        """Title, summary and candidate sections of the pick."""
+        units = self.data.units
+        ids = self.display_assignments.ids
+        source_id = pick.source_id
+        focused = self.state.focused_component
+        focused_neuron = None if focused is None else int(focused.neuron_id)
+        radius_text = (
+            f"{units.to_display(pick.radius, 'distance'):.0f} {units.label('distance')}"
+        )
+        sections = []
+        listed = {source_id}
+        pick.note = ""
+
+        def section(title, neurons):
+            rows = []
+            for neuron, distance in neurons:
+                if neuron in listed:
+                    continue
+                listed.add(neuron)
+                self._pick_row(pick, neuron, distance)
+                rows.append(neuron)
+            if rows:
+                sections.append((title, rows))
+            return rows
+
+        nearby, distances = self.find_nearby_neurons(pick.component, radius=pick.radius)
+        nearby = sorted(zip((int(n) for n in nearby), distances), key=lambda x: x[1])
+
+        # Before any row: the move rows compare against it.
+        if pick.kind == "move" and pick.moved_union is None:
+            pick.moved_union = self.data.partial_union_footprint(source_id, pick.moved)
+
+        ## the focused neuron is always offered (no distance limit: choosing
+        ## it is deliberate)
+        if focused_neuron is not None and 0 <= focused_neuron < ids.shape[0]:
+            section("Focused neuron", [(focused_neuron, None)])
+
+        if pick.kind == "reassign":
+            session = pick.moved[0]
+            pick.title = (
+                f"Reassign neuron {source_id} · {session_label(self.data, session)}"
+            )
+            pick.summary = [
+                "<b>Current assignment</b>",
+                self.info_html(pick.component, source_id, "next"),
+                self.info_html(pick.component, source_id, "previous"),
+            ]
+            ## neurons that already have a footprint in this session come
+            ## last (reassigning asks how to resolve the conflict)
+            section(
+                f"Within {radius_text}",
+                [(n, d) for n, d in nearby if ids[n, session] < 0],
+            )
+            section(
+                f"Already have a footprint in {session_label(self.data, session)}",
+                [(n, d) for n, d in nearby if ids[n, session] >= 0],
+            )
+            pick.allow_new = True
+            pick.new_tooltip = ""
+
+        else:
+            moved = np.asarray(pick.moved, dtype=int)
+            sessions = np.flatnonzero(ids[source_id] >= 0)
+            remaining = np.setdiff1d(sessions, moved)
+            pick.title = (
+                f"Move footprints of neuron {source_id}: "
+                f"{session_labels(self.data, moved, short=True)}"
+            )
+            if len(remaining):
+                # Moved footprints vs. the footprints that would remain.
+                rest = self.data.partial_union_footprint(source_id, remaining)
+                similarity, shift, p_same = self._set_statistics_between(
+                    pick.moved_union, rest
+                )
+                html = match_quality_html(
+                    similarity, shift, p_same, MATCH_QUALITY_CMAP, units=units
+                )
+                pick.summary = [
+                    f"\u25c6 {html[0] or 'p=–'} - {len(remaining)} remaining "
+                    f"footprints, {html[1]}, {html[2]}"
+                ]
+            else:
+                pick.summary = ["the whole neuron (nothing remains)"]
+
+            ## selected neurons (Overview / navigation bar) within a wider
+            ## radius than the neighbours, nearest first
+            selected = [
+                n
+                for n in dict.fromkeys(
+                    int(c.neuron_id) for c in self.state.selected_components or ()
+                )
+                if n not in listed and 0 <= n < ids.shape[0] and (ids[n] >= 0).any()
+            ]
+            if selected:
+                selected_radius = max(self.MERGE_SELECTED_RADIUS_PX, pick.radius)
+                near = sorted(
+                    (
+                        (n, d)
+                        for n in selected
+                        if (d := self._union_distance(source_id, n)) <= selected_radius
+                    ),
+                    key=lambda x: x[1],
+                )
+                n_far = len(selected) - len(near)
+                section("Selected neurons", near[: self.MERGE_MAX_SELECTED])
+                if n_far:
+                    pick.note = (
+                        f"{n_far} more selected beyond "
+                        f"{units.to_display(selected_radius, 'distance'):.0f} "
+                        f"{units.label('distance')}"
+                    )
+
+            section(f"Within {radius_text}", nearby)
+            pick.allow_new = bool(len(remaining))
+            pick.new_tooltip = (
+                "" if pick.allow_new
+                else "All footprints into a new neuron would change nothing."
+            )
+
+        if not any(title.startswith("Within") for title, _ in sections):
+            sections.append((f"Within {radius_text}", []))
+        pick.sections = sections
+        pick.candidates = listed - {source_id}
+        step = (
+            self.MERGE_RADIUS_STEP_PX if pick.kind == "move" else self.REASSIGN_RADIUS_STEP_PX
+        )
+        pick.more_text = (
+            f"Load more (within "
+            f"{units.to_display(pick.radius + step, 'distance'):.0f} "
+            f"{units.label('distance')})"
+        )
+
+    def _restore_highlight(self, previous):
+        """Highlight from before a request / pick (its footprints that still
+        exist)."""
+        if previous is None or not previous[0]:
+            self.state.update_highlighted_components(None)
+            return
+
+        components, roles = previous
+        ids = self.data.assignments.ids
+        components = [
+            c
+            for c in components
+            if c.neuron_id < len(ids)
+            and (c.session_id is None or ids[c.neuron_id, c.session_id] >= 0)
+        ]
+        self.state.update_highlighted_components(
+            components or None,
+            roles={c: roles[c] for c in components if c in roles},
+        )
     def add_preset_check_menu(self, menu: QMenu, component: NeuronComponent):
         """Submenu: check the footprint's neuron against a curator preset."""
         from catan.gui.data.curation_filter_presets import (
@@ -2213,12 +2600,16 @@ class Display(BasePlot.BaseCanvas):
     MERGE_RADIUS_PX = 20.0
     MERGE_RADIUS_STEP_PX = 10.0
     MERGE_MAX_SELECTED = 10
+    # Selected neurons are offered within this radius (px; "Load more"
+    # widens it once the neighbour radius is larger).
+    MERGE_SELECTED_RADIUS_PX = 50.0
 
     def add_move_footprints_menu(self, menu, component):
         """"Move footprints of neuron N": the scope (all / this and previous /
         this and following / highlighted), then the target neuron. Every
         scope is listed; one that does not apply is disabled with the
-        reason as tooltip. Targets are built when a scope is opened."""
+        reason as tooltip. Choosing a scope starts picking the target
+        (start_move_pick)."""
         source_id = int(component.neuron_id)
         session_id = int(component.session_id)
         sessions = np.flatnonzero(self.display_assignments.ids[source_id] >= 0)
@@ -2260,171 +2651,19 @@ class Display(BasePlot.BaseCanvas):
         )
 
         for label, moved, reason in scopes:
-            scope = QMenu(label, submenu)
-            scope.setToolTipsVisible(True)
+            scope = submenu.addAction(f"{label}…")
             if moved is highlighted and role is not None:
                 scope.setIcon(self._role_icon(role))
-            submenu.addMenu(scope)
 
             if reason is not None:
                 scope.setEnabled(False)
-                scope.menuAction().setToolTip(reason)
+                scope.setToolTip(reason)
                 continue
 
-            scope.aboutToShow.connect(
-                lambda scope=scope, moved=moved: self._fill_move_targets(
-                    scope, source_id, component, moved
-                )
+            scope.setToolTip("Then click the target neuron in the view or in the list.")
+            scope.triggered.connect(
+                lambda checked=False, moved=moved: self.start_move_pick(component, moved)
             )
-
-    def _fill_move_targets(self, scope, source_id, component, moved, radius=None):
-        """Targets for moving footprints ``moved`` (sessions) of
-        ``source_id``: the focused neuron and the selected neurons (any
-        distance), neurons within ``radius`` ("Load more" widens it), a new
-        neuron. Hovering a target highlights its footprints."""
-        scope.clear()
-
-        if not scope.property("hover_connected"):
-            scope.setProperty("hover_connected", True)
-            scope.hovered.connect(self._on_reassignment_hovered)
-            scope.aboutToHide.connect(
-                lambda: self.state.update_hovered_components(None)
-            )
-
-        sessions = np.flatnonzero(self.display_assignments.ids[source_id] >= 0)
-        remaining = np.setdiff1d(sessions, moved)
-        moved_union = self.data.partial_union_footprint(source_id, moved)
-        units = self.data.units
-
-        add_label_to_menu(
-            scope,
-            f"<b>Moving neuron {source_id}: "
-            f"{session_labels(self.data, moved, short=True)}</b>",
-        )
-
-        if len(remaining):
-            # Moved footprints vs. the footprints that would remain.
-            rest = self.data.partial_union_footprint(source_id, remaining)
-            similarity, shift, p_same = self._set_statistics_between(moved_union, rest)
-            html = match_quality_html(
-                similarity, shift, p_same, MATCH_QUALITY_CMAP, units=units
-            )
-            add_label_to_menu(
-                scope,
-                f"\u25c6 {html[0] or 'p=–'} - {len(remaining)} remaining footprints,"
-                f"\t{html[1]},\t{html[2]}",
-            )
-        else:
-            add_label_to_menu(scope, "the whole neuron (nothing remains)")
-
-        scope.addSeparator()
-
-        focused = self.state.focused_component
-        target_id = None if focused is None else int(focused.neuron_id)
-        ids = self.display_assignments.ids
-        included = self.display_assignments.union.included
-
-        def add_target(target, distance=None):
-            n_footprints = int(np.count_nonzero(ids[target] >= 0))
-            details = [f"{n_footprints} footprints"]
-            if distance is not None:
-                details.append(
-                    f"{units.to_display(distance, 'distance'):.1f} "
-                    f"{units.label('distance')} apart"
-                    if np.isfinite(distance)
-                    else "no union"
-                )
-            if not included[target]:
-                details.append("excluded")
-            action = scope.addAction(f"Into neuron {target} ({', '.join(details)})")
-            action.setData(int(target))  # hover highlights its footprints
-            action.triggered.connect(
-                lambda checked=False, target=target: self.start_neuron_merge(
-                    source_id, target, sessions=moved
-                )
-            )
-            self.add_set_info_str(scope, moved_union, target)
-            scope.addSeparator()
-
-        ## the focused neuron is always offered (no distance limit: choosing
-        ## it is deliberate)
-        listed = {source_id}
-        if target_id is None or target_id == source_id:
-            action = scope.addAction("Into focused neuron")
-            action.setEnabled(False)
-            action.setToolTip("Focus another neuron first.")
-            scope.addSeparator()
-        else:
-            add_menu_section(scope, "Focused neuron")
-            add_target(
-                target_id,
-                self.data.neuron_merge_distance(source_id, target_id, without=remaining),
-            )
-            listed.add(target_id)
-
-        ## selected neurons (Overview / navigation bar), any distance
-        selected = [
-            n
-            for n in dict.fromkeys(
-                int(c.neuron_id) for c in self.state.selected_components or ()
-            )
-            if n not in listed and 0 <= n < ids.shape[0] and (ids[n] >= 0).any()
-        ][: self.MERGE_MAX_SELECTED]
-        if selected:
-            add_menu_section(scope, "Selected neurons")
-            for neighbour in selected:
-                add_target(neighbour)
-                listed.add(neighbour)
-
-        ## neighbours within ``radius`` (unions' centres), widened by "Load more"
-        if radius is None:
-            radius = max(self.MERGE_RADIUS_PX, self.state.adjacency_radius)
-        add_menu_section(
-            scope,
-            f"Within {units.to_display(radius, 'distance'):.0f} "
-            f"{units.label('distance')}",
-        )
-        neighbours, distances = self.find_nearby_neurons(component, radius=radius)
-        n_nearby = 0
-        for neighbour, distance in sorted(zip(neighbours, distances), key=lambda x: x[1]):
-            neighbour = int(neighbour)
-            if neighbour in listed:
-                continue
-            add_target(neighbour, distance)
-            n_nearby += 1
-
-        if not n_nearby:
-            add_label_to_menu(scope, "no other neuron nearby")
-            scope.addSeparator()
-
-        wider = radius + self.MERGE_RADIUS_STEP_PX
-        more = QPushButton(
-            f"Load more (within {units.to_display(wider, 'distance'):.0f} "
-            f"{units.label('distance')})"
-        )
-        more.setFlat(True)
-        more.setStyleSheet("text-align: left; padding: 3px 15px;")
-        more.clicked.connect(
-            lambda: QTimer.singleShot(
-                0,
-                lambda: self._fill_move_targets(scope, source_id, component, moved, wider),
-            )
-        )
-        more_action = QWidgetAction(scope)
-        more_action.setDefaultWidget(more)
-        scope.addAction(more_action)
-        scope.addSeparator()
-
-        action = scope.addAction("Into a new neuron")
-        whole = not len(remaining)
-        action.setEnabled(not whole)
-        if whole:
-            action.setToolTip("All footprints into a new neuron would change nothing.")
-        action.triggered.connect(
-            lambda checked=False: self.start_neuron_merge(
-                source_id, None, sessions=moved
-            )
-        )
 
     def add_replace_with_union_menu(self, menu, component):
         """Shapes from the union of the neuron's other footprints (e.g. odd
@@ -2443,7 +2682,9 @@ class Display(BasePlot.BaseCanvas):
         submenu.setEnabled(self.state.current_request is None)
         submenu.menuAction().setToolTip(
             "Each footprint gets the union shape of the neuron's other "
-            "footprints, placed at its own position; its activity is kept."
+            "footprints, placed where those footprints put it (interpolated "
+            "between the nearest earlier and later one, as for seeds); its "
+            "activity is kept."
         )
         menu.addMenu(submenu)
 
@@ -2469,6 +2710,39 @@ class Display(BasePlot.BaseCanvas):
         action.triggered.connect(
             lambda checked=False: self._replace_with_union(neuron_id, highlighted)
         )
+
+    def add_cut_action(self, menu, component, enabled):
+        """Cut the footprint between its two lobes (no other sessions
+        needed): one part stays, the other becomes a new neuron."""
+        from catan.core.footprint_lobes import lobe_count
+
+        cut = menu.addAction("Cut at the neck")
+        reason = None
+        if not self.data.is_included(component):
+            reason = "Excluded footprints cannot be cut."
+        else:
+            session = self.data.sessions[component.session_id]
+            footprint_id = self.state.get_footprint_from_component(component)
+            if footprint_id is None or lobe_count(
+                session.footprints[:, int(footprint_id)], tuple(session.dims)
+            ) < 2:
+                reason = (
+                    "The footprint has no two lobes to cut apart "
+                    "(see the statistic Footprint lobes)."
+                )
+        cut.setEnabled(enabled and reason is None)
+        cut.setToolTip(
+            reason
+            or "Cut between its two lobes: the part matching this neuron's "
+            "other footprints stays, the other becomes a new neuron."
+        )
+        cut.triggered.connect(lambda: self._cut_footprint(component))
+
+    def _cut_footprint(self, component):
+        try:
+            self.data.cut_footprint(component)
+        except ValueError as exc:
+            QMessageBox.warning(self.native, "Footprint not cut", str(exc))
 
     def _replace_with_union(self, neuron_id, sessions):
         try:
@@ -2527,23 +2801,7 @@ class Display(BasePlot.BaseCanvas):
         previous = getattr(request, "previous_highlight", None) if restore else None
 
         self.state.current_request = None
-
-        if previous is None or not previous[0]:
-            self.state.update_highlighted_components(None)
-            return
-
-        components, roles = previous
-        ids = self.data.assignments.ids
-        components = [
-            c
-            for c in components
-            if c.neuron_id < len(ids)
-            and (c.session_id is None or ids[c.neuron_id, c.session_id] >= 0)
-        ]
-        self.state.update_highlighted_components(
-            components or None,
-            roles={c: roles[c] for c in components if c in roles},
-        )
+        self._restore_highlight(previous)
 
     def advance_or_confirm_request(self):
 
@@ -2585,14 +2843,120 @@ class Display(BasePlot.BaseCanvas):
             self.request_display.set_error("The request is not complete yet.")
             return
 
+        resolution = self._resolve_request_conflicts(request)
+        if resolution is None:
+            return
+        included, occupied = resolution
+
         try:
-            self.data.process_component_request(request)
+            self.data.process_component_request(request, **occupied)
         except Exception as exc:
+            # Nothing applied: the re-included endpoints are excluded again.
+            self.data.restore_inclusion(included)
             self.request_display.set_error(str(exc))
             return
 
         self.state.current_request = None
         self.state.update_highlighted_components(None)
+
+    def _resolve_request_conflicts(self, request):
+        """Ask about conflicts of a split / merge request before applying:
+        excluded endpoints (included again) and destinations that already
+        hold a footprint (as the curator: exclude existing / keep as a
+        separate neuron). Returns (inclusion before, see
+        Data.inclusion_state; resolution keywords for prepare()) or None
+        when cancelled."""
+        from catan.gui.data.curation_actions import (
+            OccupiedDestination,
+            occupied_destinations,
+        )
+
+        sources = tuple(request.destination)
+        targets = tuple(request.origin)
+        ids = self.data.assignments.ids
+
+        union_included = self.data.assignments.union.included
+        excluded = [
+            c
+            for c in (*sources, *targets)
+            if c.session_id is not None
+            and ids[c.neuron_id, c.session_id] >= 0
+            and not (self.data.is_included(c) and union_included[c.neuron_id])
+        ]
+        slots = occupied_destinations(self.data, request.type, sources, targets)
+
+        if not excluded and not slots:
+            return (), {}
+
+        word = {"split": "split", "merge": "merge"}.get(request.type, "change")
+        lines = []
+        if excluded:
+            lines.append("Excluded footprints in this " + word + ":")
+            lines += [
+                f"Neuron {c.neuron_id}, {session_label(self.data, c.session_id)}: "
+                f"footprint {int(ids[c.neuron_id, c.session_id])}"
+                for c in excluded
+            ]
+        if slots:
+            if lines:
+                lines.append("")
+            lines.append(str(OccupiedDestination(slots, request.type)))
+
+        info = []
+        if excluded:
+            info.append(
+                "The excluded footprints are included again (and their "
+                "neurons, as with Include footprint) before the " + word + "."
+            )
+        if slots:
+            info.append(
+                "Exclude: the existing footprint is excluded (kept as an "
+                "excluded single-footprint neuron) and the result takes its "
+                "place.\nKeep: the existing footprint moves to a separate, "
+                "included neuron; nothing is excluded."
+            )
+
+        dialog = QMessageBox(self.native)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle(f"Conflicts in this {word}")
+        dialog.setText("\n".join(lines))
+        dialog.setInformativeText("\n\n".join(info))
+
+        buttons = {}
+        prefix = "Include, " if excluded else ""
+        if slots:
+            buttons["exclude"] = dialog.addButton(
+                prefix + "exclude existing && apply", QMessageBox.ButtonRole.AcceptRole
+            )
+            buttons["detach"] = dialog.addButton(
+                prefix + "keep as separate neuron && apply",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+        else:
+            buttons["include"] = dialog.addButton(
+                "Include && apply", QMessageBox.ButtonRole.AcceptRole
+            )
+        cancel_button = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel_button)
+
+        fit_message_box_buttons(dialog)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        choice = next((key for key, button in buttons.items() if button is clicked), None)
+        if choice is None:
+            return None
+
+        previous = self.data.inclusion_state(excluded)
+        for component in excluded:
+            self.data.reinclude_component(component)
+
+        occupied = {}
+        if choice == "exclude":
+            occupied = {"exclude_occupied": True}
+        elif choice == "detach":
+            occupied = {"detach_occupied": True}
+        return previous, occupied
 
     def _on_request_interaction(self, event):
 
@@ -2643,7 +3007,7 @@ class Display(BasePlot.BaseCanvas):
     def toggle_included(self, component: NeuronComponent | int):
         # Implement the logic for handling the removal action
         if self.data.is_included(component):
-            self.data.exclude_component(component)
+            self.data.exclude_component(component, keep_alone_in_place=True)
         else:
             self.data.reinclude_component(component)
 
@@ -2896,9 +3260,35 @@ class Controller(BasePlot.CanvasController):
         )
         self._on_request_status_changed()
 
+        bar = self.canvas.pick_bar
+        self.connect_signal(bar.chosen, self.canvas.choose_pick_target, controls=True)
+        self.connect_signal(bar.hovered, self.canvas.hover_pick_target, controls=True)
+        self.connect_signal(bar.more_requested, self.canvas.widen_pick, controls=True)
+        self.connect_signal(bar.cancel_requested, self.canvas.cancel_pick, controls=True)
+        self.connect_signal(
+            bar.pick_changed,
+            lambda: self._queue_selection_update("selection"),
+            controls=True,
+        )
+
+    def deactivate(self):
+        canvas = getattr(self, "canvas", None)
+        if not self._deactivated and canvas is not None:
+            canvas.cancel_pick()
+        super().deactivate()
+
     def _on_data_changed(self, event: DataChange):
 
         self._refresh_assignments_selector()
+
+        # The candidates (and what moves) may be gone: start again.
+        if self.canvas.picking and event.has(
+            *SESSION_STRUCTURE_CHANGES,
+            C.ASSIGNMENT_SET,
+            C.ASSIGNMENT_MAPPING,
+            C.INCLUSION,
+        ):
+            self.canvas.cancel_pick()
 
         if event.has(*SESSION_STRUCTURE_CHANGES, C.ASSIGNMENT_SET):
             self.initialize_display()
@@ -2971,6 +3361,7 @@ class Controller(BasePlot.CanvasController):
         if name == self.canvas._assignment_name:
             return
 
+        self.canvas.cancel_pick()
         self.canvas._assignment_name = name
         self.config["assignments_name"] = name
         self.canvas.camera_set = False
@@ -3623,6 +4014,284 @@ class RequestDisplay(QFrame):
         self.confirm_button.setEnabled(False)
 
         self.clear_error()
+
+
+class TargetPickerBar(QFrame):
+    """Bar at the bottom of the footprints view while a target neuron is
+    picked (TargetPick): what moves, the candidates with their match
+    quality (hovering a row highlights the neuron in the view, clicking
+    chooses it), Load more, Into a new neuron, Cancel. Non-modal: the view
+    stays rotatable and a neuron can be clicked there instead."""
+
+    MAX_WIDTH = 640
+    # Share of the view's height the list may take.
+    LIST_HEIGHT_SHARE = 0.35
+
+    chosen = Signal(object)  # neuron ID; None: a new neuron
+    hovered = Signal(object)  # neuron ID or None
+    more_requested = Signal()
+    cancel_requested = Signal()
+    # Candidates or pick state changed: replot.
+    pick_changed = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("TargetPickerBar")
+        self._rows = {}
+
+        self._position_timer = QTimer(self)
+        self._position_timer.setSingleShot(True)
+        self._position_timer.setInterval(0)
+        self._position_timer.timeout.connect(self.reposition)
+        parent.installEventFilter(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+
+        title_row = QHBoxLayout()
+        self.title = QLabel("")
+        self.title.setObjectName("pickTitle")
+        self.title.setWordWrap(True)
+        title_row.addWidget(self.title, 1)
+        self.list_toggle = QToolButton(self)
+        self.list_toggle.setObjectName("pickListToggle")
+        self.list_toggle.setCheckable(True)
+        self.list_toggle.setChecked(True)
+        self.list_toggle.setToolTip("Show / hide the list (more room for the view)")
+        self.list_toggle.toggled.connect(self._on_list_toggled)
+        title_row.addWidget(self.list_toggle, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(title_row)
+
+        self.summary = QLabel("")
+        self.summary.setObjectName("pickSummary")
+        self.summary.setTextFormat(Qt.TextFormat.RichText)
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+
+        self.hint = QLabel(
+            "Click the target neuron in the view or below · right-click or Esc cancels"
+        )
+        self.hint.setObjectName("pickHint")
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        self.list = QListWidget(self)
+        self.list.setObjectName("pickList")
+        self.list.setMouseTracking(True)
+        self.list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.itemEntered.connect(self._on_item_entered)
+        self.list.itemClicked.connect(self._on_item_clicked)
+        self.list.viewport().installEventFilter(self)
+        layout.addWidget(self.list)
+
+        self.note = QLabel("")
+        self.note.setObjectName("pickHint")
+        layout.addWidget(self.note)
+
+        buttons = QHBoxLayout()
+        self.more_button = QPushButton("Load more")
+        self.more_button.clicked.connect(self.more_requested.emit)
+        self.new_button = QPushButton("Into a new neuron")
+        self.new_button.clicked.connect(lambda: self.chosen.emit(None))
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip("Esc")
+        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        buttons.addWidget(self.more_button)
+        buttons.addWidget(self.new_button)
+        buttons.addStretch()
+        buttons.addWidget(self.cancel_button)
+        layout.addLayout(buttons)
+
+        # Esc in the view (or the bar) cancels, only while picking.
+        self._escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), parent)
+        self._escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._escape.activated.connect(self.cancel_requested.emit)
+        self._escape.setEnabled(False)
+
+        self.setStyleSheet("""
+            QFrame#TargetPickerBar {
+                background-color: rgba(30, 34, 40, 240);
+                border: 1px solid #c87920;
+                border-radius: 7px;
+            }
+            QFrame#TargetPickerBar QLabel {
+                background: transparent;
+                border: none;
+                color: #e8eaed;
+            }
+            QLabel#pickTitle {
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QLabel#pickSummary { font-size: 11px; }
+            QLabel#pickHint { color: #aab2bd; font-size: 11px; }
+            QLabel#pickMessage { color: #ffd28a; font-size: 12px; font-weight: 600; }
+            QListWidget#pickList {
+                background: rgba(20, 23, 28, 200);
+                border: 1px solid #474e57;
+                border-radius: 4px;
+                color: #e8eaed;
+                outline: none;
+            }
+            QListWidget#pickList::item { border-bottom: 1px solid #343a42; }
+            QListWidget#pickList::item:hover,
+            QListWidget#pickList::item:selected {
+                background: #3b4450;
+            }
+            QFrame#TargetPickerBar QPushButton, QToolButton#pickListToggle {
+                color: #e8eaed;
+                background-color: #3b414a;
+                border: 1px solid #66707c;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QFrame#TargetPickerBar QPushButton:hover, QToolButton#pickListToggle:hover {
+                background-color: #4a525d;
+                border-color: #8793a1;
+            }
+            QFrame#TargetPickerBar QPushButton:disabled {
+                color: #777f89;
+                border-color: #474e57;
+            }
+        """)
+        self._on_list_toggled(True)
+        self.hide()
+
+    def show_pick(self, pick):
+        self.title.setText(pick.title)
+        self.summary.setText("<br>".join(pick.summary))
+        self.summary.setVisible(bool(pick.summary))
+        self.hint.setObjectName("pickHint")
+        self.hint.setText(
+            "Click the target neuron in the view or below · right-click or Esc cancels"
+        )
+        self.hint.setStyleSheet("")
+        self.note.setText(pick.note)
+        self.note.setVisible(bool(pick.note))
+        self.more_button.setText(pick.more_text)
+        self.new_button.setEnabled(pick.allow_new)
+        self.new_button.setToolTip(pick.new_tooltip)
+
+        scroll = self.list.verticalScrollBar().value()
+        self.list.clear()
+        self._rows = {}
+        for title, neurons in pick.sections:
+            header = QListWidgetItem(title.upper())
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            font = header.font()
+            font.setPointSizeF(max(6.0, font.pointSizeF() - 1.5))
+            font.setBold(True)
+            header.setFont(font)
+            header.setForeground(QColor("#8b939e"))
+            self.list.addItem(header)
+            if not neurons:
+                empty = QListWidgetItem("    no other neuron nearby")
+                empty.setFlags(Qt.ItemFlag.NoItemFlags)
+                empty.setForeground(QColor("#8b939e"))
+                self.list.addItem(empty)
+            for neuron in neurons:
+                label, lines = pick.rows[neuron]
+                self._add_row(neuron, label, lines)
+        self.list.verticalScrollBar().setValue(scroll)
+
+        self._escape.setEnabled(True)
+        self.show()
+        self.raise_()
+        self._position_timer.start()
+
+    def _add_row(self, neuron, label, lines):
+        row = QWidget()
+        row.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(8, 3, 8, 3)
+        row_layout.setSpacing(0)
+        text = QLabel(f"<b>Into {label}</b>")
+        text.setTextFormat(Qt.TextFormat.RichText)
+        row_layout.addWidget(text)
+        stats = QLabel("&nbsp;&nbsp;&nbsp;".join(lines))
+        stats.setTextFormat(Qt.TextFormat.RichText)
+        stats.setWordWrap(True)
+        stats.setStyleSheet("font-size: 11px;")
+        row_layout.addWidget(stats)
+
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, int(neuron))
+        item.setSizeHint(row.sizeHint())
+        self.list.addItem(item)
+        self.list.setItemWidget(item, row)
+        self._rows[int(neuron)] = item
+
+    def clear_pick(self):
+        self._escape.setEnabled(False)
+        self.list.clear()
+        self._rows = {}
+        self.hide()
+
+    def set_message(self, text):
+        self.hint.setText(text)
+        self.hint.setStyleSheet("color: #ffd28a; font-weight: 600;")
+
+    def mark(self, neuron):
+        """The row of the neuron hovered in the view."""
+        item = self._rows.get(neuron)
+        if item is None:
+            self.list.clearSelection()
+            return
+        self.list.setCurrentItem(item)
+        self.list.scrollToItem(item)
+
+    def _neuron(self, item):
+        value = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+        return int(value) if value is not None else None
+
+    def _on_item_entered(self, item):
+        self.hovered.emit(self._neuron(item))
+
+    def _on_item_clicked(self, item):
+        neuron = self._neuron(item)
+        if neuron is not None:
+            self.chosen.emit(neuron)
+
+    def _on_list_toggled(self, shown):
+        self.list.setVisible(shown)
+        self.list_toggle.setText("Hide list" if shown else "Show list")
+        self._position_timer.start()
+
+    def eventFilter(self, watched, event):
+        if watched is self.parentWidget() and event.type() == QEvent.Type.Resize:
+            self._position_timer.start()
+        elif watched is self.list.viewport() and event.type() == QEvent.Type.Leave:
+            self.hovered.emit(None)
+        return super().eventFilter(watched, event)
+
+    def reposition(self):
+        parent = self.parentWidget()
+        if parent is None or not self.isVisible():
+            return
+
+        margin = 8
+        width = max(1, min(self.MAX_WIDTH, parent.width() - 2 * margin))
+
+        # The list as tall as its rows, at most a share of the view.
+        rows = sum(
+            self.list.sizeHintForRow(i) for i in range(self.list.count())
+        ) + 2 * self.list.frameWidth()
+        self.list.setFixedHeight(
+            max(40, min(rows, int(parent.height() * self.LIST_HEIGHT_SHARE)))
+        )
+
+        layout = self.layout()
+        layout.activate()
+        height = self.heightForWidth(width) if self.hasHeightForWidth() else -1
+        if height <= 0:
+            height = self.sizeHint().height()
+        height = min(height, max(1, parent.height() - 2 * margin))
+        self.resize(width, height)
+        self.move(margin, max(margin, parent.height() - height - margin))
+        self.raise_()
 
 
 class FootprintParametersController(ControlPanel.ControlPanel):

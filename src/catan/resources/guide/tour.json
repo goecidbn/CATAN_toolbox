@@ -209,7 +209,7 @@
           "wait_for": "demo_available",
           "do_it": "choose_demo_folder",
           "do_it_label": "Choose demo folder…",
-          "text": "The demo dataset holds 4 sessions of one mouse (20240719–20240722): each session folder has CaImAn results (footprints and quality values; the activity traces are left out to keep it small) and, in <i>mc/</i>, a correlation image used as background.<br><br>Demo folder: <i>{demo_path}</i>"
+          "text": "The demo dataset holds 4 sessions of one mouse (20240719–20240722): each session folder has CaImAn results (footprints and quality values; the activity traces are left out to keep it small) and a correlation image used as background.<br><br>Demo folder: <i>{demo_path}</i>"
         },
         {
           "title": "Root folder",
@@ -231,7 +231,7 @@
             "demo_sessions_registered"
           ],
           "do_it": "load_demo_recipe",
-          "text": "<b>+</b> adds data. With <b>from file</b> you pick a CATAN project, a session file, a loading recipe (.json) or a path table (.csv); with <b>.* (glob)</b> you enter a pattern (e.g. <i>*/results_CaImAn_*.hdf5</i>) and CATAN finds all matching files below the root folder, assuming these are session files.<br><br>For the demo: click <b>+</b> (from file) and open <b>{demo_recipe}</b> in the demo folder. A loading recipe lists sessions together with their configuration. A dialog lists the 4 sessions — keep them selected and confirm. The guide then moves on to the loading progress.",
+          "text": "<b>+</b> adds data. With <b>from file</b> you pick a CATAN project, a session file, a loading recipe (.json) or a path table (.csv); with <b>.* (glob)</b> you enter a pattern (e.g. <i>*/neuron_detection_*.hdf5</i>) and CATAN finds all matching files below the root folder, assuming these are session files.<br><br>For the demo: click <b>+</b> (from file) and open <b>{demo_recipe}</b> in the demo folder. A loading recipe lists sessions together with their configuration. A dialog lists the 4 sessions — keep them selected and confirm. The guide then moves on to the loading progress.",
           "advance_when": "demo_sessions_registered",
           "on_enter": "offer_demo_add_start",
           "on_leave": "clear_demo_add_start"
@@ -253,7 +253,7 @@
           "anchor": "sessions.first_row.config",
           "do_it": "open_session_config",
           "do_it_label": "Open it for me",
-          "text": "The gear button opens the session's <b>configuration</b>: which file and dataset each kind of data comes from.<ul><li><b>Spatial data</b>: footprints and the background — in the demo the background is <i>mc/ID29_&lt;date&gt;_Cn.tiff</i></li><li><b>Quality data</b>: CNN, SNR, r-values from the source (optional)</li><li><b>Trace data</b>: activity — switched off in the demo</li></ul>CATAN checks in the background whether the file fits the configuration and colours each field: <b style='color:#6A9A74'>green</b> found, <b style='color:#A88A52'>yellow</b> not found but optional, <b style='color:#A8676B'>red</b> required but not found (grey: not checked yet). Loading stops while a required field is missing.<br><br>After editing a field, <b>Apply changes</b> loads what changed. For your own data, CATAN suggests a configuration from the file format; a recipe saves it for all sessions."
+          "text": "The gear button opens the session's <b>configuration</b>: which file and dataset each kind of data comes from.<ul><li><b>Spatial data</b>: footprints and the background — in the demo the background is <i>ID29_&lt;date&gt;_Cn.tiff</i> next to the session file</li><li><b>Quality data</b>: CNN, SNR, r-values from the source (optional)</li><li><b>Trace data</b>: activity — switched off in the demo</li></ul>CATAN checks in the background whether the file fits the configuration and colours each field: <b style='color:#6A9A74'>green</b> found, <b style='color:#A88A52'>yellow</b> not found but optional, <b style='color:#A8676B'>red</b> required but not found (grey: not checked yet). Loading stops while a required field is missing.<br><br>After editing a field, <b>Apply changes</b> loads what changed. For your own data, CATAN suggests a configuration from the file format; a recipe saves it for all sessions."
         },
         {
           "id": "process_session",
@@ -676,7 +676,7 @@
           "title": "The right-click menu",
           "anchor": "panel.footprints",
           "panel": "footprints",
-          "text": "Right-click a footprint for everything you can do with it, in four groups:<ul><li><b>Inspect</b>: Set focus, Highlight all footprints of neuron N, Compare footprints, Check against preset.</li><li><b>Assignment</b>: <b>Reassign this footprint</b> to the focused neuron, a nearby or a new one (with how well it fits); <b>Move footprints of neuron N</b>: all, this and previous, this and following, or the highlighted ones, into the selected neuron, a nearby or a new one. Options that do not apply are greyed out; hover them for the reason.</li><li><b>Shape</b>: split this footprint, merge it with other footprints of the session, or replace it with the union shape.</li><li><b>Inclusion</b>: exclude / include the footprint or the neuron, remove.</li></ul>"
+          "text": "Right-click a footprint for everything you can do with it, in four groups:<ul><li><b>Inspect</b>: Set focus, Highlight all footprints of neuron N, Compare footprints, Check against preset.</li><li><b>Assignment</b>: <b>Reassign this footprint…</b>; <b>Move footprints of neuron N</b>: all, this and previous, this and following, or the highlighted ones. Both then let you pick the target: a bar at the bottom of the view lists the focused, selected and nearby neurons with how well they fit, the other neurons fade. Click a neuron in the view or in the list (hovering shows its footprints), use Load more or Into a new neuron; right-click or Esc cancels. Options that do not apply are greyed out; hover them for the reason.</li><li><b>Shape</b>: split this footprint, merge it with other footprints of the session, cut it at the neck between its two lobes (two cells in one footprint, no other sessions needed), or replace it with the union shape.</li><li><b>Inclusion</b>: exclude / include the footprint or the neuron, remove.</li></ul>"
         },
         {
           "title": "The status line",
@@ -853,7 +853,7 @@
         },
         {
           "title": "Acting on matches",
-          "text": "A preset can carry an <b>action</b> — this one: <i>mark reviewed</i>.<ul><li><b>Apply current</b> — only the focused match.</li><li><b>Apply all selected</b> — all selected matches at once.</li></ul>Presets whose matches deserve a look each (merges, splits) go one by one: <b>Apply &amp; next</b> applies and moves on, <b>Skip</b> leaves the match as it is; Enter confirms.",
+          "text": "A preset can carry an <b>action</b> — this one: <i>mark reviewed</i>.<ul><li><b>Apply current</b> — only the focused match.</li><li><b>Apply all selected</b> — all selected matches at once.</li></ul>Presets whose matches deserve a look each (merges, splits) go one by one: <b>Apply &amp; next</b> applies and moves on, <b>Skip</b> leaves the match as it is; Enter confirms.<br><br>Split and merge candidates of the same two cells can keep coming back both ways. <b>Always split here…</b> / <b>Always merge here…</b> settle it once: a <b>shape decision</b> (two cells / one cell) shows what it does in every session, applies it in one go, is saved with the assignments, and the curator then proposes these cells only as decided. <b>Shape decisions…</b> lists them.",
           "anchor": "curation.actions",
           "panel": "match_curator"
         },
@@ -900,7 +900,7 @@
         },
         {
           "title": "A good order",
-          "text": "Work through the presets roughly in this order:<ol><li><b>Cleanup</b>: edge artifacts, low-quality one-offs, duplicates, size outliers.</li><li><b>Structure</b>: misassigned footprints, orphans, stray footprints, swap risk, two footprint groups.</li><li><b>Merges</b>: fragmented tracks, merge candidates.</li><li><b>High confidence / nearly clean</b>: mark the good ones as reviewed.</li><li><b>Uncertain matches</b> last.</li></ol>"
+          "text": "Work through the presets roughly in this order:<ol><li><b>Cleanup</b>: edge artifacts, low-quality one-offs, duplicates, size outliers.</li><li><b>Structure</b>: misassigned footprints, orphans, stray footprints, swap risk, two footprint groups.</li><li><b>Merges</b>: fragmented tracks, merge candidates.</li><li><b>High confidence / nearly clean / clean one-offs</b>: mark the good ones as reviewed (clean one-offs: cells seen in one session only, with a typical footprint and no possible partner or duplicate).</li><li><b>Uncertain matches</b> last.</li></ol>"
         },
         {
           "id": "own",

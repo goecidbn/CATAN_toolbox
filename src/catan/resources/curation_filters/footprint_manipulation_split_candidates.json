@@ -9,51 +9,172 @@
     "match_level": "relationship",
     "children": [
       {
-        "type": "condition",
-        "id": "a5ef6457436b4567aeb42934ed45c3aa",
-        "query": {
-          "statistic_key": "footprint_overlap",
-          "reductions": {
-            "neuron_i": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
+        "type": "group",
+        "id": "9f15d9d2d4df4240a9db83ce71e1401b",
+        "operator": "or",
+        "match_level": "relationship",
+        "count": null,
+        "comment": "Each source lies ≥ 70 % inside the target, or ≥ 45 % inside a target with two or more lobes.",
+        "apply_to": "same",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null,
+        "children": [
+          {
+            "type": "condition",
+            "id": "a5ef6457436b4567aeb42934ed45c3aa",
+            "query": {
+              "statistic_key": "footprint_overlap",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "session",
+                  "relation": "different",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {
+                "normalize_by": "i",
+                "support_threshold": 0.1
+              }
             },
-            "neuron_j": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            },
-            "session_i": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
-            },
-            "session_j": {
-              "method": "keep",
-              "index": null,
-              "error_method": "none"
+            "threshold": {
+              "direction": "greater",
+              "active": true,
+              "value": 0.7
             }
           },
-          "reduction_order": [],
-          "filters": [
-            {
-              "target": "session",
-              "relation": "different",
-              "collapse_same": true
-            }
-          ],
-          "context": "generic",
-          "parameters": {
-            "normalize_by": "i",
-            "support_threshold": 0.1
+          {
+            "type": "group",
+            "id": "61fd4acad29441f5a3bd3927ccb52d48",
+            "operator": "and",
+            "match_level": "relationship",
+            "count": null,
+            "comment": "Lobed targets: the source may lie only ≥ 45 % inside (the lobes are often smaller or shifted against the separate detections).",
+            "apply_to": "same",
+            "summary": null,
+            "manipulation": null,
+            "review_statuses": null,
+            "children": [
+              {
+                "type": "condition",
+                "id": "ab58fa9e15d147d3bb0c831b0ceae644",
+                "query": {
+                  "statistic_key": "footprint_overlap",
+                  "reductions": {
+                    "neuron_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "neuron_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session_i": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    },
+                    "session_j": {
+                      "method": "keep",
+                      "index": null,
+                      "error_method": "none"
+                    }
+                  },
+                  "reduction_order": [],
+                  "filters": [
+                    {
+                      "target": "session",
+                      "relation": "different",
+                      "collapse_same": true
+                    }
+                  ],
+                  "context": "generic",
+                  "parameters": {
+                    "normalize_by": "i",
+                    "support_threshold": 0.1
+                  }
+                },
+                "threshold": {
+                  "direction": "greater",
+                  "active": true,
+                  "value": 0.45
+                }
+              },
+              {
+                "type": "group",
+                "id": "3bacb9bd844c4e429180cbc46c5dd35f",
+                "operator": "and",
+                "match_level": "footprint",
+                "count": null,
+                "comment": "The target footprint falls apart into two or more lobes (statistic Footprint lobes).",
+                "apply_to": "target",
+                "summary": null,
+                "manipulation": null,
+                "review_statuses": null,
+                "children": [
+                  {
+                    "type": "condition",
+                    "id": "899cdc5e01234dd3b23a3196bf459852",
+                    "query": {
+                      "statistic_key": "footprint_lobes",
+                      "reductions": {
+                        "neuron": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        },
+                        "session": {
+                          "method": "keep",
+                          "index": null,
+                          "error_method": "none"
+                        }
+                      },
+                      "reduction_order": [],
+                      "filters": [],
+                      "context": "generic",
+                      "parameters": {
+                        "thr": 0.1,
+                        "peak": 0.5,
+                        "size": 0.1
+                      }
+                    },
+                    "threshold": {
+                      "direction": "greater",
+                      "active": true,
+                      "value": 2.0
+                    }
+                  }
+                ]
+              }
+            ]
           }
-        },
-        "threshold": {
-          "direction": "greater",
-          "active": true,
-          "value": 0.7
-        }
+        ]
       },
       {
         "type": "condition",
@@ -320,7 +441,7 @@
       "anchor": "target",
       "separate_partner_sessions": false
     },
-    "comment": "Find target footprints that contain two cells: footprints of two different neurons from other sessions (sources) each lie ≥ 70 % inside the target and cover 10–70 % of it. Of all compatible source pairs, the one the other sessions support most is chosen: there, the two cells appear as separate footprints more often than as one joint footprint.",
+    "comment": "Find target footprints that contain two cells: footprints of two different neurons from other sessions (sources) each lie ≥ 70 % inside the target (≥ 45 % for a target with two or more lobes) and cover 10–70 % of it. Of all compatible source pairs, the one the other sessions support most is chosen: there, the two cells appear as separate footprints more often than as one joint footprint.",
     "apply_to": "same",
     "summary": null,
     "manipulation": {

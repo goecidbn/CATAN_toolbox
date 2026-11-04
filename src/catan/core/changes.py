@@ -108,6 +108,8 @@ TRACKED_STATISTIC_STRUCTURE = frozenset({
     ChangeKind.SESSION_ACTIVITY,
     ChangeKind.ASSIGNMENT_SET,
     ChangeKind.ASSIGNMENT_MAPPING,
+    # Excluded footprints / neurons count as absent in statistics.
+    ChangeKind.INCLUSION,
 })
 
 SESSION_STRUCTURE_CHANGES = (

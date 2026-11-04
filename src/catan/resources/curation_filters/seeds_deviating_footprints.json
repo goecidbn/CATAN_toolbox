@@ -168,7 +168,7 @@
       }
     ],
     "count": null,
-    "comment": "Footprints that deviate from the other footprints of their neuron, to clean up before seeded redetection. 'Replace with union shape' gives each the union shape of the neuron's other footprints at its own position and keeps its activity; exclude footprints that belong to another cell instead. The union needs at least one other footprint of the neuron.",
+    "comment": "Footprints that deviate from the other footprints of their neuron, to clean up before seeded redetection. 'Replace with union shape' gives each the union shape of the neuron's other footprints at the position interpolated from them (as for seeds) and keeps its activity; exclude footprints that belong to another cell instead. The union needs at least one other footprint of the neuron.",
     "apply_to": "same",
     "summary": null,
     "manipulation": {

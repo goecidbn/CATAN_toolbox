@@ -167,15 +167,7 @@ def infer_aligned_footprint(
     if not observations:
         return None
 
-    previous = [item for item in observations if item[0] < session_id]
-    following = [item for item in observations if item[0] > session_id]
-
-    if previous and following:
-        a, ca = previous[-1]
-        b, cb = following[0]
-        position = ca + (cb - ca) * ((session_id - a) / (b - a))
-    else:
-        position = (previous[-1] if previous else following[0])[1]
+    position = interpolated_position(observations, session_id)
 
     column = sparse.csc_matrix(union.footprints[:, neuron_id])
 
@@ -183,6 +175,20 @@ def infer_aligned_footprint(
         raise ValueError("Union footprint does not match the session dimensions.")
 
     return place_footprint(column, dims, position)
+
+
+def interpolated_position(observations, session_id):
+    """Position in ``session_id`` from (session, position) observations
+    sorted by session: linear between the nearest earlier and later one,
+    else the nearest one."""
+    previous = [item for item in observations if item[0] < session_id]
+    following = [item for item in observations if item[0] > session_id]
+
+    if previous and following:
+        a, ca = previous[-1]
+        b, cb = following[0]
+        return ca + (cb - ca) * ((session_id - a) / (b - a))
+    return (previous[-1] if previous else following[0])[1]
 
 
 def detected_position(session, fp_id):

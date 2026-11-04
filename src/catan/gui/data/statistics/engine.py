@@ -1114,30 +1114,54 @@ class _StateView:
 
 
 def active_session_view(data, state):
-    """Data/state in which footprints of inactive sessions are unassigned
-    (``ids`` column -1), so statistics treat these sessions as absent.
-    The original objects if all sessions are active. Small identity objects
-    are copied; spatial and temporal arrays stay shared."""
+    """Data/state in which footprints of inactive sessions, excluded
+    footprints and the footprints of excluded neurons are unassigned
+    (``ids`` -1), so statistics treat them as absent: no values, partners,
+    sources or targets. The original objects if nothing is masked. Small
+    identity objects are copied; spatial and temporal arrays stay shared."""
     sessions = getattr(data, "sessions", None) or []
     assignments = getattr(data, "assignments", None)
 
-    if assignments is None or not any(
-        not getattr(session, "active", True) for session in sessions
-    ):
+    if assignments is None:
         return data, state
 
     ids = getattr(state, "assignments", None)
     ids = np.asarray(assignments.ids if ids is None else ids)
-    inactive = [
-        index
-        for index, session in enumerate(sessions)
-        if not getattr(session, "active", True) and index < ids.shape[1]
-    ]
-    if not inactive:
+    if ids.ndim != 2:
         return data, state
 
-    masked = ids.copy()
-    masked[:, inactive] = -1
+    masked = None
+
+    def mask():
+        nonlocal masked
+        if masked is None:
+            masked = ids.copy()
+        return masked
+
+    for index, session in enumerate(sessions[: ids.shape[1]]):
+        if not getattr(session, "active", True):
+            mask()[:, index] = -1
+            continue
+        included = getattr(session, "included", None)
+        if included is None:
+            continue
+        included = np.asarray(included, dtype=bool)
+        column = ids[:, index]
+        assigned = (column >= 0) & (column < len(included))
+        drop = np.zeros(len(column), dtype=bool)
+        drop[assigned] = ~included[column[assigned]]
+        if drop.any():
+            mask()[drop, index] = -1
+
+    union = getattr(assignments, "union", None)
+    neuron_included = getattr(union, "included", None)
+    if neuron_included is not None and len(neuron_included) == ids.shape[0]:
+        excluded = ~np.asarray(neuron_included, dtype=bool)
+        if excluded.any():
+            mask()[excluded] = -1
+
+    if masked is None:
+        return data, state
 
     bound_assignments = copy(assignments)
     bound_assignments.ids = masked

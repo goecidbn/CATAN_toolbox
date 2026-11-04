@@ -226,6 +226,8 @@ class NeuronNavigationBar(QWidget):
         neuron_ids = neuron_ids[(neuron_ids >= 0) & (neuron_ids < count)]
 
         neuron_ids = neuron_ids[included[neuron_ids]]
+        # Rows without footprints (left by older exclusions) show nothing.
+        neuron_ids = neuron_ids[np.any(assignments.ids[neuron_ids] >= 0, axis=1)]
 
         statuses = self.review_filter.visible_statuses
         if len(statuses) < len(ReviewStatus):

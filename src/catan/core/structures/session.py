@@ -36,6 +36,14 @@ component_quality_default = {
 }
 
 
+def empty_footprint_mask(footprints):
+    """Columns of a footprint matrix without any positive pixel."""
+    if footprints is None or footprints.shape[1] == 0:
+        return np.zeros(0 if footprints is None else footprints.shape[1], dtype=bool)
+    peaks = np.asarray(sparse.csc_matrix(footprints).max(axis=0).todense()).ravel()
+    return ~(peaks > 0)
+
+
 class SessionData:
     ## meta data
     name: Optional[str] = None  #
@@ -579,6 +587,15 @@ class SessionData:
 
         if loaded_included is not None:
             self.included = loaded_included
+
+        # Footprints without any pixel (moved entirely out of the field of
+        # view by the alignment, or empty in the source) never take part;
+        # Data reports them (empty_excluded).
+        empty = empty_footprint_mask(self.footprints) & np.asarray(self.included, dtype=bool)
+        if empty.any():
+            self.included = np.asarray(self.included, dtype=bool).copy()
+            self.included[empty] = False
+            self.empty_excluded = getattr(self, "empty_excluded", 0) + int(empty.sum())
 
         self.evaluate_alignment_status()
 

@@ -12,6 +12,7 @@ mostly inside the whole vote
 A split (the whole is two merged cells) needs more separate than joint
 votes, a merge (the pieces are fragments of one cell) more joint than
 separate votes, so a configuration can never be proposed both ways.
+A shape decision (shape_decisions) for the two pieces overrides the votes.
 """
 
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ class SessionVotes:
     # One letter per other session in session order: J joint, S separate,
     # "-" footprints there but neither, "." none inside the whole.
     votes: str
+    # Kind of a shape decision for these pieces (overrides the votes).
+    decided: str | None = None
 
     @property
     def joint(self):
@@ -47,6 +50,8 @@ class SessionVotes:
 
     def margin(self, kind):
         """Votes for the manipulation minus votes against it."""
+        if self.decided is not None:
+            return 1000 if kind == self.decided else -1000
         if kind == "split":
             return self.separate - self.joint
         return self.joint - self.separate
@@ -55,15 +60,22 @@ class SessionVotes:
         return self.margin(kind) > 0
 
     def describe(self):
-        return f"{self.separate} separate, {self.joint} joint"
+        text = f"{self.separate} separate, {self.joint} joint"
+        if self.decided is not None:
+            from catan.gui.data.shape_decisions import LABELS
+
+            return f"decided: {LABELS[self.decided]} ({text})"
+        return text
 
 
 class SessionVoter:
     """Votes for configurations of one data state (supports cached)."""
 
-    def __init__(self, sessions, ids):
+    def __init__(self, sessions, ids, decisions=()):
         self.sessions = sessions
         self.ids = np.asarray(ids)
+        # Shape decisions (ShapeDecision) overriding the votes.
+        self.decisions = tuple(decisions)
         self._supports = {}
         self._cache = {}
         # Per whole: each other session's footprints inside it (their
@@ -184,6 +196,13 @@ class SessionVoter:
             else:
                 votes.append(OTHER)
 
-        result = SessionVotes("".join(votes))
+        decided = None
+        if self.decisions:
+            from catan.gui.data.shape_decisions import matching_decision
+
+            decision = matching_decision(self, self.decisions, tuple(pieces))
+            decided = None if decision is None else decision.kind
+
+        result = SessionVotes("".join(votes), decided)
         self._cache[key] = result
         return result

@@ -604,7 +604,13 @@ def _vote_step(engine, result, root, target, compatible):
     if len(sources) < 2:
         return None
 
-    voter = SessionVoter(engine.data.sessions, engine.state.assignments)
+    from catan.gui.data.shape_decisions import decisions_of
+
+    voter = SessionVoter(
+        engine.data.sessions,
+        engine.state.assignments,
+        decisions_of(engine.data.assignments).values(),
+    )
     best = None
     for a, b in combinations(sources, 2):
         if a.neuron_id == b.neuron_id:

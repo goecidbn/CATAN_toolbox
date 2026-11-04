@@ -264,6 +264,48 @@ def calculate_footprint_eccentricity(
     return get_stat_from_session(data, state, indexers, get_shape)
 
 
+def calculate_footprint_lobes(
+    data: Data,
+    state: AppState,
+    indexers: dict[str, int] | None = None,
+    filters=(),
+    thr=0.1,
+    peak=0.5,
+    size=0.1,
+) -> np.ndarray:
+    """Number of lobes of each footprint (core/footprint_lobes): bright
+    parts that separate when it is cut at a threshold, e.g. two cells in
+    one footprint. Only the requested footprints are measured."""
+    from catan.core.footprint_lobes import lobe_counts
+
+    indexers = indexers or {}
+    N, S = state.assignments.shape
+    neuron_ids = requested_indices(N, "neuron", indexers)
+    session_ids = requested_indices(S, "session", indexers)
+    values = np.full((len(neuron_ids), len(session_ids)), np.nan)
+    ctx = current_task_context()
+
+    for j, session_id in enumerate(session_ids):
+        fp_ids = state.assignments[neuron_ids, session_id]
+        present = fp_ids >= 0
+        if not np.any(present):
+            continue
+        if ctx is not None:
+            ctx.check_cancelled()
+        session = data.sessions[session_id]
+        counts = lobe_counts(
+            session.footprints,
+            tuple(session.dims),
+            np.unique(fp_ids[present]),
+            base=thr,
+            peak=peak,
+            size=size,
+        )
+        values[present, j] = counts[fp_ids[present]]
+
+    return drop_indexed_axes(values, ("neuron", "session"), indexers)
+
+
 def calculate_relative_footprint_size(
     data: Data,
     state: AppState,

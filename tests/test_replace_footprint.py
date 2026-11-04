@@ -75,3 +75,14 @@ def test_union_placed_at_detected_position():
     assert np.allclose(centroid(session.footprints[:, 0], dims), (6.0, 25.0), atol=0.2)
     # Still the detected position after the replacement.
     assert np.allclose(detected_position(session, 0), (6.0, 25.0), atol=0.05)
+
+
+def test_union_position_interpolated_from_other_footprints():
+    from catan.core.redetection import interpolated_position
+
+    observations = [(0, np.array([10.0, 20.0])), (4, np.array([18.0, 12.0]))]
+    # Between: linear in the session index.
+    assert np.allclose(interpolated_position(observations, 1), (12.0, 18.0))
+    # Before the first / after the last: the nearest one.
+    assert np.allclose(interpolated_position(observations[1:], 2), (18.0, 12.0))
+    assert np.allclose(interpolated_position(observations, 6), (18.0, 12.0))

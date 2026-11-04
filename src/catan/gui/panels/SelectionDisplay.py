@@ -436,14 +436,30 @@ class Display(QWidget):
         if entity.session_id is not None:
             return entity
 
-        # Session-independent neuron entity.
-        if self.state.current_session_id is None:
-            return None
+        # Session-independent neuron entity (e.g. neurons selected by the
+        # curator): its footprint in the current session, else the one in
+        # the nearest session it was detected in (a one-off: its only one).
+        current = self.state.current_session_id
+        neuron = int(entity.neuron_id)
+        assignments = self.data.assignments
+        sessions = []
+        if assignments is not None and 0 <= neuron < assignments.ids.shape[0]:
+            sessions = [
+                int(s)
+                for s in np.flatnonzero(assignments.ids[neuron] >= 0)
+                if self.data.session_is_active(int(s))
+            ]
 
-        return NeuronComponent(
-            neuron_id=entity.neuron_id,
-            session_id=self.state.current_session_id,
-        )
+        if not sessions or (current is not None and current in sessions):
+            if current is None:
+                return None
+            session_id = current
+        elif current is None:
+            session_id = sessions[0]
+        else:
+            session_id = min(sessions, key=lambda s: (abs(s - current), s))
+
+        return NeuronComponent(neuron_id=neuron, session_id=session_id)
 
     def footprint_for_entity(
         self,
@@ -1632,11 +1648,9 @@ class Controller(BasePlot.TableController):
         needed for statistic evaluation.
 
         For neuron mode, session identity remains intentionally unbound.
-        For footprint mode, session-independent entities are resolved
-        against the current session.
+        For footprint mode, session-independent entities are resolved as
+        displayed (Display.component_for_entity).
         """
-
-        current_session_id = self.state.current_session_id
 
         resolved_rows = []
 
@@ -1646,27 +1660,17 @@ class Controller(BasePlot.TableController):
                 resolved_rows.append(tuple(row.entities))
                 continue
 
-            components = []
+            # The same footprints the table shows (Display.component_for_entity).
+            components = [self.table.component_for_entity(entity) for entity in row.entities]
 
-            for entity in row.entities:
-
-                session_id = entity.session_id
-
-                if session_id is None:
-                    session_id = current_session_id
-
-                if session_id is None:
-                    components = None
-                    break
-
-                components.append(
-                    NeuronComponent(
-                        neuron_id=int(entity.neuron_id),
-                        session_id=int(session_id),
-                    )
+            resolved_rows.append(
+                None
+                if any(component is None for component in components)
+                else tuple(
+                    NeuronComponent(int(c.neuron_id), int(c.session_id))
+                    for c in components
                 )
-
-            resolved_rows.append(None if components is None else tuple(components))
+            )
 
         return tuple(resolved_rows)
 

@@ -42,6 +42,7 @@ HIGHLIGHT_NEEDS = {
     "reassign": "1 source footprint and target footprints of 1 other neuron",
     "neuron_merge": "footprints of 1 source neuron and 1 target neuron",
     "replace_with_union": "target footprints (to replace) and no sources",
+    "cut": "1 target footprint (to cut) and no sources",
 }
 
 CONFLICT_HELP = {
@@ -127,6 +128,7 @@ class CuratorActions(QGroupBox):
             ("No manipulation", "none"),
             ("Split footprint", "split"),
             ("Merge footprints", "merge"),
+            ("Cut at the neck", "cut"),
             ("Merge neurons", "neuron_merge"),
             ("Reassign footprint", "reassign"),
             ("Mark reviewed", "mark_reviewed"),
@@ -210,6 +212,28 @@ class CuratorActions(QGroupBox):
 
         layout.addLayout(row)
 
+        # Shape decisions: settle a split / merge configuration once for all
+        # sessions (gui/data/shape_decisions).
+        decision_row = QHBoxLayout()
+        self.decide_split = QPushButton("Always split here…")
+        self.decide_split.setToolTip(
+            "Two cells: split every footprint covering both pieces of this "
+            "candidate, in all sessions, and let the curator propose this "
+            "configuration only as a split from now on."
+        )
+        self.decide_merge = QPushButton("Always merge here…")
+        self.decide_merge.setToolTip(
+            "One cell: merge every pair of footprints covering one piece each, "
+            "in all sessions, and let the curator propose this configuration "
+            "only as a merge from now on."
+        )
+        self.decisions_button = QPushButton("Shape decisions…")
+        self.decisions_button.setToolTip("The shape decisions made so far: review, apply, remove.")
+        for button in (self.decide_split, self.decide_merge, self.decisions_button):
+            decision_row.addWidget(button)
+        decision_row.addStretch(1)
+        layout.addLayout(decision_row)
+
         # Progress of "Apply all selected" (no modal dialog: the window and
         # conflict dialogs stay usable).
         self.progress = QProgressBar()
@@ -241,6 +265,10 @@ class CuratorActions(QGroupBox):
         self.next.setToolTip("Enter")
         self.skip.clicked.connect(self._skip)
         self.stop.clicked.connect(self._on_stop)
+        self.decide_split.clicked.connect(lambda: self._decide("split"))
+        self.decide_merge.clicked.connect(lambda: self._decide("merge"))
+        self.decisions_button.clicked.connect(self._open_decisions)
+        self.candidate.currentIndexChanged.connect(lambda *_: self._buttons())
 
         self.state.focused_component_changed.connect(self.refresh_candidates)
         self.state.selected_components_changed.connect(self.refresh_candidates)
@@ -421,7 +449,15 @@ class CuratorActions(QGroupBox):
                 (-1 if component.session_id is None else component.session_id),
             )
 
-        if kind in SHAPE_ACTIONS:
+        if kind == "cut":
+            # One candidate per matched footprint (targets only).
+            requests = [
+                ((), (target,))
+                for target in result.target_components()
+                if target.session_id is not None
+            ]
+
+        elif kind in SHAPE_ACTIONS:
             # One candidate per matched footprint not replaced already.
             ids = self.data.assignments.ids
             replaced = self.data.replaced_shape_footprints()
@@ -651,6 +687,7 @@ class CuratorActions(QGroupBox):
             "neuron_merge": f"{source} into {target}",
             "reassign": f"{source} → {target}",
             "replace_with_union": f"{target} → union shape",
+            "cut": f"{target} → cut at the neck",
         }[kind]
 
     def _show(self, plan, *, focus=False):
@@ -732,6 +769,45 @@ class CuratorActions(QGroupBox):
 
         self.next.setEnabled(self.pending is not None and not self.waiting)
         self.skip.setEnabled(self.pending is not None and not self.waiting)
+
+        shape = self.kind.currentData() in ("split", "merge")
+        plan = self.candidate.currentData()
+        configuration = (
+            plan is not None
+            and plan.kind in ("split", "merge")
+            and len(plan.sources) + len(plan.targets) == 3
+        )
+        for button in (self.decide_split, self.decide_merge):
+            button.setVisible(shape and not running)
+            button.setEnabled(configuration)
+        self.decisions_button.setVisible(
+            not running and (shape or bool(self.data.shape_decisions()))
+        )
+
+    def _decide(self, kind):
+        """Shape decision ``kind`` from the current split / merge candidate:
+        review what it does in every session, then save / apply it."""
+        from catan.gui.GUI_elements.fragments.shape_decision_dialog import (
+            decision_from_plan,
+            open_decision_dialog,
+        )
+
+        plan = self.candidate.currentData()
+        if plan is None:
+            return
+        try:
+            decision = decision_from_plan(self.data, plan, kind)
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return
+        open_decision_dialog(self, self.state, self.data, decision)
+
+    def _open_decisions(self):
+        from catan.gui.GUI_elements.fragments.shape_decision_dialog import (
+            open_decisions_list,
+        )
+
+        open_decisions_list(self, self.state, self.data)
 
     @staticmethod
     def _unique_plans(plans):

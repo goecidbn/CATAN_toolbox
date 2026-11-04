@@ -64,7 +64,7 @@ def test_root_is_default_output_directory(tmp_path):
         root=tmp_path,
     )
 
-    assert result == tmp_path.resolve() / "matching"
+    assert result == tmp_path.resolve() / "catan"
 
 
 def test_explicit_output_overrides_default(tmp_path):

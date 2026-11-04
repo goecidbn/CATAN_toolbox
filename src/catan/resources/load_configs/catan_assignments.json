@@ -61,6 +61,13 @@
                     "source": "dataset",
                     "attribute": null,
                     "exposed": false
+                },
+                "shape_decisions": {
+                    "path": "/curation/shape_decisions",
+                    "required": false,
+                    "source": "dataset",
+                    "attribute": null,
+                    "exposed": false
                 }
             }
             

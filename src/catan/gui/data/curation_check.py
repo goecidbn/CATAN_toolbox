@@ -136,6 +136,12 @@ def check_neuron(engine, root, neuron_id, component=None):
         root, result, neuron_id, None, conditions, evaluator, Scope((neuron_id,))
     )
 
+    # The curator drops excluded neurons / footprints from its results.
+    union = engine.data.assignments.union
+    if result is not None and union is not None and not union.included[neuron_id]:
+        note = f"Neuron {neuron_id} is excluded: excluded neurons are never curator results."
+        check.root.note = note + ("\n" + check.root.note if check.root.note else "")
+
     for index, (condition_check, scope, group_check) in enumerate(conditions):
         with progress_step(index, len(conditions), start=60, stop=90):
             _fill_condition(engine, condition_check, scope)

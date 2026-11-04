@@ -1,0 +1,88 @@
+{
+  "schema_version": 2,
+  "name": "footprint manipulation: cut lobed footprints",
+  "category": "footprints",
+  "root": {
+    "type": "group",
+    "id": "3cc061dcc963411a9d927e72c4cc8dc1",
+    "operator": "and",
+    "match_level": "footprint",
+    "count": null,
+    "comment": "Footprints that fall apart into two or more lobes (e.g. two cells detected as one), away from the image border. Cut at the neck cuts each between its two largest lobes: the part matching the neuron's other footprints stays, the other becomes a new neuron. Needs no other sessions; where the separate cells exist in other sessions, the split candidates preset uses them as the blueprint instead.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": {
+      "kind": "cut",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
+    "review_statuses": null,
+    "children": [
+      {
+        "type": "condition",
+        "id": "7a1c446398774579aa31893554043dde",
+        "query": {
+          "statistic_key": "footprint_lobes",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic",
+          "parameters": {
+            "thr": 0.1,
+            "peak": 0.5,
+            "size": 0.1
+          }
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 2.0
+        }
+      },
+      {
+        "type": "condition",
+        "id": "eacd0921419645b0b4e2054b99d4f724",
+        "query": {
+          "statistic_key": "border_proximity",
+          "reductions": {
+            "neuron": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            },
+            "session": {
+              "method": "keep",
+              "index": null,
+              "error_method": "none"
+            }
+          },
+          "reduction_order": [],
+          "filters": [],
+          "context": "generic",
+          "parameters": {
+            "common_border": false
+          }
+        },
+        "threshold": {
+          "direction": "greater",
+          "active": true,
+          "value": 5.0,
+          "unit": "px"
+        }
+      }
+    ]
+  }
+}

@@ -1931,6 +1931,25 @@ class Tracking:
             "progress_row_map": progress_row_map,
         }
 
+    def publish_assignment_update(self, result):
+        """Adopt a ``build_assignment_update`` result into the assignment
+        set it was built for (the GUI's publish without display updates)."""
+        if result is None:
+            return
+        result["source"].__dict__.update(result["candidate"].__dict__)
+        plan = result["plan"]
+        completed = plan["register_sessions"] + plan["isolated_sessions"]
+        paths = {
+            str(self.sessions[index].path)
+            for index in completed
+            if self.sessions[index].path is not None
+        }
+        self._stale_assignments.setdefault(
+            result["assignment_name"], set()
+        ).difference_update(paths)
+        for index in completed:
+            self._processing_state(index).assignment_isolated = False
+
     def assign_neurons(
         self,
         from_file: Optional[str | Path] = None,

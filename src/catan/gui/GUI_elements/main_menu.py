@@ -27,9 +27,9 @@ from PySide6.QtWidgets import (
 )
 
 from PySide6.QtCore import (
-    QSettings, QThreadPool, Qt, Signal, QSignalBlocker, QSize, QTimer,
+    QSettings, QThreadPool, Qt, Signal, QSignalBlocker, QSize, QTimer, QUrl,
 )
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QDesktopServices
 from shiboken6 import isValid
 from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 
@@ -415,6 +415,17 @@ class MainMenu(QFrame):
         layout.addWidget(QLabel("Root folder:"))
         layout.addWidget(self.edit_root_path)
         layout.addWidget(self.button_root_path)
+
+        # The root folder in the system's file manager (Explorer, Finder,
+        # Nautilus, ...); stays usable once sessions are loaded.
+        self.button_open_root = make_icon_button(
+            "folder-open",
+            tooltip="Open the root folder in the file manager",
+            size=28,
+            icon_size=18,
+        )
+        self.button_open_root.clicked.connect(self.open_root_folder)
+        layout.addWidget(self.button_open_root)
         self.root_selector = widget
 
         # Fresh start (e.g. another animal): removes sessions, models and
@@ -475,10 +486,31 @@ class MainMenu(QFrame):
             tip = text or "No root folder set"
             self.edit_root_path.setToolTip(tip)
             self.button_root_path.setToolTip(f"Choose the root folder\n{tip}")
+            self.button_open_root.setEnabled(bool(text.strip()))
 
         self.edit_root_path.textChanged.connect(show_root_tooltip)
         show_root_tooltip(self.edit_root_path.text())
         return widget
+
+    def open_root_folder(self):
+        """Show the root folder in the system's file manager."""
+        folder = self.edit_root_path.text().strip()
+        if not folder:
+            return
+        if not fs_guard.is_dir(folder):
+            if fs_guard.probe.timed_out:
+                warn_unresponsive(self.state, [folder])
+            else:
+                self.state.issue(
+                    "warning", "Root folder not found", f"{folder} does not exist."
+                )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(folder)):
+            self.state.issue(
+                "warning",
+                "No file manager",
+                f"The system could not open a file manager for\n{folder}",
+            )
 
     def _add_process_menu(self, button, key):
         menu = QMenu(button)
@@ -871,10 +903,23 @@ class MainMenu(QFrame):
         assignment_targets = self._ask_changed_set_targets("assignments")
         if assignment_targets is None:
             return None
+        with_analysis = self._ask_analysis_output(path)
+        if with_analysis is None:
+            return None
+
+        after_project = finished
+        if with_analysis:
+            # The analysis file after the project (its sessions file exists then).
+            def after_project():
+                self.data.queue_save_analysis(
+                    self.data.analysis_path(path),
+                    finished=lambda summary: finished() if finished is not None else None,
+                )
+
         try:
             self.data.queue_save_project(
                 path,
-                finished=finished,
+                finished=after_project,
                 model_targets=model_targets,
                 assignment_targets=assignment_targets,
             )
@@ -882,6 +927,107 @@ class MainMenu(QFrame):
             self.state.issue("warning", "Project not saved", str(exc), parent=self.window())
             return None
         return path
+
+    # Analysis file with Save project: "ask" (default), "always", "never".
+    ANALYSIS_OUTPUT_KEY = "projects/analysis_output"
+    ANALYSIS_OUTPUT_CHOICES = (
+        ("ask", "Ask when saving"),
+        ("always", "Always"),
+        ("never", "Never"),
+    )
+
+    def analysis_output_mode(self):
+        settings = self.state.settings
+        mode = "ask" if settings is None else settings.value(self.ANALYSIS_OUTPUT_KEY, "ask")
+        return mode if mode in dict(self.ANALYSIS_OUTPUT_CHOICES) else "ask"
+
+    def set_analysis_output_mode(self, mode):
+        if self.state.settings is not None and mode in dict(self.ANALYSIS_OUTPUT_CHOICES):
+            self.state.settings.setValue(self.ANALYSIS_OUTPUT_KEY, mode)
+
+    def _ask_analysis_output(self, path):
+        """Also write the analysis file (detected footprints only, see
+        Data.queue_save_analysis) with the project? Only when the active set
+        has splits, merges or replaced shapes. True / False, None: cancel."""
+        try:
+            summary = self.data.analysis_summary()
+        except Exception as exc:  # never block saving the project
+            self.state.logger.warning(f"Analysis output not checked: {exc}")
+            return False
+        if summary is None or not summary.changed:
+            return False
+        mode = self.analysis_output_mode()
+        if mode != "ask":
+            return mode == "always"
+
+        analysis_name = Path(self.data.analysis_path(path)).name
+        box = QMessageBox(self.window())
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Save an analysis file too?")
+        box.setText(
+            "Splits, merges and replaced shapes change footprints: the new "
+            "footprints have no activity traces of their own."
+        )
+        box.setInformativeText(
+            f"The analysis file {analysis_name} holds the same neurons on the "
+            "detected footprints only: each footprint a split or merge "
+            "replaced goes back to the neuron whose result overlaps it most, "
+            "replaced shapes keep their detected shape. Use it to analyse "
+            "activity; keep curating in the project.\n\n"
+            + summary.describe()
+        )
+        both = box.addButton("Project and analysis file", QMessageBox.ButtonRole.AcceptRole)
+        project_only = box.addButton("Project only", QMessageBox.ButtonRole.RejectRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(both)
+        remember = QCheckBox("Don't ask again (File ▸ Analysis file with project)")
+        box.setCheckBox(remember)
+        fit_message_box_buttons(box)
+        box.exec()
+        clicked = box.clickedButton()
+        box.deleteLater()
+        if clicked is cancel or clicked is None:
+            return None
+        if remember.isChecked():
+            self.set_analysis_output_mode("always" if clicked is both else "never")
+        return clicked is both
+
+    def export_analysis(self):
+        """File ▸ Export for activity analysis…: the analysis file of the
+        active set, wherever the user chooses."""
+        if self.data.assignments is None:
+            self.state.issue(
+                "info", "Nothing to export", "No assignments are available.", parent=self.window()
+            )
+            return None
+        default = self.data.analysis_path() or self.data.analysis_path(
+            str(self.data.project_folder() / f"{self.data.default_project_name()}{self.data.PROJECT_SUFFIX}")
+        )
+        folder, unresponsive = responsive_folder(Path(default).parent, self.data.root)
+        warn_unresponsive(self.state, unresponsive)
+        target = choose_path(
+            self,
+            init_path=folder,
+            display_text="Export for activity analysis",
+            only_existing=False,
+            default_suffix="hdf5",
+            file_filters=[("CATAN assignments", ("*.hdf5", "*.h5"))],
+            state=self.state,
+            default_filename=Path(default).name,
+        )
+        if not target:
+            return None
+
+        def saved(summary):
+            self.state.issue(
+                "info",
+                "Analysis file saved",
+                f"{display_path(str(target))}\n\n{summary.describe()}",
+                parent=self.window(),
+            )
+
+        self.data.queue_save_analysis(target, finished=saved)
+        return target
 
     CHANGED_SET_TEXTS = {
         "model": (

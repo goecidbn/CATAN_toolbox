@@ -1,6 +1,18 @@
 import numpy as np
+from functools import lru_cache
 from vispy import color
 from typing import Optional
+
+
+@lru_cache(maxsize=None)
+def _named_colormap(name):
+    # Building a vispy colormap processes its GLSL template (~2 ms); styles
+    # map colours for every drawn footprint, so each name is built once.
+    return color.get_colormap(name)
+
+
+def colormap(cmap):
+    return _named_colormap(cmap) if isinstance(cmap, str) else color.get_colormap(cmap)
 
 
 # Highlight colours: sources violet, targets (and plain highlights) orange.
@@ -117,7 +129,7 @@ class Styles:
 
         if colors is None:
             values = np.asarray(values, dtype=np.float32)
-            cmap = color.get_colormap(kwargs.get("cmap_name", self.opts[style]["cmap"]))
+            cmap = colormap(kwargs.get("cmap_name", self.opts[style]["cmap"]))
             color_array = np.asarray(cmap.map(values), dtype=np.float32).copy()
             color_array[..., 3] = style_alpha
 

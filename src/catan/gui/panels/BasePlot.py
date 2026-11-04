@@ -460,9 +460,10 @@ class BaseCanvas(scene.SceneCanvas):
 
     def __init__(self, parent, controls, config=None):
         self.styles = styles.Styles()
-        super().__init__(
-            keys="interactive", bgcolor=self.styles.bg_color, parent=parent
-        )
+        # No vispy key bindings: keys="interactive" closes the canvas on
+        # Escape (the panel went blank, e.g. Esc after a context menu) and
+        # toggles fullscreen on F11.
+        super().__init__(keys=None, bgcolor=self.styles.bg_color, parent=parent)
 
         self.native.setSizePolicy(
             QSizePolicy.Policy.Expanding,

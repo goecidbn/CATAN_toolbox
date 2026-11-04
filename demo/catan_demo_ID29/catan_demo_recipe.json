@@ -3,7 +3,7 @@
   "version": 1,
   "sessions": [
     {
-      "path": "20240719/results_CaImAn_20240719_29_barnstedt_20260222233006_Medien_XY.hdf5",
+      "path": "20240719/neuron_detection_20240719.hdf5",
       "name": "20240719",
       "load_config": {
         "format_version": 1,
@@ -28,7 +28,7 @@
                 "source": "dataset",
                 "attribute": null,
                 "required": false,
-                "source_path": "mc/ID29_20240719_Cn.tiff"
+                "source_path": "ID29_20240719_Cn.tiff"
               }
             }
           },
@@ -100,7 +100,7 @@
       }
     },
     {
-      "path": "20240720/results_CaImAn_20240720_29_barnstedt_20260223002652_Medien_XY.hdf5",
+      "path": "20240720/neuron_detection_20240720.hdf5",
       "name": "20240720",
       "load_config": {
         "format_version": 1,
@@ -125,7 +125,7 @@
                 "source": "dataset",
                 "attribute": null,
                 "required": false,
-                "source_path": "mc/ID29_20240720_Cn.tiff"
+                "source_path": "ID29_20240720_Cn.tiff"
               }
             }
           },
@@ -197,7 +197,7 @@
       }
     },
     {
-      "path": "20240721/results_CaImAn_20240721_29_barnstedt_20260223010258_Medien_XY.hdf5",
+      "path": "20240721/neuron_detection_20240721.hdf5",
       "name": "20240721",
       "load_config": {
         "format_version": 1,
@@ -222,7 +222,7 @@
                 "source": "dataset",
                 "attribute": null,
                 "required": false,
-                "source_path": "mc/ID29_20240721_Cn.tiff"
+                "source_path": "ID29_20240721_Cn.tiff"
               }
             }
           },
@@ -294,7 +294,7 @@
       }
     },
     {
-      "path": "20240722/results_CaImAn_20240722_29_barnstedt_20260223013725_Medien_XY.hdf5",
+      "path": "20240722/neuron_detection_20240722.hdf5",
       "name": "20240722",
       "load_config": {
         "format_version": 1,
@@ -319,7 +319,7 @@
                 "source": "dataset",
                 "attribute": null,
                 "required": false,
-                "source_path": "mc/ID29_20240722_Cn.tiff"
+                "source_path": "ID29_20240722_Cn.tiff"
               }
             }
           },

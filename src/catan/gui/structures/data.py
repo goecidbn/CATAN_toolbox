@@ -25,6 +25,7 @@ from catan.core.io import (
 from catan.core.structures import NeuronComponent, SessionData, sessiondata_type
 from catan.core import footprint_frame
 from catan.core.structures.load_config import FieldSpec, LoadConfig
+from catan.core.structures.loading_recipe import parse_loading_recipe, recipe_document
 from catan.gui.utils.session_labels import session_label, session_labels
 from catan.core.structures.session_snapshot import (
     prepare_session_snapshot,
@@ -420,6 +421,105 @@ class Data(Tracking):
         # Neurons whose union awaits a background rebuild (see
         # _queue_union_refresh), valid for one assignments object.
         self._union_refresh = {"assignments": None, "neurons": set(), "token": 0}
+
+        # Empty footprints (e.g. moved out of the field of view by the
+        # alignment) are excluded after geometry / assignment changes.
+        self._empty_check_pending = False
+        self.state.data_changed.connect(self._on_data_changed_check_empty)
+
+    # ----- empty footprints ------------------------------------------------
+
+    def _on_data_changed_check_empty(self, event):
+        if event.has(C.FOOTPRINT_GEOMETRY, C.ASSIGNMENT_SET) or event.has_availability(
+            "spatial"
+        ):
+            self._schedule_empty_check()
+
+    def _schedule_empty_check(self, delay_ms=0):
+        if self._empty_check_pending:
+            return
+        from PySide6.QtCore import QTimer
+
+        self._empty_check_pending = True
+        QTimer.singleShot(delay_ms, self._run_empty_check)
+
+    def _run_empty_check(self):
+        self._empty_check_pending = False
+        tasks = self.state.tasks
+        # After loading / processing: one note for a whole batch, and no
+        # exclusion while assignments may still change in a worker.
+        if tasks.tasks or tasks.processing_busy() or tasks.processing_requested:
+            self._schedule_empty_check(1000)
+            return
+        self.exclude_empty_footprints()
+
+    def exclude_empty_footprints(self, *, report=True):
+        """Exclude included footprints without any pixel, e.g. moved entirely
+        out of the field of view by the session alignment: assigned ones to
+        their own excluded neuron (exclude_components), others in the
+        session. Footprints already excluded while loading are counted too.
+        Returns {session ID: number excluded}; ``report`` shows a note."""
+        from catan.core.structures.session import empty_footprint_mask
+
+        counts = {}
+        assigned = []
+        unassigned = False
+        assignments = self.assignments
+        ids = None if assignments is None else np.asarray(assignments.ids)
+
+        for session_id, session in enumerate(self.sessions):
+            loaded = session.__dict__.pop("empty_excluded", 0)
+            if loaded:
+                counts[session_id] = loaded
+
+            if (
+                not session.status.get("spatial_loaded")
+                or session.footprints is None
+                or session.included is None
+            ):
+                continue
+
+            empty = np.flatnonzero(
+                empty_footprint_mask(session.footprints)
+                & np.asarray(session.included, dtype=bool)
+            )
+            if not len(empty):
+                continue
+
+            counts[session_id] = counts.get(session_id, 0) + len(empty)
+            for footprint in empty:
+                rows = (
+                    np.flatnonzero(ids[:, session_id] == footprint)
+                    if ids is not None and session_id < ids.shape[1]
+                    else ()
+                )
+                if len(rows):
+                    assigned.append(NeuronComponent(int(rows[0]), session_id))
+                else:
+                    session.included[footprint] = False
+                    unassigned = True
+
+        if assigned:
+            self.exclude_components(assigned)
+        elif unassigned:
+            if assignments is not None and assignments.union is not None:
+                self.rebuild_union_included()
+            self.notify_change(C.INCLUSION)
+
+        if counts and report:
+            total = sum(counts.values())
+            details = ", ".join(
+                f"{session_label(self, sid)}: {n}" for sid, n in sorted(counts.items())
+            )
+            self.state.issue(
+                "info",
+                "Footprints outside the field of view",
+                f"{total} footprint{'s' if total != 1 else ''} lie entirely outside "
+                "the field of view after the session alignment (or are empty) and "
+                f"{'were' if total != 1 else 'was'} excluded.\n\n{details}",
+            )
+
+        return counts
 
     def is_available(self, what: List[str] | None = None) -> bool:
 
@@ -2606,6 +2706,7 @@ class Data(Tracking):
             digest.update(values.tobytes())
 
         digest.update(str(len(assignments.manipulations)).encode())
+        digest.update(repr(sorted((getattr(assignments, "shape_decisions", None) or {}).items())).encode())
         return digest.hexdigest()
 
     def catan_sessions_file(self):
@@ -3258,6 +3359,75 @@ class Data(Tracking):
             str(path),
             prepared,
             finished=saved,
+        )
+
+    # ------------------------------------------------------------------
+    # Analysis output: detected footprints only (tracking/analysis_export)
+    # ------------------------------------------------------------------
+
+    def analysis_path(self, project_path=None):
+        """``<name>.analysis.hdf5`` next to the project (None: no project)."""
+        from catan.tracking.analysis_export import ANALYSIS_SUFFIX
+
+        project_path = project_path or self.project_path()
+        if project_path is None:
+            return None
+        path = Path(project_path)
+        name = path.name
+        if name.endswith(self.PROJECT_SUFFIX):
+            name = name[: -len(self.PROJECT_SUFFIX)]
+        return str(path.parent / f"{name}{ANALYSIS_SUFFIX}")
+
+    def analysis_summary(self, source=None):
+        """AnalysisSummary of the analysis output of ``source`` (default: the
+        active set); ``.changed`` is False without splits, merges or replaced
+        shapes."""
+        from catan.tracking.analysis_export import analysis_ids
+
+        source = self.assignments if source is None else source
+        if source is None:
+            return None
+        return analysis_ids(source, tuple(self.staged_sessions_for(source)))[3]
+
+    def queue_save_analysis(self, path, *, finished=None, source=None):
+        """Save the analysis output of ``source`` (default: the active set)
+        to ``path``: the assignments on the detected footprints only, every
+        footprint a split or merge consumed back with the neuron it overlaps
+        most (tracking/analysis_export). ``finished(summary)`` runs after a
+        successful save."""
+        from catan.tracking.analysis_export import prepare_analysis_save
+
+        tasks = self.state.tasks
+        if tasks.processing_busy():
+            self.state.issue(
+                "info",
+                "Cannot save while processing",
+                "Finish or cancel the current processing tasks, then save again.",
+            )
+            return None
+        source = self.assignments if source is None else source
+        if source is None:
+            self.state.issue("info", "Nothing to save", "No assignments are available.")
+            return None
+
+        try:
+            prepared, summary = prepare_analysis_save(
+                source,
+                tuple(self.staged_sessions_for(source)),
+                provenance=self.assignments_provenance(),
+            )
+        except Exception as exc:
+            self.state.issue("warning", "Could not prepare the analysis file", str(exc))
+            return None
+
+        return tasks.start(
+            "saving",
+            f"Saving analysis file: {Path(path).name}",
+            save_prepared_file_task,
+            self.state,
+            str(path),
+            prepared,
+            finished=None if finished is None else (lambda: finished(summary)),
         )
 
     @after_display_tasks
@@ -5122,14 +5292,7 @@ class Data(Tracking):
                 }
             )
 
-        if not entries:
-            raise ValueError("There are no sessions to save.")
-
-        return {
-            "type": "catan-loading-recipe",
-            "version": 1,
-            "sessions": entries,
-        }
+        return recipe_document(entries)
 
     def save_loading_recipe(self, path, document):
         payload = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode(
@@ -5159,101 +5322,10 @@ class Data(Tracking):
     @staticmethod
     def parse_loading_recipe(document, base_directory):
         """Recipe document -> unregistered SessionData (relative session
-        paths resolve against ``base_directory``)."""
-        path = Path(base_directory) / "recipe.json"
-
-        if (
-            not isinstance(document, dict)
-            or document.get("type") != "catan-loading-recipe"
-            or document.get("version") != 1
-        ):
-            raise ValueError("This JSON is not a supported CATAN loading recipe.")
-
-        entries = document.get("sessions")
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("The loading recipe contains no sessions.")
-
-        sessions = []
-        ctx = current_task_context()
-
-        for index, entry in enumerate(entries, start=1):
-            if ctx is not None:
-                ctx.check_cancelled()
-
-            try:
-                source = entry["path"]
-                if not isinstance(source, str) or not source.strip():
-                    raise ValueError("Missing session source path.")
-
-                source = Path(source).expanduser()
-                if not source.is_absolute():
-                    source = path.parent / source
-
-                # Lexical normalization, without inspecting remote sources.
-                source = os.path.abspath(str(source))
-
-                config = LoadConfig.from_dict(entry["load_config"])
-                if config.source_type != "session":
-                    raise ValueError("Expected a session load configuration.")
-
-                options = dict(entry.get("load_options", {}))
-                options.setdefault("background_orientation", "auto")
-                options.setdefault("background_mode", "configured")
-                options.setdefault("correct_rotation", False)
-
-                if options["background_orientation"] not in {
-                    "auto",
-                    "as_stored",
-                    "transpose",
-                }:
-                    raise ValueError("Invalid background orientation.")
-
-                if options["background_mode"] not in {"configured", "footprints"}:
-                    raise ValueError("Invalid background mode.")
-
-                if not isinstance(options["correct_rotation"], bool):
-                    raise ValueError("correct_rotation must be true or false.")
-
-                if options.get("alignment_source") not in {None, "background", "footprints"}:
-                    raise ValueError("Invalid alignment source.")
-
-                if "footprint_offset" in options:
-                    offset = np.asarray(options["footprint_offset"], dtype=float)
-                    if offset.shape != (2,) or not np.isfinite(offset).all():
-                        raise ValueError("footprint_offset must be two numbers (dx, dy).")
-
-                if "background_correction" in options:
-                    correction = options["background_correction"]
-                    shift = np.asarray(
-                        (correction or {}).get("shift", ()), dtype=float
-                    ).reshape(-1)
-                    rotation = (correction or {}).get("rotation", 0.0)
-                    if (
-                        not isinstance(correction, dict)
-                        or shift.shape != (2,)
-                        or not np.isfinite(shift).all()
-                        or not isinstance(rotation, (int, float))
-                    ):
-                        raise ValueError(
-                            "background_correction must be "
-                            '{"shift": [dx, dy], "rotation": degrees}.'
-                        )
-
-                session = SessionData(
-                    path=source,
-                    name=entry.get("name"),
-                )
-                session.source_config = config
-                session._recipe_options = options
-                session.active = bool(entry.get("active", True))
-                sessions.append(session)
-
-            except (KeyError, TypeError, ValueError, AttributeError) as exc:
-                raise ValueError(
-                    f"Invalid loading recipe, session entry {index}: {exc}"
-                ) from exc
-
-        return sessions
+        paths resolve against ``base_directory``; core.structures.loading_recipe)."""
+        return parse_loading_recipe(
+            document, base_directory, ctx=current_task_context()
+        )
 
     def queue_assign_neurons(
         self, session_id: int, to_present=True, callback=None, *, batch=None
@@ -5357,7 +5429,7 @@ class Data(Tracking):
             return self.sessions[session_id].included[fp_id]
 
     def exclude_component(
-        self, component: NeuronComponent | int, notify=True
+        self, component: NeuronComponent | int, notify=True, *, keep_alone_in_place=False
     ) -> NeuronComponent:
         """
         Retire one concrete component.
@@ -5368,6 +5440,11 @@ class Data(Tracking):
         - it is assigned to a new singleton neuron row
 
         Returns the new singleton NeuronComponent.
+
+        ``keep_alone_in_place``: the neuron's only footprint excludes the
+        neuron itself (no new row; a new row left an empty, still included
+        neuron behind). Not for callers that need the slot freed (splits /
+        merges retiring their origin, occupied destinations).
         """
 
         if isinstance(component, int):
@@ -5408,6 +5485,15 @@ class Data(Tracking):
         # 1. Mark the actual footprint as excluded.
         # ---------------------------------------------
         session.included[footprint_id] = False
+
+        # The neuron's only footprint: the neuron itself is the excluded
+        # singleton.
+        if keep_alone_in_place and np.count_nonzero(self.assignments.ids[neuron_id] >= 0) == 1:
+            self.assignments.union.included[neuron_id] = False
+            self.state.assignments = self.assignments.ids
+            if notify:
+                self.notify_change(C.INCLUSION, neuron_ids={neuron_id})
+            return NeuronComponent(neuron_id=neuron_id, session_id=session_id)
 
         # ---------------------------------------------
         # 2. Create an orphan/singleton neuron identity.
@@ -5509,7 +5595,9 @@ class Data(Tracking):
             if not self.is_included(component):
                 continue
 
-            retired.append(self.exclude_component(component, notify=False))
+            retired.append(
+                self.exclude_component(component, notify=False, keep_alone_in_place=True)
+            )
 
         if retired:
             self.notify_change(*ASSIGNMENT_CONTENT_CHANGES)
@@ -5520,7 +5608,9 @@ class Data(Tracking):
         self, components, *, skipped=None
     ) -> list[NeuronComponent]:
         """Give footprints the shape of their neuron's union built from its
-        other footprints, placed at each footprint's own centroid. The
+        other footprints, placed at the position interpolated from those
+        footprints (as inferred seeds: linear between the nearest earlier
+        and later one, else the nearest). The
         footprints keep their IDs and activity. Per neuron, at least one
         other included footprint must remain to build the union from.
 
@@ -5531,7 +5621,11 @@ class Data(Tracking):
             if skipped is None:
                 raise ValueError(reason)
             skipped.extend((NeuronComponent(neuron_id, s), reason) for s in sessions)
-        from catan.core.redetection import detected_position, place_footprint
+        from catan.core.redetection import (
+            detected_position,
+            interpolated_position,
+            place_footprint,
+        )
 
         if self.assignments is None or self.assignments.union is None:
             raise ValueError("Load or calculate assignments first.")
@@ -5571,12 +5665,19 @@ class Data(Tracking):
             remaining = detected or remaining
 
             union = self.partial_union_footprint(neuron_id, remaining)
+            # Detected centroids of the footprints the union is built from.
+            observations = [
+                (s, detected_position(self.sessions[s], int(ids[neuron_id, s])))
+                for s in sorted(remaining)
+            ]
 
             for session_id in sorted(sessions):
                 session = self.sessions[session_id]
                 fp_id = int(ids[neuron_id, session_id])
                 shape = place_footprint(
-                    union, tuple(session.dims), detected_position(session, fp_id)
+                    union,
+                    tuple(session.dims),
+                    interpolated_position(observations, session_id),
                 )
                 if shape is None:
                     refuse(
@@ -5663,10 +5764,39 @@ class Data(Tracking):
     def reinclude_neuron(self, neuron_id: int) -> None:
 
         self.assignments.union.included[neuron_id] = True
-        for session_id in range(self.assignments.ids.shape[1]):
-            self.reinclude_component(
-                NeuronComponent(neuron_id=neuron_id, session_id=session_id)
+        # Sessions without a footprint of the neuron have nothing to include.
+        for session_id, footprint_id in enumerate(self.assignments.ids[neuron_id]):
+            if footprint_id >= 0:
+                self.sessions[session_id].included[int(footprint_id)] = True
+
+        self.notify_change(C.INCLUSION, neuron_ids={int(neuron_id)})
+
+    def inclusion_state(self, components):
+        """Inclusion flags of footprints and their neurons, for
+        restore_inclusion()."""
+        ids = self.assignments.ids
+        return tuple(
+            (
+                c,
+                bool(self.sessions[c.session_id].included[int(ids[c.id])]),
+                bool(self.assignments.union.included[c.neuron_id]),
             )
+            for c in components
+            if c.session_id is not None and ids[c.id] >= 0
+        )
+
+    def restore_inclusion(self, state) -> None:
+        """Set the flags of inclusion_state() again (e.g. endpoints included
+        for an action that then failed; rows unchanged meanwhile)."""
+        neurons = set()
+        for component, footprint_included, neuron_included in state:
+            footprint_id = int(self.assignments.ids[component.id])
+            self.sessions[component.session_id].included[footprint_id] = footprint_included
+            self.assignments.union.included[component.neuron_id] = neuron_included
+            neurons.add(int(component.neuron_id))
+
+        if neurons:
+            self.notify_change(C.INCLUSION, neuron_ids=neurons)
 
     def remove_component(self, component: NeuronComponent | int) -> None:
         if isinstance(component, (int, np.integer)):
@@ -5874,6 +6004,77 @@ class Data(Tracking):
 
         return ManipulationBatch(self, kind)
 
+    # ----- shape decisions ("two cells" / "one cell", gui/data/shape_decisions)
+
+    def shape_decisions(self):
+        """{ID: ShapeDecision} of the active assignments."""
+        from catan.gui.data.shape_decisions import decisions_of
+
+        return {} if self.assignments is None else decisions_of(self.assignments)
+
+    def add_shape_decision(self, decision):
+        """Store a decision with the active assignments (saved with them);
+        returns its ID."""
+        from catan.gui.data.shape_decisions import add_decision
+
+        if self.assignments is None:
+            raise ValueError("No assignments loaded.")
+        return add_decision(self.assignments, decision)
+
+    def remove_shape_decision(self, decision_id):
+        """Forget a decision; what it applied stays (undo it separately)."""
+        self.assignments.shape_decisions.pop(int(decision_id), None)
+
+    def plan_shape_decision(self, decision):
+        """DecisionSteps of a decision for the current data (see
+        shape_decisions.plan)."""
+        from catan.gui.data.shape_decisions import plan
+
+        return plan(
+            decision, self.sessions, self.assignments.ids, active=self.session_is_active
+        )
+
+    def apply_shape_decision(self, decision):
+        """Apply a decision in every session where it is still to do, as one
+        batch (undone together). Returns (applied sessions, [(session ID,
+        reason)] skipped). Conflicting sessions are skipped, nothing is
+        excluded to make room."""
+        from catan.gui.data.curation_actions import (
+            ManipulationPlan,
+            OccupiedDestination,
+            ValidationReport,
+        )
+        from catan.gui.data.shape_decisions import APPLY, CONFLICT
+
+        steps = self.plan_shape_decision(decision)
+        skipped = [(step.session_id, step.note) for step in steps if step.state == CONFLICT]
+        todo = [step for step in steps if step.state == APPLY]
+        if not todo:
+            return [], skipped
+
+        batch = self.start_manipulation_batch(decision.kind)
+        applied = []
+        for step in todo:
+            plan = ManipulationPlan.capture(self, decision.kind, step.sources, step.targets)
+            try:
+                slots = batch.conflicts(plan)
+                if slots:
+                    skipped.append(
+                        (step.session_id, str(OccupiedDestination(slots, decision.kind)))
+                    )
+                    continue
+                batch.apply(plan)
+                applied.append(step.session_id)
+            except ValueError as exc:
+                skipped.append((step.session_id, str(exc)))
+
+        if batch.applied:
+            prepared = batch.finish()
+            prepared.validation = ValidationReport("passed")
+            self.commit_manipulation(prepared)
+
+        return applied, sorted(skipped)
+
     def validate_prepared_manipulation(self, prepared, spec):
         from catan.gui.data.curation_actions import (
             validate_prepared,
@@ -5947,7 +6148,13 @@ class Data(Tracking):
 
         return perform()
 
-    def process_component_request(self, request):
+    def cut_footprint(self, component):
+        """Cut a footprint at the neck between its lobes (manipulation
+        "cut", see _cut_footprint_inplace)."""
+        return self._apply_manipulation("cut", (), (component,))
+
+    def process_component_request(self, request, **resolution):
+        """``resolution``: detach_occupied / exclude_occupied, see prepare()."""
         if request.stage != "destination" or not request.is_complete:
             raise ValueError("Complete both request stages before applying.")
 
@@ -5955,6 +6162,7 @@ class Data(Tracking):
             request.type,
             tuple(request.destination),
             tuple(request.origin),
+            **resolution,
         )
 
     def merge_neuron_request(self, request):
@@ -6268,6 +6476,106 @@ class Data(Tracking):
 
         return [*added_components, *remainders]
 
+    def cut_parts(self, session_id, footprint_id):
+        """The two lobes of a footprint (catan.core.footprint_lobes,
+        default parameters: replays reproduce them), largest core first;
+        ValueError with fewer than two lobes."""
+        from catan.core.footprint_lobes import split_lobes
+
+        session = self.sessions[int(session_id)]
+        parts = split_lobes(session.footprints[:, int(footprint_id)], tuple(session.dims))
+        if parts is None:
+            raise ValueError(
+                "The footprint has no two lobes to cut apart "
+                "(see the statistic Footprint lobes)."
+            )
+        return parts
+
+    def _cut_footprint_inplace(self, component):
+        """Cut a footprint at the neck between its two lobes: the part
+        overlapping the neuron's other footprints more (their union; the
+        larger part without others) stays in the neuron, the other becomes
+        a new neuron. The detected footprint is retired (excluded), as by a
+        split. Returns (kept part, new neuron's part)."""
+        from catan.core.footprint_lobes import DEFAULTS
+
+        session_id = int(component.session_id)
+        neuron_id = int(component.neuron_id)
+        ids = self.assignments.ids
+        footprint_id = int(ids[neuron_id, session_id])
+        if footprint_id < 0:
+            raise ValueError(f"{component} has no assigned footprint.")
+
+        parts = self.cut_parts(session_id, footprint_id)
+
+        others = [
+            int(s)
+            for s in np.flatnonzero(ids[neuron_id] >= 0)
+            if int(s) != session_id
+            and self.sessions[int(s)].included[int(ids[neuron_id, s])]
+        ]
+        if others:
+            from scipy import sparse
+
+            union = sparse.csc_matrix(self.partial_union_footprint(neuron_id, others))
+            peak = union.max()
+            support = union >= DEFAULTS["base"] * peak if peak > 0 else union > 0
+            scores = [float(support.multiply(part).sum()) for part in parts]
+        else:
+            scores = [float(part.sum()) for part in parts]
+        keep = int(np.argmax(scores))
+
+        origin_ref = {
+            "session_id": session_id,
+            "neuron_id": neuron_id,
+            "footprint_id": footprint_id,
+        }
+        self.exclude_component(component, notify=False)
+
+        # Appended in the order of cut_parts (restore_manipulations repeats
+        # it); the slots take the IDs.
+        session = self.sessions[session_id]
+        part_ids = [session.append_synthetic_component(part) for part in parts]
+
+        new_neuron_id = len(self.assignments.ids)
+        self.assignments.pad_empty(n_neurons=1, n_sessions=0)
+        ids = self.assignments.ids
+        ids[neuron_id, session_id] = part_ids[keep]
+        ids[new_neuron_id, session_id] = part_ids[1 - keep]
+
+        self.update_moved_footprint_stats(
+            [(None, neuron_id, session_id), (None, new_neuron_id, session_id)]
+        )
+        self.rebuild_union_neurons([neuron_id, new_neuron_id])
+        self.assignments.union.included[[neuron_id, new_neuron_id]] = True
+        self.state.assignments = ids
+
+        kept = NeuronComponent(neuron_id, session_id)
+        added = NeuronComponent(new_neuron_id, session_id)
+        self.assignments.register_manipulation(
+            manipulation_type="cut",
+            origin=[origin_ref],
+            sources=[],
+            results=[
+                {
+                    "session_id": session_id,
+                    "neuron_id": neuron_id,
+                    "footprint_id": int(part_ids[keep]),
+                }
+            ],
+            remainders=[
+                {
+                    "session_id": session_id,
+                    "neuron_id": new_neuron_id,
+                    "footprint_id": int(part_ids[1 - keep]),
+                }
+            ],
+            affected_neurons=[neuron_id, new_neuron_id],
+        )
+
+        self.notify_change(C.FOOTPRINT_GEOMETRY, *ASSIGNMENT_CONTENT_CHANGES)
+        return kept, added
+
     def _remainder_footprint(self, origin_ref, source_refs):
         """The origin footprint without its source pieces (see
         catan.core.footprint_remainder)."""
@@ -6348,6 +6656,11 @@ class Data(Tracking):
                 manipulation["shapes"] = shapes
                 continue
 
+            # Cut at the neck: both parts again, in the order of cut_parts.
+            if manipulation["type"] == "cut":
+                self._restore_cut(manipulation_id, manipulation)
+                continue
+
             # -----------------------------------------
             # Restore excluded origin footprints
             # -----------------------------------------
@@ -6412,6 +6725,37 @@ class Data(Tracking):
                     manipulation["origin"][0], sources
                 )
                 session.append_synthetic_component(remainder)
+
+    def _restore_cut(self, manipulation_id, manipulation):
+        origin = manipulation["origin"][0]
+        session_id = int(origin["session_id"])
+        footprint_id = int(origin["footprint_id"])
+        session = self.sessions[session_id]
+        if footprint_id >= session.n_neurons:
+            raise ValueError(
+                f"Manipulation {manipulation_id} references missing origin "
+                f"footprint {footprint_id} in session {session_id}."
+            )
+        session.included[footprint_id] = False
+
+        part_ids = sorted(
+            int(ref["footprint_id"])
+            for ref in (*manipulation.get("results", []), *manipulation.get("remainders", []))
+        )
+        if not part_ids:
+            return
+        first = part_ids[0]
+        # Already restored (restore_manipulations called twice).
+        if first < session.n_neurons and session.synthetic[first]:
+            return
+        if part_ids != [first, first + 1] or first != session.n_neurons:
+            raise ValueError(
+                f"Cannot restore manipulation {manipulation_id}: expected the "
+                f"cut parts at footprint IDs {session.n_neurons} and "
+                f"{session.n_neurons + 1}, the record has {part_ids}."
+            )
+        for part in self.cut_parts(session_id, footprint_id):
+            session.append_synthetic_component(part)
 
     def _restore_synthetic_component(
         self, *, source_ref: dict, result_ref: dict, manipulation_id: int

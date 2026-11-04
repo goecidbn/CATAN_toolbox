@@ -113,6 +113,50 @@ CALCULATED_STATISTICS = {
             ),
         ),
     ),
+    "footprint_lobes": StatisticDefinition(
+        key="footprint_lobes",
+        title="Footprint lobes",
+        description=(
+            "Number of lobes of the footprint: bright parts that separate "
+            "when it is cut at some threshold, e.g. two cells detected as "
+            "one footprint. A lobe reaches the lobe peak and covers at "
+            "least the lobe size of the footprint's area; 1 = one compact "
+            "part."
+        ),
+        dims=("neuron", "session"),
+        category="neuron",
+        getter=calculations.calculate_footprint_lobes,
+        parameters=(
+            FOOTPRINT_THRESHOLD(0.1),
+            StatisticParameter(
+                key="peak",
+                short="peak",
+                label="Lobe peak",
+                kind=float,
+                default=0.5,
+                minimum=0.05,
+                maximum=1.0,
+                step=0.05,
+                decimals=2,
+                tooltip="A lobe's own peak reaches this fraction of the footprint's peak.",
+            ),
+            StatisticParameter(
+                key="size",
+                short="size",
+                label="Lobe size",
+                kind=float,
+                default=0.1,
+                minimum=0.0,
+                maximum=0.5,
+                step=0.01,
+                decimals=2,
+                tooltip=(
+                    "A lobe covers at least this fraction of the footprint's "
+                    "pixels above the pixel threshold (and at least 10 pixels)."
+                ),
+            ),
+        ),
+    ),
     "border_proximity": StatisticDefinition(
         key="border_proximity",
         title="Border distance",
@@ -662,6 +706,10 @@ _CALCULATED_DEPENDENCIES = {
         frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
         frozenset({"spatial"}),
     ),
+    "footprint_lobes": (
+        frozenset({ChangeKind.FOOTPRINT_GEOMETRY}),
+        frozenset({"spatial"}),
+    ),
     "relative_footprint_size": (
         frozenset({ChangeKind.FOOTPRINT_GEOMETRY, ChangeKind.INCLUSION}),
         frozenset({"spatial"}),
@@ -755,6 +803,7 @@ CALCULATED_STATISTICS["union_distances"].relationship_axes = (
 for key in (
     "footprint_size",
     "footprint_eccentricity",
+    "footprint_lobes",
     "border_proximity",
     "centroid_shift",
     "footprint_similarity",
@@ -902,6 +951,7 @@ CALCULATED_STATISTICS["cooccurrence"] = StatisticDefinition(
 # assignment differences count sessions.
 CALCULATED_STATISTICS["occurence"].value_bounds = (0, 1)
 CALCULATED_STATISTICS["cooccurrence"].value_bounds = (0, 1)
+CALCULATED_STATISTICS["footprint_lobes"].value_bounds = (0, None)
 CALCULATED_STATISTICS["assignment_difference"].value_bounds = lambda n_sessions: (
     0,
     n_sessions,

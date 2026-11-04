@@ -56,10 +56,11 @@ pip install catan-toolbox
 ```bash
 catan-gui
 ```
-or in GUI-less mode:
+or in GUI-less mode, matching a list of sessions into a CATAN project that the GUI opens (File ▸ Open project):
 ```bash
-catan
+catan match --root /data/mouse01 --glob "*/neuron_detection_*.hdf5" --pixel-size 1.05
 ```
+How the files are read (load preset, background image, orientation) is detected; whatever stays unclear, and any session that does not align, is asked in the terminal. Without a terminal, `--non-interactive` stops with a message naming the option that answers the question (for example `--on-issue skip|accept|abort`, `--background PATTERN`, `--load-config NAME`). `--recipe FILE.json` repeats a run, or loads a recipe saved in the GUI. See `catan match --help`.
 
 ```python
 from catan.gui.app import main

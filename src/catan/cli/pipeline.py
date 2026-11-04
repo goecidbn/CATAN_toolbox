@@ -1,42 +1,12 @@
+"""Session paths and output folder of ``catan match`` (the matching run
+itself: matching.py)."""
+
 from __future__ import annotations
 
 import csv
-import logging
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
-
-from tqdm.auto import tqdm
-
-
-from catan import Tracking
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class MatchingConfiguration:
-    neighbor_distance: float = 25.0
-    bins: int = 64
-    n_threads: int = 1
-    use_kde: bool = False
-    pixel_size: float = 536.0 / 512.0
-    align: bool = True
-    use_cdf: bool = True
-
-    def __post_init__(self) -> None:
-        if self.neighbor_distance <= 0:
-            raise ValueError("neighbor_distance must be greater than zero.")
-
-        if self.bins < 1:
-            raise ValueError("bins must be at least 1.")
-
-        if self.n_threads < 1:
-            raise ValueError("n_threads must be at least 1.")
-
-        if self.pixel_size <= 0:
-            raise ValueError("pixel_size must be greater than zero.")
 
 
 def resolve_session_paths(
@@ -235,10 +205,10 @@ def resolve_output_directory(
         return explicit_output.expanduser().resolve()
 
     if root is not None:
-        return root.expanduser().resolve() / "matching"
+        return root.expanduser().resolve() / "catan"
 
     common_parent = determine_common_parent(paths)
-    return common_parent / "matching"
+    return common_parent / "catan"
 
 
 def determine_common_parent(paths: Sequence[Path]) -> Path:
@@ -266,95 +236,3 @@ def determine_common_parent(paths: Sequence[Path]) -> Path:
         ) from exc
 
     return Path(common_path)
-
-
-def run_matching(
-    *,
-    paths: Sequence[Path],
-    output_directory: Path,
-    config: MatchingConfiguration,
-) -> None:
-    """Run CATAN's complete matching pipeline."""
-
-    # Import here rather than at module import time so path resolution and
-    # `--dry-run` remain lightweight.
-
-    output_directory.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    logger.info("Writing matching results to %s", output_directory)
-
-    tracking = Tracking(
-        neighbor_distance=config.neighbor_distance,
-        bins=config.bins,
-        n_threads=config.n_threads,
-        use_kde=config.use_kde,
-        um_per_px=config.pixel_size,
-    )
-
-    path_iteration = tqdm(
-        paths,
-        desc="Registering sessions",
-        unit="session",
-    )
-
-    for index, path in enumerate(path_iteration, start=1):
-        path_iteration.set_description(
-            f"Registering session {index}/{len(paths)}: {path.name}"
-        )
-
-        tracking.register_session(
-            from_file=path,
-            load_content=[
-                "quality",
-                "spatial",
-                "temporal",
-            ],
-            align=config.align,
-        )
-
-    tracking.reset_model()
-    for session_id in tqdm(
-        range(len(tracking.sessions)),
-        desc="Updating matching model",
-        unit="session",
-    ):
-        tracking.update_model_with_data(
-            from_session_index=session_id,
-        )
-
-    tracking.fit_to_model(
-        use_cdf=config.use_cdf,
-    )
-
-    tracking.reset_registration()
-    for session_id in tqdm(
-        range(len(tracking.sessions)),
-        desc="Registering neurons",
-        unit="session",
-    ):
-        tracking.register_neurons(
-            from_session_index=session_id,
-        )
-
-    save_matching_results(
-        tracking=tracking,
-        output_directory=output_directory,
-    )
-
-def save_matching_results(
-    *,
-    tracking: Tracking,
-    output_directory: Path,
-) -> None:
-    """Save model and registration files to one result directory."""
-
-    tracking.save_model(
-        output_directory=output_directory,
-    )
-
-    tracking.save_registration(
-        output_directory=output_directory,
-    )

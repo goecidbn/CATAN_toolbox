@@ -497,6 +497,10 @@ class CurationFilterEvaluator:
                 restrict_neurons=self._review_allowed,
             )
 
+        # Excluded neurons / footprints are no results (statistics still
+        # contain them, e.g. as partners).
+        self._drop_excluded_matches(root_result)
+
         neurons = set()
 
         for match in progress_iter(root_result.matches, start=97, stop=99):
@@ -512,6 +516,40 @@ class CurationFilterEvaluator:
             resolved_thresholds=resolved,
             skipped_nodes=tuple(skipped),
         )
+
+    def _drop_excluded_matches(self, result):
+        data = self.engine.data
+        union = data.assignments.union
+        if union is None or union.included is None:
+            return
+        neuron_included = np.asarray(union.included, dtype=bool)
+        ids = data.assignments.ids
+
+        def component_included(component):
+            if not neuron_included[component.neuron_id]:
+                return False
+            if component.session_id is None:
+                return True
+            footprint = int(ids[component.neuron_id, component.session_id])
+            included = data.sessions[component.session_id].included
+            return footprint >= 0 and (included is None or bool(included[footprint]))
+
+        def keep(match):
+            if isinstance(match, RelationshipMatch):
+                return component_included(match.target)
+            if isinstance(match, NeuronComponent):
+                return component_included(match)
+            if isinstance(match, ReassignmentMatch):
+                return bool(neuron_included[match.destination_neuron])
+            return all(neuron_included[n] for n in match_neurons(match))
+
+        dropped = {match for match in result.matches if not keep(match)}
+        if not dropped:
+            return
+        result.matches = result.matches - dropped
+        for match in dropped:
+            result.evidence_by_match.pop(match, None)
+            result.counts.pop(match, None)
 
     def resolve_thresholds(self, root):
         """Resolve the threshold recipes (threshold_references) of all
@@ -945,7 +983,13 @@ class CurationFilterEvaluator:
 
         from catan.gui.data.manipulation_votes import SessionVoter
 
-        return kind, SessionVoter(self.engine.data.sessions, self.engine.state.assignments)
+        from catan.gui.data.shape_decisions import decisions_of
+
+        return kind, SessionVoter(
+            self.engine.data.sessions,
+            self.engine.state.assignments,
+            decisions_of(self.engine.data.assignments).values(),
+        )
 
     def _voted_pair(self, voting, anchor, vertices, adjacent):
         """Best mutually compatible partner pair of ``anchor`` (the whole

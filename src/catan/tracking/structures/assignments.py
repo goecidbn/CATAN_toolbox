@@ -139,6 +139,8 @@ class Assignments:
         # Latest manipulation affecting each tracked neuron.
         self.manipulation_id: dict[int, int] = {}
         self.next_manipulation_id = 0
+        # {ID: ShapeDecision} ("two cells" / "one cell", gui/data/shape_decisions).
+        self.shape_decisions: dict = {}
 
         self.union = SessionData(name="union")
 
@@ -192,6 +194,7 @@ class Assignments:
         # Retain history; remap the lookup for surviving neuron identities.
         result.manipulations = deepcopy(self.manipulations)
         result.next_manipulation_id = self.next_manipulation_id
+        result.shape_decisions = dict(getattr(self, "shape_decisions", {}) or {})
         result.manipulation_id = {
             neuron_id_map[old_id]: manipulation_id
             for old_id, manipulation_id in self.manipulation_id.items()
@@ -470,6 +473,7 @@ class Assignments:
         self.review_status = review_status
         self._deserialize_manipulation_ids(curation.get("manipulation_id"))
         self._deserialize_manipulations(curation.get("manipulations") or {})
+        self._deserialize_shape_decisions(curation.get("shape_decisions") or {})
 
         self.status["loaded"] = True
 
@@ -581,6 +585,9 @@ class Assignments:
                 "manipulations": self._serialize_manipulations(),
             },
         }
+        decisions = self._serialize_shape_decisions()
+        if decisions:
+            save_data["curation"]["shape_decisions"] = decisions
 
         if sessions is not None:
             if self.ids.shape[1] != len(sessions):
@@ -759,6 +766,19 @@ class Assignments:
             )
 
         return serialized
+
+    def _serialize_shape_decisions(self) -> dict[str, dict]:
+        return {
+            str(int(decision_id)): decision.to_record()
+            for decision_id, decision in (getattr(self, "shape_decisions", None) or {}).items()
+        }
+
+    def _deserialize_shape_decisions(self, data) -> None:
+        from catan.tracking.structures.shape_decision import ShapeDecision
+
+        self.shape_decisions = {
+            int(key): ShapeDecision.from_record(record) for key, record in data.items()
+        }
 
     def _deserialize_manipulations(self, data) -> None:
 

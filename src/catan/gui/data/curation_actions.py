@@ -57,6 +57,7 @@ class ManipulationSpec:
             "merge",
             "neuron_merge",
             "reassign",
+            "cut",
             *BATCH_ACTIONS,
             *SHAPE_ACTIONS,
         ):
@@ -406,6 +407,8 @@ def _validate(data, kind, sources, targets):
         "reassign": (1, 1),
         # Used by the existing manual "new neuron" action.
         "new_neuron": (1, 0),
+        # Cut at the neck: the target footprint only.
+        "cut": (0, 1),
     }
 
     actual = (len(sources), len(targets))
@@ -460,6 +463,11 @@ def _validate(data, kind, sources, targets):
     if kind == "replace_with_union":
         if any(c.session_id is None for c in targets):
             raise ValueError("Replacing shapes requires footprint targets.")
+        return None
+
+    if kind == "cut":
+        if targets[0].session_id is None:
+            raise ValueError("Cutting requires a target footprint.")
         return None
 
     if kind in ("split", "merge"):
@@ -654,7 +662,7 @@ def prepare(data, plan, *, detach_occupied=False, exclude_occupied=False):
 
     changed = {}
 
-    if plan.kind in ("split", "merge"):
+    if plan.kind in ("split", "merge", "cut"):
         session_id = targets[0].session_id
         changed[session_id] = clone_session(data.sessions[session_id])
         worker.sessions[session_id] = changed[session_id]
@@ -680,6 +688,11 @@ def prepare(data, plan, *, detach_occupied=False, exclude_occupied=False):
         results = tuple(worker._process_component_request_inplace(request))
 
         replacements = {component: results for component in targets}
+
+    elif plan.kind == "cut":
+        # Kept part (in the target's neuron), then the new neuron's part.
+        results = worker._cut_footprint_inplace(targets[0])
+        replacements = {targets[0]: results}
 
     elif plan.kind == "neuron_merge":
         worker._merge_neuron_request_inplace(request)
@@ -756,7 +769,7 @@ def prepare(data, plan, *, detach_occupied=False, exclude_occupied=False):
 
     candidate = worker.assignments
 
-    if plan.kind not in ("split", "merge"):
+    if plan.kind not in ("split", "merge", "cut"):
         # Registered before the identity maps, as before; the affected
         # rows are mapped exactly as _finalize() maps them.
         row_map = worker.state.row_map
@@ -832,7 +845,7 @@ class ManipulationBatch:
     plans one by one.
     """
 
-    KINDS = ("split", "merge", "neuron_merge", "reassign")
+    KINDS = ("split", "merge", "neuron_merge", "reassign", "cut")
 
     def __init__(self, data, kind):
         if kind not in self.KINDS:
@@ -938,7 +951,7 @@ class ManipulationBatch:
             ):
                 raise ValueError("The union centroids are now more than 10 px apart.")
 
-        elif kind in ("split", "merge"):
+        elif kind in ("split", "merge", "cut"):
             session_id = targets[0].session_id
             self._session(session_id)
 
@@ -958,6 +971,9 @@ class ManipulationBatch:
 
             if kind in ("split", "merge"):
                 results = tuple(self.worker._process_component_request_inplace(request))
+
+            elif kind == "cut":
+                results = self.worker._cut_footprint_inplace(targets[0])
 
             else:
                 if kind == "neuron_merge":
@@ -993,7 +1009,7 @@ class ManipulationBatch:
                 f"{type(exc).__name__} while applying a manipulation: {exc}"
             ) from exc
 
-        if kind in ("split", "merge"):
+        if kind in ("split", "merge", "cut"):
             self.replacements.update({component: results for component in targets})
 
         self.affected.update(affected)
@@ -1311,6 +1327,11 @@ def _undo_record(worker, record, session_copy, notes):
     for session_id, footprint_id in record.get("excluded", []):
         if (session_id, footprint_id) not in created:
             session_copy(session_id).included[footprint_id] = True
+            # Its neuron's inclusion follows (e.g. a one-off's origin stays
+            # in the row it was retired to: the same footprint group).
+            row = _owner(candidate.ids, (session_id, footprint_id))
+            if row is not None:
+                touched.add(row)
     for session_id, footprint_id in record.get("included", []):
         session_copy(session_id).included[footprint_id] = False
 

@@ -665,6 +665,9 @@
       "validation_presets": [],
       "on_conflict": "ask"
     },
-    "review_statuses": null
+    "review_statuses": [
+      0,
+      2
+    ]
   }
 }

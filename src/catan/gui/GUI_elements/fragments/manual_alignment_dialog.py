@@ -184,8 +184,9 @@ class ManualAlignmentEditor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # keys=None: "interactive" closes the canvas on Escape.
         self.canvas = scene.SceneCanvas(
-            keys="interactive",
+            keys=None,
             bgcolor="#20252b",
         )
         layout.addWidget(self.canvas.native, 1)
