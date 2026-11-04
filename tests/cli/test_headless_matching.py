@@ -107,7 +107,11 @@ def test_match_demo_writes_project(demo):
     from catan.tracking.structures.assignments import Assignments
 
     ids = np.asarray(Assignments._from_file(path=str(result.project)).ids)
-    assert ids.shape == (349, 4)
+    # 349 here; the model fit differs slightly with the BLAS kernels (CPU),
+    # and S3 footprint 100 lies at the competitor threshold (p ≈ 0.30 vs
+    # 0.3), so it is dropped on some CI runners (348).
+    assert ids.shape[1] == 4
+    assert abs(ids.shape[0] - 349) <= 3
 
     # The recipe reproduces the loading (background next to each file).
     recipe = json.loads(result.recipe_file.read_text())
