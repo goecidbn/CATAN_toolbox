@@ -88,6 +88,7 @@ DEFAULT_CONFLICT_CHOICES = (
 )
 from catan.tracking.structures import ReviewStatus
 from catan.core.structures import NeuronComponent
+from catan.core.changes import ChangeKind
 from catan.gui.GUI_elements.utils.menu_creation import fit_message_box_buttons
 from catan.gui.GUI_elements.utils.enter_key import EnterKeyButton
 
@@ -260,8 +261,11 @@ class CuratorActions(QGroupBox):
         self.current.clicked.connect(lambda: self._start(False))
         self.all.clicked.connect(lambda: self._start(True))
         self.next.clicked.connect(lambda: self._apply(self.run_id))
-        # Enter = Apply & next while reviewing candidates.
-        self._enter_key = EnterKeyButton(self.next)
+        # Enter = Apply & next while reviewing candidates; a manual split /
+        # merge (Footprints request) owns the key while it is open.
+        self._enter_key = EnterKeyButton(
+            self.next, blocked=lambda: self.state.current_request is not None
+        )
         self.next.setToolTip("Enter")
         self.skip.clicked.connect(self._skip)
         self.stop.clicked.connect(self._on_stop)
@@ -273,6 +277,7 @@ class CuratorActions(QGroupBox):
         self.state.focused_component_changed.connect(self.refresh_candidates)
         self.state.selected_components_changed.connect(self.refresh_candidates)
         self.state.data_changed.connect(self._data_changed)
+        self.state.request_status_changed.connect(self._on_manual_request)
         self.state.highlighted_components_changed.connect(self._on_highlight_edited)
         self._showing = False
 
@@ -929,6 +934,13 @@ class CuratorActions(QGroupBox):
         if self.queue is not None:
             return
 
+        if self.state.current_request is not None:
+            self.status.setText(
+                "Finish or cancel the manual split / merge in the footprint "
+                "view first."
+            )
+            return
+
         if self.kind.currentData() in BATCH_ACTIONS:
             self._apply_batch(all_selected)
             return
@@ -1477,6 +1489,17 @@ class CuratorActions(QGroupBox):
 
         self._finish("Stopped" if stopped else "Finished")
 
+    def _on_manual_request(self):
+        """A manual manipulation (Footprints request) takes precedence: it
+        stops a running review / apply-all, and no run starts while it is
+        open."""
+        if self.state.current_request is not None and self.queue is not None:
+            if self._batch_running:
+                self._on_stop()
+            else:
+                self._finish("Stopped: manual manipulation started")
+        self._buttons()
+
     def _on_stop(self):
         if self._batch_running:
             self._batch_stop = True
@@ -1538,7 +1561,15 @@ class CuratorActions(QGroupBox):
         self.refresh_candidates()
         self.controller._update_filter_validity()
 
-    def _data_changed(self, *_):
+    def _data_changed(self, change=None, *_):
+        if change is not None and getattr(change, "has", None) and change.has(
+            ChangeKind.ASSIGNMENT_MAPPING,
+            ChangeKind.INCLUSION,
+            ChangeKind.FOOTPRINT_GEOMETRY,
+        ):
+            # Also after the curator's own manipulations.
+            self.controller.schedule_recheck()
+
         if self.committing:
             # _apply updates retained identities after commit completes.
             return

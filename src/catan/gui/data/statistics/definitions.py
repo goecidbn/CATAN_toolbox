@@ -873,6 +873,89 @@ CALCULATED_STATISTICS["footprint_union_overlap"] = StatisticDefinition(
     ].availability_dependencies,
 )
 
+# A footprint inside where a co-detected neuron is seen in most sessions
+# (additional / partial detection of the same cell).
+from .codetected_containment import (  # noqa: E402
+    calculate_codetected_containment,
+    codetected_containment_requested_pairs,
+)
+
+CALCULATED_STATISTICS["codetected_containment"] = StatisticDefinition(
+    key="codetected_containment",
+    title="Inside co-detected neuron",
+    description=(
+        "For a session footprint of neuron_i and another neuron neuron_j "
+        "that also has a footprint in that session: the median, over "
+        "neuron_j's footprints in the other sessions, of the share of the "
+        "footprint's core (pixels ≥ 'core' of its peak) inside each of "
+        "them (as footprint overlap normalized by i). High values: the footprint lies where neuron_j is "
+        "seen in most sessions while neuron_j is detected here as well — an "
+        "additional (often partial) detection of the same cell. NaN if "
+        "neuron_j has no footprint in the session, too few in others, or "
+        "fewer footprints than neuron_i (the longer track is the "
+        "reference). neuron_i = neuron_j: the footprint inside its own "
+        "neuron's other footprints (reference values for thresholds). "
+        "Pairs with centroids 10 px or more apart are omitted."
+    ),
+    dims=("neuron_i", "neuron_j", "session"),
+    category="pair",
+    getter=calculate_codetected_containment,
+    pairs_getter=codetected_containment_requested_pairs,
+    allowed_reductions=None,
+    default_reductions={
+        "neuron_i": ReductionSpec("keep"),
+        "neuron_j": ReductionSpec("keep"),
+        "session": ReductionSpec("single", 0),
+    },
+    parameters=(
+        StatisticParameter(
+            key="core_threshold",
+            short="core",
+            label="Core threshold",
+            kind=float,
+            default=0.5,
+            minimum=0.0,
+            maximum=0.95,
+            step=0.05,
+            decimals=2,
+            tooltip=(
+                "Pixels of the footprint counted as its core, relative to "
+                "its peak (the faint rim of a neighbouring cell may reach "
+                "into neuron_j; its core does not)."
+            ),
+        ),
+        *(
+            p
+            for p in CALCULATED_STATISTICS["footprint_overlap"].parameters
+            if p.key == "support_threshold"
+        ),
+        StatisticParameter(
+            key="min_sessions",
+            short="n",
+            label="Min. other sessions",
+            kind=int,
+            default=2,
+            minimum=1,
+            maximum=1000,
+            step=1,
+            decimals=0,
+            tooltip=(
+                "Footprints neuron_j needs in other sessions; fewer give no "
+                "value (a one-off: use footprint overlap instead)."
+            ),
+        ),
+    ),
+    independent_pairs=True,
+    compact_values=True,
+    component_axes=(("neuron_i", "session"),),
+    curation_kind="reassignment",
+    relationship_axes=(("neuron_i", "session"), ("neuron_j", None)),
+    dependencies=CALCULATED_STATISTICS["footprint_union_similarity"].dependencies,
+    availability_dependencies=CALCULATED_STATISTICS[
+        "footprint_union_similarity"
+    ].availability_dependencies,
+)
+
 # Registration probability of a footprint for its own neuron's union.
 CALCULATED_STATISTICS["match_probability"] = StatisticDefinition(
     key="match_probability",

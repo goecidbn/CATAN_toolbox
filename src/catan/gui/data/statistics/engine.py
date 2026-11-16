@@ -515,8 +515,11 @@ class StatisticEngine(QObject):
         data = self.data if data is None else data
         state = self.state if state is None else state
 
-        # Inactive sessions are absent for all statistics.
-        data, state = active_session_view(data, state)
+        # Inactive sessions are absent for all statistics; excluded
+        # footprints / neurons unless the query includes them.
+        data, state = active_session_view(
+            data, state, include_excluded=query.include_excluded
+        )
 
         if stat_def is None:
             stat_def = self.registry[query.statistic_key]
@@ -1113,12 +1116,13 @@ class _StateView:
         return getattr(self._state, name)
 
 
-def active_session_view(data, state):
+def active_session_view(data, state, *, include_excluded=False):
     """Data/state in which footprints of inactive sessions, excluded
     footprints and the footprints of excluded neurons are unassigned
     (``ids`` -1), so statistics treat them as absent: no values, partners,
-    sources or targets. The original objects if nothing is masked. Small
-    identity objects are copied; spatial and temporal arrays stay shared."""
+    sources or targets (``include_excluded``: only inactive sessions). The
+    original objects if nothing is masked. Small identity objects are
+    copied; spatial and temporal arrays stay shared."""
     sessions = getattr(data, "sessions", None) or []
     assignments = getattr(data, "assignments", None)
 
@@ -1142,6 +1146,8 @@ def active_session_view(data, state):
         if not getattr(session, "active", True):
             mask()[:, index] = -1
             continue
+        if include_excluded:
+            continue
         included = getattr(session, "included", None)
         if included is None:
             continue
@@ -1154,7 +1160,7 @@ def active_session_view(data, state):
             mask()[drop, index] = -1
 
     union = getattr(assignments, "union", None)
-    neuron_included = getattr(union, "included", None)
+    neuron_included = None if include_excluded else getattr(union, "included", None)
     if neuron_included is not None and len(neuron_included) == ids.shape[0]:
         excluded = ~np.asarray(neuron_included, dtype=bool)
         if excluded.any():

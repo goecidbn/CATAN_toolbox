@@ -1,4 +1,5 @@
 import importlib
+import time
 from copy import deepcopy
 from html import escape
 from dataclasses import replace
@@ -2002,6 +2003,13 @@ class Display(QWidget):
             self.root_widget.clear_evaluation_errors()
 
 
+# Rechecking retained results after assignment changes (Controller.
+# schedule_recheck): only for presets evaluating within this time.
+RECHECK_MAX_EVALUATION_S = 20.0
+RECHECK_DELAY_MS = 300
+RECHECK_RETRY_MS = 1000
+
+
 class Controller(BasePlot.ControlsController):
 
     menu: Display
@@ -2020,6 +2028,13 @@ class Controller(BasePlot.ControlsController):
         self._filter_generation = 0
         self._evaluation_task_id = None
         self._evaluation_token = None
+
+        # Recheck of the retained results after assignment changes.
+        self._recheck_task_id = None
+        self._recheck_token = None
+        self._recheck_timer = QTimer()
+        self._recheck_timer.setSingleShot(True)
+        self._recheck_timer.timeout.connect(self._start_recheck)
 
         self._evidence_source = ("group", self.root_filter.id)
 
@@ -2323,25 +2338,25 @@ class Controller(BasePlot.ControlsController):
 
         def evaluate():
             try:
+                started = time.perf_counter()
                 result = CurationFilterEvaluator(self.data.statistic_engine).evaluate(
                     snapshot
                 )
-
-                return result, None
+                return result, None, time.perf_counter() - started
 
             except TaskCancelled:
                 # Cancellation must reach Worker, not become a normal result.
                 raise
 
             except CurationFilterError as exc:
-                return None, (str(exc), exc.node_type, exc.node_id)
+                return None, (str(exc), exc.node_type, exc.node_id), None
 
             except Exception as exc:
                 return None, (
                     f"{type(exc).__name__}: {exc}",
                     None,
                     None,
-                )
+                ), None
 
         def accept_result(result):
             if self._evaluation_token is not token:
@@ -2358,6 +2373,7 @@ class Controller(BasePlot.ControlsController):
                     result,
                     generation=generation,
                     version=version,
+                    snapshot=snapshot,
                 )
             finally:
                 self._update_filter_validity(preserve_status=True)
@@ -2392,7 +2408,101 @@ class Controller(BasePlot.ControlsController):
 
         self.menu.status_label.setText(message)
 
+    # ------------------------------------------------------------------
+    # Recheck after assignment changes: matches the preset no longer finds
+    # (e.g. sources and targets now in different neurons) leave the results.
+
+    def schedule_recheck(self):
+        retained = self.current_result
+        if retained is None or retained.root_filter is None:
+            return
+        if retained.duration is None or retained.duration > RECHECK_MAX_EVALUATION_S:
+            return
+        self._recheck_timer.start(RECHECK_DELAY_MS)
+
+    def _start_recheck(self):
+        retained = self.current_result
+        if retained is None or self._deactivated:
+            return
+
+        if (
+            self.actions.queue is not None
+            or self.actions.committing
+            or self._evaluation_token is not None
+            or self._recheck_token is not None
+        ):
+            # After the running batch / evaluation / recheck.
+            self._recheck_timer.start(RECHECK_RETRY_MS)
+            return
+
+        root = retained.recheck_filter()
+        if root is None:
+            return
+
+        version = self.state.data_version
+        token = object()
+        self._recheck_token = token
+        engine = self.data.statistic_engine
+
+        def evaluate():
+            try:
+                return CurationFilterEvaluator(engine).evaluate(root)
+            except TaskCancelled:
+                raise
+            except Exception:
+                # A failing recheck keeps the results (Evaluate shows errors).
+                return None
+
+        def accept(result):
+            if self._recheck_token is not token:
+                return
+            self._recheck_token = None
+            self._recheck_task_id = None
+
+            if result is None or self._deactivated or self.current_result is not retained:
+                return
+            if version != self.state.data_version:
+                self.schedule_recheck()
+                return
+
+            self._apply_recheck(retained, result)
+
+        try:
+            self._recheck_task_id = self.state.tasks.start(
+                "calculating",
+                "Recheck curator results",
+                evaluate,
+                on_result=accept,
+            )
+        except Exception:
+            self._recheck_task_id = None
+            self._recheck_token = None
+            raise
+
+    def _apply_recheck(self, retained, result):
+        removed = retained.keep_only(result)
+        if not removed:
+            return
+
+        self._results_note = (
+            f"Rechecked after changes: {removed} result neuron"
+            f"{'s' if removed != 1 else ''} no longer match"
+            f"{'es' if removed == 1 else ''} the preset."
+        )
+        self.actions.refresh_candidates()
+        self._refresh_results()
+        self._update_evidence_highlight()
+
+    def _recheck_stopped(self, group, task_id):
+        if group != "calculating" or task_id != self._recheck_task_id:
+            return False
+        self._recheck_task_id = None
+        self._recheck_token = None
+        return True
+
     def _on_evaluation_cancelled(self, group, task_id):
+        if self._recheck_stopped(group, task_id):
+            return
         self._finish_stopped_evaluation(
             group,
             task_id,
@@ -2400,6 +2510,8 @@ class Controller(BasePlot.ControlsController):
         )
 
     def _on_evaluation_failed(self, group, task_id):
+        if self._recheck_stopped(group, task_id):
+            return
         self._finish_stopped_evaluation(
             group,
             task_id,
@@ -2414,6 +2526,13 @@ class Controller(BasePlot.ControlsController):
         if task_id is not None:
             self.state.tasks.cancel(task_id)
 
+        self._recheck_timer.stop()
+        recheck_id = self._recheck_task_id
+        self._recheck_task_id = None
+        self._recheck_token = None
+        if recheck_id is not None:
+            self.state.tasks.cancel(recheck_id)
+
         super().deactivate()
 
     def _on_filter_evaluated(
@@ -2422,9 +2541,10 @@ class Controller(BasePlot.ControlsController):
         *,
         generation: int,
         version: int,
+        snapshot=None,
     ):
 
-        result, error = result_and_error
+        result, error, *timing = result_and_error
 
         # Filter was edited while calculation ran.
         if generation != self._filter_generation or version != self.state.data_version:
@@ -2445,7 +2565,12 @@ class Controller(BasePlot.ControlsController):
 
             return
 
-        self.current_result = RetainedResults(result, self.data)
+        self.current_result = RetainedResults(
+            result,
+            self.data,
+            root_filter=snapshot,
+            duration=timing[0] if timing else None,
+        )
         self._results_note = ""
 
         # Show the values the threshold recipes resolved to.

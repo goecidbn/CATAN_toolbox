@@ -29,6 +29,9 @@ class RequestHandler:
 
         self.origin = []
         self.destination = []
+        # Synthetic footprints (results of earlier manipulations) as
+        # sources: only when the user asks for it (request box).
+        self.allow_synthetic = False
 
         if component is not None:
             self.origin.append(component)

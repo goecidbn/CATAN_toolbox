@@ -3511,6 +3511,11 @@ class Data(Tracking):
 
             item.remap = deepcopy(original.remap)
             item.source_config = deepcopy(original.source_config)
+            # Detected shapes of replaced footprints (changed in place by
+            # "Replace with union shape").
+            item.replaced_footprints = dict(
+                getattr(original, "replaced_footprints", None) or {}
+            )
 
             # Hold references to existing trace arrays, without
             # duplicating every session's traces. Export never
@@ -3557,18 +3562,15 @@ class Data(Tracking):
             )
             return
 
+        # The export runs on these copies in the independent "export" group:
+        # CATAN stays usable meanwhile; the files reflect the state at the
+        # start (noted when the data changed).
         def run():
             ctx = current_task_context()
             issues = []
 
             for session_id, path in jobs:
                 ctx.check_cancelled()
-
-                if self.state.data_version != version:
-                    raise ValueError(
-                        "Data changed during export. Completed files "
-                        "remain available; retry the remaining sessions."
-                    )
 
                 session = sessions[session_id]
                 values = prepared = A = None
@@ -3630,9 +3632,6 @@ class Data(Tracking):
                         },
                     }
 
-                    if self.state.data_version != version:
-                        raise ValueError("Data changed; retry export.")
-
                     ctx.check_cancelled()
 
                     save_prepared_file_task(
@@ -3667,6 +3666,13 @@ class Data(Tracking):
             return issues
 
         def finished(issues):
+            if self.state.data_version != version:
+                issues = [
+                    "The data changed during the export. The seed files "
+                    "reflect the assignments and inclusion at its start; "
+                    "export again to include the changes.",
+                    *issues,
+                ]
             if issues:
                 self.state.issue(
                     "warning",
@@ -3675,7 +3681,7 @@ class Data(Tracking):
                 )
 
         return tasks.start(
-            "saving",
+            "export",
             "Export redetection seeds",
             run,
             on_result=finished,
@@ -6116,8 +6122,9 @@ class Data(Tracking):
             return None
         return perform()
 
-    def _apply_manipulation(self, kind, sources, targets, **resolution):
-        """``resolution``: detach_occupied / exclude_occupied, see prepare()."""
+    def _apply_manipulation(self, kind, sources, targets, parameters=None, **resolution):
+        """``resolution``: detach_occupied / exclude_occupied, see prepare();
+        ``parameters``: options of the manipulation (cut: lobe parameters)."""
         from catan.gui.data.curation_actions import (
             ManipulationPlan,
             ManipulationSpec,
@@ -6128,6 +6135,7 @@ class Data(Tracking):
             kind,
             sources,
             targets,
+            parameters=parameters,
         )
 
         def perform():
@@ -6148,10 +6156,13 @@ class Data(Tracking):
 
         return perform()
 
-    def cut_footprint(self, component):
+    def cut_footprint(self, component, **parameters):
         """Cut a footprint at the neck between its lobes (manipulation
-        "cut", see _cut_footprint_inplace)."""
-        return self._apply_manipulation("cut", (), (component,))
+        "cut", see _cut_footprint_inplace); ``parameters``: lobe parameters
+        (catan.core.footprint_lobes, defaults otherwise)."""
+        return self._apply_manipulation(
+            "cut", (), (component,), parameters=parameters or None
+        )
 
     def process_component_request(self, request, **resolution):
         """``resolution``: detach_occupied / exclude_occupied, see prepare()."""
@@ -6210,6 +6221,53 @@ class Data(Tracking):
             detach_occupied=occupied == "detach",
             exclude_occupied=occupied == "exclude",
         )
+
+    def reassign_footprints(self, components, target_neuron=None, *, occupied=None):
+        """Move footprints of any neurons into ``target_neuron`` (None: a new
+        neuron) as one manipulation ("move_footprints": one record, undone
+        together; all affected unions rebuilt). One footprint per session.
+        ``occupied``: where the target already has a footprint in that
+        session — None (raise OccupiedDestination), "exclude" / "detach" it,
+        or "skip" those footprints. Returns the moved footprints."""
+        from catan.gui.data.curation_actions import OccupiedDestination
+
+        ids = self.assignments.ids
+        components = [NeuronComponent(int(c.neuron_id), int(c.session_id)) for c in components]
+        if not components:
+            raise ValueError("No footprints to move.")
+
+        sessions = [c.session_id for c in components]
+        twice = sorted({s for s in sessions if sessions.count(s) > 1})
+        if twice:
+            raise ValueError(
+                "A neuron has one footprint per session: several footprints "
+                f"to move are in {session_labels(self, twice, short=True)}."
+            )
+
+        target = None if target_neuron is None else int(target_neuron)
+        if target is not None:
+            occupied_here = [c for c in components if ids[target, c.session_id] >= 0]
+            if occupied_here and occupied is None:
+                raise OccupiedDestination(
+                    [
+                        (target, c.session_id, int(ids[target, c.session_id]))
+                        for c in occupied_here
+                    ],
+                    "reassign",
+                )
+            if occupied == "skip":
+                components = [c for c in components if c not in occupied_here]
+                if not components:
+                    return []
+
+        self._apply_manipulation(
+            "move_footprints",
+            tuple(components),
+            () if target is None else (NeuronComponent(target, None),),
+            detach_occupied=occupied == "detach",
+            exclude_occupied=occupied == "exclude",
+        )
+        return components
 
     def _merge_neuron_request_inplace(self, request):
         assignments = self.assignments
@@ -6476,38 +6534,40 @@ class Data(Tracking):
 
         return [*added_components, *remainders]
 
-    def cut_parts(self, session_id, footprint_id):
-        """The two lobes of a footprint (catan.core.footprint_lobes,
-        default parameters: replays reproduce them), largest core first;
-        ValueError with fewer than two lobes."""
+    def cut_parts(self, session_id, footprint_id, **parameters):
+        """The two lobes of a footprint (catan.core.footprint_lobes with
+        ``parameters``, defaults otherwise), largest core first; ValueError
+        with fewer than two lobes."""
         from catan.core.footprint_lobes import split_lobes
 
         session = self.sessions[int(session_id)]
-        parts = split_lobes(session.footprints[:, int(footprint_id)], tuple(session.dims))
+        parts = split_lobes(
+            session.footprints[:, int(footprint_id)], tuple(session.dims), **parameters
+        )
         if parts is None:
             raise ValueError(
-                "The footprint has no two lobes to cut apart "
-                "(see the statistic Footprint lobes)."
+                "The footprint has no two lobes to cut apart with these "
+                "settings (see the statistic Footprint lobes)."
             )
         return parts
 
-    def _cut_footprint_inplace(self, component):
-        """Cut a footprint at the neck between its two lobes: the part
-        overlapping the neuron's other footprints more (their union; the
-        larger part without others) stays in the neuron, the other becomes
-        a new neuron. The detected footprint is retired (excluded), as by a
-        split. Returns (kept part, new neuron's part)."""
-        from catan.core.footprint_lobes import DEFAULTS
-
+    def cut_preview(self, component, **parameters):
+        """(parts, index of the part that stays) of cutting ``component``
+        (see _cut_footprint_inplace); ValueError without two lobes."""
         session_id = int(component.session_id)
         neuron_id = int(component.neuron_id)
-        ids = self.assignments.ids
-        footprint_id = int(ids[neuron_id, session_id])
+        footprint_id = int(self.assignments.ids[neuron_id, session_id])
         if footprint_id < 0:
             raise ValueError(f"{component} has no assigned footprint.")
+        parts = self.cut_parts(session_id, footprint_id, **parameters)
+        return parts, self._cut_keep(neuron_id, session_id, parts)
 
-        parts = self.cut_parts(session_id, footprint_id)
+    def _cut_keep(self, neuron_id, session_id, parts):
+        """Index of the part overlapping the neuron's other included
+        footprints more (their union); the larger part without others."""
+        from catan.core.footprint_lobes import DEFAULTS
 
+        ids = self.assignments.ids
         others = [
             int(s)
             for s in np.flatnonzero(ids[neuron_id] >= 0)
@@ -6523,7 +6583,25 @@ class Data(Tracking):
             scores = [float(support.multiply(part).sum()) for part in parts]
         else:
             scores = [float(part.sum()) for part in parts]
-        keep = int(np.argmax(scores))
+        return int(np.argmax(scores))
+
+    def _cut_footprint_inplace(self, component, **parameters):
+        """Cut a footprint at the neck between its two lobes (``parameters``:
+        lobe parameters): the part overlapping the neuron's other footprints
+        more (their union; the larger part without others) stays in the
+        neuron, the other becomes a new neuron. The detected footprint is
+        retired (excluded), as by a split; both parts are stored in the
+        record (replays do not depend on the parameters). Returns (kept
+        part, new neuron's part)."""
+        session_id = int(component.session_id)
+        neuron_id = int(component.neuron_id)
+        ids = self.assignments.ids
+        footprint_id = int(ids[neuron_id, session_id])
+        if footprint_id < 0:
+            raise ValueError(f"{component} has no assigned footprint.")
+
+        parts = self.cut_parts(session_id, footprint_id, **parameters)
+        keep = self._cut_keep(neuron_id, session_id, parts)
 
         origin_ref = {
             "session_id": session_id,
@@ -6571,6 +6649,8 @@ class Data(Tracking):
                 }
             ],
             affected_neurons=[neuron_id, new_neuron_id],
+            # Both parts in the order of cut_parts (_restore_cut).
+            shapes=list(parts),
         )
 
         self.notify_change(C.FOOTPRINT_GEOMETRY, *ASSIGNMENT_CONTENT_CHANGES)
@@ -6754,7 +6834,9 @@ class Data(Tracking):
                 f"cut parts at footprint IDs {session.n_neurons} and "
                 f"{session.n_neurons + 1}, the record has {part_ids}."
             )
-        for part in self.cut_parts(session_id, footprint_id):
+        # Stored parts; older records (no shapes) used the default parameters.
+        parts = manipulation.get("shapes") or self.cut_parts(session_id, footprint_id)
+        for part in parts:
             session.append_synthetic_component(part)
 
     def _restore_synthetic_component(

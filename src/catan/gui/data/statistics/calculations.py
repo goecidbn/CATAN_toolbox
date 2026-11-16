@@ -540,12 +540,12 @@ def calculate_occurrence(
     indexers=None,
     filters=(),
 ):
-    selected = apply_indexers(
-        state.assignments,
-        ("neuron", "session"),
-        indexers,
-    )
-    return selected >= 0
+    # 1 / 0 per session; NaN for neurons without any footprint (empty
+    # rows, or all footprints excluded): they have no occurrence at all.
+    assigned = np.asarray(state.assignments) >= 0
+    present = assigned.astype(float)
+    present[~assigned.any(axis=1)] = np.nan
+    return apply_indexers(present, ("neuron", "session"), indexers)
 
 
 def calculate_centroid_shift(

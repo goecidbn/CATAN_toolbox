@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 import traceback
 from html import escape
@@ -2395,6 +2395,18 @@ class Controller(BasePlot.CanvasController):
         self.controls["aggregate_scatter"] = aggregate_scatter
         self.controls["panel"].form.addRow(aggregate_scatter)
 
+        include_excluded = QCheckBox("Include excluded footprints")
+        include_excluded.setToolTip(
+            "Count excluded footprints and neurons as present. Off: they "
+            "are left out of every statistic (values, partners, sources "
+            "and targets), as in the curator."
+        )
+        include_excluded.setChecked(bool(self.config.get("include_excluded", False)))
+        include_excluded.toggled.connect(self._set_include_excluded)
+
+        self.controls["include_excluded"] = include_excluded
+        self.controls["panel"].form.addRow(include_excluded)
+
         for slot in ("x", "y"):
             selector = self.controls[f"{slot}_selector"]
             selector.assignment_name = self.config.get(f"scatter_assignments_{slot}")
@@ -2433,6 +2445,7 @@ class Controller(BasePlot.CanvasController):
         self.rebuild_plot()
 
     def _on_query_changed(self, which, query: StatisticsData.StatisticQuery):
+        query = self._with_exclusion_option(query)
 
         if which == "x":
             self.current_query["x"] = query
@@ -2513,6 +2526,18 @@ class Controller(BasePlot.CanvasController):
     def _set_scatter_comparison(self, enabled):
         self.config["compare_scatter"] = bool(enabled)
         self._sync_comparison_controls()
+        self.recalculate_statistics(force=True)
+
+    def _with_exclusion_option(self, query):
+        include = bool(self.config.get("include_excluded", False))
+        if query is None or query.include_excluded == include:
+            return query
+        return replace(query, include_excluded=include)
+
+    def _set_include_excluded(self, enabled):
+        self.config["include_excluded"] = bool(enabled)
+        for slot, query in tuple(self.current_query.items()):
+            self.current_query[slot] = self._with_exclusion_option(query)
         self.recalculate_statistics(force=True)
 
     def _set_scatter_aggregation(self, enabled):

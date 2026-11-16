@@ -42,3 +42,16 @@ def test_split_lobes_cuts_between_the_cells():
     x_second = np.argmax(parts[1].toarray().reshape(DIMS).max(axis=0))
     assert x_first == 18 and x_second == 34
     assert split_lobes(_column(_blob(20, 25, sigma=3.5)), DIMS) is None
+
+
+def test_lower_peak_forces_the_cut_of_a_faint_side_cell():
+    # A dim second cell: no lobe by default, a cut with a lower lobe peak
+    # or at a fixed threshold below its peak.
+    pair = _column(_blob(20, 18) + _blob(20, 34, amplitude=0.3))
+    assert split_lobes(pair, DIMS) is None
+    assert lobe_count(pair, DIMS, peak=0.2) == 2
+    parts = split_lobes(pair, DIMS, peak=0.2)
+    assert parts is not None and abs(parts[0] + parts[1] - pair).sum() < 1e-9
+    assert split_lobes(pair, DIMS, peak=0.2, threshold=0.2) is not None
+    # Above the dim cell's peak only one lobe remains.
+    assert split_lobes(pair, DIMS, peak=0.2, threshold=0.5) is None

@@ -134,6 +134,7 @@ def make_engine_query_for_session_series(
         filters=query.filters,
         context=query.context,
         parameters=query.parameters,
+        include_excluded=query.include_excluded,
     )
 
 

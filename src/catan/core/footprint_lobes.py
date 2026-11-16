@@ -8,7 +8,9 @@ relative to the footprint's peak) whose own peak reaches ``peak`` and whose
 area is at least ``size`` of the footprint's area at ``base`` (and at least
 ``min_pixels``). The lobe count is the largest number of such parts at any
 threshold; faint side blobs (peak below ``peak``) and small specks do not
-count.
+count. ``threshold`` (optional) uses that single threshold instead (forcing
+a cut where the search finds none, e.g. a dim second lobe with a lower
+``peak``).
 """
 
 import numpy as np
@@ -16,7 +18,7 @@ from scipy import ndimage, sparse
 
 EIGHT = np.ones((3, 3), dtype=bool)
 
-DEFAULTS = dict(peak=0.5, size=0.1, base=0.1, step=0.05, min_pixels=10)
+DEFAULTS = dict(peak=0.5, size=0.1, base=0.1, step=0.05, min_pixels=10, threshold=None)
 
 
 def footprint_image(column, dims):
@@ -38,14 +40,15 @@ def footprint_image(column, dims):
     return image, (y0, x0)
 
 
-def _lobes_at_best_threshold(image, peak, size, base, step, min_pixels):
+def _lobes_at_best_threshold(image, peak, size, base, step, min_pixels, threshold=None):
     """(count, labels of the qualifying lobes at the threshold with the
-    most of them, their label ids)."""
+    most of them, their label ids); only ``threshold`` if given."""
     image = image / image.max()
     need = max(float(min_pixels), size * float(np.count_nonzero(image >= base)))
     best = (1, None, ())
 
-    for threshold in np.arange(base, 1.0, step):
+    thresholds = np.arange(base, 1.0, step) if threshold is None else [float(threshold)]
+    for threshold in thresholds:
         labels, n = ndimage.label(image >= threshold, EIGHT)
         if n < 2:
             continue

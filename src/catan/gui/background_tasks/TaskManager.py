@@ -106,7 +106,13 @@ class TaskManager(QObject):
         "model update",
         "calculating",
         "saving",
+        "export",
     )
+
+    # Work on its own snapshot (e.g. seed export): runs next to everything
+    # else — no processing (others are not blocked or deferred by it), not
+    # held by display workers or processing pauses; one at a time.
+    INDEPENDENT_GROUPS = ("export",)
 
     def __init__(self):
         super().__init__()
@@ -161,9 +167,11 @@ class TaskManager(QObject):
         return bool(self._processing_holds)
 
     def processing_busy(self):
-        """Active/queued processing, excluding requests waiting for its end."""
+        """Active/queued processing, excluding requests waiting for its end
+        and independent work (INDEPENDENT_GROUPS)."""
         return bool(self._processing_holds) or any(
             not task.background
+            and task.group not in self.INDEPENDENT_GROUPS
             and (not task.after_processing or self.current[task.group] is task)
             for task in self.tasks.values()
         )
@@ -187,6 +195,7 @@ class TaskManager(QObject):
         return not any(
             other is not task
             and not other.background
+            and other.group not in self.INDEPENDENT_GROUPS
             and (not other.after_processing or self.current[other.group] is other)
             for other in self.tasks.values()
         )
@@ -401,16 +410,19 @@ class TaskManager(QObject):
         group: str,
     ) -> None:
 
+        independent = group in self.INDEPENDENT_GROUPS
+
         # Completion callbacks may show a modal selection dialog.
         # Do not promote further work until those callbacks finish.
-        if self._finishing_depth or self._processing_holds:
+        if self._finishing_depth or (self._processing_holds and not independent):
             return
         # Only one task per group at once.
         if self.current[group] is not None:
             return
 
-        # A display worker reads live data. Let it stop before processing.
-        if self._background_running():
+        # A display worker reads live data. Let it stop before processing
+        # (independent work reads its own snapshot).
+        if self._background_running() and not independent:
             return
 
         queue = self.queues[group]

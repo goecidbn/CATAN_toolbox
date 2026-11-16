@@ -1,5 +1,7 @@
 """Retained inspection results with remappable component identities."""
 
+from copy import deepcopy
+
 from catan.core.structures import NeuronComponent as Component
 from catan.gui.data.curation_actions import EndpointRef
 
@@ -12,30 +14,39 @@ def _session_key(session):
     return (getattr(session, "path", None), _footprint_count(session))
 
 
+def root_target_evidence(result):
+    """Root target -> sources of a relationship / reassignment root, only
+    for result neurons; None for neuron / footprint roots."""
+    root = result.root_result.target_evidence
+
+    if root is None and result.root_result.match_level == "reassignment":
+        # Destination neuron -> footprints proposed for it.
+        root = {}
+        for match in result.root_result.matches:
+            root.setdefault(Component(match.destination_neuron, None), set()).add(
+                Component(match.source_neuron, match.source_session)
+            )
+
+    if root is None:
+        return None
+
+    return {
+        target: set(sources)
+        for target, sources in root.items()
+        if target.neuron_id in result.neurons
+    }
+
+
 class RetainedResults:
-    def __init__(self, result, data):
+    def __init__(self, result, data, root_filter=None, duration=None):
         self.snapshot = result
         self.root_id = result.root_result.group_id
+        # The evaluated preset (for rechecking after data changes) and the
+        # evaluation time in s.
+        self.root_filter = root_filter
+        self.duration = duration
 
-        root = result.root_result.target_evidence
-
-        if root is None and result.root_result.match_level == "reassignment":
-            # Destination neuron -> footprints proposed for it.
-            root = {}
-            for match in result.root_result.matches:
-                root.setdefault(Component(match.destination_neuron, None), set()).add(
-                    Component(match.source_neuron, match.source_session)
-                )
-
-        self.remaining = (
-            None
-            if root is None
-            else {
-                target: set(sources)
-                for target, sources in root.items()
-                if target.neuron_id in result.neurons
-            }
-        )
+        self.remaining = root_target_evidence(result)
 
         self.positions = {
             Component(n, s): Component(n, s)
@@ -305,3 +316,74 @@ class RetainedResults:
             self.positions[old] = replacement
 
         self._remember_data(data)
+
+    def recheck_filter(self):
+        """The evaluated preset with its threshold recipes fixed at the
+        values they resolved to (a recheck tests the same thresholds); None
+        without a stored preset."""
+        if self.root_filter is None:
+            return None
+
+        root = deepcopy(self.root_filter)
+        resolved = self.snapshot.resolved_thresholds
+
+        def visit(node):
+            children = getattr(node, "children", None)
+            if children is not None:
+                for child in children:
+                    visit(child)
+                return
+            if node.id not in resolved:
+                return
+            value, upper_value = resolved[node.id]
+            threshold = node.threshold
+            if threshold.reference is not None:
+                threshold.value = value
+                threshold.reference = None
+            if threshold.upper_reference is not None:
+                threshold.upper_value = upper_value
+                threshold.upper_reference = None
+
+        visit(root)
+        return root
+
+    def keep_only(self, result):
+        """Drop retained matches the preset no longer finds.
+
+        ``result``: the preset evaluated on the current data (same
+        assignment table as now). Matches are only removed, never added.
+        Returns the number of result neurons removed.
+        """
+        before = self.neurons
+
+        if self.remaining is not None:
+            found = root_target_evidence(result) or {}
+            for old_target, old_sources in list(self.remaining.items()):
+                target = self.positions.get(old_target)
+                if target is None or target not in found:
+                    del self.remaining[old_target]
+                    continue
+                kept = {
+                    old_source
+                    for old_source in old_sources
+                    if self.positions.get(old_source) in found[target]
+                }
+                if old_sources and not kept:
+                    del self.remaining[old_target]
+                else:
+                    self.remaining[old_target] = kept
+        else:
+            root = self.snapshot.root_result
+            if root.match_level == "footprint":
+                matches = result.root_result.matches
+                for old in root.matches:
+                    if self.positions.get(old) not in matches:
+                        self.positions[old] = None
+
+            for neuron in self.snapshot.neurons:
+                old = Component(neuron, None)
+                current = self.positions.get(old)
+                if current is not None and current.neuron_id not in result.neurons:
+                    self.positions[old] = None
+
+        return len(before - self.neurons)

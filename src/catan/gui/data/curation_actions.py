@@ -155,9 +155,12 @@ class ManipulationPlan:
         compare=False,
         repr=False,
     )
+    # Options of the manipulation (cut: lobe parameters, see
+    # catan.core.footprint_lobes), as sorted (key, value) pairs.
+    parameters: tuple = ()
 
     @classmethod
-    def capture(cls, data, kind, sources, targets):
+    def capture(cls, data, kind, sources, targets, parameters=None):
         ids = data.assignments.ids
 
         return cls(
@@ -166,6 +169,7 @@ class ManipulationPlan:
             targets=tuple(EndpointRef.capture(ids, component) for component in targets),
             assignments=data.assignments,
             sessions=tuple(data.sessions),
+            parameters=tuple(sorted((parameters or {}).items())),
         )
 
     def resolve(self, data):
@@ -691,7 +695,7 @@ def prepare(data, plan, *, detach_occupied=False, exclude_occupied=False):
 
     elif plan.kind == "cut":
         # Kept part (in the target's neuron), then the new neuron's part.
-        results = worker._cut_footprint_inplace(targets[0])
+        results = worker._cut_footprint_inplace(targets[0], **dict(plan.parameters))
         replacements = {targets[0]: results}
 
     elif plan.kind == "neuron_merge":

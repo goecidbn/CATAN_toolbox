@@ -89,6 +89,14 @@ HOVER_NEURON_FADE_S = 2.0
 # Picking a target neuron: the neurons that are no candidate fade to this.
 PICK_FADED_ALPHA = 0.08
 
+# Split / merge sources (Display.source_unusable_reason).
+EXCLUDED_SOURCE = "Excluded footprints cannot be sources."
+SYNTHETIC_SOURCE = (
+    "Synthetic footprints (results of earlier splits, merges or cuts) are no "
+    "sources by default: manipulations would depend on each other. Tick "
+    "\"Allow synthetic sources\" in the request box to use them anyway."
+)
+
 INFERRED_RGBA = np.array(
     [0.0, 166 / 255, 178 / 255, 1.0],
     dtype=np.float32,
@@ -132,7 +140,7 @@ class TargetPick:
     """Picking the target neuron of a reassignment / move (Display.
     start_reassign_pick / start_move_pick); shown by TargetPickerBar."""
 
-    kind: str  # "reassign" or "move"
+    kind: str  # "reassign", "move" or "move_many"
     component: NeuronComponent  # the right-clicked footprint
     source_id: int
     moved: list  # sessions of the source's footprints that move
@@ -148,6 +156,8 @@ class TargetPick:
     new_tooltip: str = ""
     moved_union: object = None
     previous_highlight: tuple = None
+    # "move_many": the footprints that move (any neurons).
+    components: list = field(default_factory=list)
 
 
 class Display(BasePlot.BaseCanvas):
@@ -303,8 +313,22 @@ class Display(BasePlot.BaseCanvas):
             return
 
         status = ReviewStatus(self.display_assignments.review_status[neuron_id])
+        union = self.display_assignments.union
+        # An excluded neuron takes part in nothing: its tag says so instead
+        # of its review status (kept, and still settable in the menu).
+        excluded = (
+            union is not None
+            and union.included is not None
+            and neuron_id < len(union.included)
+            and not bool(union.included[neuron_id])
+        )
+        status_text = "excluded" if excluded else status.label
 
-        if status == ReviewStatus.REVIEWED:
+        if excluded:
+            background = "#a63a2c"
+            border = "#d9604c"
+
+        elif status == ReviewStatus.REVIEWED:
             background = "#357a4f"
             border = "#58a873"
 
@@ -319,12 +343,16 @@ class Display(BasePlot.BaseCanvas):
         # Only the active assignments' status can be changed here.
         editable = self.displays_active_assignments
         self.review_status_label.setMenu(self.review_status_menu if editable else None)
-        self.review_status_label.setToolTip(
-            "Set the review status" if editable else ""
-        )
+        tooltip = "Set the review status" if editable else ""
+        if excluded:
+            tooltip = (
+                f"Neuron {neuron_id} is excluded (review status: "
+                f"{status.label}). " + tooltip
+            ).strip()
+        self.review_status_label.setToolTip(tooltip)
         self.review_status_label.setText(
             f"Neuron {neuron_id} · {assignment_label(self.assignment_name)} · "
-            f"{status.label}" + (" ▾" if editable else "")
+            f"{status_text}" + (" ▾" if editable else "")
         )
 
         self.review_status_label.setStyleSheet(f"""
@@ -571,9 +599,18 @@ class Display(BasePlot.BaseCanvas):
             self.display_focused_component if infer and not filter_focused else None
         )
 
+        manipulating = self.manipulating()
+        excluded_visible = self.excluded_visible()
+        manipulated = self.manipulated_components()
+        self.plotting["manipulating"] = manipulating
+
         context = (
             self.assignment_name,
             id(self.display_assignments),
+            # Meshes hold excluded footprints only while they are shown
+            # (add_footprint_data).
+            excluded_visible,
+            frozenset(manipulated),
             infer,
             (int(self.controls["session_filter"].slider.value()) if infer else None),
             filter_focused if infer else False,
@@ -639,6 +676,21 @@ class Display(BasePlot.BaseCanvas):
             if 0 <= component.neuron_id < n_neurons
         }
 
+        # Excluded neurons only with "Show excluded" (never while
+        # manipulating), whatever brings them in (focus, highlights, scope,
+        # pick candidates); the manipulated footprints' own neurons stay.
+        neuron_included = self.display_assignments.union.included
+        manipulated_neurons = {int(c.neuron_id) for c in manipulated}
+
+        def visible(neuron):
+            return (
+                excluded_visible
+                or bool(neuron_included[neuron])
+                or int(neuron) in manipulated_neurons
+            )
+
+        required_neurons = {neuron for neuron in required_neurons if visible(neuron)}
+
         display_scope = self.controls["parameter"].display_scope
         if display_scope == "adjacent":
 
@@ -654,19 +706,16 @@ class Display(BasePlot.BaseCanvas):
         else:
             raise ValueError(f"Unknown footprint display scope: " f"{display_scope!r}")
 
-        show_excluded = self.controls["parameter"].checkbox_show_excluded.isChecked()
-
-        if not show_excluded:
-            included = self.display_assignments.union.included
-            to_plot_neurons = [neuron for neuron in to_plot_neurons if included[neuron]]
+        to_plot_neurons = [neuron for neuron in to_plot_neurons if visible(neuron)]
 
         in_scope = {int(neuron) for neuron in to_plot_neurons}
-        # The focused neuron is always drawn: excluded (flipping through
-        # curator results) or without a union centroid (no distance to
-        # itself), it was dropped and the panel showed only its tag.
+        # The focused neuron is always drawn (without a union centroid it
+        # has no distance to itself and was dropped), unless excluded and
+        # excluded footprints are hidden (the hint below its tag says so).
+        focused_drawn = {int(this_neuron)} if visible(this_neuron) else set()
         to_plot_neurons = np.union1d(
             np.asarray(to_plot_neurons, dtype=int),
-            np.asarray(sorted(required_neurons | {int(this_neuron)}), dtype=int),
+            np.asarray(sorted(required_neurons | focused_drawn), dtype=int),
         )
 
         review_mask = ReviewStatusFilter.neuron_mask(
@@ -694,11 +743,16 @@ class Display(BasePlot.BaseCanvas):
         pick = self._pick
         picked = None
         if pick is not None:
-            picked = {pick.source_id, *pick.candidates}
+            picked = {
+                pick.source_id,
+                *pick.candidates,
+                *(int(c.neuron_id) for c in pick.components),
+            }
             to_plot_neurons = np.union1d(
                 to_plot_neurons,
                 np.asarray(
-                    [n for n in pick.candidates if 0 <= n < n_neurons], dtype=int
+                    [n for n in pick.candidates if 0 <= n < n_neurons and visible(n)],
+                    dtype=int,
                 ),
             )
 
@@ -843,6 +897,13 @@ class Display(BasePlot.BaseCanvas):
         sessions = [int(s) for s in np.flatnonzero(ids[neuron] >= 0)]
         if not sessions:
             return f"Neuron {neuron} has no footprints."
+
+        if not self.excluded_visible() and not self.display_assignments.union.included[neuron]:
+            return (
+                f"Neuron {neuron} is excluded: hidden while manipulating."
+                if self.manipulating()
+                else f"Neuron {neuron} is excluded: tick \"Show excluded\" to see it."
+            )
 
         def tags(session_ids):
             return ", ".join(session_tag(s) for s in session_ids[:6]) + (
@@ -1103,6 +1164,13 @@ class Display(BasePlot.BaseCanvas):
             self._rotation_timer.timeout.connect(self._rotation_step)
         self._rotation_timer.start()
 
+    def mark_focus_rotated(self):
+        """Treat the focused neuron as already turned around (rotate_on_focus
+        skips it)."""
+        focused = self.display_focused_component
+        if focused is not None:
+            self._rotated_neuron = int(focused.neuron_id)
+
     def stop_rotation(self):
         if self._rotation_timer is not None:
             self._rotation_timer.stop()
@@ -1225,6 +1293,9 @@ class Display(BasePlot.BaseCanvas):
 
         levels = self.session_levels()
 
+        excluded_visible = self.excluded_visible()
+        manipulated = self.manipulated_components()
+
         for session in self.data.sessions:
             if (
                 session.id >= assignments.ids.shape[1]
@@ -1266,12 +1337,16 @@ class Display(BasePlot.BaseCanvas):
                 rgba = INFERRED_RGBA.copy()
 
             else:
-                # A whole excluded neuron is drawn only when focused or
-                # required (plot_neurons): then with all its footprints.
+                # Excluded footprints (or of an excluded neuron): only with
+                # "Show excluded", never while manipulating (except the
+                # manipulated footprints themselves).
                 if (
-                    not parameters.checkbox_show_excluded.isChecked()
-                    and not session.included[footprint_id]
-                    and assignments.union.included[neuron]
+                    not excluded_visible
+                    and component not in manipulated
+                    and not (
+                        session.included[footprint_id]
+                        and assignments.union.included[neuron]
+                    )
                 ):
                     continue
 
@@ -1328,6 +1403,68 @@ class Display(BasePlot.BaseCanvas):
             thr=threshold,
         )
 
+    def manipulating(self):
+        """A reassignment / move pick or a split / merge / move request is
+        running (excluded footprints are hidden meanwhile)."""
+        return self._pick is not None or self.state.current_request is not None
+
+    def excluded_visible(self):
+        """Excluded footprints are drawn only with "Show excluded" and
+        never while manipulating."""
+        return (
+            self.controls["parameter"].checkbox_show_excluded.isChecked()
+            and not self.manipulating()
+        )
+
+    def manipulated_components(self):
+        """Footprints being manipulated (drawn even when excluded): the
+        current request's and the pick's moved footprints."""
+        components = set()
+        request = self.state.current_request
+        if request is not None:
+            components.update(self.components_from_active(list(request.components)))
+        pick = self._pick
+        if pick is not None:
+            components.add(pick.component)
+            components.update(
+                pick.components
+                or [NeuronComponent(pick.source_id, s) for s in pick.moved]
+            )
+        return components
+
+    def source_picking(self):
+        """A split / merge request choosing its sources (stage
+        "destination") in the active assignments."""
+        request = self.state.current_request
+        return (
+            request is not None
+            and getattr(request, "type", None) in ("split", "merge")
+            and request.stage == "destination"
+            and self.displays_active_assignments
+        )
+
+    def source_unusable_reason(self, component):
+        """Why a drawn footprint cannot be a split / merge source (None if
+        it can): excluded footprints are bad detections; synthetic ones
+        (results of earlier manipulations) would chain manipulations."""
+        footprint_id = self.display_footprint_id(component)
+        if footprint_id is None:
+            return "Inferred footprints cannot be sources."
+        union = self.display_assignments.union
+        session = self.data.sessions[component.session_id]
+        if not union.included[component.neuron_id] or not session.included[footprint_id]:
+            return EXCLUDED_SOURCE
+        synthetic = getattr(session, "synthetic", None)
+        request = self.state.current_request
+        if (
+            synthetic is not None
+            and footprint_id < len(synthetic)
+            and synthetic[footprint_id]
+            and not getattr(request, "allow_synthetic", False)
+        ):
+            return SYNTHETIC_SOURCE
+        return None
+
     def find_closest_component(self, mouse_pos) -> Optional[NeuronComponent]:
 
         if not self.plotting["visuals"]:
@@ -1357,6 +1494,17 @@ class Display(BasePlot.BaseCanvas):
                 )
             )
         ]
+
+        if self.source_picking():
+            # Excluded and synthetic footprints are no sources: they cannot
+            # be hovered or chosen (synthetic ones stay visible).
+            own = set(self.components_from_active(self.state.current_request.components))
+            keys = [
+                key
+                for key in keys
+                if NeuronComponent(*key) in own
+                or self.source_unusable_reason(NeuronComponent(*key)) is None
+            ]
 
         if not keys:
             return None
@@ -1553,7 +1701,6 @@ class Display(BasePlot.BaseCanvas):
                     self.state.update_highlighted_components(
                         mapped,
                         event.modifiers,
-                        max_components=3,
                     )
 
             return
@@ -1582,7 +1729,6 @@ class Display(BasePlot.BaseCanvas):
                     self.state.update_highlighted_components(
                         mapped,
                         event.modifiers,
-                        max_components=3,
                     )
                 elif self.changes_on_click == "selected":
                     self.state.update_selected_components(
@@ -1962,6 +2108,7 @@ class Display(BasePlot.BaseCanvas):
         )
         reassign.triggered.connect(lambda: self.start_reassign_pick(this_component))
         self.add_move_footprints_menu(menu, this_component)
+        self.add_move_highlighted_action(menu, this_component)
 
         ## === shape of this footprint ===
         add_menu_section(menu, "Shape")
@@ -2059,6 +2206,25 @@ class Display(BasePlot.BaseCanvas):
             )
         )
 
+    def start_move_many_pick(self, component, components):
+        """"Move highlighted footprints…" (footprints of several neurons):
+        pick the neuron they all move into (Data.reassign_footprints)."""
+        if self.state.current_request is not None:
+            return
+        components = sorted(
+            set(components), key=lambda c: (c.neuron_id, c.session_id)
+        )
+        self._start_pick(
+            TargetPick(
+                "move_many",
+                component,
+                int(component.neuron_id),
+                sorted({int(c.session_id) for c in components}),
+                max(self.MERGE_RADIUS_PX, self.state.adjacency_radius),
+                components=components,
+            )
+        )
+
     @property
     def picking(self):
         return self._pick is not None
@@ -2077,7 +2243,9 @@ class Display(BasePlot.BaseCanvas):
         self._fill_pick(pick)
 
         # What is moved: violet (source).
-        moved = [NeuronComponent(pick.source_id, s) for s in pick.moved]
+        moved = list(pick.components) or [
+            NeuronComponent(pick.source_id, s) for s in pick.moved
+        ]
         self.state.update_highlighted_components(
             moved, roles={c: "source" for c in moved}
         )
@@ -2103,9 +2271,9 @@ class Display(BasePlot.BaseCanvas):
         if pick is None:
             return
         pick.radius += (
-            self.MERGE_RADIUS_STEP_PX
-            if pick.kind == "move"
-            else self.REASSIGN_RADIUS_STEP_PX
+            self.REASSIGN_RADIUS_STEP_PX
+            if pick.kind == "reassign"
+            else self.MERGE_RADIUS_STEP_PX
         )
         self._fill_pick(pick)
         self.pick_bar.show_pick(pick)
@@ -2117,6 +2285,12 @@ class Display(BasePlot.BaseCanvas):
         if pick is None:
             return
         ids = self.data.assignments.ids
+        if pick.kind == "move_many":
+            if neuron is not None and not 0 <= int(neuron) < ids.shape[0]:
+                return
+            self.cancel_pick()
+            self._move_many(pick.components, None if neuron is None else int(neuron))
+            return
         if neuron is not None:
             neuron = int(neuron)
             if neuron == pick.source_id or not 0 <= neuron < ids.shape[0]:
@@ -2134,6 +2308,78 @@ class Display(BasePlot.BaseCanvas):
             )
         else:
             self.change_neuron_assignment_dialog(pick.component, neuron)
+
+    def _move_many(self, components, target):
+        """Move ``components`` (any neurons) into ``target`` (None: a new
+        neuron) as one manipulation; occupied target slots are resolved for
+        all of them at once."""
+        from catan.gui.data.curation_actions import OccupiedDestination
+
+        components = [c for c in components if c.neuron_id != target]
+        if not components:
+            QMessageBox.information(
+                self.native,
+                "Nothing to move",
+                f"All highlighted footprints already belong to neuron {target}.",
+            )
+            return
+
+        occupied = None
+        while True:
+            try:
+                moved = self.data.reassign_footprints(components, target, occupied=occupied)
+            except OccupiedDestination as exc:
+                occupied = self._ask_occupied_many(exc.slots, target)
+                if occupied is None:
+                    return
+                continue
+            except ValueError as exc:
+                QMessageBox.warning(self.native, "Footprints not moved", str(exc))
+                return
+            break
+
+        skipped = len(components) - len(moved)
+        if skipped:
+            QMessageBox.information(
+                self.native,
+                "Footprints moved",
+                f"Moved {len(moved)} footprints into neuron {target}; skipped "
+                f"{skipped} where it already has a footprint.",
+            )
+
+    def _ask_occupied_many(self, slots, target):
+        """"exclude", "detach", "skip" or None (cancelled) for the sessions
+        where ``target`` already has a footprint."""
+        sessions = session_labels(self.data, sorted({int(s) for _, s, _ in slots}), short=True)
+        dialog = QMessageBox(self.native)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Neuron already has footprints there")
+        dialog.setText(
+            f"Neuron {target} already has a footprint in {len(slots)} of these "
+            f"sessions ({sessions})."
+        )
+        dialog.setInformativeText(
+            "Exclude: its footprints there are excluded and the moved ones "
+            "take their place.\nKeep: its footprints there move to separate, "
+            "included neurons.\nSkip: those footprints stay where they are."
+        )
+        exclude_button = dialog.addButton(
+            "Exclude existing && move", QMessageBox.ButtonRole.AcceptRole
+        )
+        detach_button = dialog.addButton(
+            "Keep as separate neurons && move", QMessageBox.ButtonRole.AcceptRole
+        )
+        skip_button = dialog.addButton("Skip those && move", QMessageBox.ButtonRole.AcceptRole)
+        cancel_button = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel_button)
+        fit_message_box_buttons(dialog)
+        dialog.exec()
+
+        return {
+            exclude_button: "exclude",
+            detach_button: "detach",
+            skip_button: "skip",
+        }.get(dialog.clickedButton())
 
     def hover_pick_target(self, neuron):
         """Highlight all footprints of ``neuron`` (None: nothing)."""
@@ -2177,6 +2423,30 @@ class Display(BasePlot.BaseCanvas):
             )
         show_tooltip(QCursor.pos(), text, self.native)
 
+    def _combined_footprint(self, components):
+        """Peak-normalized maximum of footprints (the moved footprints of
+        several neurons, compared with each candidate's union)."""
+        from scipy import sparse
+
+        columns = []
+        for component in components:
+            footprint_id = self.display_footprint_id(component)
+            if footprint_id is None:
+                continue
+            column = sparse.csc_matrix(
+                self.data.sessions[component.session_id].footprints[:, footprint_id],
+                dtype=np.float64,
+            )
+            peak = column.max()
+            if peak > 0:
+                columns.append(column / peak)
+        if not columns:
+            return None
+        combined = columns[0]
+        for column in columns[1:]:
+            combined = combined.maximum(column)
+        return sparse.csc_matrix(combined)
+
     def _union_distance(self, first, second):
         centroids = self.display_assignments.union.centroids
         distance = float(np.linalg.norm(centroids[first] - centroids[second]))
@@ -2203,6 +2473,16 @@ class Display(BasePlot.BaseCanvas):
             if not self.display_assignments.union.included[neuron]:
                 details.append("excluded")
             lines = [self.set_info_html(pick.moved_union, neuron)]
+        elif pick.kind == "move_many":
+            moved_here = [c for c in pick.components if c.neuron_id != neuron]
+            occupied = [c.session_id for c in moved_here if ids[neuron, c.session_id] >= 0]
+            if occupied:
+                details.append(
+                    "has footprints in " + session_labels(self.data, occupied, short=True)
+                )
+            if len(moved_here) < len(pick.components):
+                details.append(f"holds {len(pick.components) - len(moved_here)} of them")
+            lines = [self.set_info_html(pick.moved_union, neuron)]
         else:
             session = pick.moved[0]
             if ids[neuron, session] >= 0:
@@ -2226,13 +2506,19 @@ class Display(BasePlot.BaseCanvas):
             f"{units.to_display(pick.radius, 'distance'):.0f} {units.label('distance')}"
         )
         sections = []
-        listed = {source_id}
+        # Moving footprints of several neurons: any of them can be the
+        # target (its own highlighted footprints stay).
+        listed = set() if pick.kind == "move_many" else {source_id}
         pick.note = ""
+
+        neuron_included = self.display_assignments.union.included
 
         def section(title, neurons):
             rows = []
             for neuron, distance in neurons:
-                if neuron in listed:
+                # Excluded neurons are no targets (and are hidden while
+                # picking, plot_neurons).
+                if neuron in listed or not neuron_included[neuron]:
                     continue
                 listed.add(neuron)
                 self._pick_row(pick, neuron, distance)
@@ -2247,13 +2533,50 @@ class Display(BasePlot.BaseCanvas):
         # Before any row: the move rows compare against it.
         if pick.kind == "move" and pick.moved_union is None:
             pick.moved_union = self.data.partial_union_footprint(source_id, pick.moved)
+        if pick.kind == "move_many" and pick.moved_union is None:
+            pick.moved_union = self._combined_footprint(pick.components)
 
         ## the focused neuron is always offered (no distance limit: choosing
         ## it is deliberate)
         if focused_neuron is not None and 0 <= focused_neuron < ids.shape[0]:
             section("Focused neuron", [(focused_neuron, None)])
 
-        if pick.kind == "reassign":
+        if pick.kind == "move_many":
+            neurons = sorted({int(c.neuron_id) for c in pick.components})
+            pick.title = (
+                f"Move {len(pick.components)} highlighted footprints of "
+                f"{len(neurons)} neurons"
+            )
+            pick.summary = [
+                ", ".join(
+                    f"N{n} "
+                    + session_labels(
+                        self.data,
+                        [c.session_id for c in pick.components if c.neuron_id == n],
+                        short=True,
+                    )
+                    for n in neurons
+                )
+            ]
+            moved_sessions = list(pick.moved)
+            ## the moved footprints' own neurons first (collecting them in
+            ## one of them), then neighbours; occupied ones last
+            section(
+                "Neurons of the moved footprints",
+                [(n, None) for n in neurons],
+            )
+            section(
+                f"Within {radius_text}",
+                [(n, d) for n, d in nearby if not np.any(ids[n, moved_sessions] >= 0)],
+            )
+            section(
+                "Already have footprints in these sessions",
+                [(n, d) for n, d in nearby if np.any(ids[n, moved_sessions] >= 0)],
+            )
+            pick.allow_new = True
+            pick.new_tooltip = ""
+
+        elif pick.kind == "reassign":
             session = pick.moved[0]
             pick.title = (
                 f"Reassign neuron {source_id} · {session_label(self.data, session)}"
@@ -2340,7 +2663,7 @@ class Display(BasePlot.BaseCanvas):
         pick.sections = sections
         pick.candidates = listed - {source_id}
         step = (
-            self.MERGE_RADIUS_STEP_PX if pick.kind == "move" else self.REASSIGN_RADIUS_STEP_PX
+            self.REASSIGN_RADIUS_STEP_PX if pick.kind == "reassign" else self.MERGE_RADIUS_STEP_PX
         )
         pick.more_text = (
             f"Load more (within "
@@ -2665,6 +2988,46 @@ class Display(BasePlot.BaseCanvas):
                 lambda checked=False, moved=moved: self.start_move_pick(component, moved)
             )
 
+    def add_move_highlighted_action(self, menu, component):
+        """"Move highlighted footprints (k of m neurons)…": highlighted
+        footprints of several neurons into one neuron, as one batch."""
+        highlighted = [
+            c
+            for c in (self.state.highlighted_components or ())
+            if c.session_id is not None
+            and self.display_footprint_id(c) is not None
+        ]
+        # Excluded footprints are not moved.
+        movable = [c for c in highlighted if self.data.is_included(c)]
+        neurons = {int(c.neuron_id) for c in movable}
+
+        action = menu.addAction(
+            f"Move highlighted footprints ({len(movable)} of {len(neurons)} neurons)…"
+        )
+        reason = None
+        if self.state.current_request is not None:
+            reason = "Finish the current split / merge first."
+        elif len(neurons) < 2:
+            reason = (
+                "Highlight footprints of several neurons (Ctrl + click). For "
+                "one neuron use “Move footprints of neuron N ▸ Highlighted”."
+            )
+        action.setEnabled(reason is None)
+        action.setToolTip(
+            reason
+            or "Then click the neuron they all move into (or a new neuron). "
+            "One footprint per session; one manipulation (undone together)."
+            + (
+                f" {len(highlighted) - len(movable)} excluded highlighted "
+                "footprints are left out."
+                if len(movable) < len(highlighted)
+                else ""
+            )
+        )
+        action.triggered.connect(
+            lambda checked=False: self.start_move_many_pick(component, movable)
+        )
+
     def add_replace_with_union_menu(self, menu, component):
         """Shapes from the union of the neuron's other footprints (e.g. odd
         shapes before seeded redetection); activity is kept."""
@@ -2716,31 +3079,46 @@ class Display(BasePlot.BaseCanvas):
         needed): one part stays, the other becomes a new neuron."""
         from catan.core.footprint_lobes import lobe_count
 
-        cut = menu.addAction("Cut at the neck")
+        cut = menu.addAction("Cut at the neck…")
         reason = None
+        hint = ""
         if not self.data.is_included(component):
             reason = "Excluded footprints cannot be cut."
         else:
             session = self.data.sessions[component.session_id]
             footprint_id = self.state.get_footprint_from_component(component)
-            if footprint_id is None or lobe_count(
+            if footprint_id is None:
+                reason = "No detected footprint here."
+            elif lobe_count(
                 session.footprints[:, int(footprint_id)], tuple(session.dims)
             ) < 2:
-                reason = (
-                    "The footprint has no two lobes to cut apart "
-                    "(see the statistic Footprint lobes)."
+                # Still possible: the preview lowers the lobe criteria.
+                hint = (
+                    " No two lobes with the default settings: lower them "
+                    "in the preview to force a cut."
                 )
         cut.setEnabled(enabled and reason is None)
         cut.setToolTip(
             reason
-            or "Cut between its two lobes: the part matching this neuron's "
-            "other footprints stays, the other becomes a new neuron."
+            or "Preview the cut between its two lobes: the part matching this "
+            "neuron's other footprints stays, the other becomes a new neuron."
+            + hint
         )
         cut.triggered.connect(lambda: self._cut_footprint(component))
 
     def _cut_footprint(self, component):
+        from catan.gui.GUI_elements.fragments.cut_preview_dialog import CutPreviewDialog
+
+        dialog = CutPreviewDialog(self.data, component, self.native)
         try:
-            self.data.cut_footprint(component)
+            if dialog.exec() != CutPreviewDialog.DialogCode.Accepted:
+                return
+            parameters = dialog.parameters()
+        finally:
+            dialog.deleteLater()
+
+        try:
+            self.data.cut_footprint(component, **parameters)
         except ValueError as exc:
             QMessageBox.warning(self.native, "Footprint not cut", str(exc))
 
@@ -2994,6 +3372,9 @@ class Display(BasePlot.BaseCanvas):
             return
 
         error = request.validation_error(component)
+
+        if error is None and request.stage == "destination":
+            error = self.source_unusable_reason(component)
 
         if error is not None:
             self.request_display.set_error(error)
@@ -3281,6 +3662,12 @@ class Controller(BasePlot.CanvasController):
 
         self._refresh_assignments_selector()
 
+        # A manipulation (reassign, move, split, merge, cut, curator apply)
+        # may focus its result: no "Rotate on focus" turn for that, only
+        # when the user focuses another neuron.
+        if event.has(C.ASSIGNMENT_MAPPING):
+            self.canvas.mark_focus_rotated()
+
         # The candidates (and what moves) may be gone: start again.
         if self.canvas.picking and event.has(
             *SESSION_STRUCTURE_CHANGES,
@@ -3307,6 +3694,7 @@ class Controller(BasePlot.CanvasController):
             C.REVIEW_STATUS,
             C.ASSIGNMENT_SET,
             C.ASSIGNMENT_MAPPING,
+            C.INCLUSION,
         ):
             self.canvas.update_review_status_tag()
 
@@ -3498,6 +3886,10 @@ class Controller(BasePlot.CanvasController):
 
     def _on_request_status_changed(self):
         self.canvas.sync_request_display()
+
+        # Manipulating hides excluded footprints (Display.plot_neurons).
+        if self.canvas.manipulating() != self.canvas.plotting.get("manipulating", False):
+            self.update_neuron_selection()
 
 
 class SessionFilterControl(QWidget):
@@ -3693,6 +4085,18 @@ class RequestDisplay(QFrame):
         self.destination_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.destination_label.setWordWrap(True)
         root_layout.addWidget(self.destination_label)
+
+        # Split / merge sources: synthetic footprints only on request.
+        self._request = None
+        self.allow_synthetic = QCheckBox("Allow synthetic sources")
+        self.allow_synthetic.setToolTip(
+            "Also offer footprints created by earlier splits, merges or cuts "
+            "as sources (e.g. a pair detected as one footprint in every "
+            "session). The new manipulation then builds on them."
+        )
+        self.allow_synthetic.toggled.connect(self._set_allow_synthetic)
+        self.allow_synthetic.hide()
+        root_layout.addWidget(self.allow_synthetic)
 
         self.error_label = QLabel("")
         self.error_label.setObjectName("requestError")
@@ -3902,12 +4306,28 @@ class RequestDisplay(QFrame):
         )
         self.raise_()
 
+    def _set_allow_synthetic(self, allowed):
+        if self._request is not None:
+            self._request.allow_synthetic = bool(allowed)
+
     def set_request(
         self,
         request_handler: request_handler.RequestHandler | None,
     ):
 
         self.highlight_selector.hide()
+        self._request = request_handler
+        sources = (
+            request_handler is not None
+            and request_handler.type in ("split", "merge")
+            and request_handler.stage == "destination"
+        )
+        self.allow_synthetic.blockSignals(True)
+        self.allow_synthetic.setChecked(
+            bool(getattr(request_handler, "allow_synthetic", False))
+        )
+        self.allow_synthetic.blockSignals(False)
+        self.allow_synthetic.setVisible(sources)
         if request_handler is None:
             self.clear_request()
             return

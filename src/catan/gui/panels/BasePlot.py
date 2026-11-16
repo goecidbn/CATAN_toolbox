@@ -555,6 +555,10 @@ class BaseCanvas(scene.SceneCanvas):
         else:
             text = f"Neuron ID: {component.neuron_id}\n" f"Not in {session_name}"
 
+        excluded = self._excluded_text(component, fp_id)
+        if excluded:
+            text += f"\n{excluded}"
+
         statistic_lines = self._tooltip_statistic_lines(component)
 
         if statistic_lines:
@@ -565,6 +569,23 @@ class BaseCanvas(scene.SceneCanvas):
             text,
             self.native,
         )
+
+    def _excluded_text(self, component, fp_id):
+        """"Excluded …" for an excluded neuron / footprint, else ""
+        (statistics leave them out, so the tooltip says why)."""
+        assignments = getattr(self.data, "assignments", None)
+        union = getattr(assignments, "union", None)
+        neuron = int(component.neuron_id)
+        included = getattr(union, "included", None)
+        if included is not None and neuron < len(included) and not included[neuron]:
+            return "Excluded neuron (not in statistics)"
+        if fp_id is None or fp_id < 0 or component.session_id is None:
+            return ""
+        session = self.data.sessions[component.session_id]
+        flags = getattr(session, "included", None)
+        if flags is not None and fp_id < len(flags) and not flags[fp_id]:
+            return "Excluded footprint (not in statistics)"
+        return ""
 
     def on_mouse_move(self, event):
         # Camera interaction must not trigger picking or tooltip work.
@@ -612,7 +633,7 @@ class BaseCanvas(scene.SceneCanvas):
             self.state.focused_component = component
         elif self.changes_on_click == "highlighted":
             self.state.update_highlighted_components(
-                component, event.modifiers, max_components=3
+                component, event.modifiers
             )
         else:
             raise ValueError(f"Invalid changes_on_click value: {self.changes_on_click}")

@@ -1,0 +1,138 @@
+{
+  "schema_version": 2,
+  "name": "Cleanup: additional partial detections",
+  "category": "footprints",
+  "root": {
+    "type": "group",
+    "id": "bf12112a5cb646e7b6a902138e0c17d4",
+    "operator": "and",
+    "match_level": "footprint",
+    "children": [
+      {
+        "type": "group",
+        "id": "068fbd4d122748289fc8d718f2472fac",
+        "operator": "and",
+        "match_level": "relationship",
+        "children": [
+          {
+            "type": "condition",
+            "id": "a946156171aa44fdad3385a03f09d758",
+            "query": {
+              "statistic_key": "codetected_containment",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "different",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {
+                "core_threshold": 0.5,
+                "support_threshold": 0.1,
+                "min_sessions": 2
+              }
+            },
+            "threshold": {
+              "direction": "greater",
+              "active": true,
+              "reference": {
+                "kind": "percentile",
+                "sample": "Same neuron",
+                "level": 10.0
+              }
+            }
+          },
+          {
+            "type": "condition",
+            "id": "8c680b58ed7b4341b178fea5fbe6cdbb",
+            "query": {
+              "statistic_key": "partner_session_match",
+              "reductions": {
+                "neuron_i": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "neuron_j": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                },
+                "session": {
+                  "method": "keep",
+                  "index": null,
+                  "error_method": "none"
+                }
+              },
+              "reduction_order": [],
+              "filters": [
+                {
+                  "target": "neuron",
+                  "relation": "different",
+                  "collapse_same": true
+                }
+              ],
+              "context": "generic",
+              "parameters": {
+                "gamma": 0.1
+              }
+            },
+            "threshold": {
+              "direction": "greater",
+              "active": true,
+              "reference": {
+                "kind": "percentile",
+                "sample": "Same neuron",
+                "level": 5.0
+              }
+            }
+          }
+        ],
+        "count": {
+          "target": "footprint",
+          "comparison": "ge",
+          "value": 1,
+          "unit": "neuron",
+          "anchor": "source",
+          "separate_partner_sessions": false
+        },
+        "comment": "Another neuron is detected in this session as well (its own footprint here matches its union at least as well as 95 % of same-neuron footprints), and the core of this footprint lies inside that neuron's footprints in most other sessions as much as for 90 % of same-neuron footprints. Only neurons with at least as many footprints count (the longer track is the reference).",
+        "apply_to": "same",
+        "summary": null,
+        "manipulation": null,
+        "review_statuses": null
+      }
+    ],
+    "count": null,
+    "comment": "Additional (often partial) detections of a cell that is already detected in the same session by another neuron: the footprint lies where that neuron is seen in most sessions. These footprints are excluded (the other neuron keeps its own footprint). Often one-offs, sometimes repeated over several sessions.",
+    "apply_to": "same",
+    "summary": null,
+    "manipulation": {
+      "kind": "exclude_footprint",
+      "group_id": null,
+      "confirm_each": true,
+      "validation_presets": [],
+      "on_conflict": "ask"
+    },
+    "review_statuses": null
+  }
+}

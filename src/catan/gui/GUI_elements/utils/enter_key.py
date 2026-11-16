@@ -24,11 +24,13 @@ class EnterKeyButton(QObject):
     """Enter / Return clicks ``button`` while it is shown and enabled, if the
     key goes to a widget of the button's window, no popup or modal dialog is
     open and no text input has the focus. The application event filter is
-    installed only while the button is shown."""
+    installed only while the button is shown. ``blocked()`` (optional)
+    leaves the key to others while it returns True."""
 
-    def __init__(self, button):
+    def __init__(self, button, blocked=None):
         super().__init__(button)
         self.button = button
+        self.blocked = blocked
         self._filtering = False
         button.installEventFilter(self)
         self._set_filtering(button.isVisible())
@@ -53,6 +55,7 @@ class EnterKeyButton(QObject):
             and QApplication.activeModalWidget() is None
             and watched.window() is button.window()
             and not _edits_text(QApplication.focusWidget())
+            and not (self.blocked is not None and self.blocked())
         )
 
     def eventFilter(self, watched, event):

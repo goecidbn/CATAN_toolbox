@@ -1409,7 +1409,7 @@ class CurationFilterEvaluator:
 
                         with progress_scope(85, 100, "Projecting subgroup matches"):
                             child_result = self._project_group_result(
-                                child_result, group.match_level
+                                child_result, group.match_level, count=child.count
                             )
 
                     except CurationFilterError as exc:
@@ -2595,9 +2595,30 @@ class CurationFilterEvaluator:
         )
 
     @reports_progress("Projecting subgroup evidence")
-    def _project_group_result(self, result, match_level):
+    def _project_group_result(self, result, match_level, count=None):
         if result.match_level == match_level:
             return result
+
+        # "At least n partners per source footprint" inside a footprint
+        # group: its sources (counts accepting 0 select them already).
+        if (
+            match_level == "footprint"
+            and result.match_level == "relationship"
+            and count is not None
+            and count.anchor == "source"
+            and count.target == "footprint"
+            and result.endpoint_kinds is not None
+            and result.endpoint_kinds[0] == "footprint"
+        ):
+            sources = {pair.source for pair in result.matches}
+            return CurationFilterGroupResult(
+                group_id=result.group_id,
+                match_level="footprint",
+                matches=sources,
+                evidence_by_match={source: {source} for source in sources},
+                neuron_domain={source.neuron_id for source in sources},
+                footprint_domain=set(sources),
+            )
 
         if match_level == "neuron":
             evidence = {}

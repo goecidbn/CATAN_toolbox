@@ -165,6 +165,9 @@ class StatisticQuery:
     filters: tuple[PairFilter, ...] = ()
     context: Contexts = "generic"
     parameters: tuple[tuple[str, float | int | bool], ...] = ()
+    # Statistics panel option: excluded footprints / neurons count as
+    # present (engine.active_session_view); everything else leaves them out.
+    include_excluded: bool = False
 
     def reduction_dict(self):
         return dict(self.reductions)
@@ -191,6 +194,7 @@ class StatisticQuery:
             ],
             "context": self.context,
             "parameters": dict(self.parameters),
+            **({"include_excluded": True} if self.include_excluded else {}),
         }
 
     @classmethod
@@ -228,6 +232,7 @@ class StatisticQuery:
             ),
             context=data.get("context", "generic"),
             parameters=tuple(sorted(data.get("parameters", {}).items())),
+            include_excluded=bool(data.get("include_excluded", False)),
         )
 
 
